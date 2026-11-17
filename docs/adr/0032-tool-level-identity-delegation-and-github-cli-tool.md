@@ -8,7 +8,7 @@ Accepted
 
 ## Context
 
-Issue [imaustink/agent-controller#86](https://github.com/imaustink/agent-controller/issues/86)
+Issue [imaustink/aktis#86](https://github.com/imaustink/aktis/issues/86)
 asked for "a tool with the GH CLI preinstalled... wired up in prod", using
 "the OAuth delegation stuff in the integration gateway to get a token" —
 i.e. the same per-user GitHub identity-link mechanism ADR 0022 built for
@@ -99,7 +99,7 @@ reimplementation, but the same mechanism extended one CRD kind further.
    otherwise — same `if not identityLink.enabled` branching as
    `agent-opencode-swe.yaml`) and `templates/serviceaccount-github.yaml`
    (plain ServiceAccount, mirrors `serviceaccount-web-fetch.yaml`). No
-   changes needed to `orchestrator/charts/agent-controller` (the orchestrator/gateway
+   changes needed to `orchestrator/charts/aktis` (the orchestrator/gateway
    identity-link plumbing — `IDENTITY_LINK_GATEWAY_URL/TOKEN`,
    `GATEWAY_IDENTITY_LINK_TOKEN`, the orchestrator's `secrets: create/patch`
    RBAC — is already provider/CR-kind-agnostic and shared by any Agent or,
