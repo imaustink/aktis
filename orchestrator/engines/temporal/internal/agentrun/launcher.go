@@ -47,6 +47,12 @@ type LaunchSpec struct {
 	// Launch sets spec.identityMode (AGENT_IDENTITY_MODE) and the immutable
 	// spec.launch audit record (docs/adr/0049). Zero sets neither.
 	Launch audit.Launch
+	// ContentCapture sets spec.contentCapture (docs/adr/0050 §5): "content"
+	// lets the run's own telemetry record text. Empty writes nothing.
+	ContentCapture string
+	// OTLPEndpoint sets spec.telemetry.otlpEndpoint (docs/adr/0050 §3c): the
+	// collector the run exports to. Empty: the run exports nothing.
+	OTLPEndpoint string
 }
 
 // Launcher creates AgentRun CRs. The core-controller reconciles each into a
@@ -98,6 +104,12 @@ func (l *K8sLauncher) Launch(ctx context.Context, spec LaunchSpec) error {
 	}
 	if spec.Launch.IdentityMode != "" {
 		crSpec["identityMode"] = spec.Launch.IdentityMode
+	}
+	if spec.ContentCapture != "" {
+		crSpec["contentCapture"] = spec.ContentCapture
+	}
+	if spec.OTLPEndpoint != "" {
+		crSpec["telemetry"] = map[string]any{"otlpEndpoint": spec.OTLPEndpoint}
 	}
 	if launch := launchSpec(spec.Launch); launch != nil {
 		crSpec["launch"] = launch
@@ -181,6 +193,8 @@ func launchSpec(l audit.Launch) map[string]any {
 	set("requestedIdentityMode", l.RequestedIdentityMode)
 	set("identityModeSource", l.IdentityModeSource)
 	set("targetRepository", l.TargetRepository)
+	set("traceId", l.TraceID)
+	set("traceparent", l.Traceparent)
 	if l.Sender != nil {
 		sender := map[string]any{}
 		for k, v := range map[string]string{"provider": l.Sender.Provider, "login": l.Sender.Login, "accountId": l.Sender.AccountID} {

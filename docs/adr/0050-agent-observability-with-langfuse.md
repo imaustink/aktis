@@ -115,15 +115,48 @@ turn                                  (Temporal ConversationWorkflow)
 - The gateway's `/invoke` starts the root span. Its context is propagated
   into the workflow by the interceptor.
 
-**b. Sub-agent activity, with no instrumentation in the pod.** Sub-agents
-already stream TurnEvents (`tool-*`, `approval-*`, `warning`, `narration`,
-`turn-completed`) back to the engine
-(`internal/messaging/turnevent.go`, consumed in `workflows/agentloop.go`). The
-engine turns that stream into child spans under the `agent_run` span. That
-gives tool-level visibility for **every** agent image immediately, with no
-image changes and no telemetry egress from pods.
+**b. Sub-agent activity, with no instrumentation in the pod.** Spans are never
+made in workflow code, which must stay deterministic. Two sources cover it:
 
-**c. Model calls inside the pod.** This is a later phase. The SWE agents run
+- **The agent-run bridge** (`internal/agentrun`). It runs in the worker
+  process and sees every up-message a pod agent sends. It opens an
+  `agent_run` span under the launching activity's span, then:
+  - a child span per `tool_call`, closed by the `tool_result` sent back down
+    (a call still open when the run ends is closed as failed);
+  - `progress`, `warning` and `reply` as span events;
+  - `failed` as the span's error status.
+- **The Temporal interceptor** already traces activities (the parent's tool
+  runs) and update/signal handling (tool approvals).
+
+That gives tool-level visibility for **every** agent image immediately, with
+no image changes and no telemetry egress from pods.
+
+**c. Model calls inside the pod.** *As built:* the engine sets
+`AgentRun.spec.telemetry.otlpEndpoint` (its own collector endpoint). The
+controller maps that, plus `spec.launch.traceparent`, to `OTEL_EXPORTER_OTLP_*`,
+`OTEL_SERVICE_NAME` and `TRACEPARENT`. `@aktis/agent-runtime` exposes them as
+`session.telemetry` without pulling in an OpenTelemetry SDK.
+
+claude-code-swe-agent turns on the CLI's beta span export
+(`CLAUDE_CODE_ENABLE_TELEMETRY` + `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA` +
+`OTEL_TRACES_EXPORTER=otlp`, with an explicit traces endpoint). Its `-p` runs
+parent on `TRACEPARENT`. Metrics and logs are off, and text flags are set
+only for a run cleared for content.
+
+opencode (checked against the shipped 1.19.5 binary; its docs don't cover this):
+- Whenever `OTEL_EXPORTER_OTLP_ENDPOINT` is set it exports its own operation
+  spans to `/v1/traces` and logs to `/v1/logs`, with no switch for either. It
+  reads `OTEL_RESOURCE_ATTRIBUTES` but not `TRACEPARENT`, so its spans form a
+  trace of their own. The controller's resource attributes
+  (`aktis.agent_run`, `aktis.trace_id`) join that trace to the turn's.
+- `experimental.openTelemetry` adds the AI SDK's model-call spans. opencode
+  sets no `recordInputs`/`recordOutputs`, so those spans carry prompt and
+  response text. opencode-swe-agent therefore enables them only for a run
+  cleared for content.
+- The collector accepts OTLP logs into a `nop` exporter, so opencode's log
+  export succeeds instead of retrying; Langfuse takes traces only.
+
+The original plan for this phase: The SWE agents run
 the Claude Code CLI and opencode as subprocesses, so `@aktis/agent-runtime`
 never sees their model calls.
 - The launcher passes `TRACEPARENT` and `OTEL_EXPORTER_OTLP_ENDPOINT` into the
@@ -143,7 +176,26 @@ never sees their model calls.
 The context passes integration-gateway → agent-orchestrator → the Temporal
 gateway `/invoke` → workflow → AgentRun → pod.
 
-- Every HTTP hop uses the W3C `traceparent` header.
+- Every HTTP hop uses the W3C `traceparent` header, and every hop forwards
+  the context of a span it exports, so no span in the trace points at a
+  parent nobody reported. *As built* (OpenTelemetry SDK, no
+  auto-instrumentation; exported only when the chart sets
+  `OTEL_EXPORTER_OTLP_ENDPOINT`, otherwise each hop still mints/continues a
+  `traceparent` as before):
+  - **integration-gateway:** a `webhook delivery` server span per delivery
+    (continuing the sender's valid `traceparent`), and a `cron tick` span per
+    tick. They record `aktis.event_source`, `aktis.event_id`,
+    `aktis.event.outcome` (`ignored`, `dropped`, `rejected`, `failed`,
+    `identity-required` or `accepted`), the trigger and invocation id, and
+    the response status. A re-submit after linking is an `event resubmit`
+    client span in the same trace.
+  - **agent-orchestrator:** a `POST /invoke` server span, whose context the
+    turn carries, and an `engine POST /invoke` / `engine POST /invoke/check`
+    client span per engine call. The engine's server span nests under the
+    client span.
+  - Span attributes pass an allowlist at the emitter (`aktis.*` plus a few
+    `http.*` and `error.type` keys). Headers, bodies, URLs and sender logins
+    are never recorded.
 - The Temporal interceptor carries it from the gateway into the workflow.
 - The AgentRun carries it as `spec.launch.traceparent` (0049's `spec.launch`)
   and the controller passes it to the pod as `TRACEPARENT`.
@@ -164,14 +216,25 @@ people can read than the source system allows would undo 0040.
 - **`metadata` (default):** spans carry structure, timing, model, token
   counts, tool ids, outcomes and error codes. No prompt or output text.
 - **`content`:** also capture prompts and outputs, truncated to a size limit.
-- **Precedence:**
-  - The chart's global `observability.contentCapture` is the ceiling.
-  - `Agent.spec.observability.capture` can opt an agent in, up to that
-    ceiling.
-  - A turn that touched a knowledge base, or ran in `delegated`/`hybrid`
-    mode, is forced to `metadata`. Content read with a user's own
+- **Precedence (as built):**
+  - The chart's `global.observability.contentCapture` is the ceiling
+    (`AGENT_TRACE_CONTENT_CEILING` on the worker).
+  - `Agent.spec.observability.capture: content` opts an agent's **runs** in,
+    up to that ceiling.
+  - A run is forced to `metadata` when it acts with a caller's credentials
+    (`delegated`/`hybrid`, or no decided mode), or when it can reach a tool
+    that does: a knowledge base (always per-user hydrated), an MCP tool, or
+    any tool declaring identity providers. Content read with a user's own
     credentials stays out of a shared backend. Same "only restricts" rule as
     `readOnly`.
+  - The workflow decides eligibility from its own inputs
+    (`contentEligible`). The launch activity applies the ceiling, because
+    env is not readable in workflow code. The decision is recorded as
+    `AgentRun.spec.contentCapture`, which becomes `AGENT_TRACE_CONTENT=true`
+    in the pod.
+  - **The engine's own planner calls are always `metadata`.** Their prompts
+    mix catalog text, knowledge-base results and the caller's request, and
+    no per-turn signal says which was present, so they never record text.
 - **Never captured at any level:** credential env values, `secretEnv`,
   `Authorization` headers, assertion headers, identity-link tokens. This is
   enforced twice: an allowlist of attributes at the emitter, and an
@@ -230,7 +293,8 @@ subchart, so a pre-existing Langfuse in another namespace, another cluster,
 or behind an ingress is just a URL. It only has to be reachable from the
 collector.
 
-**The bundled path is not a toy, but its defaults are.** Langfuse v3 needs
+**The bundled path is not a toy, but its defaults are.** Langfuse (v4; chart
+`langfuse-k8s` 2.2.4, pinned) needs
 Postgres, ClickHouse, Redis and S3-compatible blob storage. Its chart can run
 each one in-release, or point each at an external service. We don't build an
 opinion on top. Our `values.yaml` shows:
@@ -239,10 +303,13 @@ opinion on top. Our `values.yaml` shows:
   Postgres and Redis. S3 from an ACK-provisioned bucket, the same pattern as
   image-gen, with IRSA on EKS rather than static keys.
 
-The upstream chart's datastore subcharts and images must be checked before
-pinning. Some upstream datastore images have changed registries or
-licensing terms. Pin images we can keep pulling, rather than whatever the
-subchart defaults to.
+Checked at pinning (chart 2.2.4): its datastores are groundhog2k Postgres,
+Valkey and SeaweedFS, none of them Bitnami, so the registry and licensing
+concern does not apply. ClickHouse is deployed through ClickHouse-operator
+CRDs, which must already be installed (the chart refuses to render
+otherwise). Offline renders pass `langfuse.clickhouse.crdCheck=false`. The
+headless-init variables (`LANGFUSE_INIT_*`) are wired from the shared key
+Secret but still need verifying against a running v4 instance.
 
 **Upstream values pass through untouched** under `langfuse:`, the same as
 `openwebui:`. Only three things are wired for the operator:

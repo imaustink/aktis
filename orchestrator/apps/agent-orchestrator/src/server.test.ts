@@ -7,6 +7,12 @@ import type { AgentOrchestratorChannel } from "./agents/nats-agent-channel.js";
 import { InMemorySessionStore } from "./session/in-memory-session-store.js";
 import type { Envelope, EventTriggerResource } from "@aktis/event-triggers";
 import { CrdEventTriggerRegistry } from "./routing/crd-event-trigger-registry.js";
+import { traceIdOf } from "./traceparent.js";
+import { setupTelemetry } from "./telemetry.js";
+import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
+
+/** Any version-00 traceparent: every /invoke turn carries its server span's (docs/adr/0050 §4). */
+const ANY_TRACEPARENT = expect.stringMatching(/^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$/);
 
 /**
  * Every request in this file goes over a fresh TCP connection.
@@ -246,6 +252,7 @@ describe("InvokeServer", () => {
       authToken: "tok-1",
       remoteControlUrlListener: expect.any(Function),
       reportIdentityLinkPending: expect.any(Function),
+      traceparent: ANY_TRACEPARENT,
     });
 
     const pendingRes = await fetch(`http://127.0.0.1:${port}/invoke/${id}`);
@@ -347,6 +354,7 @@ describe("InvokeServer", () => {
       authToken: "",
       remoteControlUrlListener: expect.any(Function),
       reportIdentityLinkPending: expect.any(Function),
+      traceparent: ANY_TRACEPARENT,
     });
 
     await new Promise((r) => setTimeout(r, 10));
@@ -924,6 +932,7 @@ describe("InvokeServer session-scoped pending identity link (GitHub OAuth Device
       authToken: "tok-1",
       remoteControlUrlListener: expect.any(Function),
       reportIdentityLinkPending: expect.any(Function),
+      traceparent: ANY_TRACEPARENT,
       sessionId: "session-1",
       activeSkillId: undefined,
       activeAgentId: undefined,
@@ -1775,6 +1784,7 @@ describe("InvokeServer session-scoped active skill (ADR 0012)", () => {
       authToken: "tok-1",
       remoteControlUrlListener: expect.any(Function),
       reportIdentityLinkPending: expect.any(Function),
+      traceparent: ANY_TRACEPARENT,
       sessionId: "cli-7",
       activeSkillId: "recipe-skill",
       sessionSubject: "open-webui",
@@ -1804,6 +1814,7 @@ describe("InvokeServer session-scoped active skill (ADR 0012)", () => {
       remoteControlUrlListener: expect.any(Function),
       identityLinkFlow: "device",
       reportIdentityLinkPending: expect.any(Function),
+      traceparent: ANY_TRACEPARENT,
     });
 
     await server.close();
@@ -1954,6 +1965,7 @@ describe("InvokeServer session-scoped active skill (ADR 0012)", () => {
       authToken: "tok-1",
       remoteControlUrlListener: expect.any(Function),
       reportIdentityLinkPending: expect.any(Function),
+      traceparent: ANY_TRACEPARENT,
     });
 
     const invalidRes = await fetch(`http://127.0.0.1:${port}/invoke`, {
@@ -1968,6 +1980,7 @@ describe("InvokeServer session-scoped active skill (ADR 0012)", () => {
       authToken: "tok-1",
       remoteControlUrlListener: expect.any(Function),
       reportIdentityLinkPending: expect.any(Function),
+      traceparent: ANY_TRACEPARENT,
     });
 
     await server.close();
@@ -2560,5 +2573,139 @@ describe("InvokeServer consumer-supplied tools (docs/adr/0035)", () => {
     });
 
     await server.close();
+  });
+});
+
+describe("InvokeServer accept-phase identity check (docs/adr/0049 §6)", () => {
+  const SECRET = "assertion-secret";
+  const agentTrigger: EventTriggerResource = {
+    metadata: { name: "triage-as-sender" },
+    spec: {
+      target: { agentRef: "swe", promptTemplate: "triage", identity: "delegated" },
+      reply: { github: { repository: "acme/widgets", issueNumber: "7", onIdentityError: true } },
+    },
+  };
+  const claims = { login: "alice", accountId: "583231", subjectStatus: "unlinked" as const };
+
+  async function post(graph: AgentGraphLike, trigger = agentTrigger): Promise<{ res: Response; server: InvokeServer }> {
+    const server = new InvokeServer(graph, undefined, undefined, await triggerRegistry([trigger]), undefined, SECRET);
+    const port = await listenOn(server);
+    const res = await fetch(`http://127.0.0.1:${port}/invoke`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer tok-1",
+        [SENDER_ASSERTION_HEADER]: mintSenderAssertion(SECRET, claims),
+      },
+      body: JSON.stringify({ event: envelope({ sender: { login: "alice" } }) }),
+    });
+    return { res, server };
+  }
+
+  const refusal = {
+    status: "failed" as const,
+    error: { code: "identity_link_required", message: "alice: link your GitHub account so swe can act as you: https://gw/x" },
+  };
+
+  it("answers 403 with the engine's identity error and the trigger's reply, and runs nothing", async () => {
+    const checkIdentity = vi.fn().mockResolvedValue(refusal);
+    const graph: AgentGraphLike = { invoke: vi.fn(), stream: vi.fn(), checkIdentity };
+    const { res, server } = await post(graph);
+
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: Record<string, unknown> };
+    expect(body.error.code).toBe("identity_link_required");
+    expect(body.error.trigger).toMatchObject({ name: "triage-as-sender", reply: { github: { onIdentityError: true } } });
+    expect(graph.invoke).not.toHaveBeenCalled();
+
+    // The check saw the turn as the engine would: forced agent, signed
+    // override, and the gateway's full sender claims.
+    expect(checkIdentity).toHaveBeenCalledWith(
+      expect.objectContaining({ forcedAgentId: "swe", identityOverride: "delegated", senderLogin: "alice", senderClaims: claims }),
+    );
+    await server.close();
+  });
+
+  it("accepts as before when the engine has no objection, carrying the claims into the run", async () => {
+    const graph: AgentGraphLike = {
+      invoke: vi.fn().mockResolvedValue({ request: "x", authToken: "t", skillCandidates: [], result: "done" } as AgentState),
+      stream: vi.fn().mockResolvedValue(noStream()),
+      checkIdentity: vi.fn().mockResolvedValue(undefined),
+    };
+    const { res, server } = await post(graph);
+    expect(res.status).toBe(202);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(graph.invoke).toHaveBeenCalledWith(expect.objectContaining({ senderClaims: claims }));
+    await server.close();
+  });
+
+  it("does not check a trigger that names no agent", async () => {
+    const checkIdentity = vi.fn().mockResolvedValue(refusal);
+    const graph: AgentGraphLike = {
+      invoke: vi.fn().mockResolvedValue({ request: "x", authToken: "t", skillCandidates: [], result: "done" } as AgentState),
+      stream: vi.fn().mockResolvedValue(noStream()),
+      checkIdentity,
+    };
+    const { res, server } = await post(graph, catchAllTrigger);
+    expect(res.status).toBe(202);
+    expect(checkIdentity).not.toHaveBeenCalled();
+    await server.close();
+  });
+});
+
+describe("InvokeServer trace context (docs/adr/0050 §4)", () => {
+  it("continues a valid inbound traceparent into the turn (a child span of it), and roots a new trace for a malformed one", async () => {
+    for (const [header, expectedTrace] of [
+      ["00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", "4bf92f3577b34da6a3ce929d0e0e4736"],
+      ["not-a-traceparent", undefined],
+    ] as const) {
+      const graph: AgentGraphLike = {
+        invoke: vi.fn().mockResolvedValue({ request: "x", authToken: "t", skillCandidates: [], result: "done" } as AgentState),
+        stream: vi.fn().mockResolvedValue(noStream()),
+      };
+      const server = new InvokeServer(graph);
+      const port = await listenOn(server);
+      await fetch(`http://127.0.0.1:${port}/invoke`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer t", traceparent: header },
+        body: JSON.stringify({ request: "hi" }),
+      });
+      await new Promise((r) => setTimeout(r, 10));
+      const arg = (graph.invoke as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as { traceparent?: string };
+      expect(arg.traceparent).toEqual(ANY_TRACEPARENT);
+      // Never the inbound span itself: this hop is a span of its own.
+      expect(arg.traceparent).not.toBe(header);
+      if (expectedTrace) expect(traceIdOf(arg.traceparent)).toBe(expectedTrace);
+      else expect(traceIdOf(arg.traceparent)).not.toBe("4bf92f3577b34da6a3ce929d0e0e4736");
+      await server.close();
+    }
+  });
+
+  it("with export on, hands the turn the context of an exported server span under the inbound one", async () => {
+    const exporter = new InMemorySpanExporter();
+    const stop = setupTelemetry("agent-orchestrator", { spanProcessor: new SimpleSpanProcessor(exporter) });
+    try {
+      const graph: AgentGraphLike = {
+        invoke: vi.fn().mockResolvedValue({ request: "x", authToken: "t", skillCandidates: [], result: "done" } as AgentState),
+        stream: vi.fn().mockResolvedValue(noStream()),
+      };
+      const server = new InvokeServer(graph);
+      const port = await listenOn(server);
+      const res = await fetch(`http://127.0.0.1:${port}/invoke`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer t", traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" },
+        body: JSON.stringify({ request: "hi" }),
+      });
+      const { id } = (await res.json()) as { id: string };
+      await new Promise((r) => setTimeout(r, 10));
+      const span = exporter.getFinishedSpans().find((s) => s.name === "POST /invoke");
+      expect(span?.parentSpanContext?.spanId).toBe("00f067aa0ba902b7");
+      const arg = (graph.invoke as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as { traceparent?: string };
+      expect(arg.traceparent).toBe(`00-4bf92f3577b34da6a3ce929d0e0e4736-${span!.spanContext().spanId}-01`);
+      expect(span?.attributes).toMatchObject({ "http.response.status_code": 202, "aktis.invocation_id": id });
+      await server.close();
+    } finally {
+      await stop();
+    }
   });
 });

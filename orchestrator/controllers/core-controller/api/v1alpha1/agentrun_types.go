@@ -79,12 +79,36 @@ type AgentRunSpec struct {
 	// +optional
 	IdentityMode IdentityMode `json:"identityMode,omitempty"`
 
+	// contentCapture is what this run's own telemetry may record (docs/adr/
+	// 0050 §5), decided by the launching engine from the deployment ceiling,
+	// the Agent's opt-in and what the run can reach. "content" maps to
+	// AGENT_TRACE_CONTENT=true; anything else records metadata only.
+	// +optional
+	// +kubebuilder:validation:Enum=metadata;content
+	ContentCapture string `json:"contentCapture,omitempty"`
+
+	// telemetry is where this run's own OpenTelemetry goes (docs/adr/0050
+	// §3c), set by the launching engine when tracing is on. The controller
+	// maps it, with spec.launch.traceparent, to the standard OTEL_* env and
+	// TRACEPARENT, which the run's CLI subprocesses inherit.
+	// +optional
+	Telemetry *AgentRunTelemetry `json:"telemetry,omitempty"`
+
 	// launch records who launched this run and as what (docs/adr/0049 §3),
 	// for anyone inspecting the run while it exists. The durable copy is the
 	// engine's audit log line; this mirrors it. Immutable once set.
 	// +optional
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="launch is immutable"
 	Launch *AgentRunLaunch `json:"launch,omitempty"`
+}
+
+// AgentRunTelemetry is an AgentRun's telemetry export target.
+type AgentRunTelemetry struct {
+	// otlpEndpoint is the in-cluster collector's OTLP/HTTP base URL. Never a
+	// trace backend directly: only the collector holds backend keys.
+	// +optional
+	// +kubebuilder:validation:Pattern=`^https?://`
+	OTLPEndpoint string `json:"otlpEndpoint,omitempty"`
 }
 
 // AgentRunLaunch is an AgentRun's launch audit record (docs/adr/0049 §3).
@@ -136,6 +160,16 @@ type AgentRunLaunch struct {
 	// targetRepository is the "owner/name" the run was gated on and scoped to.
 	// +optional
 	TargetRepository string `json:"targetRepository,omitempty"`
+
+	// traceId is the W3C trace id of the turn that launched this run
+	// (docs/adr/0050 §1): the join from this record to its trace.
+	// +optional
+	TraceID string `json:"traceId,omitempty"`
+
+	// traceparent is the W3C trace context the run's own telemetry continues
+	// (docs/adr/0050 §4).
+	// +optional
+	Traceparent string `json:"traceparent,omitempty"`
 }
 
 // LaunchSender identifies a webhook sender.

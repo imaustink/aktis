@@ -11,6 +11,8 @@ import { InMemoryPendingLabelStore } from "./label-reconciler.js";
 import type { AcceptedTrigger, EventSubmitResult, OrchestratorClient, OrchestratorInvokeResult, PollHooks } from "./orchestrator-client.js";
 import { GatewayServer, type GatewayServerOptions } from "./server.js";
 import { InMemorySessionPageStore } from "./session-page-store.js";
+import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { setupTelemetry } from "./telemetry.js";
 
 // Wrapped so a test can prove verification rejected a request BEFORE anything
 // parsed it -- the property the whole handler order exists for.
@@ -64,6 +66,23 @@ const SOURCES: EventSourceResource[] = [
         loginFrom: "body.sender.login",
         isBotFrom: 'body.sender.type == "Bot"',
         repositoryFrom: "body.repository.full_name",
+      },
+    },
+  },
+  {
+    // docs/adr/0049 §5: a source that also extracts the immutable account id.
+    metadata: { name: "github-ids" },
+    spec: {
+      webhook: {
+        verify: { scheme: "hmacSha256", header: "x-hub-signature-256", prefix: "sha256=", secretRef: { name: "gh", key: "secret" } },
+        deliveryIdHeader: "x-github-delivery",
+      },
+      sender: {
+        provider: "github",
+        loginFrom: "body.sender.login",
+        isBotFrom: 'body.sender.type == "Bot"',
+        repositoryFrom: "body.repository.full_name",
+        accountIdFrom: "body.sender.id",
       },
     },
   },
@@ -406,7 +425,7 @@ describe("sender verification", () => {
     await postGithub(h);
     await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
     expect(h.resolve).toHaveBeenCalledWith("alice", false, { owner: "acme", repo: "widgets" });
-    expect(h.submitEvent.mock.calls[0]?.[1]).toBe("alice");
+    expect(h.submitEvent.mock.calls[0]?.[1]).toEqual({ login: "alice" });
     const envelope = submittedEnvelope(h);
     expect(envelope.sender).toEqual({ login: "alice", isBot: false });
     expect(envelope.repository).toBe("acme/widgets");
@@ -483,7 +502,7 @@ describe("sender lookups are skipped for deliveries no trigger could match", () 
     await postGithub(h);
     await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
     expect(h.resolve).toHaveBeenCalledWith("alice", false, { owner: "acme", repo: "widgets" });
-    expect(h.submitEvent.mock.calls[0]?.[1]).toBe("alice");
+    expect(h.submitEvent.mock.calls[0]?.[1]).toEqual({ login: "alice" });
   });
 
   it("a trigger that reads `sender` can't be decided early, so the sender is resolved", async () => {
@@ -842,3 +861,166 @@ describe("live session tunnel (ADR 0026)", () => {
     expect((await h.sessionPageStore.getByToken(entry.token))?.live).toEqual({ agentRunId: "run-42", opencodeSessionId: "ses_abc123" });
   });
 });
+
+describe("webhook sender -> delegated subject (docs/adr/0049 §5-§6)", () => {
+  const PAYLOAD = { ...GITHUB_PAYLOAD, sender: { login: "alice", type: "User", id: 583231 } };
+  function postIds(h: Harness): Promise<Response> {
+    const body = JSON.stringify(PAYLOAD);
+    return fetch(`http://localhost:${h.port}/webhooks/github-ids`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-github-event": "pull_request",
+        "x-github-delivery": "delivery-ids",
+        "x-hub-signature-256": `sha256=${hmacHex("gh-secret", body)}`,
+      },
+      body,
+    });
+  }
+
+  it.each([
+    ["one linked subject", async () => ["openwebui:alice"], { subject: "openwebui:alice", subjectStatus: "linked" }],
+    ["no linked subject", async () => [], { subjectStatus: "unlinked" }],
+    ["several linked subjects", async () => ["openwebui:a", "openwebui:b"], { subjectStatus: "ambiguous" }],
+    [
+      "a failed lookup",
+      async () => {
+        throw new Error("apiserver down");
+      },
+      { subjectStatus: "unavailable" },
+    ],
+  ] as Array<[string, () => Promise<string[]>, Record<string, string>]>)(
+    "vouches for the sender's account id and subject: %s",
+    async (_, find, expected) => {
+      const findSubjectsByAccount = vi.fn(find);
+      const h = await start({ senderSubjects: { findSubjectsByAccount } });
+      expect((await postIds(h)).status).toBe(202);
+      expect(findSubjectsByAccount).toHaveBeenCalledWith("github", "583231");
+      expect(h.submitEvent.mock.calls[0]?.[1]).toEqual({ login: "alice", accountId: "583231", ...expected });
+    },
+  );
+
+  it("is unavailable, never linked, when no store is configured", async () => {
+    const h = await start();
+    await postIds(h);
+    expect(h.submitEvent.mock.calls[0]?.[1]).toEqual({ login: "alice", accountId: "583231", subjectStatus: "unavailable" });
+  });
+
+  const identityError = (onIdentityError: boolean): EventSubmitResult => ({
+    kind: "identity-required",
+    body: {
+      status: "failed",
+      error: {
+        code: "identity_link_required",
+        message: "alice: link your GitHub account so swe can act as you: https://gw/connections",
+        trigger: {
+          name: "review",
+          sessionId: "s",
+          reply: { github: { repository: "acme/widgets", issueNumber: 7, ...(onIdentityError ? { onIdentityError: true } : {}) } },
+        },
+      },
+    },
+  });
+
+  it("answers 403 with the engine's identity error body, verbatim", async () => {
+    const h = await start({ senderSubjects: { findSubjectsByAccount: async () => [] } });
+    h.submitEvent.mockResolvedValueOnce(identityError(false));
+    const res = await postIds(h);
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("identity_link_required");
+    expect(body.error.message).toContain("link your GitHub account");
+    await settle();
+    expect(h.poll).not.toHaveBeenCalled();
+    expect(h.postIssueComment).not.toHaveBeenCalled();
+  });
+
+  it("posts the identity error's message on the issue only when the trigger opts in", async () => {
+    const h = await start({ senderSubjects: { findSubjectsByAccount: async () => [] } });
+    h.submitEvent.mockResolvedValueOnce(identityError(true));
+    expect((await postIds(h)).status).toBe(403);
+    await vi.waitFor(() => expect(h.postIssueComment).toHaveBeenCalled());
+    expect(h.postIssueComment).toHaveBeenCalledWith(
+      "acme",
+      "widgets",
+      7,
+      "alice: link your GitHub account so swe can act as you: https://gw/connections",
+    );
+  });
+});
+
+describe("webhook trace context (docs/adr/0050 §4)", () => {
+  it("relays the delivery in the sender's trace when it sent one, else a new one", async () => {
+    const h = await start();
+    const body = JSON.stringify(GITHUB_PAYLOAD);
+    await fetch(`http://localhost:${h.port}/webhooks/github`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-github-event": "pull_request",
+        "x-github-delivery": "d-trace",
+        "x-hub-signature-256": `sha256=${hmacHex("gh-secret", body)}`,
+        traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+      },
+      body,
+    });
+    const traced = h.submitEvent.mock.calls[0] as unknown as [unknown, unknown, string];
+    expect(traced[2]).toMatch(/^00-4bf92f3577b34da6a3ce929d0e0e4736-[0-9a-f]{16}-01$/);
+
+    await postGithub(h);
+    const fresh = h.submitEvent.mock.calls[1] as unknown as [unknown, unknown, string];
+    expect(fresh[2]).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+    expect(fresh[2].slice(3, 35)).not.toBe("4bf92f3577b34da6a3ce929d0e0e4736");
+  });
+
+  describe("with export on", () => {
+    // A fresh exporter per test: shutting a provider down stops its exporter.
+    let exporter = new InMemorySpanExporter();
+    let stop: () => Promise<void> = async () => {};
+    afterEach(async () => {
+      await stop();
+      exporter = new InMemorySpanExporter();
+    });
+
+    it("exports one server span per delivery, continuing the sender's trace, and forwards THAT span to /invoke", async () => {
+      stop = setupTelemetry("integration-gateway", { spanProcessor: new SimpleSpanProcessor(exporter) });
+      const h = await start();
+      await postGithub(h, GITHUB_PAYLOAD, { extraHeaders: { traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" } });
+      await settle();
+      const [span] = exporter.getFinishedSpans();
+      expect(span?.name).toBe("webhook delivery");
+      expect(span?.spanContext().traceId).toBe("4bf92f3577b34da6a3ce929d0e0e4736");
+      expect(span?.parentSpanContext?.spanId).toBe("00f067aa0ba902b7");
+      // The orchestrator's span must nest under an EXPORTED span, not a
+      // minted id nobody reports.
+      const sent = (h.submitEvent.mock.calls[0] as unknown as [unknown, unknown, string])[2];
+      expect(sent).toBe(`00-${span!.spanContext().traceId}-${span!.spanContext().spanId}-01`);
+      expect(span?.attributes).toMatchObject({
+        "aktis.event_source": "github",
+        "aktis.event_id": "delivery-123",
+        "aktis.event.outcome": "accepted",
+        "http.response.status_code": 202,
+      });
+    });
+
+    it("ends a refused delivery's trace in an error span carrying the identity error code", async () => {
+      stop = setupTelemetry("integration-gateway", { spanProcessor: new SimpleSpanProcessor(exporter) });
+      const h = await start();
+      h.submitEvent.mockResolvedValueOnce({
+        kind: "identity-required",
+        body: { status: "failed", error: { code: "identity_link_required", message: "link your account" } },
+      });
+      expect((await postGithub(h)).status).toBe(403);
+      await settle();
+      const [span] = exporter.getFinishedSpans();
+      expect(span?.status.code).toBe(2); // SpanStatusCode.ERROR
+      expect(span?.attributes).toMatchObject({
+        "error.type": "identity_link_required",
+        "aktis.identity_error": "identity_link_required",
+        "aktis.event.outcome": "identity-required",
+        "http.response.status_code": 403,
+      });
+    });
+  });
+});
+

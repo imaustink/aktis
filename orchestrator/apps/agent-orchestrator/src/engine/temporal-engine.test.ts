@@ -1,7 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { setupTelemetry } from "../telemetry.js";
 import { TemporalEngine } from "./temporal-engine.js";
 import { SENDER_ASSERTION_HEADER } from "../rbac/sender-assertion.js";
-import { verifySenderAssertion } from "../rbac/sender-assertion.js";
+import { verifySenderAssertion, verifySenderClaims } from "../rbac/sender-assertion.js";
 import type { AgentGraphInput } from "../server.js";
 import { SignJWT } from "jose";
 import { CALLER_IDENTITY_HEADER } from "../rbac/caller-identity-assertion.js";
@@ -651,6 +653,92 @@ describe("TemporalEngine", () => {
       expect(state.result).toBe("ok");
       expect(resolve).not.toHaveBeenCalled();
       expect(assertedSubjects(calls)).toEqual([undefined]);
+    });
+  });
+});
+
+describe("TemporalEngine sender claims and the accept-phase check (docs/adr/0049 §5-§6)", () => {
+  const claims = { login: "alice", accountId: "583231", subject: "openwebui:a", subjectStatus: "linked" as const };
+
+  it("re-signs the gateway's full sender claims onto the engine hop", async () => {
+    const { impl, calls } = scriptedFetch([{ id: "x", status: "succeeded", result: "ok" }]);
+    const engine = new TemporalEngine({ baseUrl: BASE, fetchImpl: impl, senderAssertionSecret: ASSERTION_SECRET });
+    await engine.invoke(input({ senderLogin: "alice", senderClaims: claims }));
+    const header = (calls[0]!.init!.headers as Record<string, string>)[SENDER_ASSERTION_HEADER]!;
+    expect(verifySenderClaims(ASSERTION_SECRET, header)).toEqual(claims);
+  });
+
+  it("returns the engine's 403 identity error, and nothing for any other answer", async () => {
+    const refusal = { status: "failed", error: { code: "identity_link_required", message: "link it" } };
+    const answers: Array<[Response | Error, unknown]> = [
+      [new Response(JSON.stringify(refusal), { status: 403 }), refusal],
+      [new Response(null, { status: 204 }), undefined],
+      [new Response("nope", { status: 500 }), undefined],
+      [new Response(JSON.stringify({ unrelated: true }), { status: 403 }), undefined],
+      [new Error("connection refused"), undefined],
+    ];
+    for (const [answer, expected] of answers) {
+      const urls: string[] = [];
+      const impl = vi.fn(async (url: string | URL | Request) => {
+        urls.push(String(url));
+        if (answer instanceof Error) throw answer;
+        return answer;
+      }) as unknown as typeof fetch;
+      const engine = new TemporalEngine({ baseUrl: BASE, fetchImpl: impl, senderAssertionSecret: ASSERTION_SECRET });
+      const got = await engine.checkIdentity(
+        input({ triggerName: "t", forcedAgentId: "swe", senderLogin: "alice", senderClaims: claims, identityOverride: "delegated" }),
+      );
+      expect(got).toEqual(expected);
+      expect(urls).toEqual([`${BASE}/invoke/check`]);
+    }
+  });
+});
+
+describe("TemporalEngine trace context (docs/adr/0050 §4)", () => {
+  it("sends a child of the turn's inbound traceparent, or a fresh root", async () => {
+    for (const inbound of ["00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", undefined]) {
+      const { impl, calls } = scriptedFetch([{ id: "x", status: "succeeded", result: "ok" }]);
+      const engine = new TemporalEngine({ baseUrl: BASE, fetchImpl: impl });
+      await engine.invoke(input(inbound ? { traceparent: inbound } : {}));
+      const sent = (calls[0]!.init!.headers as Record<string, string>)["traceparent"]!;
+      expect(sent).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+      if (inbound) {
+        expect(sent.slice(3, 35)).toBe("4bf92f3577b34da6a3ce929d0e0e4736");
+        expect(sent).not.toBe(inbound);
+      }
+    }
+  });
+
+  describe("with export on", () => {
+    let exporter = new InMemorySpanExporter();
+    let stop: () => Promise<void> = async () => {};
+    afterEach(async () => {
+      await stop();
+      exporter = new InMemorySpanExporter();
+    });
+
+    it("sends the context of an exported client span that is a child of the turn's", async () => {
+      stop = setupTelemetry("agent-orchestrator", { spanProcessor: new SimpleSpanProcessor(exporter) });
+      const { impl, calls } = scriptedFetch([{ id: "x", status: "succeeded", result: "ok" }]);
+      const engine = new TemporalEngine({ baseUrl: BASE, fetchImpl: impl });
+      await engine.invoke(input({ traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" }));
+      await new Promise((r) => setTimeout(r, 0));
+      const hop = exporter.getFinishedSpans().find((s) => s.name === "engine POST /invoke");
+      expect(hop?.parentSpanContext?.spanId).toBe("00f067aa0ba902b7");
+      const sent = (calls[0]!.init!.headers as Record<string, string>)["traceparent"];
+      expect(sent).toBe(`00-4bf92f3577b34da6a3ce929d0e0e4736-${hop!.spanContext().spanId}-01`);
+      expect(hop?.attributes).toMatchObject({ "http.response.status_code": 202, "aktis.invocation_id": "conversation-abc.upd-1" });
+    });
+
+    it("marks a failed engine call's span with the status code", async () => {
+      stop = setupTelemetry("agent-orchestrator", { spanProcessor: new SimpleSpanProcessor(exporter) });
+      const impl = vi.fn(async () => new Response("no", { status: 503 })) as unknown as typeof fetch;
+      const engine = new TemporalEngine({ baseUrl: BASE, fetchImpl: impl });
+      await expect(engine.invoke(input())).rejects.toThrow(/503/);
+      await new Promise((r) => setTimeout(r, 0));
+      const hop = exporter.getFinishedSpans().find((s) => s.name === "engine POST /invoke");
+      expect(hop?.status.code).toBe(2);
+      expect(hop?.attributes["error.type"]).toBe("http_503");
     });
   });
 });

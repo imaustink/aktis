@@ -263,17 +263,44 @@ needs to do so. The only exception is opt-in: a GitHub trigger can have
 `reply.github.onIdentityError` post `message` as a comment (see Resolved
 questions).
 
-**The decision moves into the Temporal gateway's `/invoke` accept phase.**
-agent-orchestrator matches the trigger synchronously and forwards the resolved
-turn under the signed dispatch assertion. For an `agentRef` or `toolRef`
-target, the Temporal gateway then resolves the effective mode. It runs the
-non-interactive link check (`authz.ResolveLinked`) against `delegatedSubject`
-before starting the workflow. agent-orchestrator passes its `403` straight
-back to integration-gateway.
+**The decision is made in the accept phase, by the worker.** The check is
+`authz.Service.CheckIdentity`: the pre-flight's own mode decision plus a
+read-only token lookup under `delegatedSubject`. It never starts a flow or
+writes a Secret. It runs on the worker, where the catalog and identity-link
+client live, through a short `IdentityCheckWorkflow`, so the gateway grows no
+second copy of authorization. Two callers:
 
-`POST /webhooks/:source` stops relaying in the background for such sources. It
-awaits `/invoke` and passes the verdict through. This is well inside GitHub's
-10 s delivery timeout.
+- The Temporal gateway's own `/invoke` runs it before starting the workflow,
+  for a direct caller whose turn names its agent.
+- agent-orchestrator accepts a trigger turn (`202`) *before* the turn reaches
+  the engine. So for an `agentRef` trigger with a sender, it first asks
+  `POST /invoke/check` (same body and signed headers as `/invoke`; `204` = no
+  objection, `403` = the error). It answers the webhook relay with that `403`,
+  adding the trigger's rendered `reply`.
+
+The check only ever *speeds up* a refusal. When it cannot run (timeout,
+error, the agent is not visible) it answers "no objection", and the run's
+own pre-flight refuses the same way.
+
+`POST /webhooks/:source` now answers once the relay's accept is known,
+instead of acking `202` up front. A refused sender gets the `403` body
+verbatim. Every other outcome (dropped, unmatched, a failed relay, or an
+accepted run that continues in the background) is still `202`, so senders
+don't retry.
+
+A sender the gateway could not resolve to exactly one subject gets a code
+naming why, and only `identity_link_required` asks them to link:
+
+| sender status | code |
+| --- | --- |
+| linked, but no usable link under it | `identity_link_required` |
+| `unlinked` (no subject holds the account) | `identity_link_required` |
+| `ambiguous` (several subjects) | `identity_ambiguous` |
+| `unavailable` (lookup failed or not configured), or no `accountIdFrom` on the source | `identity_unavailable` |
+
+The account-id index is a `aktis.ai/account-id` label holding a SHA-256 prefix
+of the id (not every provider's id is a valid label value). The exact
+`accountId` field is re-checked on every hit.
 
 ```
 HTTP/1.1 403 Forbidden
@@ -328,10 +355,9 @@ HTTP/1.1 403 Forbidden
   rules keyed on the bot identity will see a different actor.
 - Non-GitHub resource providers (Atlassian, Slack) get `delegated` mode for
   free once their links carry `accountId`. `agent`/`hybrid` for them needs an
-  agent-side credential (`IdentityProvider.spec.agentCredential`, e.g. a
-  Secret or a minting strategy), which is deferred. Until then, validation
-  rejects `agent`/`hybrid` for an Agent whose resource providers have no agent
-  credential.
+  agent-side credential (`IdentityProvider.spec.agentCredential`). Step 5
+  adds it as a Secret, for Tools and MCPTools; a minting strategy (an App-like
+  exchange) is not built.
 
 ## Rollout (PR sequence)
 
@@ -363,8 +389,31 @@ Temporal gateway's verdicts.
      passed through agent-orchestrator to a synchronous webhook response, with
      the `identity_link_required` / `identity_ambiguous` error object.
    - `reply.github.onIdentityError`.
-5. **Later:** `IdentityProvider.spec.agentCredential` for non-GitHub
-   providers, and `defaultIdentity` on Tool / MCPTool.
+5. **Agent credentials and tool identity.**
+   - `IdentityProvider.spec.agentCredential.secretRef`: the operator's own
+     credential for a provider. The Secret must carry
+     `core.aktis.ai/agent-credential=true`; the label is the Secret owner's
+     opt-in, so whoever can write an IdentityProvider cannot have the engine
+     copy an unrelated Secret into a tool Job. The IdentityProvider
+     reconciler checks the Secret, key and label.
+   - `defaultIdentity: agent | delegated` on Tool, MCPServer and MCPTool
+     (copied server → tool by the broker). There is no `hybrid`: one tool
+     call has no read/write split to divide. `delegated` is the default and
+     the pre-0049 behaviour. Not allowed on an agent-backed Tool, whose
+     identity is its Agent's.
+   - In `agent` identity each resource provider presents its agentCredential
+     (container Tool: into the run's credential Secret under the provider's
+     env var; MCPTool: as the broker's delegated token). Runtime providers
+     stay the caller's, as on an Agent. A read-only turn still refuses a
+     github Tool. A Tool missing an agentCredential is not `Ready` and is
+     `misconfigured` at dispatch; it never falls back to the caller.
+   - Every identity-bearing tool call writes a `tool-authorization` audit
+     record naming the caller and whose credential each provider used.
+   - LangGraph refuses an `agent`-identity tool (the freeze below).
+   - **Still out of scope:** an Agent pod declaring a non-GitHub resource
+     provider. The Temporal engine's Agent providers remain the fixed
+     github/claude/claude-remote set; GitHub's agent credential is the App,
+     minted in the pod.
 
 ### The LangGraph engine is frozen, and fails closed
 

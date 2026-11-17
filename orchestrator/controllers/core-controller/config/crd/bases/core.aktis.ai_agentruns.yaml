@@ -94,6 +94,16 @@ spec:
                       Required when natsSubject is empty.
                     type: string
                 type: object
+              contentCapture:
+                description: |-
+                  contentCapture is what this run's own telemetry may record (docs/adr/
+                  0050 §5), decided by the launching engine from the deployment ceiling,
+                  the Agent's opt-in and what the run can reach. "content" maps to
+                  AGENT_TRACE_CONTENT=true; anything else records metadata only.
+                enum:
+                - metadata
+                - content
+                type: string
               goal:
                 description: |-
                   goal is the scoped natural-language objective handed to the agent loop
@@ -205,6 +215,16 @@ spec:
                     description: targetRepository is the "owner/name" the run was
                       gated on and scoped to.
                     type: string
+                  traceId:
+                    description: |-
+                      traceId is the W3C trace id of the turn that launched this run
+                      (docs/adr/0050 §1): the join from this record to its trace.
+                    type: string
+                  traceparent:
+                    description: |-
+                      traceparent is the W3C trace context the run's own telemetry continues
+                      (docs/adr/0050 §4).
+                    type: string
                   trigger:
                     description: trigger is the EventTrigger that produced the launching
                       turn.
@@ -270,6 +290,20 @@ spec:
                   - secretRef
                   type: object
                 type: array
+              telemetry:
+                description: |-
+                  telemetry is where this run's own OpenTelemetry goes (docs/adr/0050
+                  §3c), set by the launching engine when tracing is on. The controller
+                  maps it, with spec.launch.traceparent, to the standard OTEL_* env and
+                  TRACEPARENT, which the run's CLI subprocesses inherit.
+                properties:
+                  otlpEndpoint:
+                    description: |-
+                      otlpEndpoint is the in-cluster collector's OTLP/HTTP base URL. Never a
+                      trace backend directly: only the collector holds backend keys.
+                    pattern: ^https?://
+                    type: string
+                type: object
               timeoutSeconds:
                 description: timeoutSeconds bounds the Job's activeDeadlineSeconds.
                   Defaults to 300 if unset.

@@ -141,6 +141,13 @@ type Identity struct {
 	// credentials. Absent the assertion this degrades to no sharing, never to
 	// the wrong principal.
 	PerUser bool `json:"perUser,omitempty"`
+
+	// DelegatedSubject is the subject a webhook sender's account is linked
+	// under, vouched for by integration-gateway (docs/adr/0049 §5). It lets a
+	// caller-mode run act as the SENDER on a shared subject: resource
+	// credentials are keyed by it. It never makes the caller PerUser, so
+	// nothing interactive (link flows, principal re-keying) runs under it.
+	DelegatedSubject string `json:"delegatedSubject,omitempty"`
 }
 
 // Request is everything the pre-flight depends on, named explicitly rather
@@ -205,6 +212,18 @@ type Request struct {
 	DefaultIdentity   string   `json:"defaultIdentity,omitempty"`
 	AllowedIdentities []string `json:"allowedIdentities,omitempty"`
 	IdentityOverride  string   `json:"identityOverride,omitempty"`
+
+	// ToolIdentity is a Tool/MCPTool's defaultIdentity, read only by
+	// ResolveLinked: "agent" presents each resource provider's
+	// agentCredential instead of the caller's link (docs/adr/0049 step 5).
+	ToolIdentity string `json:"toolIdentity,omitempty"`
+
+	// SenderAccountID / SenderSubjectStatus are the rest of the gateway's
+	// sender claim (docs/adr/0049 §5): the immutable account id, and whether
+	// it resolved to a subject (linked | unlinked | ambiguous | unavailable).
+	// They decide which identity error a refusal reports.
+	SenderAccountID     string `json:"senderAccountId,omitempty"`
+	SenderSubjectStatus string `json:"senderSubjectStatus,omitempty"`
 }
 
 // suppressWriteCredentials removes, from a read-only run's credential set,
@@ -352,6 +371,11 @@ type Verdict struct {
 	// DecisionID names this decision in the audit trail. Set by the activity
 	// that ran it, never by this package.
 	DecisionID string `json:"decisionId,omitempty"`
+	// TraceID / Traceparent are the trace the decision ran in (docs/adr/0050
+	// §1), set by the activity alongside DecisionID: the audit record's join
+	// to its trace, and the context the launched run continues.
+	TraceID     string `json:"traceId,omitempty"`
+	Traceparent string `json:"traceparent,omitempty"`
 
 	// --- link-required ---
 
@@ -361,6 +385,12 @@ type Verdict struct {
 	// --- misconfigured ---
 
 	Error string `json:"error,omitempty"`
+
+	// --- refused, for an identity reason ---
+
+	// IdentityError is set when a caller-mode launch cannot act as its
+	// webhook sender (docs/adr/0049 §6). Message is its printable text.
+	IdentityError *IdentityError `json:"identityError,omitempty"`
 }
 
 // SecretWriter persists a run's resolved credentials and returns the object's
@@ -397,6 +427,11 @@ type Deps struct {
 	// missing provider instead of a provider's own flow; see
 	// UsesConnectionsPage. Empty keeps direct links everywhere.
 	ConnectionsURL string
+
+	// AgentCredentials resolves IdentityProvider.spec.agentCredential for a
+	// tool whose defaultIdentity is agent (docs/adr/0049 step 5). Nil refuses
+	// every such tool as misconfigured.
+	AgentCredentials AgentCredentialSource
 }
 
 // Service is the pre-flight. Constructed once from deps; unreachable from any
@@ -466,9 +501,9 @@ func (s *Service) Authorize(ctx context.Context, req Request) (Verdict, error) {
 		v, verr := s.misconfigured(req, "", err.Error())
 		return mode.annotate(v), verr
 	}
-	if refusal != "" {
+	if refusal != nil {
 		logVerdict(KindRefused, req.AgentID, map[string]any{"identityMode": mode.requested, "reason": "no caller credential"})
-		return mode.annotate(Verdict{Kind: KindRefused, Message: refusal}), nil
+		return mode.annotate(*refusal), nil
 	}
 	v, err := s.authorize(ctx, req, mode)
 	return mode.annotate(v), err
@@ -519,21 +554,31 @@ func (m launchMode) annotate(v Verdict) Verdict {
 //     operator said this run acts as the person who asked. Quietly running it
 //     as the agent instead would hand it the App's wider reach, so it is
 //     refused.
-func (s *Service) decideMode(req Request) (launchMode, string, error) {
+//
+// A webhook sender the gateway resolved to a linked subject (docs/adr/0049
+// §5) IS someone to act as: their DelegatedSubject's links are used. An
+// explicit caller mode whose sender did not resolve gets an IdentityError the
+// webhook consumer can act on (§6).
+func (s *Service) decideMode(req Request) (launchMode, *Verdict, error) {
 	d, err := ResolveMode(req.IdentityOverride, req.DefaultIdentity, req.AllowedIdentities, req.IdentityProviders)
 	m := launchMode{requested: d.Requested, source: d.Source, run: d.Requested, declared: req.IdentityProviders, readOnly: req.ReadOnly}
 	if err != nil {
-		return m, "", err
+		return m, nil, err
 	}
-	if m.run.usesCaller() && !req.Identity.PerUser {
+	actsAsSomeone := req.Identity.PerUser || req.Identity.DelegatedSubject != ""
+	if m.run.usesCaller() && !actsAsSomeone {
 		if d.Source == SourceInferred {
 			m.run = ModeAgent
-		} else {
-			return m, fmt.Sprintf("%s is set to act as the person who asked, and this request doesn't come from one person "+
-				"whose linked account I can use, so I didn't start it.", req.AgentID), nil
+			return m, nil, nil
 		}
+		if isWebhookSender(req) {
+			ie := s.identityError(req, m.requested, req.SenderSubjectStatus, callerResourceProviders(req.IdentityProviders))
+			return m, &Verdict{Kind: KindRefused, Message: ie.Message, IdentityError: ie}, nil
+		}
+		return m, &Verdict{Kind: KindRefused, Message: fmt.Sprintf("%s is set to act as the person who asked, and this request "+
+			"doesn't come from one person whose linked account I can use, so I didn't start it.", req.AgentID)}, nil
 	}
-	return m, "", nil
+	return m, nil, nil
 }
 
 // authorize is the provider pre-flight under an already-decided mode.
@@ -566,6 +611,9 @@ func (s *Service) authorize(ctx context.Context, req Request, mode launchMode) (
 	var ownedSecretNames []string
 	var pending []pendingEntry
 	var failedToStart []string
+	// delegatedMissing are a webhook sender's resource providers with no
+	// usable link under their delegated subject (docs/adr/0049 §6).
+	var delegatedMissing []string
 
 	// actorLoginFromLoop is the caller's login read off their resolved github
 	// link. Deliberately from the stored record rather than a /user call: the
@@ -645,7 +693,7 @@ func (s *Service) authorize(ctx context.Context, req Request, mode launchMode) (
 		// the shared-credential bug in its original form. Such a turn reads
 		// with the App token scoped to the repository its sender was
 		// verified on, and gateRepository insists that sender exists.
-		if step.name == identitylink.ProviderGitHub && !step.principalOnly && !req.Identity.PerUser {
+		if step.name == identitylink.ProviderGitHub && !step.principalOnly && !req.Identity.PerUser && req.Identity.DelegatedSubject == "" {
 			continue
 		}
 
@@ -658,11 +706,25 @@ func (s *Service) authorize(ctx context.Context, req Request, mode launchMode) (
 		if CrossEntryPointProviders[step.name] {
 			credentialSubject = principal
 		}
+		// A webhook sender's resource credentials are their own, read from
+		// the subject the gateway resolved them to (docs/adr/0049 §5).
+		delegated := !req.Identity.PerUser && req.Identity.DelegatedSubject != "" && !RuntimeProviders[step.name] && !step.principalOnly
+		if delegated {
+			credentialSubject = req.Identity.DelegatedSubject
+		}
 
 		token, err := s.deps.Links.Token(ctx, step.name, credentialSubject)
 		if err != nil {
 			log.Printf("[authorization] token lookup failed for %s@%s: %v", step.name, credentialSubject, err)
 			token = nil
+		}
+
+		if token == nil && delegated {
+			// Never prompt on a webhook sender's behalf: there is nobody here
+			// to complete a flow, and starting one under the sender's subject
+			// would be a link they never asked for. Reported to the consumer.
+			delegatedMissing = append(delegatedMissing, step.name)
+			continue
 		}
 
 		if token == nil {
@@ -823,6 +885,12 @@ func (s *Service) authorize(ctx context.Context, req Request, mode launchMode) (
 		}
 	}
 
+	if len(delegatedMissing) > 0 {
+		ie := s.identityError(req, mode.requested, "unlinked", delegatedMissing)
+		logVerdict(KindRefused, req.AgentID, map[string]any{"identityError": ie.Code, "missing": delegatedMissing})
+		return Verdict{Kind: KindRefused, Message: ie.Message, IdentityError: ie}, nil
+	}
+
 	// One decision point for the whole provider set, reached only after every
 	// provider has been assessed.
 	if len(pending) > 0 || len(failedToStart) > 0 {
@@ -937,7 +1005,7 @@ func (s *Service) ResolveLinked(ctx context.Context, req Request) (Verdict, erro
 	if len(req.IdentityProviders) == 0 {
 		return Verdict{Kind: KindAuthorized, Principal: s.principalOf(req)}, nil
 	}
-	if s.deps.Links == nil {
+	if s.deps.Links == nil && needsCallerLinks(req) {
 		return s.misconfigured(req, "", "no identity-link gateway is configured")
 	}
 
@@ -948,8 +1016,15 @@ func (s *Service) ResolveLinked(ctx context.Context, req Request) (Verdict, erro
 	// GITHUB_TOKEN would expose whatever static token the Tool template
 	// carries — an operator credential, typically broader than the caller's.
 	// An agent pod has no such fallback; a tool Job may. Fail closed.
+	agentIdentity := req.ToolIdentity == ToolIdentityAgent
 	if req.ReadOnly && containsString(req.IdentityProviders, identitylink.ProviderGitHub) {
-		msg := fmt.Sprintf("%s acts on GitHub as you, which this read-only request does not allow, so I didn't run it.", req.AgentID)
+		// The same refusal in agent identity: the agentCredential is as able
+		// to write as the caller's token, and a static one usually more so.
+		who := "as you"
+		if agentIdentity {
+			who = "with the agent's own credential"
+		}
+		msg := fmt.Sprintf("%s acts on GitHub %s, which this read-only request does not allow, so I didn't run it.", req.AgentID, who)
 		logVerdict(KindRefused, req.AgentID, map[string]any{"readOnly": true})
 		return Verdict{Kind: KindRefused, Message: msg, Error: msg}, nil
 	}
@@ -958,11 +1033,25 @@ func (s *Service) ResolveLinked(ctx context.Context, req Request) (Verdict, erro
 	credentials := map[string]string{}
 	var missing []string
 
+	var used []LaunchCredential
 	for _, provider := range req.IdentityProviders {
+		// Agent identity: a resource provider presents the operator's own
+		// credential, so the caller needs no link for it. A runtime provider
+		// (the model credential) is always the caller's, as on an Agent.
+		if agentIdentity && !RuntimeProviders[provider] {
+			cred, problem := s.agentCredential(ctx, provider)
+			if problem != "" {
+				return s.misconfigured(req, provider, problem)
+			}
+			credentials[cred.EnvVar] = cred.Value
+			used = append(used, LaunchCredential{Provider: provider, Read: "agent", Write: "agent"})
+			continue
+		}
 		envVar, supported := ProviderEnvVar[provider]
 		if !supported {
 			return s.misconfigured(req, provider, fmt.Sprintf("unsupported identity provider %q", provider))
 		}
+		used = append(used, LaunchCredential{Provider: provider, Read: "caller", Write: "caller"})
 		subject := req.Identity.Subject
 		if CrossEntryPointProviders[provider] {
 			subject = principal
@@ -984,7 +1073,10 @@ func (s *Service) ResolveLinked(ctx context.Context, req Request) (Verdict, erro
 		}, nil
 	}
 
-	verdict := Verdict{Kind: KindAuthorized, Principal: principal}
+	verdict := Verdict{Kind: KindAuthorized, Principal: principal, Credentials: used, IdentityMode: ModeDelegated}
+	if agentIdentity {
+		verdict.IdentityMode = ModeAgent
+	}
 	if len(credentials) > 0 {
 		if s.deps.Secret == nil {
 			return s.misconfigured(req, "", "resolved credentials but no secret writer is configured")
@@ -997,6 +1089,20 @@ func (s *Service) ResolveLinked(ctx context.Context, req Request) (Verdict, erro
 		verdict.EnvVarNames = sortedKeys(credentials)
 	}
 	return verdict, nil
+}
+
+// needsCallerLinks reports whether ResolveLinked reads any caller link: every
+// provider does, except a resource provider of an agent-identity tool.
+func needsCallerLinks(req Request) bool {
+	if req.ToolIdentity != ToolIdentityAgent {
+		return true
+	}
+	for _, p := range req.IdentityProviders {
+		if RuntimeProviders[p] {
+			return true
+		}
+	}
+	return false
 }
 
 // planProviders builds the assessment order, putting the principal-

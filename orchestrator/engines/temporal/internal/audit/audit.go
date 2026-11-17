@@ -7,6 +7,10 @@
 //     link prompts, written by the Authorize activity before anything starts.
 //   - "agent-launch": every AgentRun actually created, written by the launch
 //     activity, joined to its decision by decisionId.
+//   - "tool-authorization": every credential decision for a Tool or MCPTool
+//     call that declares identity providers, naming whose credential it used
+//     (docs/adr/0049 step 5). An agent-identity tool acts with the operator's
+//     credential for any role-permitted caller, so this is its accountability.
 //
 // This line is the durable record. AgentRun CRs are garbage-collected, and
 // the copy on AgentRun.spec.launch exists only for as long as the run does.
@@ -30,6 +34,7 @@ import (
 const (
 	KindAuthorization = "agent-authorization"
 	KindLaunch        = "agent-launch"
+	KindTool          = "tool-authorization"
 )
 
 // Entry points a launching turn can arrive through.
@@ -84,14 +89,20 @@ type Launch struct {
 	Credentials           []Credential `json:"credentials,omitempty"`
 	TargetRepository      string       `json:"targetRepository,omitempty"`
 	ReadOnly              bool         `json:"readOnly,omitempty"`
+	// TraceID joins this record to the turn's trace (docs/adr/0050 §1);
+	// Traceparent is what the launched run's own telemetry continues.
+	TraceID     string `json:"traceId,omitempty"`
+	Traceparent string `json:"traceparent,omitempty"`
 }
 
 // Record is one audit line.
 type Record struct {
 	Kind     string `json:"kind"`
 	Time     string `json:"time"`
-	Agent    string `json:"agent"`
+	Agent    string `json:"agent,omitempty"`
 	AgentRun string `json:"agentRun,omitempty"`
+	// Tool is the Tool or MCPTool a tool-authorization record is about.
+	Tool string `json:"tool,omitempty"`
 	// Outcome is the pre-flight verdict for an authorization record
 	// (authorized | link-required | refused | misconfigured), and "launched"
 	// for a launch record.
