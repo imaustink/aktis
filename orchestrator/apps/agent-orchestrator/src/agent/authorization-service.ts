@@ -165,7 +165,9 @@ export interface PendingIdentityLink {
  */
 export interface AuthorizationRequest {
   /** The Agent about to be launched: its id and the providers it declares. */
-  agent: { id: string; identityProviders?: string[] };
+  agent: { id: string; identityProviders?: string[]; defaultIdentity?: string };
+  /** The trigger's `target.identity` (docs/adr/0049); refused here like `defaultIdentity`. */
+  identityOverride?: string;
   /** The resolved caller (subject, principal, roles). */
   identity: Identity;
   /** This turn's request text, captured onto a parked link so the resume re-delegates THIS goal. */
@@ -366,6 +368,21 @@ export class AuthorizationService {
    */
   async authorize(req: AuthorizationRequest): Promise<AuthorizationOutcome> {
     const { agent, identity } = req;
+
+    // Identity modes (docs/adr/0049) are built on the Temporal engine only.
+    // This engine is frozen ahead of deprecation, so it refuses an Agent that
+    // chose a mode rather than silently running it as whatever inference
+    // happens to produce here -- which, for `agent` vs `hybrid`, would hand
+    // the run a different credential than its operator chose.
+    const mode = req.identityOverride ?? agent.defaultIdentity;
+    if (mode) {
+      const where = req.identityOverride ? "this turn's EventTrigger sets identity" : `agent ${agent.id} sets defaultIdentity`;
+      this.logVerdict("misconfigured", agent.id, { identityMode: mode, reason: "temporal-only" });
+      return {
+        kind: "misconfigured",
+        error: `${where} "${mode}", which needs the Temporal engine (AGENT_ENGINE=temporal); this engine does not implement identity modes`,
+      };
+    }
     const catalog = this.catalog();
     const isCrossEntryPoint = (provider: string): boolean => catalog.get(provider)?.crossEntryPoint === true;
     let secretEnv: CredentialEnvEntry[] | undefined;
@@ -424,6 +441,13 @@ export class AuthorizationService {
     // declared `github` takes.
     const providerPlan: { name: string; principalOnly?: boolean }[] = (agent.identityProviders ?? [])
       .filter((name) => !(req.readOnly && WRITE_CAPABLE_PROVIDERS.has(name)))
+      // A shared subject (a webhook relay's service identity) never holds a
+      // `github` token. `github` is keyed by the raw subject, so the first
+      // person to link under it would become every sender's GitHub identity --
+      // the shared-credential bug in its original form. Such a turn reads with
+      // the App token instead, exactly as the Temporal engine already does
+      // (authz.go). Kept despite this engine's freeze: it is a security fix.
+      .filter((name) => !(name === "github" && identity.perUser !== true))
       .map((name) => ({ name }));
     // Before offering a link, ask whether this caller already HAS one whose login
     // we can use. `resolveIdentity` asks the same question a node earlier, but it

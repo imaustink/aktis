@@ -23,6 +23,50 @@ import (
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
+// IdentityMode is the identity an agent run acts as on the external systems
+// its resource providers reach (docs/adr/0049).
+// +kubebuilder:validation:Enum=agent;delegated;hybrid
+type IdentityMode string
+
+const (
+	// IdentityModeAgent: the agent's own credential for reads and writes.
+	IdentityModeAgent IdentityMode = "agent"
+	// IdentityModeDelegated: the caller's own credential for reads and writes.
+	IdentityModeDelegated IdentityMode = "delegated"
+	// IdentityModeHybrid: the caller's credential for reads, the agent's for
+	// writes (docs/adr/0041).
+	IdentityModeHybrid IdentityMode = "hybrid"
+)
+
+// ToolIdentityMode is the identity a single tool call acts as on the system
+// its identity providers reach (docs/adr/0049 step 5). A tool call has no
+// read/write split for "hybrid" to divide, so there are only two.
+// +kubebuilder:validation:Enum=agent;delegated
+type ToolIdentityMode string
+
+const (
+	// ToolIdentityModeAgent: the call uses each resource provider's
+	// IdentityProvider.spec.agentCredential, the operator's own credential.
+	// The caller needs no linked account; the audit record names them.
+	ToolIdentityModeAgent ToolIdentityMode = "agent"
+	// ToolIdentityModeDelegated: the call uses the caller's own linked
+	// credential. The default, and the only behaviour before step 5.
+	ToolIdentityModeDelegated ToolIdentityMode = "delegated"
+)
+
+// AgentObservability is an agent's trace settings (docs/adr/0050 §5).
+type AgentObservability struct {
+	// capture opts this agent's runs in to recording prompt and output text
+	// on their traces ("content"), up to the deployment's ceiling. Default
+	// "metadata": structure, timing, model and token counts, no text. A run
+	// that acts with a caller's credentials (delegated/hybrid) or can reach a
+	// knowledge base or MCP tool is always metadata, whatever this says.
+	// +optional
+	// +kubebuilder:validation:Enum=metadata;content
+	// +kubebuilder:default=metadata
+	Capture string `json:"capture,omitempty"`
+}
+
 // AgentSpec defines the desired state of Agent. An Agent is a full agent
 // loop launched as a one-shot Job (same execution architecture as Tool):
 // given a goal at run time (AgentRun.spec.goal), it iterates internally and
@@ -30,6 +74,7 @@ import (
 // catalog half of the spec (description/input/output/allowedRoles/tier)
 // mirrors ToolSpec so agents participate in the same RBAC-scoped RAG
 // retrieval; the launch half (image/serviceAccountName/env) mirrors it too.
+// +kubebuilder:validation:XValidation:rule="!has(self.defaultIdentity) || !has(self.allowedIdentities) || self.defaultIdentity in self.allowedIdentities",message="defaultIdentity must be one of allowedIdentities"
 type AgentSpec struct {
 	// description is fed to the orchestrator's embedder for RAG retrieval.
 	// +required
@@ -146,6 +191,35 @@ type AgentSpec struct {
 	// catalog entry.
 	// +optional
 	IdentityProviders []string `json:"identityProviders,omitempty"`
+
+	// defaultIdentity is the identity this agent acts as on the systems its
+	// resource providers (e.g. "github") reach (docs/adr/0049):
+	//   - agent: the agent's own credential (e.g. the GitHub App) for reads
+	//     and writes; the caller needs no provider link.
+	//   - delegated: the caller's own linked credential for reads and writes.
+	//   - hybrid: the caller's credential for reads, the agent's for writes
+	//     (docs/adr/0041).
+	// Runtime providers (the model credential: "claude", "claude-remote")
+	// resolve the same way in every mode. Unset infers the pre-0049
+	// behaviour: hybrid when "github" is declared, agent otherwise. An
+	// EventTrigger's target.identity may override it within
+	// allowedIdentities. Honoured by the Temporal engine only; the LangGraph
+	// engine refuses a launch that sets it.
+	// +optional
+	DefaultIdentity IdentityMode `json:"defaultIdentity,omitempty"`
+
+	// allowedIdentities restricts which modes an EventTrigger's
+	// target.identity may select for this agent. Unset allows all three.
+	// Setting it lets an agent author forbid, e.g., a trigger downgrading a
+	// delegated agent to agent mode, which would widen what it can reach.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=3
+	AllowedIdentities []IdentityMode `json:"allowedIdentities,omitempty"`
+
+	// observability tunes this agent's traces (docs/adr/0050). Optional.
+	// +optional
+	Observability *AgentObservability `json:"observability,omitempty"`
 
 	// initContainers are Job pod init containers run before the main "run"
 	// container starts (e.g. to seed a shared /tmp volume with a credential

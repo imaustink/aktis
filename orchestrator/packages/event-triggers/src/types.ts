@@ -85,6 +85,8 @@ export interface EventSender {
   loginFrom: string;
   isBotFrom?: string;
   repositoryFrom?: string;
+  /** CEL -> the sender's immutable account id (docs/adr/0049 §5). */
+  accountIdFrom?: string;
   dropBots?: boolean;
 }
 
@@ -118,6 +120,8 @@ export interface EventTriggerTargetSpec {
   toolRef?: string;
   promptTemplate?: string;
   readOnly?: boolean;
+  /** Identity-mode override for the agents this turn launches (docs/adr/0049). */
+  identity?: string;
 }
 
 export interface GitHubReplySpec {
@@ -127,6 +131,8 @@ export interface GitHubReplySpec {
   sessionPage?: boolean;
   result?: boolean;
   removeLabel?: string;
+  /** Post an identity error's message as a comment (docs/adr/0049 §6). */
+  onIdentityError?: boolean;
 }
 
 export interface HttpReplySpec {
@@ -173,6 +179,12 @@ export interface TriggerTarget {
   ref?: string;
   readOnly: boolean;
   promptTemplate?: string;
+  /**
+   * `target.identity` (docs/adr/0049): the identity mode every agent the turn
+   * authorizes runs in. Can widen what a run reaches, so it is forwarded only
+   * inside a signed dispatch assertion.
+   */
+  identity?: string;
 }
 
 /** `reply` with every template rendered; `issueNumber` parsed to a number. */
@@ -184,6 +196,7 @@ export interface RenderedReply {
     sessionPage?: boolean;
     result?: boolean;
     removeLabel?: string;
+    onIdentityError?: boolean;
   };
   http?: {
     url: string;

@@ -80,6 +80,11 @@ type invokeRequest struct {
 	// never a trigger turn's own mode: that comes from the trigger.
 	ReadOnly bool `json:"readOnly,omitempty"`
 
+	// Identity is refused when set: an identity override can widen what a run
+	// reaches (docs/adr/0049), so it comes only from a trigger matched here
+	// or a verified rbac.DispatchAssertionHeader.
+	Identity string `json:"identity,omitempty"`
+
 	// CallerTools / CallerToolRequired carry a chat turn's caller-supplied
 	// tools (ADR 0035) across this hop, already parsed, validated and ranked
 	// by agent-orchestrator's own handleChat before it ever calls
@@ -258,7 +263,7 @@ func shapeInvokeTurn(
 		return shapedInvoke{}, errNotAnEnvelope
 	}
 	if req.ForcedSkillID != "" || req.ForcedAgentID != "" || req.ForcedToolID != "" ||
-		req.ToolInput != "" || len(req.Params) > 0 || req.TriggerName != "" {
+		req.ToolInput != "" || len(req.Params) > 0 || req.TriggerName != "" || req.Identity != "" {
 		return shapedInvoke{}, errBodyDispatch
 	}
 	if req.Event != nil && dispatchHeader != "" {
@@ -276,8 +281,16 @@ func shapeInvokeTurn(
 	// this endpoint's token could name an arbitrary login and be handed that
 	// person's credentials.
 	var senderLogin string
+	// sender carries what the gateway vouched for beyond the login (docs/adr/
+	// 0049 §5): the account id and the subject it is linked under. Only ever
+	// from a SIGNED assertion -- an unsigned envelope says nothing about whose
+	// links a run may use.
+	var sender *rbac.SenderClaims
 	if assertionSecret != "" {
-		senderLogin = rbac.VerifySenderAssertion(assertionSecret, assertionHeader, now)
+		sender = rbac.VerifySenderClaims(assertionSecret, assertionHeader, now)
+		if sender != nil {
+			senderLogin = sender.Login
+		}
 	} else if req.Event != nil {
 		if raw, ok := req.Event.Sender["login"].(string); ok {
 			senderLogin = strings.TrimSpace(raw)
@@ -305,6 +318,11 @@ func shapeInvokeTurn(
 		SenderLogin:      senderLogin,
 		IdentityLinkFlow: identityLinkFlow,
 		TargetRepository: strings.TrimSpace(req.TargetRepository),
+	}
+	if sender != nil {
+		turn.SenderAccountID = sender.AccountID
+		turn.SenderSubjectStatus = sender.SubjectStatus
+		turn.DelegatedSubject = sender.Subject
 	}
 
 	// A resolved trigger turn from agent-orchestrator, or a plain turn. The
@@ -338,6 +356,7 @@ func shapeInvokeTurn(
 			turn.ReadOnly = d.ReadOnly || req.ReadOnly
 			turn.Params = d.Params
 			turn.TriggerName = d.TriggerName
+			turn.IdentityOverride = d.Identity
 		}
 		// A forced tool's input is ToolInput, so its prompt may legitimately
 		// be empty (a toolRef trigger needs no promptTemplate). Anything else
@@ -376,6 +395,7 @@ func shapeInvokeTurn(
 	turn.ReadOnly = target.ReadOnly || req.ReadOnly
 	turn.Params = m.StringParams
 	turn.TriggerName = m.Trigger.Name
+	turn.IdentityOverride = target.Identity
 	// The repository the source's sender was verified on (§2 repositoryFrom)
 	// — never one read out of the prompt.
 	if turn.TargetRepository == "" {
@@ -433,6 +453,15 @@ func (s *Server) handleInvoke(c *gin.Context) {
 	sessionID := shaped.sessionID
 	if sessionID == "" {
 		sessionID = uuid.NewString()
+	}
+
+	// Accept-phase identity check (docs/adr/0049 §6): a turn whose agent
+	// must act as its webhook sender, who cannot be acted as, is refused here
+	// -- synchronously, so the caller can resolve it -- before anything starts.
+	if ie := s.checkIdentity(c.Request.Context(), turn); ie != nil {
+		log.Printf("/invoke: %s refused for sender %s (%s)", turn.ForcedAgentID, turn.SenderLogin, ie.Code)
+		refuseIdentity(c, ie, shaped.match, sessionID)
+		return
 	}
 	workflowID := "conversation-" + sanitizeID(sessionID)
 	updateID := uuid.NewString()

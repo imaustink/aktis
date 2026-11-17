@@ -19,6 +19,7 @@ type toolSpec struct {
 	Approval          string   `json:"approval,omitempty"`
 	AgentRef          string   `json:"agentRef,omitempty"`
 	IdentityProviders []string `json:"identityProviders,omitempty"`
+	DefaultIdentity   string   `json:"defaultIdentity,omitempty"`
 }
 
 type agentSpec struct {
@@ -36,6 +37,11 @@ type agentSpec struct {
 	MaxIterations          int32    `json:"maxIterations,omitempty"`
 	IdentityProviders      []string `json:"identityProviders,omitempty"`
 	ToolRefs               []string `json:"toolRefs,omitempty"`
+	DefaultIdentity        string   `json:"defaultIdentity,omitempty"`
+	AllowedIdentities      []string `json:"allowedIdentities,omitempty"`
+	Observability          *struct {
+		Capture string `json:"capture,omitempty"`
+	} `json:"observability,omitempty"`
 }
 
 type envVarSpec struct {
@@ -86,6 +92,7 @@ type mcpToolSpec struct {
 	Tier              string   `json:"tier,omitempty"`
 	Approval          string   `json:"approval,omitempty"`
 	IdentityProviders []string `json:"identityProviders,omitempty"`
+	DefaultIdentity   string   `json:"defaultIdentity,omitempty"`
 }
 
 type skillSpec struct {
@@ -121,6 +128,7 @@ func DecodeTool(obj *unstructured.Unstructured) (ToolDescriptor, error) {
 		Approval:          spec.Approval,
 		AgentRef:          spec.AgentRef,
 		IdentityProviders: spec.IdentityProviders,
+		DefaultIdentity:   spec.DefaultIdentity,
 	}, nil
 }
 
@@ -194,6 +202,7 @@ func DecodeMCPTool(obj *unstructured.Unstructured) (ToolDescriptor, error) {
 		Approval:          spec.Approval,
 		Hidden:            spec.Hidden,
 		IdentityProviders: spec.IdentityProviders,
+		DefaultIdentity:   spec.DefaultIdentity,
 		MCPExec: &MCPExecSpec{
 			ServerRef:      spec.ServerRef,
 			RemoteToolName: spec.RemoteToolName,
@@ -224,7 +233,15 @@ func DecodeAgent(obj *unstructured.Unstructured) (AgentDescriptor, error) {
 		Model:                  spec.Model,
 		MaxIterations:          spec.MaxIterations,
 		IdentityProviders:      spec.IdentityProviders,
-		ToolRefs:               spec.ToolRefs,
+		DefaultIdentity:        spec.DefaultIdentity,
+		AllowedIdentities:      spec.AllowedIdentities,
+		ContentCapture: func() string {
+			if spec.Observability == nil {
+				return ""
+			}
+			return spec.Observability.Capture
+		}(),
+		ToolRefs: spec.ToolRefs,
 	}, nil
 }
 

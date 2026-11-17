@@ -26,10 +26,25 @@ import type { ClaudeTokenStore } from "./claude-auth/store.js";
 import type { IdentityResolver, RepoContext } from "./identity.js";
 import type {
   AcceptedTrigger,
+  IdentityErrorBody,
   OrchestratorClient,
   OrchestratorInvokeResult,
   PollHooks,
 } from "./orchestrator-client.js";
+import { parseAcceptedTrigger } from "./orchestrator-client.js";
+import type { SenderClaims } from "./sender-assertion.js";
+import { startSpan, type TraceSpan } from "./telemetry.js";
+
+/**
+ * How a webhook delivery is answered: a status (and optional JSON body) sent
+ * once the relay's accept is known, plus any work that continues after the
+ * response (an accepted run, an opt-in identity-error comment).
+ */
+interface WebhookOutcome {
+  status: number;
+  body?: unknown;
+  after?: () => Promise<void>;
+}
 import { ClaudeCredentialRefresher, ClaudeCredentialSweeper } from "./claude-auth/credential-refresher.js";
 import { renderSessionPage } from "./session-page.js";
 import type { SessionPageStore } from "./session-page-store.js";
@@ -99,6 +114,12 @@ export interface GatewayServerOptions {
   tickNamespace?: string;
   /** Maps a source's sender login to an identity; only a login it resolves is ever forwarded. */
   identityResolver: IdentityResolver;
+  /**
+   * Resolves a verified sender's immutable account id to the subject(s) their
+   * links live under (docs/adr/0049 §5) -- the identity-link store. Absent:
+   * no sender ever resolves to a subject ("unavailable"), which fails closed.
+   */
+  senderSubjects?: { findSubjectsByAccount?(provider: string, accountId: string): Promise<string[]> };
   orchestratorClient: OrchestratorClient;
   githubReplyClient: GithubReplyClient;
   /** `fetch` used for `reply.http` deliveries; injectable for tests. */
@@ -520,16 +541,47 @@ export class GatewayServer {
     const deliveryHeader = source.webhook.deliveryIdHeader?.toLowerCase();
     const id = (deliveryHeader ? headers[deliveryHeader] : undefined) || randomUUID();
 
-    res.writeHead(202).end();
-
-    this.ingestWebhook(source, { id, headers, body, receivedAt }).catch(this.report);
+    // The answer waits for the relay's ACCEPT (never for the run): a sender
+    // whose agent must act as them but who has no usable linked account gets
+    // a synchronous 403 they can act on (docs/adr/0049 §6). Everything else is
+    // the same 202 as before -- a dropped or unmatched event is not the
+    // sender's error, and a non-2xx would only make them retry the same drop.
+    // One trace per delivery (docs/adr/0050 §4), continuing the sender's own
+    // traceparent when it sent a valid one. The span covers verification-to-
+    // answer; what it decided is `aktis.event.outcome`.
+    const span = startSpan("webhook delivery", typeof req.headers.traceparent === "string" ? req.headers.traceparent : undefined, {
+      kind: "server",
+      attributes: {
+        "http.request.method": "POST",
+        "http.route": "/webhooks/:source",
+        "aktis.event_source": source.name,
+        "aktis.event_id": id,
+      },
+    });
+    let outcome: WebhookOutcome;
+    try {
+      outcome = await this.ingestWebhook(source, { id, headers, body, receivedAt }, span);
+    } catch (error) {
+      this.report(error);
+      span.fail("internal_error");
+      outcome = { status: 202 };
+    }
+    span.set({ "http.response.status_code": outcome.status });
+    span.end();
+    if (outcome.body !== undefined) {
+      res.writeHead(outcome.status, { "content-type": "application/json" }).end(JSON.stringify(outcome.body));
+    } else {
+      res.writeHead(outcome.status).end();
+    }
+    outcome.after?.().catch(this.report);
   }
 
   private async ingestWebhook(
     source: Extract<CompiledEventSource, { kind: "webhook" }>,
     input: { id: string; headers: Record<string, string>; body: JsonValue; receivedAt: Date },
-  ): Promise<void> {
-    let senderLogin: string | undefined;
+    span: TraceSpan,
+  ): Promise<WebhookOutcome> {
+    let senderClaims: SenderClaims | undefined;
     let sender: Envelope["sender"] | undefined;
     let repository: string | undefined;
     if (source.sender) {
@@ -541,16 +593,18 @@ export class GatewayServer {
       const triggers = this.options.eventTriggers?.all();
       if (triggers && !couldMatchBeforeSender(triggers, preliminary)) {
         this.log(`webhook ${source.name} event ${input.id}: no trigger could match (ignored before sender lookup)`);
-        return;
+        span.set({ "aktis.event.outcome": "ignored" });
+        return { status: 202 };
       }
       const resolved = await this.resolveSender(source.sender, preliminary);
       if (!resolved.ok) {
         // 202 already sent: a dropped event is not the sender's error, and a
         // non-2xx would only make it retry the same drop.
         this.log(`webhook ${source.name} event ${input.id}: dropped (${resolved.reason})`);
-        return;
+        span.set({ "aktis.event.outcome": "dropped" });
+        return { status: 202 };
       }
-      senderLogin = resolved.login;
+      senderClaims = await this.senderClaims(source.name, resolved);
       sender = { login: resolved.login, isBot: resolved.isBot };
       repository = resolved.repository;
     }
@@ -563,7 +617,36 @@ export class GatewayServer {
       ...(repository ? { repository } : {}),
       now: input.receivedAt,
     });
-    await this.relayEvent(envelope, senderLogin);
+    return this.relayEvent(envelope, senderClaims, span);
+  }
+
+  /**
+   * What the gateway vouches for about a verified sender (docs/adr/0049 §5):
+   * their login, and -- when the source extracts an account id -- the one
+   * subject that account is linked under, or why there isn't one. Never
+   * throws: a lookup failure is "unavailable", which no agent acting as the
+   * sender will accept, so it fails closed.
+   */
+  private async senderClaims(sourceName: string, resolved: { login: string; accountId?: string }): Promise<SenderClaims> {
+    const claims: SenderClaims = { login: resolved.login };
+    if (!resolved.accountId) return claims;
+    claims.accountId = resolved.accountId;
+    const lookup = this.options.senderSubjects?.findSubjectsByAccount;
+    if (!lookup) return { ...claims, subjectStatus: "unavailable" };
+    try {
+      const subjects = await lookup.call(this.options.senderSubjects, "github", resolved.accountId);
+      if (subjects.length === 1) return { ...claims, subject: subjects[0]!, subjectStatus: "linked" };
+      if (subjects.length > 1) {
+        // One GitHub account linked from several chat users. The subject also
+        // keys every OTHER provider's links, so picking one would be arbitrary.
+        this.log(`webhook ${sourceName}: sender ${resolved.login} is linked under ${subjects.length} subjects (ambiguous)`);
+        return { ...claims, subjectStatus: "ambiguous" };
+      }
+      return { ...claims, subjectStatus: "unlinked" };
+    } catch (error) {
+      this.report(error);
+      return { ...claims, subjectStatus: "unavailable" };
+    }
   }
 
   /**
@@ -577,7 +660,9 @@ export class GatewayServer {
   private async resolveSender(
     sender: CompiledSender,
     preliminary: Envelope,
-  ): Promise<{ ok: true; login: string; isBot: boolean; repository: string } | { ok: false; reason: string }> {
+  ): Promise<
+    { ok: true; login: string; isBot: boolean; repository: string; accountId?: string } | { ok: false; reason: string }
+  > {
     const login = evaluate(sender.loginFrom, preliminary);
     if (!login.ok) return { ok: false, reason: `sender.loginFrom failed: ${login.error}` };
     if (typeof login.value !== "string" || !login.value) return { ok: false, reason: "sender.loginFrom is not a non-empty string" };
@@ -598,6 +683,17 @@ export class GatewayServer {
       repository = r.value;
     }
 
+    // The immutable account id (docs/adr/0049 §5). A number in GitHub's
+    // payload, so a bare `body.sender.id` is accepted as well as string(...).
+    let accountId: string | undefined;
+    if (sender.accountIdFrom) {
+      const r = evaluate(sender.accountIdFrom, preliminary);
+      if (!r.ok) return { ok: false, reason: `sender.accountIdFrom failed: ${r.error}` };
+      if (typeof r.value === "string" && r.value) accountId = r.value;
+      else if (typeof r.value === "bigint" || (typeof r.value === "number" && Number.isSafeInteger(r.value))) accountId = String(r.value);
+      else return { ok: false, reason: "sender.accountIdFrom is not a non-empty string or integer" };
+    }
+
     // Self-trigger guard: the agent's own comments/labels come from a bot.
     if (isBot && sender.dropBots) return { ok: false, reason: `sender ${login.value} is a bot` };
 
@@ -605,7 +701,7 @@ export class GatewayServer {
     const repoContext: RepoContext | undefined = repoMatch ? { owner: repoMatch[1] as string, repo: repoMatch[2] as string } : undefined;
     const identity = await this.options.identityResolver.resolve(login.value, isBot, repoContext);
     if (!identity) return { ok: false, reason: `sender ${login.value} not verified by provider ${sender.provider}` };
-    return { ok: true, login: login.value, isBot, repository };
+    return { ok: true, login: login.value, isBot, repository, ...(accountId ? { accountId } : {}) };
   }
 
   /**
@@ -630,7 +726,18 @@ export class GatewayServer {
     }
     const envelope = buildCronEnvelope({ source: source.name, ...(source.cron.payload !== undefined ? { payload: source.cron.payload } : {}), now: this.now() });
     res.writeHead(202).end();
-    this.relayEvent(envelope, undefined).catch(this.report);
+    const span = startSpan("cron tick", undefined, {
+      kind: "server",
+      attributes: { "http.request.method": "POST", "http.route": "/events/:source/tick", "aktis.event_source": source.name },
+    });
+    this.relayEvent(envelope, undefined, span)
+      .catch((error: unknown) => {
+        span.fail("internal_error");
+        throw error;
+      })
+      .finally(() => span.end())
+      .then((outcome) => outcome.after?.())
+      .catch(this.report);
   }
 
   private async tickAuthorized(authorization: string | undefined, rawName: string): Promise<boolean> {
@@ -664,22 +771,55 @@ export class GatewayServer {
    * an accepted event has side effects, and only the ones its trigger's
    * `reply` declares.
    */
-  private async relayEvent(envelope: Envelope, senderLogin: string | undefined): Promise<void> {
-    const submitted = await this.options.orchestratorClient.submitEvent(envelope, senderLogin);
+  private async relayEvent(envelope: Envelope, sender: SenderClaims | undefined, span: TraceSpan): Promise<WebhookOutcome> {
+    const submitted = await this.options.orchestratorClient.submitEvent(envelope, sender, span.traceparent);
+    this.log(`event ${envelope.source}/${envelope.id}: trace ${span.traceId}`);
+    span.set({ "aktis.event.outcome": submitted.kind });
     switch (submitted.kind) {
       case "ignored":
         this.log(`event ${envelope.source}/${envelope.id}: no trigger matched (ignored)`);
-        return;
+        return { status: 202 };
       case "rejected":
         this.log(`event ${envelope.source}/${envelope.id}: trigger matched but failed for this event (422): ${submitted.error}`);
-        return;
+        return { status: 202 };
       case "failed":
         this.log(`event ${envelope.source}/${envelope.id}: relay failed: ${submitted.error}`);
-        return;
+        span.fail("relay_failed");
+        return { status: 202 };
+      case "identity-required":
+        this.log(`event ${envelope.source}/${envelope.id}: refused, ${submitted.body.error.code} for sender ${sender?.login ?? "?"}`);
+        // docs/adr/0050 §4: a refused delivery is a short trace ending in an
+        // error span that carries the code ("how often do senders hit the
+        // link wall?").
+        span.set({ "aktis.identity_error": submitted.body.error.code });
+        span.fail(submitted.body.error.code);
+        return {
+          status: 403,
+          body: submitted.body,
+          after: () => this.postIdentityError(submitted.body),
+        };
       case "accepted":
-        await this.runAcceptedEvent(envelope, senderLogin, submitted.id, submitted.trigger);
-        return;
+        span.set({ "aktis.trigger": submitted.trigger.name, "aktis.invocation_id": submitted.id });
+        return {
+          status: 202,
+          after: () => this.runAcceptedEvent(envelope, sender, submitted.id, submitted.trigger, span.traceparent),
+        };
     }
+  }
+
+  /**
+   * GitHub never reads a webhook's response body, so a trigger may opt in to
+   * having the 403's printable message posted where the sender will see it
+   * (`reply.github.onIdentityError`, docs/adr/0049). The target is the
+   * trigger's own rendered reply, carried back on the 403.
+   */
+  private async postIdentityError(body: IdentityErrorBody): Promise<void> {
+    const trigger = (body.error as { trigger?: unknown }).trigger;
+    if (typeof trigger !== "object" || trigger === null) return;
+    const accepted = parseAcceptedTrigger(trigger);
+    const gh = this.githubReplyTarget(accepted);
+    if (!gh || !accepted.reply?.github?.onIdentityError) return;
+    await this.options.githubReplyClient.postIssueComment(gh.owner, gh.repo, gh.issueNumber, body.error.message);
   }
 
   /** Validates `reply.github` from the orchestrator; an unusable one is logged and treated as absent (it would only produce 404s against a garbage path). */
@@ -715,9 +855,10 @@ export class GatewayServer {
    */
   private async runAcceptedEvent(
     envelope: Envelope,
-    senderLogin: string | undefined,
+    sender: SenderClaims | undefined,
     invocationId: string,
     trigger: AcceptedTrigger,
+    traceparent?: string,
   ): Promise<void> {
     const gh = this.githubReplyTarget(trigger);
     const http = trigger.reply?.http;
@@ -772,9 +913,21 @@ export class GatewayServer {
         await this.completeTurn(sessionId, tracked, outcome);
         if (gh) await best(() => this.options.githubReplyClient.postIssueComment(gh.owner, gh.repo, gh.issueNumber, outcome.result ?? ""));
         const resumed = await this.waitAndResume(outcome.identityLink, async () => {
-          const again = await this.options.orchestratorClient.submitEvent(envelope, senderLogin);
+          // The resumed turn stays in the delivery's trace.
+          const hop = startSpan("event resubmit", traceparent, { kind: "client", attributes: { "aktis.event_source": envelope.source } });
+          let again: Awaited<ReturnType<OrchestratorClient["submitEvent"]>>;
+          try {
+            again = await this.options.orchestratorClient.submitEvent(envelope, sender, hop.traceparent);
+            hop.set({ "aktis.event.outcome": again.kind });
+            if (again.kind === "identity-required") hop.fail(again.body.error.code);
+            else if (again.kind === "failed") hop.fail("relay_failed");
+          } finally {
+            hop.end();
+          }
           if (again.kind !== "accepted") {
-            return { status: "failed", error: `re-submitting the event after linking: ${again.kind === "ignored" ? "no trigger matched" : again.error}` };
+            const why =
+              again.kind === "ignored" ? "no trigger matched" : again.kind === "identity-required" ? again.body.error.code : again.error;
+            return { status: "failed", error: `re-submitting the event after linking: ${why}` };
           }
           return this.options.orchestratorClient.poll(again.id, hooks);
         });

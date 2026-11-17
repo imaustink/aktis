@@ -8,6 +8,7 @@ import (
 	"go.temporal.io/sdk/activity"
 
 	"github.com/aktisai/orchestrator/engines/temporal/internal/agentrun"
+	"github.com/aktisai/orchestrator/engines/temporal/internal/audit"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/toolrun"
 )
 
@@ -37,6 +38,17 @@ type LaunchAgentRunInput struct {
 	// 0048): turn properties set by the matched EventTrigger.
 	ReadOnly bool              `json:"readOnly,omitempty"`
 	Params   map[string]string `json:"params,omitempty"`
+
+	// Launch is the pre-flight's audit view of this launch (docs/adr/0049):
+	// it becomes spec.identityMode + spec.launch, and the agent-launch audit
+	// line. Zero for a launch no Authorize decision covered.
+	Launch audit.Launch `json:"launch,omitempty"`
+
+	// ContentEligible says the workflow found nothing that forbids recording
+	// this run's text (docs/adr/0050 §5): the Agent opted in, it acts as
+	// itself, and it reaches no caller-credentialed tool. The deployment
+	// ceiling still applies here, in the activity.
+	ContentEligible bool `json:"contentEligible,omitempty"`
 }
 
 // AgentDownInput sends one message down to a running agent.
@@ -67,6 +79,14 @@ type AgentRunActivities struct {
 	// pods. Required by the CRD; a NATS-driven agent reports over its own
 	// channel and generally never posts to it.
 	CallbackBaseURL string
+	// ContentCeiling is the deployment's trace content ceiling (docs/adr/0050
+	// §5): only "content" lets an eligible run record text. Read once from
+	// AGENT_TRACE_CONTENT_CEILING at startup, never in workflow code.
+	ContentCeiling string
+	// OTLPEndpoint is the collector agent runs export to (docs/adr/0050 §3c):
+	// this worker's own OTEL_EXPORTER_OTLP_ENDPOINT. Empty: runs export
+	// nothing.
+	OTLPEndpoint string
 }
 
 func (a *AgentRunActivities) LaunchAgentRun(ctx context.Context, in LaunchAgentRunInput) error {
@@ -74,7 +94,10 @@ func (a *AgentRunActivities) LaunchAgentRun(ctx context.Context, in LaunchAgentR
 		return fmt.Errorf("launch requires runId and workflowId")
 	}
 
-	if err := a.Bridge.Attach(in.RunID, in.WorkflowID); err != nil {
+	// Traced: the run's agent_run span opens under this activity's span
+	// (the Temporal interceptor's), so a pod agent's tool calls land in the
+	// turn's trace (docs/adr/0050 §3b).
+	if err := a.Bridge.AttachTraced(ctx, in.RunID, in.WorkflowID, in.AgentRef); err != nil {
 		return fmt.Errorf("attach bridge for %s: %w", in.RunID, err)
 	}
 
@@ -99,10 +122,27 @@ func (a *AgentRunActivities) LaunchAgentRun(ctx context.Context, in LaunchAgentR
 		SecretEnv:      secretEnv,
 		ReadOnly:       in.ReadOnly,
 		Params:         in.Params,
+		Launch:         in.Launch,
+		ContentCapture: contentCapture(a.ContentCeiling, in.ContentEligible),
+		OTLPEndpoint:   a.OTLPEndpoint,
 	})
 	if err != nil {
 		a.Bridge.Detach(in.RunID)
 		return err
+	}
+	if in.Launch.DecisionID != "" {
+		annotateIdentity(ctx, in.Launch, in.WorkflowID)
+		// Joined to its agent-authorization record by decisionId. A retry
+		// after a successful create can repeat this line; both copies are
+		// identical and name the same agentRun.
+		audit.Emit(audit.Record{
+			Kind:         audit.KindLaunch,
+			Agent:        in.AgentRef,
+			AgentRun:     in.RunID,
+			Outcome:      "launched",
+			Conversation: workflowIDFromContext(ctx),
+			Launch:       in.Launch,
+		})
 	}
 	return nil
 }
@@ -148,4 +188,14 @@ func workflowIDFromContext(ctx context.Context) string {
 		return ""
 	}
 	return activity.GetInfo(ctx).WorkflowExecution.ID
+}
+
+// contentCapture applies the deployment ceiling to a run the workflow found
+// eligible (docs/adr/0050 §5). The platform can only tighten: an unset or
+// unknown ceiling is metadata.
+func contentCapture(ceiling string, eligible bool) string {
+	if eligible && ceiling == "content" {
+		return "content"
+	}
+	return "metadata"
 }

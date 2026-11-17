@@ -49,6 +49,9 @@ type EventTriggerTarget struct {
 	ToolRef        string    `json:"toolRef,omitempty"`
 	PromptTemplate string    `json:"promptTemplate,omitempty"`
 	ReadOnly       bool      `json:"readOnly,omitempty"`
+	// Identity overrides the identity mode of every agent the turn
+	// authorizes (docs/adr/0049); see authz.ResolveMode.
+	Identity string `json:"identity,omitempty"`
 }
 
 type EventSecretKeySelector struct {
@@ -63,6 +66,8 @@ type EventGitHubReply struct {
 	SessionPage bool   `json:"sessionPage,omitempty"`
 	Result      bool   `json:"result,omitempty"`
 	RemoveLabel string `json:"removeLabel,omitempty"`
+	// OnIdentityError: docs/adr/0049 §6.
+	OnIdentityError bool `json:"onIdentityError,omitempty"`
 }
 
 // EventHTTPReply's URL is a literal and is never rendered: a reply target must
@@ -511,6 +516,10 @@ func (d *EventTriggerDescriptor) compile() error {
 	if d.Spec.Target.ToolRef == "" && strings.TrimSpace(d.Spec.Target.PromptTemplate) == "" {
 		return fmt.Errorf("promptTemplate is required unless toolRef is set")
 	}
+	// Identity modes apply to agent runs; a tool has none (docs/adr/0049).
+	if d.Spec.Target.ToolRef != "" && d.Spec.Target.Identity != "" {
+		return fmt.Errorf("identity cannot be set with toolRef")
+	}
 
 	if expr := strings.TrimSpace(d.Spec.Match.CEL); expr != "" {
 		compiled, err := compileEventExpr(expr, cel.BoolType)
@@ -598,6 +607,8 @@ type RenderedGitHubReply struct {
 	SessionPage bool   `json:"sessionPage,omitempty"`
 	Result      bool   `json:"result,omitempty"`
 	RemoveLabel string `json:"removeLabel,omitempty"`
+	// OnIdentityError: docs/adr/0049 §6.
+	OnIdentityError bool `json:"onIdentityError,omitempty"`
 }
 
 type RenderedReply struct {
@@ -828,6 +839,7 @@ func renderReply(reply *EventTriggerReply, params map[string]any) (*RenderedRepl
 		if rendered.RemoveLabel, err = RenderEventTemplate(g.RemoveLabel, params); err != nil {
 			return nil, fmt.Errorf("github.removeLabel: %w", err)
 		}
+		rendered.OnIdentityError = g.OnIdentityError
 		out.GitHub = rendered
 	}
 	if h := reply.HTTP; h != nil {

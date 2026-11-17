@@ -19,6 +19,7 @@ import (
 	"github.com/aktisai/orchestrator/engines/temporal/internal/kubeconfig"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/llm"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/localtool"
+	"github.com/aktisai/orchestrator/engines/temporal/internal/telemetry"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/temporal"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/temporal/activities"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/temporal/workflows"
@@ -28,6 +29,12 @@ import (
 
 func main() {
 	cfg := temporal.ConfigFromEnv()
+	shutdownTracing := telemetry.Setup(context.Background(), "temporal-engine-worker")
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = shutdownTracing(ctx)
+	}()
 
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	if apiKey == "" {
@@ -74,6 +81,9 @@ func main() {
 	w.RegisterWorkflowWithOptions(workflows.BridgedAgentWorkflow, workflow.RegisterOptions{
 		Name: workflows.BridgedAgentWorkflowName,
 	})
+	w.RegisterWorkflowWithOptions(workflows.IdentityCheckWorkflow, workflow.RegisterOptions{
+		Name: workflows.IdentityCheckWorkflowName,
+	})
 	w.RegisterActivityWithOptions((&activities.LLMActivities{Client: llmClient}).CompleteTurn, activity.RegisterOptions{
 		Name: activities.CompleteTurnActivityName,
 	})
@@ -117,9 +127,13 @@ func main() {
 	// The Secret writer is what keeps a credential out of Temporal's event
 	// history: the pre-flight writes values here and returns only a name.
 	var secretWriter authz.SecretWriter
+	// The agent-credential source reads IdentityProvider.spec.agentCredential
+	// for agent-identity Tools and MCPTools (docs/adr/0049 step 5).
+	var agentCredentials authz.AgentCredentialSource
 	if kubeCfg, err := kubeconfig.Load(); err == nil {
 		if dynamicClient, err := dynamic.NewForConfig(kubeCfg); err == nil {
 			secretWriter = authz.NewK8sSecretWriter(dynamicClient, getenv("CATALOG_NAMESPACE", "controller-agent"))
+			agentCredentials = authz.NewK8sAgentCredentials(dynamicClient, getenv("CATALOG_NAMESPACE", "controller-agent"))
 		} else {
 			log.Printf("no dynamic client for credential secrets: %v", err)
 		}
@@ -128,8 +142,9 @@ func main() {
 	}
 
 	authorize := &activities.AuthorizeActivities{Service: authz.New(authz.Deps{
-		Links:  links,
-		Secret: secretWriter,
+		Links:            links,
+		Secret:           secretWriter,
+		AgentCredentials: agentCredentials,
 		// One bounded hop. The workflow's own durable wait is what spans a
 		// human's attention; this only lets the gateway short-circuit it when
 		// the link lands immediately.
@@ -145,6 +160,7 @@ func main() {
 	})}
 	w.RegisterActivityWithOptions(authorize.Authorize, activity.RegisterOptions{Name: activities.AuthorizeActivityName})
 	w.RegisterActivityWithOptions(authorize.ResolveLinked, activity.RegisterOptions{Name: activities.ResolveLinkedActivityName})
+	w.RegisterActivityWithOptions(authorize.CheckIdentity, activity.RegisterOptions{Name: activities.CheckIdentityActivityName})
 	w.RegisterActivityWithOptions(authorize.ResolveToolCredentials, activity.RegisterOptions{Name: activities.ResolveToolCredentialsActivityName})
 
 	// Retrieval activities need Qdrant; without it the worker still serves
@@ -214,9 +230,10 @@ func main() {
 		// activity resolves the caller's delegated token and relays one call.
 		if mcpBrokerURL := os.Getenv("MCP_BROKER_URL"); mcpBrokerURL != "" {
 			mcp := &activities.MCPActivities{
-				Credentials: &activities.LinkedCredentials{Links: links},
-				BrokerURL:   mcpBrokerURL,
-				BrokerToken: os.Getenv("MCP_BROKER_TOKEN"),
+				Credentials:      &activities.LinkedCredentials{Links: links},
+				BrokerURL:        mcpBrokerURL,
+				BrokerToken:      os.Getenv("MCP_BROKER_TOKEN"),
+				AgentCredentials: agentCredentials,
 			}
 			w.RegisterActivityWithOptions(mcp.RunMCPTool,
 				activity.RegisterOptions{Name: activities.RunMCPToolActivityName})
@@ -255,6 +272,10 @@ func main() {
 		}
 
 		agentRuns := &activities.AgentRunActivities{
+			// docs/adr/0050 §5: the platform's ceiling on recording run text.
+			ContentCeiling: os.Getenv("AGENT_TRACE_CONTENT_CEILING"),
+			// docs/adr/0050 §3c: runs export to the same collector.
+			OTLPEndpoint: os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
 			Launcher: agentrun.NewK8sLauncher(
 				dynamicClient,
 				getenv("TOOLRUN_NAMESPACE", "controller-agent"),

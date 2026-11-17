@@ -259,7 +259,7 @@ func toCoreEnv(staticEnv []toolv1alpha1.EnvVar, secretEnv []toolv1alpha1.SecretE
 // a read-only gate that rides on a prompt string surviving intact is one an
 // event body can talk its way past. Absent/false fields add nothing, so an
 // agent reads "unset" as "not read-only" and "no params".
-func agentEventEnv(spec toolv1alpha1.AgentRunSpec) []toolv1alpha1.EnvVar {
+func agentEventEnv(name string, spec toolv1alpha1.AgentRunSpec) []toolv1alpha1.EnvVar {
 	var env []toolv1alpha1.EnvVar
 	if spec.ReadOnly {
 		env = append(env, toolv1alpha1.EnvVar{Name: "AGENT_READ_ONLY", Value: "true"})
@@ -270,6 +270,17 @@ func agentEventEnv(spec toolv1alpha1.AgentRunSpec) []toolv1alpha1.EnvVar {
 		raw, _ := json.Marshal(spec.Params)
 		env = append(env, toolv1alpha1.EnvVar{Name: "AGENT_PARAMS", Value: string(raw)})
 	}
+	// The engine's decided identity mode (docs/adr/0049): the agent switches
+	// on this instead of inferring delegation from which tokens are present.
+	if spec.IdentityMode != "" {
+		env = append(env, toolv1alpha1.EnvVar{Name: "AGENT_IDENTITY_MODE", Value: string(spec.IdentityMode)})
+	}
+	// Only the opt-in is an env var: absent means metadata, so a run the
+	// engine did not decide can never default to recording text.
+	if spec.ContentCapture == "content" {
+		env = append(env, toolv1alpha1.EnvVar{Name: "AGENT_TRACE_CONTENT", Value: "true"})
+	}
+	env = append(env, agentTelemetryEnv(name, spec)...)
 	return env
 }
 
@@ -503,4 +514,32 @@ func parseResourceList(m map[string]string) (corev1.ResourceList, error) {
 		out[corev1.ResourceName(k)] = qty
 	}
 	return out, nil
+}
+
+// agentTelemetryEnv is a run's OpenTelemetry export env (docs/adr/0050 §3c):
+// the standard OTEL_* variables plus W3C TRACEPARENT, so the run -- and every
+// CLI subprocess it spawns, which inherit its env -- exports into the
+// launching turn's trace. Nothing when the engine set no endpoint.
+//
+// The resource attributes name the run and the launching turn's trace, so a
+// CLI that ignores TRACEPARENT (opencode) still exports spans that can be
+// joined to the turn: its trace is separate, but carries aktis.trace_id.
+func agentTelemetryEnv(runName string, spec toolv1alpha1.AgentRunSpec) []toolv1alpha1.EnvVar {
+	if spec.Telemetry == nil || spec.Telemetry.OTLPEndpoint == "" {
+		return nil
+	}
+	attrs := "aktis.agent=" + spec.AgentRef + ",aktis.agent_run=" + runName
+	if spec.Launch != nil && spec.Launch.TraceID != "" {
+		attrs += ",aktis.trace_id=" + spec.Launch.TraceID
+	}
+	env := []toolv1alpha1.EnvVar{
+		{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: spec.Telemetry.OTLPEndpoint},
+		{Name: "OTEL_EXPORTER_OTLP_PROTOCOL", Value: "http/protobuf"},
+		{Name: "OTEL_SERVICE_NAME", Value: spec.AgentRef},
+		{Name: "OTEL_RESOURCE_ATTRIBUTES", Value: attrs},
+	}
+	if spec.Launch != nil && spec.Launch.Traceparent != "" {
+		env = append(env, toolv1alpha1.EnvVar{Name: "TRACEPARENT", Value: spec.Launch.Traceparent})
+	}
+	return env
 }

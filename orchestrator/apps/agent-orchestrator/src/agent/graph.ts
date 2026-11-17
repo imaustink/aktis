@@ -48,6 +48,7 @@ import {
   makeSubAgentToolCallHandler,
   readOnlyGitHubRefusal,
   readOnlyMCPRefusal,
+  toolIdentityRefusal,
   type ToolCatalog,
 } from "./dispatch-tool.js";
 import {
@@ -771,6 +772,15 @@ export const AgentStateAnnotation = Annotation.Root({
   }),
   /** Name of the EventTrigger that started this turn, for error messages and logs. */
   triggerName: Annotation<string | undefined>({
+    reducer: (_current, update) => update,
+    default: () => undefined,
+  }),
+  /**
+   * The trigger's `target.identity` (docs/adr/0049). Identity modes are a
+   * Temporal-engine feature: carried here only so this engine refuses an
+   * agent launch on such a turn rather than silently ignoring the mode.
+   */
+  identityOverride: Annotation<string | undefined>({
     reducer: (_current, update) => update,
     default: () => undefined,
   }),
@@ -2480,7 +2490,8 @@ export function buildAgentGraph(deps: AgentGraphDeps) {
       // credentials" is answered by one call with a total return type rather
       // than by reading the node.
       const verdict = await authorization.authorize({
-        agent: { id: agent.id, identityProviders: agent.identityProviders },
+        agent: { id: agent.id, identityProviders: agent.identityProviders, defaultIdentity: agent.defaultIdentity },
+        ...(state.identityOverride ? { identityOverride: state.identityOverride } : {}),
         identity: state.identity,
         request: state.request,
         senderLogin: state.senderLogin,
@@ -3077,6 +3088,8 @@ export function buildAgentGraph(deps: AgentGraphDeps) {
       // MCP; a tool-level error or a missing link comes back as prose the model
       // can act on, not a thrown turn.
       if (tool.mcpExec) {
+        const mcpIdentityRefusal = toolIdentityRefusal(tool);
+        if (mcpIdentityRefusal) return { error: mcpIdentityRefusal };
         if (!deps.mcpBrokerClient) {
           return { error: `tool ${tool.id} is an MCP tool but the mcp-broker is not configured` };
         }
@@ -3134,6 +3147,8 @@ export function buildAgentGraph(deps: AgentGraphDeps) {
         // names any agent that links the same provider. Unlike the agent-backed
         // branch, a container Tool with no declared providers needs no identity
         // at all, so the gate is skipped entirely rather than run for nothing.
+        const containerIdentityRefusal = toolIdentityRefusal(tool);
+        if (containerIdentityRefusal) return { error: containerIdentityRefusal };
         let identitySecretEnv: CredentialEnvEntry[] | undefined;
         if (tool.identityProviders && tool.identityProviders.length > 0) {
           const gate = await resolveToolIdentitySecretEnv(
