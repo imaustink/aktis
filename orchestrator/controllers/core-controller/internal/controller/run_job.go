@@ -84,6 +84,11 @@ type runJobParams struct {
 	// case the Job pod's InitContainers field is left unset entirely.
 	initContainers []toolv1alpha1.InitContainer
 
+	// skills, if non-empty, are mounted read-only into the "run" container
+	// only, one ConfigMap volume each, at skillsMountDir/<name>, and
+	// AKTIS_SKILLS_DIR is set to skillsMountDir (docs/adr/0051).
+	skills []toolv1alpha1.AgentSkill
+
 	callback       toolv1alpha1.ToolRunCallback
 	timeoutSeconds int32
 }
@@ -136,6 +141,22 @@ func buildRunJob(p runJobParams) (*batchv1.Job, error) {
 	resources, err := toCoreResourceRequirements(p.resources)
 	if err != nil {
 		return nil, err
+	}
+
+	volumes := []corev1.Volume{
+		{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+	}
+	runMounts := []corev1.VolumeMount{
+		{Name: "tmp", MountPath: "/tmp"},
+	}
+	skillVols, skillMounts, err := skillVolumes(p.skills)
+	if err != nil {
+		return nil, fmt.Errorf("job %s/%s: %w", p.namespace, p.jobName, err)
+	}
+	if len(skillVols) > 0 {
+		volumes = append(volumes, skillVols...)
+		runMounts = append(runMounts, skillMounts...)
+		env = append(env, corev1.EnvVar{Name: "AKTIS_SKILLS_DIR", Value: skillsMountDir})
 	}
 
 	var initContainers []corev1.Container
@@ -191,9 +212,7 @@ func buildRunJob(p runJobParams) (*batchv1.Job, error) {
 							Type: corev1.SeccompProfileTypeRuntimeDefault,
 						},
 					},
-					Volumes: []corev1.Volume{
-						{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-					},
+					Volumes:        volumes,
 					InitContainers: initContainers,
 					Containers: []corev1.Container{
 						{
@@ -211,9 +230,7 @@ func buildRunJob(p runJobParams) (*batchv1.Job, error) {
 							Args:            p.args,
 							Env:             env,
 							Resources:       resources,
-							VolumeMounts: []corev1.VolumeMount{
-								{Name: "tmp", MountPath: "/tmp"},
-							},
+							VolumeMounts:    runMounts,
 							SecurityContext: &corev1.SecurityContext{
 								AllowPrivilegeEscalation: ptr.To(false),
 								ReadOnlyRootFilesystem:   ptr.To(true),
@@ -227,6 +244,94 @@ func buildRunJob(p runJobParams) (*batchv1.Job, error) {
 		},
 	}
 	return job, nil
+}
+
+// skillsMountDir is where AgentSpec.Skills are mounted, one directory per
+// skill. Deliberately NOT under /tmp: a mount nested inside the tmp emptyDir
+// (say at /tmp/home/.claude/skills/x) makes the container runtime create the
+// missing parent directories as root, after which the non-root agent can no
+// longer write its own ~/.claude. Agents copy or link from here instead.
+const skillsMountDir = "/etc/aktis/skills"
+
+// skillFileMode keeps skill files readable and any bundled scripts
+// executable; the mount itself is read-only.
+const skillFileMode int32 = 0o555
+
+// skillVolumes turns AgentSpec.Skills into one read-only ConfigMap volume per
+// skill plus its mount at skillsMountDir/<name>. The ConfigMap is not
+// optional: a missing one keeps the pod from starting (FailedMount) rather
+// than letting the agent run silently without a skill it was configured
+// with. Names and paths are checked here, not only by the API server, so a
+// bad one fails the run with a clear reason instead of a Job create that is
+// retried forever.
+func skillVolumes(skills []toolv1alpha1.AgentSkill) ([]corev1.Volume, []corev1.VolumeMount, error) {
+	if len(skills) == 0 {
+		return nil, nil, nil
+	}
+	volumes := make([]corev1.Volume, 0, len(skills))
+	mounts := make([]corev1.VolumeMount, 0, len(skills))
+	seen := make(map[string]bool, len(skills))
+	for i, skill := range skills {
+		if !validSkillName(skill.Name) {
+			return nil, nil, fmt.Errorf("skill %d: invalid name %q", i, skill.Name)
+		}
+		if seen[skill.Name] {
+			return nil, nil, fmt.Errorf("skill %q is listed more than once", skill.Name)
+		}
+		seen[skill.Name] = true
+		if skill.ConfigMapName == "" {
+			return nil, nil, fmt.Errorf("skill %q: configMapName is required", skill.Name)
+		}
+		var items []corev1.KeyToPath
+		for _, f := range skill.Files {
+			if f.Key == "" || !validSkillFilePath(f.Path) {
+				return nil, nil, fmt.Errorf("skill %q: invalid file mapping %q -> %q (path must be relative, without empty or \"..\" segments)", skill.Name, f.Key, f.Path)
+			}
+			items = append(items, corev1.KeyToPath{Key: f.Key, Path: f.Path})
+		}
+		// Indexed, not named after the skill: "skill-" + a 63-char skill
+		// name would overflow the volume name's DNS-label limit.
+		volName := fmt.Sprintf("skill-%d", i)
+		volumes = append(volumes, corev1.Volume{
+			Name: volName,
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: skill.ConfigMapName},
+				Items:                items,
+				DefaultMode:          ptr.To(skillFileMode),
+			}},
+		})
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      volName,
+			MountPath: skillsMountDir + "/" + skill.Name,
+			ReadOnly:  true,
+		})
+	}
+	return volumes, mounts, nil
+}
+
+// validSkillName mirrors the CRD's DNS-label pattern for AgentSkill.name.
+func validSkillName(name string) bool {
+	if name == "" || len(name) > 63 || name[0] == '-' || name[len(name)-1] == '-' {
+		return false
+	}
+	for _, r := range name {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func validSkillFilePath(p string) bool {
+	if p == "" || strings.HasPrefix(p, "/") {
+		return false
+	}
+	for seg := range strings.SplitSeq(p, "/") {
+		if seg == "" || seg == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // toCoreEnv builds a corev1.EnvVar list from static name/value pairs plus

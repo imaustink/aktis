@@ -67,10 +67,8 @@ spec:
   {{- end }}
   image: {{ .Values.claudeCodeSweAgent.image }}
   serviceAccountName: {{ .Values.claudeCodeSweAgent.serviceAccountName }}
-  {{- if or .Values.claudeCodeSweAgent.remoteControl.enabled .Values.claudeCodeSweAgent.skills.names }}
-  initContainers:
-  {{- end }}
   {{- if .Values.claudeCodeSweAgent.remoteControl.enabled }}
+  initContainers:
   # Seeds a full ~/.claude/.credentials.json into the shared tmp emptyDir
   # (mounted at /tmp on both this init container and the main "run"
   # container) before the main container starts, for Remote Control
@@ -100,46 +98,24 @@ spec:
             key: {{ .Values.claudeCodeSweAgent.remoteControl.credentialsSecretKey }}
       {{- end }}
   {{- end }}
-  {{- with .Values.claudeCodeSweAgent.skills }}
-  {{- if .names }}
-    # Installs the selected Claude Code skills into the run's ~/.claude/skills
-    # (the shared tmp emptyDir, as above) before the main container starts.
-    # Downloads the whole repo tarball at the pinned ref -- small, and it saves
-    # needing git -- then copies only the named skill directories out of it.
-    # The agent lists that directory at startup to know which leading
-    # `/<skill>` in a request to hand the CLI (catalog/agents/claude-code-swe-agent/src/skills.ts).
-    - name: install-claude-skills
-      image: {{ $.Values.claudeCodeSweAgent.image }}
-      command: ["sh", "-c"]
-      args:
-        - |
-          set -eu
-          stage="$(mktemp -d)"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
-            "https://codeload.github.com/$SKILLS_REPO/tar.gz/$SKILLS_REF" | tar -xzf - -C "$stage"
-          src="$(echo "$stage"/*/"$SKILLS_PATH")"
-          mkdir -p "$SWE_HOME/.claude/skills"
-          for name in $(echo "$SKILLS" | tr ',' ' '); do
-            if [ ! -f "$src/$name/SKILL.md" ]; then
-              echo "unknown skill '$name' in $SKILLS_REPO@$SKILLS_REF/$SKILLS_PATH; available:" >&2
-              ls "$src" >&2
-              exit 1
-            fi
-            cp -R "$src/$name" "$SWE_HOME/.claude/skills/"
-          done
-          rm -rf "$stage"
-      env:
-        - name: SWE_HOME
-          value: "/tmp/home"
-        - name: SKILLS_REPO
-          value: {{ .repo | quote }}
-        - name: SKILLS_REF
-          value: {{ .ref | quote }}
-        - name: SKILLS_PATH
-          value: {{ .path | quote }}
-        - name: SKILLS
-          value: {{ join "," .names | quote }}
-  {{- end }}
+  {{- if or .Values.claudeCodeSweAgent.skills .Values.claudeCodeSweAgent.extraSkills }}
+  # Claude Code skills (docs/adr/0051): the core-controller mounts each
+  # ConfigMap read-only at /etc/aktis/skills/<name>, and the agent copies them
+  # into ~/.claude/skills at startup (catalog/agents/claude-code-swe-agent/src/skills.ts).
+  # The vendored ones come from claude-code-skills-configmaps.yaml.
+  skills:
+    {{- range $name := .Values.claudeCodeSweAgent.skills }}
+    - name: {{ $name }}
+      configMapName: {{ include "claudeCodeSkills.configMapName" $name }}
+      files:
+        {{- range $file := include "claudeCodeSkills.files" (dict "Files" $.Files "name" $name) | fromJsonArray }}
+        - key: {{ $file.key | quote }}
+          path: {{ $file.path | quote }}
+        {{- end }}
+    {{- end }}
+    {{- with .Values.claudeCodeSweAgent.extraSkills }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
   {{- end }}
   resources:
     {{- toYaml .Values.claudeCodeSweAgent.resources | nindent 4 }}

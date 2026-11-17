@@ -35,3 +35,33 @@ Count of githubApp*SecretKey values set, as a string -- used to tell "none"
 {{- define "tools.githubAppKeyCount" -}}
 {{- len (compact (list .githubAppIdSecretKey .githubAppPrivateKeySecretKey .githubAppInstallationIdSecretKey)) -}}
 {{- end }}
+
+{{/*
+Claude Code skills vendored under skills/claude-code/<name>/ (docs/adr/0051).
+"claudeCodeSkills.files" takes (dict "Files" $.Files "name" <skill>) and
+returns a JSON array of {key, path, content}, one per file in the skill's
+directory, nested ones included. ConfigMap keys can't contain "/", so the key
+encodes the relative path with "__" in its place; the Agent's spec.skills
+files list maps each key back. Fails the render on an invalid or unknown
+skill name, so a typo can't ship an agent silently missing a skill.
+*/}}
+{{- define "claudeCodeSkills.files" -}}
+{{- $name := .name -}}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $name) -}}
+{{- fail (printf "claudeCodeSweAgent.skills: %q is not a valid skill name (lowercase letters, digits and dashes)" $name) -}}
+{{- end -}}
+{{- $prefix := printf "skills/claude-code/%s/" $name -}}
+{{- if not (.Files.Get (printf "%sSKILL.md" $prefix)) -}}
+{{- fail (printf "claudeCodeSweAgent.skills: no vendored skill %q (expected %sSKILL.md in the community-components chart)" $name $prefix) -}}
+{{- end -}}
+{{- $files := list -}}
+{{- range $path, $_ := .Files.Glob (printf "%s**" $prefix) -}}
+{{- $rel := trimPrefix $prefix $path -}}
+{{- $files = append $files (dict "key" (replace "/" "__" $rel) "path" $rel "content" ($.Files.Get $path)) -}}
+{{- end -}}
+{{- toJson $files -}}
+{{- end }}
+
+{{- define "claudeCodeSkills.configMapName" -}}
+claude-code-skill-{{ . }}
+{{- end }}

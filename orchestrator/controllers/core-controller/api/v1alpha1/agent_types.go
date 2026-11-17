@@ -228,6 +228,65 @@ type AgentSpec struct {
 	// volume config needed on this struct itself.
 	// +optional
 	InitContainers []InitContainer `json:"initContainers,omitempty"`
+
+	// skills are file-based skill bundles (e.g. a Claude Code skill: a
+	// SKILL.md plus any files it references) mounted read-only into the run
+	// container, each from its own ConfigMap, at
+	// /etc/aktis/skills/<name>/ -- the run container's AKTIS_SKILLS_DIR env
+	// points at the parent directory (docs/adr/0051). The agent image decides
+	// what to do with them (claude-code-swe-agent copies them into
+	// ~/.claude/skills at startup).
+	//
+	// Not to be confused with skillRefs: those name platform Skill CRs --
+	// planner prompt material plus toolRefs/agentRefs, resolved by the
+	// orchestrator. These are opaque files handed to the agent's own engine.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=64
+	Skills []AgentSkill `json:"skills,omitempty"`
+}
+
+// AgentSkill is one file-based skill bundle mounted into an agent's run pod
+// from a ConfigMap in the Agent's namespace (see AgentSpec.Skills).
+type AgentSkill struct {
+	// name is the skill's directory name under AKTIS_SKILLS_DIR, and so
+	// (for Claude Code) its `/<name>` slash command.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Name string `json:"name"`
+
+	// configMapName is the ConfigMap (same namespace as the run) holding the
+	// skill's files.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	ConfigMapName string `json:"configMapName"`
+
+	// files maps ConfigMap keys to paths within the skill's directory.
+	// ConfigMap keys can't contain "/", so a skill with nested files (e.g.
+	// references/api.md) lists them here; same semantics as a configMap
+	// volume's items. When empty, every key is projected flat under its own
+	// name -- enough for a skill that is a lone SKILL.md.
+	// +optional
+	Files []SkillFile `json:"files,omitempty"`
+}
+
+// SkillFile maps one ConfigMap key to a relative path inside a skill's
+// mounted directory -- a narrow mirror of corev1.KeyToPath.
+type SkillFile struct {
+	// key in the ConfigMap's data or binaryData.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	Key string `json:"key"`
+
+	// path, relative to the skill's directory, the key is projected at. May
+	// not be absolute or contain "..".
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Pattern=`^[^/]`
+	Path string `json:"path"`
 }
 
 // InitContainer is a narrow, opt-in Job pod init container run before the
