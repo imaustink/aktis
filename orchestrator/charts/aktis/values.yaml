@@ -1,4 +1,4 @@
-# Values for the agent-controller system chart. Each top-level key maps to a
+# Values for the aktis system chart. Each top-level key maps to a
 # subchart (by its dependency name/alias in Chart.yaml); set `<key>.enabled`
 # to toggle that component. Anything nested under a key is passed straight
 # through to that subchart -- see each subchart's own values.yaml for the full
@@ -110,7 +110,7 @@ integration-gateway:
 # ---------------------------------------------------------------------------
 # Optional Open WebUI chat UI (upstream open-webui chart, aliased `openwebui`)
 # in front of the orchestrator's OpenAI-compatible facade (ADR 0007). Off by
-# default. Run `helm dependency update orchestrator/charts/agent-controller` once so the
+# default. Run `helm dependency update orchestrator/charts/aktis` once so the
 # subchart tarball is fetched.
 #
 # IMPORTANT auth caveat: Open WebUI sends `openaiApiKey` as a plain
@@ -194,7 +194,7 @@ openwebui:
 # ---------------------------------------------------------------------------
 # Optional SearXNG metasearch instance (https://docs.searxng.org/), backing
 # community-components' web-search Tool. Off by default. Hand-authored
-# templates (orchestrator/charts/agent-controller/templates/searxng.yaml), not a Helm
+# templates (orchestrator/charts/aktis/templates/searxng.yaml), not a Helm
 # dependency -- there is no maintained official SearXNG Helm chart to pin to
 # (searxng/searxng-helm-chart was archived May 2025), the same reasoning
 # agent-orchestrator/templates/redis.yaml already applies to Redis.
