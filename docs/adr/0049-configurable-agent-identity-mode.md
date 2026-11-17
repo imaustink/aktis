@@ -168,7 +168,7 @@ unchanged).
   "identityModeSource": "default",         // default | trigger | inferred
   "credentials": [{"provider": "github", "read": "agent", "write": "agent"}],   // never token material
   "readOnly": false,
-  "targetRepository": "imaustink/agent-controller"
+  "targetRepository": "imaustink/aktis"
 }
 ```
 

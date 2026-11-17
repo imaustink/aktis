@@ -243,7 +243,7 @@ people can read than the source system allows would undo 0040.
 
 ### 6. Deployment
 
-- **The collector** ships in the agent-controller chart, off by default
+- **The collector** ships in the aktis chart, off by default
   (`observability.enabled`), like the MCP broker.
 - **Langfuse is self-hosted.** Trace data, including user subjects, never
   leaves infrastructure the operator controls. Langfuse Cloud is not a
@@ -251,7 +251,7 @@ people can read than the source system allows would undo 0040.
 
 #### Two ways to get a Langfuse, the same as Open WebUI
 
-The agent-controller chart gets an optional `langfuse` dependency on
+The aktis chart gets an optional `langfuse` dependency on
 Langfuse's official chart (`https://langfuse.github.io/langfuse-k8s`). It is
 pinned exact and off by default, wired the same way `openwebui` is: a remote
 dependency with `condition: langfuse.enabled`. The collector doesn't care
