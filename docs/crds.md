@@ -388,7 +388,7 @@ metadata: { name: nightly-sweep }
 spec:
   cron:
     schedule: "0 7 * * *"
-    payload: { repo: imaustink/agent-controller, limit: 25 }
+    payload: { repo: imaustink/aktis, limit: 25 }
 ```
 
 ### EventTrigger

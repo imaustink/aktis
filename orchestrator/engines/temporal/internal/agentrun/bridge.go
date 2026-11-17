@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	protocolv1 "github.com/imaustink/agent-controller/framework/protocol/go/aktis/protocol/v1"
+	protocolv1 "github.com/imaustink/aktis/framework/protocol/go/aktis/protocol/v1"
 	"github.com/nats-io/nats.go"
 	"go.opentelemetry.io/otel/trace"
 

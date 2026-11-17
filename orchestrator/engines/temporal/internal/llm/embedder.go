@@ -16,7 +16,7 @@ import (
 	"github.com/aktisai/orchestrator/engines/temporal/internal/telemetry"
 )
 
-// DefaultEmbedModel matches agent-controller's index (1536 dims).
+// DefaultEmbedModel matches Aktis's index (1536 dims).
 const (
 	DefaultEmbedModel = "text-embedding-3-small"
 	DefaultEmbedDims  = 1536
