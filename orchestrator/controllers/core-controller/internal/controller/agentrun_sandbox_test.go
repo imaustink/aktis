@@ -39,7 +39,10 @@ import (
 	"github.com/aktisai/orchestrator/controllers/core-controller/internal/sandboxapi"
 )
 
-const sandboxTestNS = "aktis"
+const (
+	sandboxTestNS  = "aktis"
+	sandboxRunName = "on-sandbox"
+)
 
 func sandboxTestScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
@@ -108,13 +111,13 @@ func TestAgentRunLaunchesSandboxWithTheJobBackendsPod(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&toolv1alpha1.AgentRun{}).
 		WithObjects(agentFixture(nil),
-			agentRunFixture("on-sandbox", sandboxAnnotated()),
+			agentRunFixture(sandboxRunName, sandboxAnnotated()),
 			agentRunFixture("on-job", nil)).
 		Build()
 	r := &AgentRunReconciler{Client: c, Scheme: scheme}
 
-	sbRun := reconcileAgentRun(t, r, "on-sandbox")
-	if sbRun.Status.ExecutionBackend != string(BackendSandbox) || sbRun.Status.JobName != "on-sandbox" || sbRun.Status.Phase != toolv1alpha1.ToolRunPhasePending {
+	sbRun := reconcileAgentRun(t, r, sandboxRunName)
+	if sbRun.Status.ExecutionBackend != string(BackendSandbox) || sbRun.Status.JobName != sandboxRunName || sbRun.Status.Phase != toolv1alpha1.ToolRunPhasePending {
 		t.Fatalf("sandbox run status = %+v, want Pending on backend sandbox", sbRun.Status)
 	}
 	jobRun := reconcileAgentRun(t, r, "on-job")
@@ -124,13 +127,13 @@ func TestAgentRunLaunchesSandboxWithTheJobBackendsPod(t *testing.T) {
 
 	ctx := context.Background()
 	var sb sandboxapi.Sandbox
-	if err := c.Get(ctx, types.NamespacedName{Namespace: sandboxTestNS, Name: "on-sandbox"}, &sb); err != nil {
+	if err := c.Get(ctx, types.NamespacedName{Namespace: sandboxTestNS, Name: sandboxRunName}, &sb); err != nil {
 		t.Fatalf("the Sandbox was not created: %v", err)
 	}
-	if err := c.Get(ctx, types.NamespacedName{Namespace: sandboxTestNS, Name: "on-sandbox"}, &batchv1.Job{}); err == nil {
+	if err := c.Get(ctx, types.NamespacedName{Namespace: sandboxTestNS, Name: sandboxRunName}, &batchv1.Job{}); err == nil {
 		t.Fatal("a Job was created for a run on the Sandbox backend")
 	}
-	if owner := metav1.GetControllerOf(&sb); owner == nil || owner.Kind != "AgentRun" || owner.Name != "on-sandbox" {
+	if owner := metav1.GetControllerOf(&sb); owner == nil || owner.Kind != "AgentRun" || owner.Name != sandboxRunName {
 		t.Errorf("Sandbox controller owner = %+v, want the AgentRun (it is what reclaims the Sandbox)", owner)
 	}
 
@@ -167,7 +170,7 @@ func TestAgentRunLaunchesSandboxWithTheJobBackendsPod(t *testing.T) {
 	if !skillMounted {
 		t.Error("the Agent's skill is not mounted read-only in the Sandbox pod")
 	}
-	if sb.Spec.PodTemplate.ObjectMeta.Labels["core.aktis.ai/agentrun"] != "on-sandbox" {
+	if sb.Spec.PodTemplate.ObjectMeta.Labels["core.aktis.ai/agentrun"] != sandboxRunName {
 		t.Error("the Sandbox pod template lacks the agentrun label the failure lookup selects on")
 	}
 }
