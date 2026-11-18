@@ -3,7 +3,7 @@
 # tick POSTs integration-gateway's /events/nightly-sweep/tick as that
 # ServiceAccount. The gateway builds the envelope with `payload` as its body,
 # so triggers read it exactly as they would a webhook body. No Secret needed.
-apiVersion: core.controller-agent.dev/v1alpha1
+apiVersion: core.aktis.ai/v1alpha1
 kind: EventSource
 metadata:
   name: nightly-sweep
@@ -14,5 +14,5 @@ spec:
     # timeZone: America/Chicago
     # suspend: true
     payload:
-      repo: imaustink/agent-controller
+      repo: imaustink/aktis
       limit: 25

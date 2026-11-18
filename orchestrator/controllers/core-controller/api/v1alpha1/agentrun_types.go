@@ -1,0 +1,274 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package v1alpha1
+
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
+// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
+
+// AgentRunSpec defines the desired state of AgentRun. The orchestrator (or
+// another caller) creates one per agent invocation — exactly the ToolRun
+// pattern, but the payload is a natural-language `goal` rather than
+// positional args, and the target is an Agent CR.
+type AgentRunSpec struct {
+	// agentRef is the name of the Agent CR (same namespace) to launch.
+	// +required
+	AgentRef string `json:"agentRef"`
+
+	// goal is the scoped natural-language objective handed to the agent loop
+	// (passed as the Job container's argument).
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	Goal string `json:"goal"`
+
+	// callback configures result/progress reporting for the launched Job,
+	// reusing the same HMAC callback protocol as ToolRun (ADR 0006/0010).
+	// +required
+	Callback ToolRunCallback `json:"callback"`
+
+	// timeoutSeconds bounds the Job's activeDeadlineSeconds. Defaults to 300 if unset.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	TimeoutSeconds int32 `json:"timeoutSeconds,omitempty"`
+
+	// secretEnv are per-invocation environment variables sourced from Secret
+	// keys (same namespace), merged over the referenced Agent's static
+	// AgentSpec.SecretEnv at Job-build time. An entry here with the same
+	// `name` as an Agent-level entry wins for this run only; entries unique
+	// to either side are both included. Intended for short-lived,
+	// caller-scoped credentials (e.g. a per-user GitHub token) that must not
+	// be baked into the Agent template.
+	// +optional
+	SecretEnv []SecretEnvVar `json:"secretEnv,omitempty"`
+
+	// readOnly runs the agent read-only (AGENT_READ_ONLY=true): it may not
+	// push, open/merge/edit pull requests, or hold a write credential. Set
+	// from an EventTrigger's target.readOnly (docs/event-triggers.md §6) —
+	// a structured field, never a marker in the goal.
+	// +optional
+	ReadOnly bool `json:"readOnly,omitempty"`
+
+	// params are an EventTrigger's rendered params, handed to the agent as
+	// AGENT_PARAMS (a JSON object of strings).
+	// +optional
+	Params map[string]string `json:"params,omitempty"`
+
+	// identityMode is the identity this run acts as, decided once by the
+	// launching engine's authorization pre-flight (docs/adr/0049) and handed
+	// to the agent as AGENT_IDENTITY_MODE. It describes the credentials this
+	// run was actually given, so a read-only run of a hybrid agent (whose
+	// caller token was withheld) is "agent". Unset: the agent infers its
+	// mode the pre-0049 way.
+	// +optional
+	IdentityMode IdentityMode `json:"identityMode,omitempty"`
+
+	// contentCapture is what this run's own telemetry may record (docs/adr/
+	// 0050 §5), decided by the launching engine from the deployment ceiling,
+	// the Agent's opt-in and what the run can reach. "content" maps to
+	// AGENT_TRACE_CONTENT=true; anything else records metadata only.
+	// +optional
+	// +kubebuilder:validation:Enum=metadata;content
+	ContentCapture string `json:"contentCapture,omitempty"`
+
+	// telemetry is where this run's own OpenTelemetry goes (docs/adr/0050
+	// §3c), set by the launching engine when tracing is on. The controller
+	// maps it, with spec.launch.traceparent, to the standard OTEL_* env and
+	// TRACEPARENT, which the run's CLI subprocesses inherit.
+	// +optional
+	Telemetry *AgentRunTelemetry `json:"telemetry,omitempty"`
+
+	// launch records who launched this run and as what (docs/adr/0049 §3),
+	// for anyone inspecting the run while it exists. The durable copy is the
+	// engine's audit log line; this mirrors it. Immutable once set.
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="launch is immutable"
+	Launch *AgentRunLaunch `json:"launch,omitempty"`
+}
+
+// AgentRunTelemetry is an AgentRun's telemetry export target.
+type AgentRunTelemetry struct {
+	// otlpEndpoint is the in-cluster collector's OTLP/HTTP base URL. Never a
+	// trace backend directly: only the collector holds backend keys.
+	// +optional
+	// +kubebuilder:validation:Pattern=`^https?://`
+	OTLPEndpoint string `json:"otlpEndpoint,omitempty"`
+}
+
+// AgentRunLaunch is an AgentRun's launch audit record (docs/adr/0049 §3).
+// Identifiers only: it never holds credential material.
+type AgentRunLaunch struct {
+	// decisionId joins this run to the engine's authorization audit record.
+	// +optional
+	DecisionID string `json:"decisionId,omitempty"`
+
+	// entryPoint is how the launching turn arrived.
+	// +optional
+	// +kubebuilder:validation:Enum=chat;webhook;event;api
+	EntryPoint string `json:"entryPoint,omitempty"`
+
+	// launchedBy is the authenticated caller's subject (e.g.
+	// "openwebui:<id>", or a webhook relay's service identity).
+	// +optional
+	LaunchedBy string `json:"launchedBy,omitempty"`
+
+	// delegatedSubject is the subject a webhook sender resolved to, whose
+	// links this run's caller credentials came from.
+	// +optional
+	DelegatedSubject string `json:"delegatedSubject,omitempty"`
+
+	// sender is the human an adapter vouched for on a webhook turn.
+	// +optional
+	Sender *LaunchSender `json:"sender,omitempty"`
+
+	// trigger is the EventTrigger that produced the launching turn.
+	// +optional
+	Trigger string `json:"trigger,omitempty"`
+
+	// requestedIdentityMode is the mode resolved from the trigger override,
+	// the Agent's defaultIdentity, or inference, before read-only or a
+	// shared caller narrowed it to spec.identityMode.
+	// +optional
+	RequestedIdentityMode IdentityMode `json:"requestedIdentityMode,omitempty"`
+
+	// identityModeSource says where requestedIdentityMode came from.
+	// +optional
+	// +kubebuilder:validation:Enum=default;trigger;inferred
+	IdentityModeSource string `json:"identityModeSource,omitempty"`
+
+	// credentials lists, per provider, whose credential the run reads and
+	// writes with. Names only.
+	// +optional
+	Credentials []LaunchCredential `json:"credentials,omitempty"`
+
+	// targetRepository is the "owner/name" the run was gated on and scoped to.
+	// +optional
+	TargetRepository string `json:"targetRepository,omitempty"`
+
+	// traceId is the W3C trace id of the turn that launched this run
+	// (docs/adr/0050 §1): the join from this record to its trace.
+	// +optional
+	TraceID string `json:"traceId,omitempty"`
+
+	// traceparent is the W3C trace context the run's own telemetry continues
+	// (docs/adr/0050 §4).
+	// +optional
+	Traceparent string `json:"traceparent,omitempty"`
+}
+
+// LaunchSender identifies a webhook sender.
+type LaunchSender struct {
+	// +optional
+	Provider string `json:"provider,omitempty"`
+	// +optional
+	Login string `json:"login,omitempty"`
+	// accountId is the provider's immutable account id.
+	// +optional
+	AccountID string `json:"accountId,omitempty"`
+}
+
+// LaunchCredential records whose credential a provider's reads and writes use.
+type LaunchCredential struct {
+	// +required
+	Provider string `json:"provider"`
+	// read is "caller" (the caller's own linked credential) or "agent" (the
+	// agent's own, e.g. the GitHub App).
+	// +optional
+	// +kubebuilder:validation:Enum=caller;agent
+	Read string `json:"read,omitempty"`
+	// write is "caller", "agent", or "none" (read-only).
+	// +optional
+	// +kubebuilder:validation:Enum=caller;agent;none
+	Write string `json:"write,omitempty"`
+}
+
+// AgentRunStatus defines the observed state of AgentRun — identical shape
+// and semantics to ToolRunStatus (the owned Job is the source of truth for
+// lifecycle; result payloads flow over the callback protocol).
+type AgentRunStatus struct {
+	// phase is the coarse lifecycle state, derived from the owned Job's status.
+	// +optional
+	Phase ToolRunPhase `json:"phase,omitempty"`
+
+	// jobName is the name of the Job this AgentRun created.
+	// +optional
+	JobName string `json:"jobName,omitempty"`
+
+	// startTime is when the owned Job started.
+	// +optional
+	StartTime *metav1.Time `json:"startTime,omitempty"`
+
+	// completionTime is when the owned Job finished (succeeded or failed).
+	// +optional
+	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+
+	// message is a human-readable explanation of the current phase.
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	// conditions represent the current state of the AgentRun resource.
+	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
+	//
+	// Standard condition types include:
+	// - "Available": the resource is fully functional
+	// - "Progressing": the resource is being created or updated
+	// - "Degraded": the resource failed to reach or maintain its desired state
+	//
+	// The status of each condition is one of True, False, or Unknown.
+	// +listType=map
+	// +listMapKey=type
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Job",type=string,JSONPath=`.status.jobName`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+
+// AgentRun is the Schema for the agentruns API
+type AgentRun struct {
+	metav1.TypeMeta `json:",inline"`
+
+	// metadata is a standard object metadata
+	// +optional
+	metav1.ObjectMeta `json:"metadata,omitzero"`
+
+	// spec defines the desired state of AgentRun
+	// +required
+	Spec AgentRunSpec `json:"spec"`
+
+	// status defines the observed state of AgentRun
+	// +optional
+	Status AgentRunStatus `json:"status,omitzero"`
+}
+
+// +kubebuilder:object:root=true
+
+// AgentRunList contains a list of AgentRun
+type AgentRunList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitzero"`
+	Items           []AgentRun `json:"items"`
+}
+
+func init() {
+	SchemeBuilder.Register(&AgentRun{}, &AgentRunList{})
+}

@@ -1,0 +1,250 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	batchv1 "k8s.io/api/batch/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	toolv1alpha1 "github.com/aktisai/orchestrator/controllers/core-controller/api/v1alpha1"
+)
+
+// The event-trigger fields of a run reach its container as env
+// (docs/event-triggers.md §6), through the real reconcilers rather than the
+// helpers alone, so a run controller that stops passing them fails here.
+var _ = Describe("Run event env", func() {
+	ctx := context.Background()
+
+	callback := toolv1alpha1.ToolRunCallback{NatsSubject: "callbacks.event-env"}
+
+	envOf := func(job *batchv1.Job) map[string]string {
+		out := map[string]string{}
+		for _, e := range job.Spec.Template.Spec.Containers[0].Env {
+			out[e.Name] = e.Value
+		}
+		return out
+	}
+
+	// envtest runs no garbage collector, so the owned Job is removed by hand.
+	jobFor := func(name string) *batchv1.Job {
+		var job batchv1.Job
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, &job)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, &job, client.PropagationPolicy(metav1.DeletePropagationBackground))
+		})
+		return &job
+	}
+
+	Context("an AgentRun", func() {
+		const agentName = "event-env-agent"
+
+		BeforeEach(func() {
+			agent := &toolv1alpha1.Agent{
+				ObjectMeta: metav1.ObjectMeta{Name: agentName, Namespace: "default"},
+				Spec: toolv1alpha1.AgentSpec{
+					Description:  "event env agent",
+					Input:        "a goal",
+					Output:       "a result",
+					AllowedRoles: []string{"reader"},
+					Image:        "example.com/agent:latest",
+				},
+			}
+			Expect(k8sClient.Create(ctx, agent)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, agent) })
+		})
+
+		launch := func(name string, readOnly bool, params map[string]string) map[string]string {
+			run := &toolv1alpha1.AgentRun{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+				Spec: toolv1alpha1.AgentRunSpec{
+					AgentRef: agentName,
+					Goal:     "review the pull request",
+					Callback: callback,
+					ReadOnly: readOnly,
+					Params:   params,
+				},
+			}
+			Expect(k8sClient.Create(ctx, run)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, run) })
+
+			r := &AgentRunReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: "default"}})
+			Expect(err).NotTo(HaveOccurred())
+			// An AgentRun's Job is named after the run itself.
+			return envOf(jobFor(name))
+		}
+
+		It("carries readOnly and params as AGENT_READ_ONLY and a compact AGENT_PARAMS object", func() {
+			env := launch("agentrun-event-env", true, map[string]string{"repo": "o/r", "number": "7"})
+			Expect(env).To(HaveKeyWithValue("AGENT_READ_ONLY", "true"))
+			Expect(env).To(HaveKeyWithValue("AGENT_PARAMS", `{"number":"7","repo":"o/r"}`))
+		})
+
+		It("carries spec.identityMode as AGENT_IDENTITY_MODE (docs/adr/0049)", func() {
+			run := &toolv1alpha1.AgentRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "agentrun-identity-mode", Namespace: "default"},
+				Spec: toolv1alpha1.AgentRunSpec{
+					AgentRef:     agentName,
+					Goal:         "review the pull request",
+					Callback:     callback,
+					IdentityMode: toolv1alpha1.IdentityModeHybrid,
+					Launch: &toolv1alpha1.AgentRunLaunch{
+						EntryPoint: "chat",
+						LaunchedBy: "openwebui:abc",
+						Credentials: []toolv1alpha1.LaunchCredential{
+							{Provider: "github", Read: "caller", Write: "agent"},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, run)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, run) })
+
+			r := &AgentRunReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: run.Name, Namespace: "default"}})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(envOf(jobFor(run.Name))).To(HaveKeyWithValue("AGENT_IDENTITY_MODE", "hybrid"))
+			Expect(envOf(jobFor(run.Name))).NotTo(HaveKey("AGENT_TRACE_CONTENT"), "metadata unless the engine decided content")
+		})
+
+		It("carries spec.contentCapture=content as AGENT_TRACE_CONTENT (docs/adr/0050 §5)", func() {
+			run := &toolv1alpha1.AgentRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "agentrun-content-capture", Namespace: "default"},
+				Spec: toolv1alpha1.AgentRunSpec{
+					AgentRef: agentName, Goal: "g", Callback: callback, ContentCapture: "content",
+				},
+			}
+			Expect(k8sClient.Create(ctx, run)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, run) })
+			r := &AgentRunReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: run.Name, Namespace: "default"}})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(envOf(jobFor(run.Name))).To(HaveKeyWithValue("AGENT_TRACE_CONTENT", "true"))
+		})
+
+		It("exports the run's telemetry into the launching turn's trace (docs/adr/0050 §3c)", func() {
+			const tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+			run := &toolv1alpha1.AgentRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "agentrun-telemetry", Namespace: "default"},
+				Spec: toolv1alpha1.AgentRunSpec{
+					AgentRef: agentName, Goal: "g", Callback: callback,
+					Telemetry: &toolv1alpha1.AgentRunTelemetry{OTLPEndpoint: "http://t-otel-collector:4318"},
+					Launch:    &toolv1alpha1.AgentRunLaunch{Traceparent: tp, TraceID: "4bf92f3577b34da6a3ce929d0e0e4736"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, run)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, run) })
+			r := &AgentRunReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: run.Name, Namespace: "default"}})
+			Expect(err).NotTo(HaveOccurred())
+			env := envOf(jobFor(run.Name))
+			Expect(env).To(HaveKeyWithValue("OTEL_EXPORTER_OTLP_ENDPOINT", "http://t-otel-collector:4318"))
+			Expect(env).To(HaveKeyWithValue("OTEL_SERVICE_NAME", agentName))
+			Expect(env).To(HaveKeyWithValue("TRACEPARENT", tp))
+			// opencode ignores TRACEPARENT; the resource attributes still join it.
+			Expect(env).To(HaveKeyWithValue("OTEL_RESOURCE_ATTRIBUTES",
+				"aktis.agent="+agentName+",aktis.agent_run=agentrun-telemetry,aktis.trace_id=4bf92f3577b34da6a3ce929d0e0e4736"))
+		})
+
+		It("refuses to change spec.launch once set", func() {
+			run := &toolv1alpha1.AgentRun{
+				ObjectMeta: metav1.ObjectMeta{Name: "agentrun-launch-immutable", Namespace: "default"},
+				Spec: toolv1alpha1.AgentRunSpec{
+					AgentRef: agentName,
+					Goal:     "review the pull request",
+					Callback: callback,
+					Launch:   &toolv1alpha1.AgentRunLaunch{LaunchedBy: "openwebui:abc"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, run)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, run) })
+
+			run.Spec.Launch.LaunchedBy = "openwebui:someone-else"
+			err := k8sClient.Update(ctx, run)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("launch is immutable"))
+		})
+
+		It("sets neither when the run has no readOnly or params", func() {
+			env := launch("agentrun-no-event-env", false, nil)
+			Expect(env).NotTo(HaveKey("AGENT_READ_ONLY"))
+			Expect(env).NotTo(HaveKey("AGENT_PARAMS"))
+			Expect(env).NotTo(HaveKey("AGENT_IDENTITY_MODE"))
+			Expect(env).NotTo(HaveKey("OTEL_EXPORTER_OTLP_ENDPOINT"), "no telemetry unless the engine set it")
+			// The run still launched normally.
+			Expect(env).To(HaveKeyWithValue("AGENT_GOAL", "review the pull request"))
+		})
+	})
+
+	Context("a ToolRun", func() {
+		const toolName = "event-env-tool"
+
+		BeforeEach(func() {
+			tool := &toolv1alpha1.Tool{
+				ObjectMeta: metav1.ObjectMeta{Name: toolName, Namespace: "default"},
+				Spec: toolv1alpha1.ToolSpec{
+					Description:        "event env tool",
+					Input:              "params",
+					Output:             "a result",
+					AllowedRoles:       []string{"reader"},
+					Image:              "example.com/tool:latest",
+					ServiceAccountName: "tool",
+					Env:                []toolv1alpha1.EnvVar{{Name: "STATIC", Value: "kept"}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, tool)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, tool) })
+		})
+
+		launch := func(name string, readOnly bool) map[string]string {
+			run := &toolv1alpha1.ToolRun{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+				Spec: toolv1alpha1.ToolRunSpec{
+					ToolRef:  toolName,
+					Callback: callback,
+					ReadOnly: readOnly,
+				},
+			}
+			Expect(k8sClient.Create(ctx, run)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, run) })
+
+			r := &ToolRunReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: "default"}})
+			Expect(err).NotTo(HaveOccurred())
+			return envOf(jobFor("toolrun-" + name))
+		}
+
+		It("carries readOnly as TOOL_READ_ONLY alongside the Tool's static env", func() {
+			env := launch("event-env-ro", true)
+			Expect(env).To(HaveKeyWithValue("TOOL_READ_ONLY", "true"))
+			Expect(env).To(HaveKeyWithValue("STATIC", "kept"))
+		})
+
+		It("does not set TOOL_READ_ONLY when the run is not read-only", func() {
+			env := launch("event-env-rw", false)
+			Expect(env).NotTo(HaveKey("TOOL_READ_ONLY"))
+			Expect(env).To(HaveKeyWithValue("STATIC", "kept"))
+		})
+	})
+})

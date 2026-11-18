@@ -1,15 +1,15 @@
 # Custom resource reference
 
 Every workload and every piece of catalog in this system is a Kubernetes custom
-resource in the group **`core.controller-agent.dev/v1alpha1`**. They are all
+resource in the group **`core.aktis.ai/v1alpha1`**. They are all
 **namespaced**. The CRD definitions ship in the `core-controller` chart's
 install-only `crds/` directory (generated from
-`controllers/core-controller/api/v1alpha1/*_types.go`), so installing that chart
+`orchestrator/controllers/core-controller/api/v1alpha1/*_types.go`), so installing that chart
 registers every kind below.
 
 Two kinds of actor reconcile them:
 
-- **The `core-controller` operator** (`controllers/core-controller`) watches most
+- **The `core-controller` operator** (`orchestrator/controllers/core-controller`) watches most
   kinds. Only `ToolRun` and `AgentRun` create Kubernetes Jobs; `Corpus` creates a
   sync CronJob and a cron `EventSource` a tick CronJob; every other controller only validates the spec and sets a `Ready`
   condition.
@@ -112,10 +112,11 @@ former JS `manifest.json` ([ADR 0009](adr/0009-static-build-time-tool-manifests.
   - `image` + `serviceAccountName` (string) — container launch target (the SA must pre-exist).
   - `args` / `env` / `secretEnv` / `resources` / `timeoutSeconds` — Job container config; `secretEnv` sources from Secret keys, never literals.
   - `identityProviders` ([]string) — `IdentityProvider` CRs the caller must have linked.
-  - **CEL:** exactly one of `agentRef` **or** (`image` **and** `serviceAccountName`).
+  - `defaultIdentity` (enum `agent;delegated`, default `delegated`) — whose credential a call presents on its resource providers: the caller's link, or each provider's `agentCredential` ([ADR 0049](adr/0049-configurable-agent-identity-mode.md) step 5). Temporal engine only; LangGraph refuses `agent`.
+  - **CEL:** exactly one of `agentRef` **or** (`image` **and** `serviceAccountName`); `defaultIdentity` not with `agentRef`.
 - **Status:** `Ready` condition.
 - **Referenced by:** `Skill.toolRefs`, `Agent.toolRefs`, `EventTrigger.target.toolRef`, `ToolRun.toolRef`.
-- **Acted on by:** `tool_controller.go` (validates the launch target); orchestrator (retrieval + dispatch).
+- **Acted on by:** `tool_controller.go` (validates the launch target, and in `agent` identity that every resource provider has an `agentCredential`); orchestrator (retrieval + dispatch).
 - **Sample:** `config/samples/tool_v1alpha1_tool.yaml`.
 
 ### LocalTool
@@ -175,8 +176,11 @@ mirrors `Tool` so agents join the same RBAC-scoped retrieval
   - `agentPrompt` — the system prompt the **sub-agent's** own loop runs with.
   - `skillRefs` ([]string) — `Skill` CRs this agent may load.
   - `toolRefs` ([]string) — `Tool` CRs this agent's own loop may call ([ADR 0028](adr/0028-agent-tool-refs-sub-agent-tool-calls.md)).
+  - `skills` ([]`{name, configMapName, files[]}`) — file-based engine skills (e.g. Claude Code `SKILL.md` dirs), each a ConfigMap mounted read-only at `/etc/aktis/skills/<name>` in the run container (`AKTIS_SKILLS_DIR`). Not `Skill` CRs — see [ADR 0051](adr/0051-file-based-agent-skills.md).
   - `model` (advisory), `maxIterations`, `env` / `secretEnv` / `resources`, `initContainers`.
-  - `identityProviders` ([]string).
+  - `identityProviders` ([]string) — providers this agent can use on the caller's behalf.
+  - `defaultIdentity` (`agent` | `delegated` | `hybrid`) — whose credential the agent reads and writes with on its resource providers; unset infers `hybrid` when `github` is declared, else `agent`. `allowedIdentities` limits which modes an `EventTrigger` may override to; CEL requires `defaultIdentity ∈ allowedIdentities` ([ADR 0049](adr/0049-configurable-agent-identity-mode.md)). Temporal engine only.
+  - `observability.capture` (`metadata` | `content`) — opt this agent's runs in to recording prompt/output text on traces, up to the deployment ceiling; forced to `metadata` for caller-credentialed runs and agents that reach a KB, MCP or identity-declaring tool ([ADR 0050](adr/0050-agent-observability-with-langfuse.md) §5).
 - **Status:** `Ready` condition.
 - **Referenced by:** `Tool.agentRef`, `Skill.agentRefs`, `EventTrigger.target.agentRef`, `AgentRun.agentRef`.
 - **Acted on by:** `agent_controller.go`; launched via `AgentRun` by the orchestrator.
@@ -188,7 +192,7 @@ mirrors `Tool` so agents join the same RBAC-scoped retrieval
 natural-language `goal` and the target is an `Agent`.
 
 - **Authored by:** system — created by the orchestrator (or another caller).
-- **Key spec fields:** `agentRef` (**required**), `goal` (string, **required**), `callback` (**required**, reuses the ToolRun HMAC/NATS protocol), `secretEnv` (merged over the Agent's), `timeoutSeconds`.
+- **Key spec fields:** `agentRef` (**required**), `goal` (string, **required**), `callback` (**required**, reuses the ToolRun HMAC/NATS protocol), `secretEnv` (merged over the Agent's), `timeoutSeconds`, `readOnly` (`AGENT_READ_ONLY`), `params` (`AGENT_PARAMS`), `identityMode` (`AGENT_IDENTITY_MODE`: the mode the engine decided, describing the credentials actually given), `contentCapture` (`content` → `AGENT_TRACE_CONTENT=true`; ADR 0050 §5), `launch` (immutable launch audit record: entry point, launcher, sender, trigger, requested mode and source, per-provider read/write credential owner, target repository, and the `traceId`/`traceparent` of the launching turn; [ADR 0049](adr/0049-configurable-agent-identity-mode.md) §3, [ADR 0050](adr/0050-agent-observability-with-langfuse.md) §1).
 - **Status:** same shape as `ToolRun` — `phase`, `jobName`, timings, `message`, `conditions`.
 - **Acted on by:** `agentrun_controller.go` (owns a `batch/v1` Job).
 - **Sample:** `config/samples/tool_v1alpha1_agentrun.yaml`.
@@ -310,6 +314,7 @@ it introduces an externally-controlled call path reachable by agents.
   - `url` (string, **required**, `^https?://`) — the broker's endpoint; `https` for an external server, `http` permitted for a cluster-internal one.
   - `secretEnv` — the shared-service **discovery** credential (for `tools/list`).
   - `identityProviders` ([]string) — the per-user **invocation** credential, presented on `tools/call`; fails **closed**, never falling back to the discovery credential.
+  - `defaultIdentity` (enum `agent;delegated`) — `agent` presents the providers' `agentCredential` instead of the caller's link (ADR 0049 step 5); copied onto each `MCPTool`.
   - `exposure` ([]MCPToolExposure, default-**deny**, keyed by `remoteToolName`) — each entry: `remoteToolName` (**required**), `expose` (*bool, default true), `allowedRoles` (**required**, ≥1), `toolID` (optional, must be a DNS-1123 name), `hidden`, `tier`.
 - **Status:** `discoveredTools` (the full advertised inventory, each marked `exposed`), `exposedTools` (count), `Ready`/Degraded conditions.
 - **Owns:** the derived `MCPTool` CRs (via `ownerReferences`, so deletion cascades).
@@ -324,7 +329,7 @@ kind is `mcpExec`, carrying what the broker needs to proxy one `tools/call`.
 `MCPServer`'s exposure map and reconciles any hand-edit back.
 
 - **Authored by:** system — the `mcp-broker` (owner-referenced to its `MCPServer`).
-- **Key spec fields:** `serverRef` (**required**), `remoteToolName` (**required**), `description` (**required**, RAG), `inputSchema` (the remote JSON Schema, verbatim), `allowedRoles` (**required**, ≥1, copied from the exposure entry), `hidden`, `tier`, `identityProviders` (copied from the server).
+- **Key spec fields:** `serverRef` (**required**), `remoteToolName` (**required**), `description` (**required**, RAG), `inputSchema` (the remote JSON Schema, verbatim), `allowedRoles` (**required**, ≥1, copied from the exposure entry), `hidden`, `tier`, `identityProviders` and `defaultIdentity` (copied from the server).
 - **Status:** `Ready` condition (the owning server still advertises this remote tool; the broker deletes it otherwise — the §6 existence rule).
 - **Referenced by:** `Skill.toolRefs` / `Agent.toolRefs`, by its catalog id (like any tool).
 - **Acted on by:** the **`mcp-broker`** — no in-cluster controller.
@@ -355,13 +360,13 @@ a cron source becomes a core-controller-owned `CronJob` that ticks
   - `webhook.verify` — `scheme` (`hmacSha256` | `slackV0` | `bearer`; there is no "none": unauthenticated is not a source), `header` (required for `hmacSha256`; `bearer` defaults to `authorization`), `prefix` (stripped before the hex compare), `secretRef` (`{name, key}`, same namespace).
   - `webhook.deliveryIdHeader` — becomes `envelope.id` (else a uuid).
   - `cron` — `schedule` (5-field), `timeZone`, `suspend`, `payload` (any JSON object, delivered as `envelope.body`).
-  - `sender` (webhook only) — `provider: github`, CEL `loginFrom` / `isBotFrom` / `repositoryFrom`, `dropBots` (default `true`). A login is only forwarded as the turn's principal after the provider verifies it; a source without `sender` runs as the gateway's service identity.
+  - `sender` (webhook only) — `provider: github`, CEL `loginFrom` / `isBotFrom` / `repositoryFrom` / `accountIdFrom` (the immutable account id, e.g. `body.sender.id`, resolved to the subject the sender linked under; [ADR 0049](adr/0049-configurable-agent-identity-mode.md) §5), `dropBots` (default `true`). A login is only forwarded as the turn's principal after the provider verifies it; a source without `sender` runs as the gateway's service identity.
 - **Status:** `Ready` condition; cron sources also `status.cronJobName` (`eventsource-<name>`). A cron source is `Ready=False` (`TickNotConfigured`) when core-controller has no `EVENT_TICK_URL`.
 - **Acted on by:** `eventsource_controller.go` (validates, owns the cron `CronJob`); `integration-gateway` serves and verifies webhooks from it.
 - **Sample:** `config/samples/core_v1alpha1_eventsource.yaml`.
 
 ```yaml
-apiVersion: core.controller-agent.dev/v1alpha1
+apiVersion: core.aktis.ai/v1alpha1
 kind: EventSource
 metadata: { name: github }              # POST /webhooks/github
 spec:
@@ -378,13 +383,13 @@ spec:
     isBotFrom: body.sender.type == "Bot"
     repositoryFrom: body.repository.full_name
 ---
-apiVersion: core.controller-agent.dev/v1alpha1
+apiVersion: core.aktis.ai/v1alpha1
 kind: EventSource
 metadata: { name: nightly-sweep }
 spec:
   cron:
     schedule: "0 7 * * *"
-    payload: { repo: imaustink/agent-controller, limit: 25 }
+    payload: { repo: imaustink/aktis, limit: 25 }
 ```
 
 ### EventTrigger
@@ -400,14 +405,14 @@ fallback.
   - `match.cel` — a `bool` CEL expression over the envelope (absent = every event from `sourceRef`). A compile failure is `Ready=False`; an evaluation error is a non-match.
   - `params` — name → CEL, evaluated to typed values; rendered into every `{{name}}` template.
   - `sessionKey` — template for the turn's session id (else `event:<source>:<id>`).
-  - `target` — **CEL:** exactly one of `orchestrator: {}` (ordinary conversational turn), `skillRef`, `agentRef`, `toolRef` (runs the Tool once with `params` as its input, skipping the planner); `promptTemplate` (required unless `toolRef`); `readOnly` — the deterministic write gate, carried onto every `AgentRun`/`ToolRun` the turn launches.
-  - `reply.github` — `repository`, `issueNumber`, `ack` (+ `sessionPage`), `result`, `removeLabel` (on every outcome, durably). `reply.http` — a **literal** `url` (never templated) + optional signing `secretRef`. Executed by `integration-gateway`.
+  - `target` — **CEL:** exactly one of `orchestrator: {}` (ordinary conversational turn), `skillRef`, `agentRef`, `toolRef` (runs the Tool once with `params` as its input, skipping the planner); `promptTemplate` (required unless `toolRef`); `readOnly` — the deterministic write gate, carried onto every `AgentRun`/`ToolRun` the turn launches; `identity` (`agent` | `delegated` | `hybrid`) — identity-mode override for every agent the turn authorizes, must be in the target Agent's `allowedIdentities` (`IdentityNotAllowed` otherwise), invalid with `toolRef`, signed-dispatch only ([ADR 0049](adr/0049-configurable-agent-identity-mode.md)).
+  - `reply.github` — `repository`, `issueNumber`, `ack` (+ `sessionPage`), `result`, `removeLabel` (on every outcome, durably), `onIdentityError` (post the printable message of an identity `403` as a comment; ADR 0049 §6). `reply.http` — a **literal** `url` (never templated) + optional signing `secretRef`. Executed by `integration-gateway`.
 - **Status:** `Ready` condition (CEL compiles, refs resolve).
 - **Acted on by:** `eventtrigger_controller.go` (compile + ref check); agent-orchestrator and the Temporal gateway match and dispatch.
 - **Sample:** `config/samples/core_v1alpha1_eventtrigger.yaml`; the shipped examples are bare manifests in `examples/event-triggers/` (not part of any chart).
 
 ```yaml
-apiVersion: core.controller-agent.dev/v1alpha1
+apiVersion: core.aktis.ai/v1alpha1
 kind: EventTrigger
 metadata: { name: github-pr-review }
 spec:
@@ -447,18 +452,19 @@ orchestrator so this is cluster config, watched like the catalog kinds
   - `label` (string, **required**) — human-facing name in link prompts; unique per namespace.
   - `flow` (enum `oauth;claude-cli-setup-token;claude-remote-login`, default `oauth`) — which link flow backs it ([ADR 0027](adr/0027-per-user-claude-oauth-setup-token-delegation.md)).
   - `crossEntryPoint` (bool) — key the credential by principal vs raw entry-point subject ([ADR 0030](adr/0030-authorization-preflight-outside-the-llm.md) §6).
+  - `agentCredential.secretRef` ({name, key}) — the operator's own credential for the provider, used by `agent`-identity Tools/MCPTools ([ADR 0049](adr/0049-configurable-agent-identity-mode.md) step 5). The Secret must be labelled `core.aktis.ai/agent-credential=true`, so an IdentityProvider alone cannot point the engine at an unrelated Secret.
 - **Status:** `conditions`.
 - **Referenced by:** `Tool`, `Agent`, `Connection`, `MCPServer`, `MCPTool` — all via `identityProviders`.
-- **Acted on by:** `identityprovider_controller.go` (uniqueness check only); the orchestrator reads it.
+- **Acted on by:** `identityprovider_controller.go` (uniqueness, and the `agentCredential` Secret's existence, key and opt-in label); the orchestrator reads it, and the Temporal worker reads `agentCredential` per agent-identity tool call.
 - **Sample:** none.
 
 ---
 
 ## Adding or changing a CRD
 
-1. Edit the Go type in `controllers/core-controller/api/v1alpha1/<kind>_types.go`
+1. Edit the Go type in `orchestrator/controllers/core-controller/api/v1alpha1/<kind>_types.go`
    (the doc comments on each field are the source of truth for this reference).
-2. Run `make manifests generate` in `controllers/core-controller` — this
+2. Run `make manifests generate` in `orchestrator/controllers/core-controller` — this
    regenerates the CRD YAML, the deepcopy methods, and **syncs the CRD into the
    chart's `crds/`** automatically.
 3. The chart's hand-maintained RBAC (`charts/.../rbac.yaml` for each process that

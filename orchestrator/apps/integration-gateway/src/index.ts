@@ -1,0 +1,502 @@
+import * as k8s from "@kubernetes/client-node";
+import { config } from "./config.js";
+import { setupTelemetry } from "./telemetry.js";
+import { ClaudeSetupTokenFlows } from "./claude-auth/pty-setup-token.js";
+import { ClaudeLoginFlows } from "./claude-auth/pty-login.js";
+import { K8sSecretClaudeTokenStore } from "./claude-auth/k8s-secret-store.js";
+import { decodeEncryptionKey } from "./credential-store/field-encryption.js";
+import type { SecretApiLike, WatchLike } from "./credential-store/secret-record-store.js";
+import { GithubReplyClient } from "./github-client.js";
+import { OAuthAuthCodeLinker } from "./identity-link/oauth-authcode-linker.js";
+import { loadOAuthProviders } from "./identity-link/providers.js";
+import { GithubDeviceFlowLinker } from "./identity-link/device-flow-linker.js";
+import { K8sSecretIdentityLinkStore } from "./identity-link/k8s-secret-store.js";
+import {
+  CompositeGithubIdentityResolver,
+  GithubCollaboratorPermissionResolver,
+  GithubIdentityResolver,
+  GithubTeamMembershipResolver,
+  loadGithubIdentitiesFromEnv,
+  loadPermissionRolesFromEnv,
+  loadTeamRolesFromEnv,
+} from "./identity.js";
+import { OrchestratorClient } from "./orchestrator-client.js";
+import { OidcTokenProvider } from "./oidc-token-provider.js";
+import { OidcLoginClient } from "./connections/oidc-login.js";
+import { K8sSecretPrincipalDirectory } from "./connections/principal-directory.js";
+import { deriveKey } from "./connections/signed-token.js";
+import { GatewayServer, type GatewayServerOptions } from "./server.js";
+import { InMemorySessionPageStore, RedisSessionPageStore } from "./session-page-store.js";
+import { InMemoryPendingLabelStore, RedisPendingLabelStore } from "./label-reconciler.js";
+import { CrdEventSourceRegistry, SecretKeyReader, type SecretReadApi } from "./event-sources.js";
+import { CrdEventTriggerRegistry } from "./event-triggers.js";
+import { JwksTokenAuthenticator, kubeIssuerKeySource, TICK_TOKEN_AUDIENCE } from "./tick-auth.js";
+
+const EXIT_STARTUP_FAILURE = 1;
+
+// A local `retryWithBackoff` lived here to hold startup until the credential
+// stores' Redis connections came up. Both stores are Secret-backed now
+// (docs/adr/0034) and hold no connection to establish -- each call is a request
+// against the API server, retried by the client and degraded per-call by the
+// store -- so there is nothing left to wait for at boot.
+
+async function main(): Promise<void> {
+  // docs/adr/0050 §4: spans for each delivery, exported only when the chart
+  // sets OTEL_EXPORTER_OTLP_ENDPOINT.
+  const shutdownTelemetry = setupTelemetry("integration-gateway");
+  // OIDC client_credentials fields (automatic token fetch/refresh) are an
+  // opt-in alternative to the static GATEWAY_ORCHESTRATOR_TOKEN -- same
+  // partial-config-fails-closed discipline as identity-link below (a typo'd
+  // Secret/values file leaving some but not all four set is far more likely
+  // than an intentional partial configuration).
+  const orchestratorOidcFields = {
+    GATEWAY_ORCHESTRATOR_OIDC_TOKEN_ENDPOINT: config.orchestratorOidcTokenEndpoint,
+    GATEWAY_ORCHESTRATOR_OIDC_CLIENT_ID: config.orchestratorOidcClientId,
+    GATEWAY_ORCHESTRATOR_OIDC_CLIENT_SECRET: config.orchestratorOidcClientSecret,
+    GATEWAY_ORCHESTRATOR_OIDC_RESOURCE: config.orchestratorOidcResource,
+  };
+  const orchestratorOidcFieldEntries = Object.entries(orchestratorOidcFields);
+  const orchestratorOidcFieldsSet = orchestratorOidcFieldEntries.filter(([, value]) => Boolean(value));
+  if (orchestratorOidcFieldsSet.length > 0 && orchestratorOidcFieldsSet.length < orchestratorOidcFieldEntries.length) {
+    const missing = orchestratorOidcFieldEntries.filter(([, value]) => !value).map(([name]) => name);
+    console.error(`Partial orchestrator OIDC configuration -- missing: ${missing.join(", ")}`);
+    process.exit(EXIT_STARTUP_FAILURE);
+  }
+  const orchestratorOidcEnabled = orchestratorOidcFieldsSet.length === orchestratorOidcFieldEntries.length;
+
+  if (!orchestratorOidcEnabled && !config.orchestratorToken) {
+    console.error(
+      "GATEWAY_ORCHESTRATOR_TOKEN is required (or the four GATEWAY_ORCHESTRATOR_OIDC_* fields, for automatic token refresh)",
+    );
+    process.exit(EXIT_STARTUP_FAILURE);
+  }
+
+  // Identity-link (docs/adr/0022) is an opt-in feature (chart's
+  // identityLink.enabled), so it must never be unconditionally required --
+  // an integration-gateway deployment that doesn't use it (e.g. today's
+  // production, which only relays GitHub issue comments) must keep starting
+  // with none of these four set. Only fail closed on a PARTIAL
+  // configuration (some but not all set), since that's almost certainly a
+  // typo'd Secret/values file rather than an intentional choice -- same
+  // discipline as opencode-swe-agent's GitHub App fields (ADR 0018).
+  //
+  // `AGENT_REDIS_URL` is deliberately NOT among these any more: linked
+  // credentials live in Kubernetes Secrets as of docs/adr/0034, so requiring a
+  // Redis URL to enable identity-link would demand a dependency the feature no
+  // longer has. Redis remains required only by the session-page store below.
+  const identityLinkFields = {
+    GATEWAY_IDENTITY_LINK_TOKEN: config.identityLinkToken,
+    GITHUB_APP_CLIENT_ID: config.githubAppClientId,
+    IDENTITY_LINK_ENCRYPTION_KEY: config.identityLinkEncryptionKey,
+  };
+  const identityLinkFieldEntries = Object.entries(identityLinkFields);
+  const identityLinkFieldsSet = identityLinkFieldEntries.filter(([, value]) => Boolean(value));
+  if (identityLinkFieldsSet.length > 0 && identityLinkFieldsSet.length < identityLinkFieldEntries.length) {
+    const missing = identityLinkFieldEntries.filter(([, value]) => !value).map(([name]) => name);
+    console.error(`Partial identity-link configuration -- missing: ${missing.join(", ")}`);
+    process.exit(EXIT_STARTUP_FAILURE);
+  }
+  const identityLinkEnabled = identityLinkFieldsSet.length === identityLinkFieldEntries.length;
+
+  const identities = loadGithubIdentitiesFromEnv(config.githubIdentities);
+  const staticIdentityResolver = new GithubIdentityResolver(identities, config.githubBotLogin);
+
+  // Prod-grade primary identity source (docs/adr's follow-up on the static
+  // allowlist): GitHub org/team membership, no commit/redeploy needed to add
+  // or remove a person. Only constructed when GATEWAY_GITHUB_TEAM_ROLES is
+  // actually set, so a deployment that hasn't migrated yet keeps working off
+  // the static allowlist alone.
+  const teamRoles = loadTeamRolesFromEnv(config.githubTeamRoles);
+  const teamMembershipResolver =
+    teamRoles.size > 0
+      ? new GithubTeamMembershipResolver({
+          teamRoles,
+          authConfig: {
+            githubToken: config.githubToken,
+            githubAppId: config.githubAppId,
+            githubAppPrivateKey: config.githubAppPrivateKey,
+            githubAppInstallationId: config.githubAppInstallationId,
+            githubApiUrl: config.githubApiUrl,
+          },
+          githubApiUrl: config.githubApiUrl,
+          botLogin: config.githubBotLogin,
+        })
+      : undefined;
+
+  // Same idea, but for personal-account (no-org) repos where team membership
+  // has nothing to check against -- grants roles by the sender's actual
+  // collaborator permission on the specific repo the webhook fired on.
+  const collaboratorRoles = loadPermissionRolesFromEnv(config.githubCollaboratorRoles);
+  const collaboratorPermissionResolver =
+    collaboratorRoles.size > 0
+      ? new GithubCollaboratorPermissionResolver({
+          permissionRoles: collaboratorRoles,
+          authConfig: {
+            githubToken: config.githubToken,
+            githubAppId: config.githubAppId,
+            githubAppPrivateKey: config.githubAppPrivateKey,
+            githubAppInstallationId: config.githubAppInstallationId,
+            githubApiUrl: config.githubApiUrl,
+          },
+          githubApiUrl: config.githubApiUrl,
+          botLogin: config.githubBotLogin,
+        })
+      : undefined;
+
+  const identityResolver = new CompositeGithubIdentityResolver(
+    [teamMembershipResolver, collaboratorPermissionResolver],
+    staticIdentityResolver,
+  );
+
+  // Automatic token fetch/refresh (previously a documented, unbuilt
+  // follow-up -- see imaustink/homelab's kubernetes/manifests/agent-controller
+  // /README.md's "integration-gateway token refresh (not yet built)" note)
+  // when the OIDC fields are configured; otherwise the static token, exactly
+  // as before this feature existed.
+  const orchestratorTokenProvider = orchestratorOidcEnabled
+    ? new OidcTokenProvider({
+        tokenEndpoint: config.orchestratorOidcTokenEndpoint!,
+        clientId: config.orchestratorOidcClientId!,
+        clientSecret: config.orchestratorOidcClientSecret!,
+        resource: config.orchestratorOidcResource,
+      })
+    : undefined;
+
+  const orchestratorClient = new OrchestratorClient({
+    baseUrl: config.orchestratorUrl,
+    token: orchestratorTokenProvider ? () => orchestratorTokenProvider.getToken() : config.orchestratorToken,
+    pollIntervalMs: config.pollIntervalMs,
+    pollTimeoutMs: config.pollTimeoutMs,
+    senderAssertionSecret: config.senderAssertionSecret,
+  });
+  if (!config.senderAssertionSecret) {
+    console.error(
+      "WARNING: GATEWAY_SENDER_ASSERTION_SECRET is not set -- the sender login is relayed to agent-orchestrator UNSIGNED. " +
+        "That login selects the caller's principal and therefore which stored credentials a run receives, so anything " +
+        "holding this gateway's /invoke token could name an arbitrary login. Set it (and the orchestrator's matching " +
+        "AGENT_SENDER_ASSERTION_SECRET) to have the orchestrator require a verified assertion (docs/adr/0030).",
+    );
+  }
+
+  const githubReplyClient = new GithubReplyClient({
+    githubToken: config.githubToken,
+    githubAppId: config.githubAppId,
+    githubAppPrivateKey: config.githubAppPrivateKey,
+    githubAppInstallationId: config.githubAppInstallationId,
+    githubApiUrl: config.githubApiUrl,
+  });
+
+  /**
+   * The in-cluster Kubernetes client backing every credential store
+   * (docs/adr/0034). Built once, lazily, so a deployment with neither
+   * identity-link nor claude-auth enabled never needs a ServiceAccount token or
+   * the RBAC Role -- and so `loadFromCluster` throwing outside a cluster
+   * surfaces as a startup failure of the feature that asked for it, naming what
+   * is missing, rather than an import-time crash.
+   */
+  let credentialApis: { api: SecretApiLike; watch: WatchLike } | undefined;
+  const credentialStoreApis = (): { api: SecretApiLike; watch: WatchLike } => {
+    if (credentialApis) return credentialApis;
+    const kubeConfig = new k8s.KubeConfig();
+    kubeConfig.loadFromDefault();
+    credentialApis = {
+      api: kubeConfig.makeApiClient(k8s.CoreV1Api) as unknown as SecretApiLike,
+      watch: new k8s.Watch(kubeConfig) as unknown as WatchLike,
+    };
+    return credentialApis;
+  };
+
+  let identityLinkStore: K8sSecretIdentityLinkStore | undefined;
+  let identityLinkLinker: GithubDeviceFlowLinker | undefined;
+  let identityLinkAuthCodeLinkers: ReadonlyMap<string, OAuthAuthCodeLinker> | undefined;
+  if (identityLinkEnabled) {
+    identityLinkStore = new K8sSecretIdentityLinkStore(decodeEncryptionKey(config.identityLinkEncryptionKey), {
+      namespace: config.credentialNamespace,
+      ...credentialStoreApis(),
+    });
+    console.error(
+      `Using Kubernetes Secret identity-link store in namespace ${config.credentialNamespace} (durable across restarts, docs/adr/0034)`,
+    );
+
+    identityLinkLinker = new GithubDeviceFlowLinker({
+      clientId: config.githubAppClientId,
+      scope: config.deviceFlowScope,
+      store: identityLinkStore,
+      clientSecret: config.githubAppClientSecret,
+      stateSecret: config.identityLinkStateSecret,
+      redirectUri: config.githubOauthRedirectUri,
+      // Without this the linker falls back to its own github.com default,
+      // so a GitHub Enterprise Server deployment would send its users to
+      // github.com/login/device/code -- which 404s for a GHES-registered
+      // App's client id.
+      githubBaseUrl: config.githubBaseUrl,
+      // The REST API host, distinct from the OAuth host above -- the
+      // post-poll login lookup hits `/user`, which lives on api.github.com
+      // in production but must follow this same override wherever
+      // githubBaseUrl does (e2e's fake-github serves both from one address).
+      apiBaseUrl: config.githubApiUrl,
+    });
+
+    // The generic authorization-code providers (Atlassian, and anything else
+    // providers.ts learns to build). Until now loadOAuthProviders was written,
+    // tested and never called, and createServer's
+    // `identityLinkAuthCodeLinkers` was never passed — so every non-GitHub
+    // link attempt answered "Unsupported identity provider", and the
+    // deployment had no ATLASSIAN_* env because nothing would have read it.
+    //
+    // That made the per-user delegated path (docs/adr/0040) unreachable in
+    // production for Confluence and Drive, which is the path a knowledge
+    // base's live read and live lookup BOTH run on — neither has a
+    // service-credential fallback, by design.
+    //
+    // The redirect URI is derived rather than configured per provider: the
+    // callback route is `/identity-link/:provider/callback` for all of them,
+    // so a second knob would only be a second thing to get out of step with
+    // the route. It does still have to match what is registered with the
+    // provider, which is why startup says what it derived.
+    if (config.publicUrl) {
+      const linkers = new Map<string, OAuthAuthCodeLinker>();
+      for (const [name, providerConfig] of loadOAuthProviders()) {
+        linkers.set(
+          name,
+          new OAuthAuthCodeLinker({
+            config: providerConfig,
+            store: identityLinkStore,
+            stateSecret: config.identityLinkStateSecret,
+            redirectUri: `${config.publicUrl.replace(/\/+$/, "")}/identity-link/${name}/callback`,
+          }),
+        );
+      }
+      if (linkers.size > 0) {
+        identityLinkAuthCodeLinkers = linkers;
+        for (const [name] of linkers) {
+          console.error(
+            `identity-link provider "${name}" enabled; its app must register ` +
+              `${config.publicUrl.replace(/\/+$/, "")}/identity-link/${name}/callback`,
+          );
+        }
+      }
+    } else if (loadOAuthProviders().size > 0) {
+      // Configured but unusable, which is worth saying loudly: the symptom is
+      // otherwise a link button that reports an unsupported provider.
+      console.error(
+        "WARNING: OAuth identity-link providers are configured but GATEWAY_PUBLIC_URL is " +
+          "unset, so no redirect URI can be derived and none of them are enabled.",
+      );
+    }
+  }
+
+  // Session page (issue #81) is opt-in: only enabled once a public base URL
+  // is configured, since a page link with nowhere reachable to send it is
+  // useless. The Redis-backed store is preferred (survives a pod restart --
+  // this link is posted into a GitHub comment and may be revisited days
+  // later) but falls back to in-memory, sharing the same
+  // "works standalone, better with Redis" posture as elsewhere in this app.
+  const sessionPageEnabled = Boolean(config.publicUrl);
+  const sessionPageRedisUrl = config.sessionPageRedisUrl ?? config.redisUrl;
+  let sessionPageStore: RedisSessionPageStore | InMemorySessionPageStore | undefined;
+  if (sessionPageEnabled) {
+    sessionPageStore = sessionPageRedisUrl ? new RedisSessionPageStore(sessionPageRedisUrl) : new InMemorySessionPageStore();
+    console.error(
+      `Session pages enabled at ${config.publicUrl} (${sessionPageRedisUrl ? `Redis: ${sessionPageRedisUrl}` : "in-memory"})`,
+    );
+  }
+
+  // EventSources (ADR 0048): the event routes exist only for sources this
+  // gateway can see. Without CRD_NAMESPACE nothing is loaded and every
+  // /webhooks/:source and /events/:source/tick answers 404 -- said loudly,
+  // since that is otherwise a silent "every delivery 404s". A failed initial
+  // list is fatal: starting with an empty table would 404 real deliveries
+  // until the first successful relist, with nothing in the logs explaining it
+  // beyond the list error.
+  let eventSources: CrdEventSourceRegistry | undefined;
+  let eventTriggers: CrdEventTriggerRegistry | undefined;
+  let eventSecrets: SecretKeyReader | undefined;
+  let tickAuthenticator: JwksTokenAuthenticator | undefined;
+  if (config.crdNamespace) {
+    const kubeConfig = new k8s.KubeConfig();
+    kubeConfig.loadFromDefault();
+    eventSources = CrdEventSourceRegistry.fromKubeConfig(kubeConfig, {
+      namespace: config.crdNamespace,
+      group: config.crdGroup,
+      version: config.crdVersion,
+    });
+    eventSecrets = new SecretKeyReader({
+      api: kubeConfig.makeApiClient(k8s.CoreV1Api) as unknown as SecretReadApi,
+      namespace: config.crdNamespace,
+    });
+    tickAuthenticator = new JwksTokenAuthenticator(kubeIssuerKeySource(kubeConfig));
+    await eventSources.start();
+    // Only an optimization (skip GitHub sender lookups for deliveries no
+    // trigger could match), so it starts in the background and a failed list
+    // just means every sender is resolved.
+    eventTriggers = CrdEventTriggerRegistry.fromKubeConfig(kubeConfig, {
+      namespace: config.crdNamespace,
+      group: config.crdGroup,
+      version: config.crdVersion,
+    });
+    eventTriggers.start();
+    console.error(
+      `Serving EventSources (${config.crdGroup}/${config.crdVersion}) from namespace ${config.crdNamespace}; ` +
+        `cron ticks authenticate as their ServiceAccount (issuer keys, audience ${TICK_TOKEN_AUDIENCE})`,
+    );
+  } else {
+    console.error("WARNING: CRD_NAMESPACE is not set -- no EventSources are loaded, so every event route answers 404.");
+  }
+
+  // Durable self-heal for trigger-declared label removal (the headline "only
+  // works ~3/4 of the time" bug): an outbox of owed label removals, Redis-backed so it
+  // survives the gateway pod restart/OOM that loses the in-process `finally`.
+  // Reuses the same Redis as the session-page store, and falls back to in-memory
+  // (which heals a same-process throw but not a restart) with the same
+  // "works standalone, better with Redis" posture as elsewhere here. Always on:
+  // no public URL or other feature flag is needed, since it only reconciles
+  // labels this gateway itself applied.
+  const pendingLabelRedisUrl = config.sessionPageRedisUrl ?? config.redisUrl;
+  const pendingLabelStore = pendingLabelRedisUrl
+    ? new RedisPendingLabelStore(pendingLabelRedisUrl)
+    : new InMemoryPendingLabelStore();
+  console.error(
+    `Label reconciler enabled (${pendingLabelRedisUrl ? `Redis: ${pendingLabelRedisUrl}` : "in-memory (not durable across restarts)"})`,
+  );
+
+  // Claude-auth (docs/adr/0027) is opt-in and layered on top of
+  // identity-link's Redis/encryption-key/bearer-token config and
+  // session-page's publicUrl -- fail closed (not silently disabled) if
+  // enabled without those, since a misconfigured deployment here means every
+  // Claude-Code-swe-agent delegation that needs a per-user token silently
+  // has nowhere to send the user, not a graceful degradation.
+  if (config.claudeAuthEnabled && !(identityLinkEnabled && sessionPageEnabled)) {
+    console.error(
+      "GATEWAY_CLAUDE_AUTH_ENABLED=true requires identity-link (GATEWAY_IDENTITY_LINK_TOKEN/GITHUB_APP_CLIENT_ID/IDENTITY_LINK_ENCRYPTION_KEY) and GATEWAY_PUBLIC_URL to also be configured",
+    );
+    process.exit(EXIT_STARTUP_FAILURE);
+  }
+  let claudeTokenStore: K8sSecretClaudeTokenStore | undefined;
+  let claudeAuthFlows: ClaudeSetupTokenFlows | undefined;
+  let claudeLoginFlows: ClaudeLoginFlows | undefined;
+  if (config.claudeAuthEnabled) {
+    claudeTokenStore = new K8sSecretClaudeTokenStore(decodeEncryptionKey(config.identityLinkEncryptionKey), {
+      namespace: config.credentialNamespace,
+      ...credentialStoreApis(),
+    });
+    claudeAuthFlows = new ClaudeSetupTokenFlows();
+    // Same gate as the setup-token flow above -- both need the same `claude`
+    // CLI binary in this image and the same PTY mechanics, just a different
+    // subcommand/captured payload (docs/adr/0027's "claude-remote" follow-up).
+    // Without this, `mode=login` requests 501 forever and no Remote Control
+    // credential can ever be created, regardless of anything else being
+    // configured correctly downstream.
+    claudeLoginFlows = new ClaudeLoginFlows();
+    console.error("Claude Code per-user OAuth linking enabled (setup-token + full-login/Remote Control)");
+  }
+
+  // Connections page (docs/adr/0046). Opt-in by configuring its OIDC client;
+  // every piece is required, so a partial config is said out loud rather than
+  // leaving a page that 404s or a login that can never complete.
+  let connections: GatewayServerOptions["connections"];
+  const connectionsConfigured = [
+    config.connectionsOidcIssuer,
+    config.connectionsOidcClientId,
+    config.connectionsOidcClientSecret,
+  ];
+  const publicBase = config.publicUrl.replace(/\/+$/, "");
+  if (connectionsConfigured.every(Boolean)) {
+    if (!identityLinkStore || !publicBase || !config.identityLinkStateSecret) {
+      console.error(
+        "WARNING: Connections page OIDC is configured but identity-link, GATEWAY_PUBLIC_URL or " +
+          "IDENTITY_LINK_STATE_SECRET is not, so the page is disabled.",
+      );
+    } else {
+      const redirectUri = `${publicBase}/connections/callback`;
+      connections = {
+        store: identityLinkStore,
+        directory: new K8sSecretPrincipalDirectory({
+          namespace: config.credentialNamespace,
+          api: credentialStoreApis().api,
+        }),
+        oidc: new OidcLoginClient({
+          issuer: config.connectionsOidcIssuer,
+          clientId: config.connectionsOidcClientId,
+          clientSecret: config.connectionsOidcClientSecret,
+          redirectUri,
+          scopes: config.connectionsOidcScopes,
+          allowUnverifiedEmail: config.connectionsAllowUnverifiedEmail,
+        }),
+        // Derived from the state secret so the page needs no Secret key of its
+        // own; rotating that secret signs everyone out, which is acceptable.
+        cookieKey: deriveKey(config.identityLinkStateSecret, "connections-cookie"),
+        sessionTtlMs: config.connectionsSessionTtlSeconds * 1000,
+        githubAuthCode: Boolean(config.githubOauthRedirectUri && config.githubAppClientSecret),
+      };
+      console.error(
+        `Connections page enabled at ${publicBase}/connections ` +
+          `(OIDC issuer ${config.connectionsOidcIssuer}; register redirect URI ${redirectUri})`,
+      );
+      if (config.connectionsAllowUnverifiedEmail) {
+        console.error("WARNING: Connections page accepts UNVERIFIED IdP emails (GATEWAY_CONNECTIONS_ALLOW_UNVERIFIED_EMAIL).");
+      }
+    }
+  } else if (connectionsConfigured.some(Boolean)) {
+    console.error(
+      "WARNING: Connections page is partially configured -- GATEWAY_CONNECTIONS_OIDC_ISSUER, _CLIENT_ID and " +
+        "_CLIENT_SECRET must all be set -- so it is disabled.",
+    );
+  }
+
+  const server = new GatewayServer({
+    ...(eventSources ? { eventSources } : {}),
+    ...(eventTriggers ? { eventTriggers } : {}),
+    ...(eventSecrets ? { secrets: eventSecrets } : {}),
+    ...(tickAuthenticator ? { tickAuthenticator, tickNamespace: config.crdNamespace } : {}),
+    identityResolver,
+    // docs/adr/0049 §5: a verified sender's account id -> the subject their
+    // links live under.
+    ...(identityLinkStore ? { senderSubjects: identityLinkStore } : {}),
+    orchestratorClient,
+    githubReplyClient,
+    ...(identityLinkLinker ? { identityLinkLinker, identityLinkToken: config.identityLinkToken } : {}),
+    ...(identityLinkAuthCodeLinkers ? { identityLinkAuthCodeLinkers } : {}),
+    ...(sessionPageStore ? { sessionPageStore, publicBaseUrl: config.publicUrl } : {}),
+    pendingLabelStore,
+    ...(config.labelReconcilerIntervalMs ? { labelReconcilerIntervalMs: config.labelReconcilerIntervalMs } : {}),
+    ...(config.labelReconcilerGraceMs !== undefined ? { labelReconcilerGraceMs: config.labelReconcilerGraceMs } : {}),
+    ...(claudeAuthFlows && claudeTokenStore ? { claudeAuthFlows, claudeAuthStore: claudeTokenStore } : {}),
+    ...(claudeLoginFlows ? { claudeLoginFlows } : {}),
+    ...(connections ? { connections } : {}),
+    resumeWaitMs: config.resumeWaitMs,
+    claudeCredentialRefreshEnabled: config.claudeCredentialRefreshEnabled,
+    claudeCredentialRefreshMarginMs: config.claudeCredentialRefreshMarginMs,
+    claudeCredentialSweepIntervalMs: config.claudeCredentialSweepIntervalMs,
+    claudeCredentialSweepMarginMs: config.claudeCredentialSweepMarginMs,
+  });
+
+  await server.listen(config.httpPort);
+  console.error(`integration-gateway listening on :${config.httpPort}`);
+
+  let shuttingDown = false;
+  const shutdown = async (signal: string): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.error(`Received ${signal}; shutting down integration-gateway...`);
+    await server.close();
+    eventSources?.stop();
+    eventTriggers?.stop();
+    // The credential stores hold no long-lived connection to close: each call is
+    // a request against the API server, and the only durable thing they own is
+    // the Secret itself (docs/adr/0034). The Redis handles that used to need
+    // draining here went with them.
+    if (sessionPageStore instanceof RedisSessionPageStore) await sessionPageStore.close();
+    if (pendingLabelStore instanceof RedisPendingLabelStore) await pendingLabelStore.close();
+    await shutdownTelemetry();
+    process.exit(0);
+  };
+
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+}
+
+void main().catch((error) => {
+  console.error(error);
+  process.exit(EXIT_STARTUP_FAILURE);
+});

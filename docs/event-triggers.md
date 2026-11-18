@@ -17,7 +17,7 @@ document; where code and this document disagree, one of them is a bug.
  orchestrator (LangGraph or Temporal): match EventTriggers (CEL) ─► params ─► target
 ```
 
-## 1. CRDs (`core.controller-agent.dev/v1alpha1`, namespaced)
+## 1. CRDs (`core.aktis.ai/v1alpha1`, namespaced)
 
 Both kinds live in the release namespace (the one agent-orchestrator,
 integration-gateway and the Temporal gateway watch).
@@ -27,7 +27,7 @@ integration-gateway and the Temporal gateway watch).
 How events arrive and how far they are trusted. Exactly one of `webhook` / `cron`.
 
 ```yaml
-apiVersion: core.controller-agent.dev/v1alpha1
+apiVersion: core.aktis.ai/v1alpha1
 kind: EventSource
 metadata: { name: github }          # the name IS the route: POST /webhooks/github
 spec:
@@ -43,6 +43,7 @@ spec:
     loginFrom: body.sender.login    # CEL -> string
     isBotFrom: body.sender.type == "Bot"   # CEL -> bool (optional; default false)
     repositoryFrom: body.repository.full_name  # CEL -> "owner/name" (optional)
+    accountIdFrom: body.sender.id   # CEL -> immutable account id (optional; ADR 0049 §5)
     dropBots: true                  # default true: bot-authored events are dropped (self-trigger guard)
 ---
 kind: EventSource
@@ -52,7 +53,7 @@ spec:
     schedule: "0 7 * * *"           # standard 5-field cron
     timeZone: America/Chicago       # optional
     suspend: false                  # optional
-    payload: { repo: imaustink/agent-controller }   # optional, any JSON; becomes envelope.body
+    payload: { repo: imaustink/aktis }   # optional, any JSON; becomes envelope.body
 ```
 
 Rules:
@@ -75,7 +76,7 @@ Rules:
 What a matching event dispatches.
 
 ```yaml
-apiVersion: core.controller-agent.dev/v1alpha1
+apiVersion: core.aktis.ai/v1alpha1
 kind: EventTrigger
 metadata: { name: github-pr-review }
 spec:
@@ -128,6 +129,13 @@ Rules:
   read-only, and a writable trigger sharing that session key (triage on the
   same issue) makes it writable again. A read-only turn is never forwarded
   into an agent run that was launched writable; the turn fails instead.
+- `identity: agent | delegated | hybrid` overrides the identity mode of every
+  agent the turn authorizes, in place of the Agent's `defaultIdentity`
+  ([ADR 0049](adr/0049-configurable-agent-identity-mode.md)). Unlike
+  `readOnly` it can **widen** what a run reaches, so it must be in the Agent's
+  `allowedIdentities` (the trigger is not `Ready` otherwise), it is invalid with
+  `toolRef`, and it is honoured only by the Temporal engine. A turn that parks
+  on an account link resumes under the same override. It is not a session mode.
 - A trigger whose CEL fails to compile is `Ready=False` and never matches.
 
 ## 2. The envelope
@@ -149,7 +157,7 @@ Every source produces exactly this JSON object. It is both the `event` field of
 ## 3. CEL
 
 One environment, used identically by core-controller (compile-only), the TS
-orchestrator + gateway (`@controller-agent/event-triggers`, `@marcbachmann/cel-js`)
+orchestrator + gateway (`@aktis/event-triggers`, `@marcbachmann/cel-js`)
 and the Temporal gateway (`cel-go`):
 
 - Variables: `source`, `kind`, `id`, `time`, `repository` (string), `headers`
@@ -172,7 +180,7 @@ and the Temporal gateway (`cel-go`):
   value must be JSON-representable (null/bool/int/double/string/list/map, finite
   doubles) — anything else is a `params` error. A `params` evaluation error after a
   match fails the event (`422`, §5) — never a silent empty value.
-- The shared fixture file `packages/event-triggers/fixtures/cel-parity.json` is the
+- The shared fixture file `orchestrator/packages/event-triggers/fixtures/cel-parity.json` is the
   executable definition of this section: every case runs in the TS package's
   tests and in the Temporal engine's Go tests, and both must produce the listed
   verdict / value.
@@ -218,7 +226,7 @@ engine modes) and on the Temporal gateway (for direct callers). Request:
 
 An event is always matched against the registry. Dispatch is never taken from
 the body: `forcedSkillId`, `forcedAgentId`, `forcedToolId`, `toolInput`,
-`params` and `triggerName` in an `/invoke` body are ignored by
+`params`, `triggerName` and `identity` in an `/invoke` body are ignored by
 agent-orchestrator and refused with `400` by the Temporal gateway. The Temporal
 gateway honours a body `readOnly: true`, which can only restrict.
 
@@ -228,7 +236,7 @@ envelope. Body: `request` (rendered prompt), `sessionId`, `readOnly` (only
 travels in the signed `x-orchestrator-dispatch-assertion` header, an
 HMAC-SHA256 `<payload>.<signature>` under the sender-assertion secret with
 payload `{typ:"dispatch", triggerName, forcedSkillId | forcedAgentId |
-forcedToolId, toolInput, readOnly, params, sessionId, requestSha256, exp}`.
+forcedToolId, toolInput, readOnly, params, identity, sessionId, requestSha256, exp}`.
 It is bound to the turn's session and prompt and expires after 300 s. The
 gateway refuses (`400`) an invalid, expired or mis-bound assertion and one sent
 with an `event`. Without the secret, agent-orchestrator fails a Temporal-mode
@@ -242,7 +250,7 @@ trigger turn instead of sending it unsigned.
 | `AgentRun.spec.params` (map<string,string>) | `AGENT_PARAMS=<json object>` |
 | `ToolRun.spec.readOnly` | `TOOL_READ_ONLY=true` |
 
-`@controller-agent/agent-runtime` exposes them as `session.readOnly` /
+`@aktis/agent-runtime` exposes them as `session.readOnly` /
 `session.params`. The SWE agents enforce read-only (deny `git push`, `gh pr
 create|merge|close|reopen|ready|edit`, mint a `contents:read` token) from
 `session.readOnly` alone.
@@ -266,6 +274,16 @@ create|merge|close|reopen|ready|edit`, mint a `contents:read` token) from
   requires the username `system:serviceaccount:<CRD_NAMESPACE>:eventsource-<source>`
   — anything else (including another source's tick) is `401`, before the source
   is looked up; then `404` unless the source is `cron`; `202`.
+- **The webhook is answered once the relay's accept is known** (ADR 0049 §6).
+  An agent that must act as its sender, who cannot be acted as, is a `403`
+  carrying `{status:"failed", error:{code, message, identityMode, target,
+  sender, missing[{provider,label,linkUrl}], trigger}}`. `message` is safe to
+  print to the sender. `code` is `identity_link_required`,
+  `identity_ambiguous` or `identity_unavailable`. Every other outcome is `202`.
+  With `reply.github.onIdentityError` the message is also posted as a comment,
+  since GitHub never reads a response body. A source's `sender.accountIdFrom`
+  is what resolves a sender to the subject their links live under. The gateway
+  signs `{login, accountId, subject?, subjectStatus}` into the sender assertion.
 - Reply adapters run only for the `reply` the orchestrator returned: `github.ack`
   (+ session page link) before polling; `github.result` / `http` after;
   `github.removeLabel` after, on every outcome, through the durable pending-action

@@ -39,14 +39,14 @@ set -uo pipefail
 # --- configuration (env-overridable, defaults match the deploy job) ----------
 NAMESPACE="${NAMESPACE:-controller-agent}"
 # Long-running Deployments restarted by the deploy job's "Rollout restart" step.
-DEPLOYMENTS="${DEPLOYMENTS:-agent-orchestrator core-controller agent-controller-integration-gateway}"
+DEPLOYMENTS="${DEPLOYMENTS:-agent-orchestrator core-controller agent-controller-integration-gateway agent-controller-temporal-engine-worker agent-controller-temporal-engine-gateway agent-controller-temporal-engine-catalog-sync}"
 
 UPGRADE_AGENT_OUTCOME="${UPGRADE_AGENT_OUTCOME:-}"
 UPGRADE_COMMUNITY_OUTCOME="${UPGRADE_COMMUNITY_OUTCOME:-}"
 ROLLOUT_OUTCOME="${ROLLOUT_OUTCOME:-}"
 
 # GitHub context (all provided by Actions; guarded for local dry-runs).
-GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-imaustink/agent-controller}"
+GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-imaustink/aktis}"
 GITHUB_SHA="${GITHUB_SHA:-unknown}"
 GITHUB_REF_NAME="${GITHUB_REF_NAME:-unknown}"
 GITHUB_ACTOR="${GITHUB_ACTOR:-unknown}"
