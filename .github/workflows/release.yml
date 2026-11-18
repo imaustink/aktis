@@ -27,7 +27,7 @@ permissions:
 jobs:
   changes:
     # Cheap, network-light job: figures out which images actually need a
-    # rebuild, and whether charts/ changed, so downstream jobs only do work
+    # rebuild, and whether orchestrator/charts/ changed, so downstream jobs only do work
     # when relevant. Runs on a GitHub-hosted runner since it doesn't touch
     # the internal registry or cluster.
     runs-on: ubuntu-latest
@@ -46,86 +46,94 @@ jobs:
             agent-orchestrator:
               - 'package.json'
               - 'package-lock.json'
-              - 'packages/messaging/**'
-              - 'apps/agent-orchestrator/**'
+              - 'framework/messaging/**'
+              - 'orchestrator/apps/agent-orchestrator/**'
             opencode-swe-agent:
               - 'package.json'
               - 'package-lock.json'
-              - 'packages/messaging/**'
-              - 'packages/agent-runtime/**'
-              - 'packages/github-app-auth/**'
-              - 'apps/opencode-swe-agent/**'
+              - 'framework/messaging/**'
+              - 'framework/agent-runtime/**'
+              - 'framework/github-app-auth/**'
+              - 'catalog/agents/opencode-swe-agent/**'
             claude-code-swe-agent:
               - 'package.json'
               - 'package-lock.json'
-              - 'packages/messaging/**'
-              - 'packages/agent-runtime/**'
-              - 'packages/github-app-auth/**'
-              - 'apps/claude-code-swe-agent/**'
+              - 'framework/messaging/**'
+              - 'framework/agent-runtime/**'
+              - 'framework/github-app-auth/**'
+              - 'catalog/agents/claude-code-swe-agent/**'
             integration-gateway:
               - 'package.json'
               - 'package-lock.json'
-              - 'packages/github-app-auth/**'
-              - 'apps/integration-gateway/**'
+              - 'framework/github-app-auth/**'
+              - 'orchestrator/apps/integration-gateway/**'
+            connection-broker:
+              - 'package.json'
+              - 'package-lock.json'
+              - 'orchestrator/apps/connection-broker/**'
+            mcp-broker:
+              - 'package.json'
+              - 'package-lock.json'
+              - 'orchestrator/apps/mcp-broker/**'
             recipe-scraper:
               - 'package.json'
               - 'package-lock.json'
-              - 'packages/messaging/**'
-              - 'tools/recipe-scraper/**'
+              - 'framework/messaging/**'
+              - 'catalog/tools/recipe-scraper/**'
             recipe-publisher:
               - 'package.json'
               - 'package-lock.json'
-              - 'packages/messaging/**'
-              - 'tools/recipe-publisher/**'
+              - 'framework/messaging/**'
+              - 'catalog/tools/recipe-publisher/**'
             web-search:
               - 'package.json'
               - 'package-lock.json'
-              - 'packages/messaging/**'
-              - 'tools/web-search/**'
+              - 'framework/messaging/**'
+              - 'catalog/tools/web-search/**'
             web-fetch:
               - 'package.json'
               - 'package-lock.json'
-              - 'packages/messaging/**'
-              - 'tools/web-fetch/**'
+              - 'framework/messaging/**'
+              - 'catalog/tools/web-fetch/**'
             image-gen:
               - 'package.json'
               - 'package-lock.json'
-              - 'packages/messaging/**'
-              - 'tools/image-gen/**'
+              - 'framework/messaging/**'
+              - 'catalog/tools/image-gen/**'
             kubectl-readonly:
               - 'package.json'
               - 'package-lock.json'
-              - 'packages/messaging/**'
-              - 'tools/kubectl-readonly/**'
+              - 'framework/messaging/**'
+              - 'catalog/tools/kubectl-readonly/**'
             signoz-query:
               - 'package.json'
               - 'package-lock.json'
-              - 'packages/messaging/**'
-              - 'tools/signoz-query/**'
+              - 'framework/messaging/**'
+              - 'catalog/tools/signoz-query/**'
             github-tool:
               - 'package.json'
               - 'package-lock.json'
-              - 'packages/messaging/**'
-              - 'packages/github-app-auth/**'
-              - 'tools/github/**'
+              - 'framework/messaging/**'
+              - 'framework/github-app-auth/**'
+              - 'catalog/tools/github/**'
             glyph:
               - 'package.json'
               - 'package-lock.json'
-              - 'packages/messaging/**'
-              - 'tools/glyph/**'
+              - 'framework/messaging/**'
+              - 'catalog/tools/glyph/**'
             ssh-tool:
               - 'package.json'
               - 'package-lock.json'
-              - 'packages/messaging/**'
-              - 'tools/ssh/**'
+              - 'framework/messaging/**'
+              - 'catalog/tools/ssh/**'
             core-controller:
-              - 'controllers/core-controller/**'
+              - 'orchestrator/controllers/core-controller/**'
             temporal-engine:
-              - 'engines/temporal/**'
+              - 'orchestrator/engines/temporal/**'
             localtool-executor:
-              - 'sidecars/localtool-executor/**'
+              - 'orchestrator/sidecars/localtool-executor/**'
             charts:
-              - 'charts/**'
+              - 'orchestrator/charts/**'
 
       - name: Compute image matrix
         id: matrix
@@ -155,76 +163,213 @@ jobs:
           echo "Building: $(echo "$MATRIX" | jq -c '[.[].image]')"
           echo "result=$MATRIX" >> "$GITHUB_OUTPUT"
 
-  publish-images:
+  build-images:
+    # Multi-arch (linux/amd64 + linux/arm64), built NATIVELY: every image x
+    # architecture pair is its own job, amd64 on GitHub's x86 runners and arm64
+    # on GitHub's arm64 runners (free for public repos). That beats a single
+    # `platforms: linux/amd64,linux/arm64` build two ways: no QEMU emulation
+    # (several times faster for npm/go/apt-heavy stages), and maximum
+    # parallelism -- there is deliberately no `max-parallel`, so every pair runs
+    # at once, bounded only by the account's concurrent-job limit.
+    #
+    # GitHub-hosted, not the self-hosted ARC runner: building and pushing needs
+    # only GHCR (via GITHUB_TOKEN), never the cluster. `deploy` below stays on
+    # ARC because it is the only runner holding cluster credentials.
+    #
+    # Each job pushes its single-arch image BY DIGEST (untagged) and hands the
+    # digest to `publish-images`, which stitches them into one multi-arch
+    # manifest per image and applies the real tags. So `:latest`/`:<sha>` only
+    # ever move once BOTH architectures exist -- never a half-published image.
     needs: changes
-    runs-on: arc-runner-set-agent-controller
-    # Self-hosted runner: only ever reachable via push to main (collaborators only).
-    # Guard so a fork that somehow re-targets this job cannot run it on our infra.
-    if: github.repository == 'imaustink/agent-controller' && needs.changes.outputs.matrix != '[]'
+    # push-to-main only (collaborators), but keep a fork from pushing to our
+    # GHCR namespace if this workflow is ever re-targeted.
+    if: github.repository == 'imaustink/aktis' && needs.changes.outputs.matrix != '[]'
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJson(needs.changes.outputs.matrix) }}
+        img: ${{ fromJson(needs.changes.outputs.matrix) }}
+        arch: [amd64, arm64]
+    name: build ${{ matrix.img.image }} (${{ matrix.arch }})
     steps:
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Docker login
+      # Public images on GHCR, one package per image under a shared
+      # `agent-controller/` path: ghcr.io/imaustink/agent-controller/<image>.
+      # A package is created on its first push, so adding an image is still
+      # just an entry in release-images.json. GITHUB_TOKEN can push because
+      # the workflow grants `packages: write`.
+      - name: Log in to GHCR
         run: |
-          echo "$REGISTRY_PASSWORD" | docker login registry.kurpuis.com:5000 \
-            -u "$REGISTRY_USERNAME" --password-stdin
+          echo "$GITHUB_TOKEN" | docker login ghcr.io \
+            -u "${{ github.actor }}" --password-stdin
         env:
-          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
-          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & push ${{ matrix.image }}
+      - name: Build & push ${{ matrix.img.image }} (linux/${{ matrix.arch }}) by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.dockerfile }}
-          push: true
-          build-args: ${{ matrix.build_args }}
-          tags: registry.kurpuis.com:5000/${{ matrix.image }}:latest
-          # GitHub Actions cache backend, scoped per image so unrelated images
-          # don't evict each other's layers. `mode=max` also caches
-          # intermediate (build-stage) layers, not just the final stage --
-          # needed here since npm ci / go mod download / apt-get all happen
-          # in earlier stages than what gets pushed.
-          cache-from: type=gha,scope=${{ matrix.image }}
-          cache-to: type=gha,scope=${{ matrix.image }},mode=max
+          context: ${{ matrix.img.context }}
+          file: ${{ matrix.img.dockerfile }}
+          build-args: ${{ matrix.img.build_args }}
+          platforms: linux/${{ matrix.arch }}
+          # Links each package to this repo on GHCR, so it shows up on the
+          # repo page and can inherit its access settings.
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          # Untagged, by digest: tags are applied to the multi-arch manifest in
+          # `publish-images`, so a single arch never lands under :latest alone.
+          outputs: type=image,name=ghcr.io/imaustink/agent-controller/${{ matrix.img.image }},push-by-digest=true,name-canonical=true,push=true
+          # Registry cache, per image AND arch, in the image's own GHCR package.
+          # Not the GHA cache backend: ~24 images x 2 arches with `mode=max`
+          # (which also caches the npm ci / go mod download / apt-get build
+          # stages) would blow through the repo's 10GB Actions cache and evict
+          # itself every run. `ignore-error` so a cache-export hiccup can never
+          # fail a publish; `image-manifest`/`oci-mediatypes` for GHCR.
+          cache-from: type=registry,ref=ghcr.io/imaustink/agent-controller/${{ matrix.img.image }}:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=ghcr.io/imaustink/agent-controller/${{ matrix.img.image }}:buildcache-${{ matrix.arch }},mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
+
+      - name: Export digest
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "$RUNNER_TEMP/digests/${digest#sha256:}"
+
+      # `__` delimiters so one image's pattern can never match another image
+      # that merely shares a prefix (e.g. `github` vs a future `github-x`).
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests__${{ matrix.img.image }}__${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-images:
+    # One job per image: combine its per-arch digests into a single multi-arch
+    # manifest list and tag it. `:latest` tracks main; `:<sha>` is immutable,
+    # for pinning. Runs only when EVERY build-images job succeeded (default
+    # `needs` semantics), so tags never point at a partial set of arches.
+    needs: [changes, build-images]
+    if: github.repository == 'imaustink/aktis' && needs.changes.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        img: ${{ fromJson(needs.changes.outputs.matrix) }}
+    name: publish ${{ matrix.img.image }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests__${{ matrix.img.image }}__*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        run: |
+          echo "$GITHUB_TOKEN" | docker login ghcr.io \
+            -u "${{ github.actor }}" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create & push multi-arch manifest
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE: ghcr.io/imaustink/agent-controller/${{ matrix.img.image }}
+        run: |
+          # The index-level source annotation is what GHCR reads to link a
+          # multi-arch package to this repo (the per-arch label alone isn't).
+          refs=()
+          for digest in *; do refs+=("$IMAGE@sha256:$digest"); done
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            -t "$IMAGE:latest" \
+            -t "$IMAGE:$GITHUB_SHA" \
+            "${refs[@]}"
+
+      - name: Verify both architectures are published
+        env:
+          IMAGE: ghcr.io/imaustink/agent-controller/${{ matrix.img.image }}
+        run: |
+          # Ignore attestation entries (platform unknown/unknown) that buildx
+          # adds for provenance; assert the real platforms are exactly the two.
+          platforms=$(docker buildx imagetools inspect --raw "$IMAGE:$GITHUB_SHA" \
+            | jq -r '[.manifests[].platform | select(.os != "unknown") | "\(.os)/\(.architecture)"] | sort | unique | join(",")')
+          echo "$IMAGE:$GITHUB_SHA -> $platforms"
+          if [ "$platforms" != "linux/amd64,linux/arm64" ]; then
+            echo "::error::$IMAGE:$GITHUB_SHA has platforms '$platforms', expected linux/amd64,linux/arm64"
+            exit 1
+          fi
 
   publish-charts:
-    # Publishes the two Helm charts (charts/agent-controller,
-    # charts/community-components) as OCI artifacts to ghcr.io whenever
-    # something under charts/ changes on main. Runs on a GitHub-hosted
-    # runner (not the arc-runner-set-agent-controller self-hosted runner
-    # used by publish-images) -- this job only needs outbound internet to
-    # ghcr.io and a GITHUB_TOKEN, not access to the internal cluster or
-    # registry.kurpuis.com.
+    # Publishes the two Helm charts (orchestrator/charts/aktis,
+    # orchestrator/charts/community-components) as OCI artifacts to ghcr.io whenever
+    # something under orchestrator/charts/ changes on main. Runs on a GitHub-hosted
+    # runner, like the image jobs above -- it only needs outbound internet to
+    # ghcr.io and a GITHUB_TOKEN, not access to the internal cluster (only
+    # `deploy` needs that, which is why it alone stays self-hosted).
     #
-    # Charts are pushed under their Chart.yaml `version` -- OCI tags are
-    # mutable, so pushing again at the same version overwrites that tag
-    # rather than creating a new one. Bump `version` in the relevant
-    # Chart.yaml before merging if you want a new immutable release tag to
-    # show up.
+    # OCI chart tags are MUTABLE: pushing the same Chart.yaml `version` again
+    # overwrites that tag, and Argo (pinned to it) then caches the first render
+    # and never re-applies later template changes -- the stale-ClusterRole
+    # crashloop from PR #257. To make a reused tag impossible, this job bumps
+    # each chart's patch version, commits it back to main (the version stays the
+    # source of truth, in git, as clean sequential semver), and publishes THAT.
     #
     # Install with:
-    #   helm install agent-controller oci://ghcr.io/imaustink/charts/agent-controller --version <version>
+    #   helm install agent-controller oci://ghcr.io/imaustink/charts/aktis --version <version>
     #   helm install community-components oci://ghcr.io/imaustink/charts/community-components --version <version>
     needs: changes
     runs-on: ubuntu-latest
     # Guard so a fork that somehow re-targets this job cannot publish under our package namespace.
-    if: github.repository == 'imaustink/agent-controller' && needs.changes.outputs.charts == 'true'
+    if: github.repository == 'imaustink/aktis' && needs.changes.outputs.charts == 'true'
+    # contents: write to push the version bump back to main; packages: write to
+    # push the chart to GHCR (this job's override replaces the workflow default).
+    permissions:
+      contents: write
+      packages: write
+    # Serialize release runs so two can't read the same version and both bump to
+    # it. Queue rather than cancel, so no release is dropped.
+    concurrency:
+      group: chart-release
+      cancel-in-progress: false
     steps:
+      # ref: main (not the triggering SHA) + full history so the bump is computed
+      # from, and pushed onto, the current branch tip -- a fast-forward under the
+      # concurrency serialization above.
       - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Bump chart patch versions
+        # Edit only here; the commit + push happens after packaging has
+        # validated the build (below), and before the OCI push.
+        run: |
+          set -euo pipefail
+          for chart in orchestrator/charts/aktis orchestrator/charts/community-components; do
+            f="$chart/Chart.yaml"
+            base=$(awk '/^version:/{print $2; exit}' "$f")
+            major=${base%%.*}; rest=${base#*.}; minor=${rest%%.*}; patch=${rest#*.}
+            case "$patch" in
+              *[!0-9]* | "") echo "::error::$f version '$base' is not X.Y.Z"; exit 1 ;;
+            esac
+            new="${major}.${minor}.$((patch + 1))"
+            sed -i "s/^version:.*/version: ${new}/" "$f"
+            echo "${chart#orchestrator/charts/}: ${base} -> ${new}"
+          done
 
       - name: Sync core-controller CRDs into the Helm chart
-        # charts/agent-controller/charts/core-controller/crds/*.yaml is
+        # orchestrator/charts/aktis/charts/core-controller/crds/*.yaml is
         # generated (not committed, see its README.md) -- Helm's crds/
         # convention needs the files physically present before `helm
         # dependency update`/`helm package` will pick them up.
-        run: cp controllers/core-controller/config/crd/bases/*.yaml charts/agent-controller/charts/core-controller/crds/
+        run: cp orchestrator/controllers/core-controller/config/crd/bases/*.yaml orchestrator/charts/aktis/charts/core-controller/crds/
 
       - name: Set up Helm
         uses: azure/setup-helm@v4
@@ -236,19 +381,39 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io \
             -u "${{ github.actor }}" --password-stdin
 
-      - name: Fetch agent-controller chart dependencies
+      - name: Fetch aktis chart dependencies
         run: |
           # Helm doesn't recurse into file:// subchart dependencies, so the
           # agent-orchestrator subchart's own qdrant dependency needs its own
           # `dependency update` before the parent chart's.
-          helm dependency update charts/agent-controller/charts/agent-orchestrator
-          helm dependency update charts/agent-controller
+          helm dependency update orchestrator/charts/aktis/charts/agent-orchestrator
+          helm dependency update orchestrator/charts/aktis
 
       - name: Package charts
+        # Uses the bumped versions now in each Chart.yaml. Done before the git
+        # push so a chart that fails to build aborts the job without having
+        # committed a version to main.
         run: |
           mkdir -p /tmp/charts
-          helm package charts/agent-controller -d /tmp/charts
-          helm package charts/community-components -d /tmp/charts
+          helm package orchestrator/charts/aktis -d /tmp/charts
+          helm package orchestrator/charts/community-components -d /tmp/charts
+
+      - name: Commit the version bump back to main
+        # git BEFORE the OCI push: the version is claimed in git first, so a
+        # push that loses a race fails the job before any tag is written — a
+        # reused/overwritten OCI tag (the bug this prevents) is impossible. A
+        # failure AFTER this leaves an unpublished version (a harmless gap in the
+        # sequence), never an overwrite.
+        #
+        # [skip ci] so this commit — which only touches Chart.yaml under orchestrator/charts/
+        # — does not re-trigger this workflow and loop.
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add orchestrator/charts/aktis/Chart.yaml orchestrator/charts/community-components/Chart.yaml
+          git commit -m "chore(release): bump chart versions [skip ci]"
+          git push origin HEAD:main
 
       - name: Push charts to GHCR
         run: |
@@ -257,19 +422,27 @@ jobs:
           done
 
   deploy:
-    needs: [publish-images, publish-charts]
+    # build-images is listed explicitly, not just reached through
+    # publish-images: when a build fails, publish-images is SKIPPED (not
+    # failed), and the `always()` guard below only rejects failure/cancellation
+    # among DIRECT needs -- so without it a broken build would deploy anyway.
+    # `changes` is listed for the same reason: if it fails, every downstream
+    # job is skipped, and deploy would otherwise run on the unchanged :latest.
+    needs: [changes, build-images, publish-images, publish-charts]
+    # Self-hosted ARC runner, deliberately NOT GitHub-hosted like the build jobs
+    # above: it is the only runner with credentials for the cluster. Only ever
+    # reachable via push to main (collaborators only).
     runs-on: arc-runner-set-agent-controller
-    # Self-hosted runner: only ever reachable via push to main (collaborators only).
     # Guard so a fork that somehow re-targets this job cannot run it on our infra.
     #
-    # `always()` because publish-images/publish-charts are legitimately
+    # `always()` because build-images/publish-images/publish-charts are legitimately
     # skipped when nothing relevant changed (e.g. a docs-only push) -- a
     # skip must not block deploy the way a failure should. Explicitly reject
     # failure/cancellation instead of just checking for 'success' so deploy
     # doesn't run (and restart images) on top of a build it can't trust.
     if: |
       always() &&
-      github.repository == 'imaustink/agent-controller' &&
+      github.repository == 'imaustink/aktis' &&
       !contains(needs.*.result, 'failure') &&
       !contains(needs.*.result, 'cancelled')
     # Override the workflow-level permissions (contents: read, packages: write):
@@ -289,19 +462,19 @@ jobs:
       - uses: azure/setup-kubectl@v4
 
       - name: Sync core-controller CRDs into the Helm chart
-        # charts/agent-controller/charts/core-controller/crds/*.yaml is
+        # orchestrator/charts/aktis/charts/core-controller/crds/*.yaml is
         # generated (not committed, see its README.md) -- Helm's crds/
         # convention needs the files physically present before `helm
         # dependency update`/`helm upgrade` will pick them up. Same step
         # publish-charts runs before packaging.
         #
         # This only covers a FIRST install. See the next step for why.
-        run: cp controllers/core-controller/config/crd/bases/*.yaml charts/agent-controller/charts/core-controller/crds/
+        run: cp orchestrator/controllers/core-controller/config/crd/bases/*.yaml orchestrator/charts/aktis/charts/core-controller/crds/
 
       - name: Apply CRDs
         # Helm's crds/ directory is INSTALL-ONLY: `helm upgrade` never creates a
         # newly-added CRD and never updates an existing one
-        # (charts/agent-controller/charts/core-controller/crds/README.md). On a
+        # (orchestrator/charts/aktis/charts/core-controller/crds/README.md). On a
         # cluster whose release predates a CRD, that CRD simply never arrives,
         # and a CRD that gained a field keeps serving the old schema -- so the
         # API server silently PRUNES the new field out of every CR written to
@@ -311,9 +484,9 @@ jobs:
         #
         # Until now the only thing closing that gap was a human remembering to
         # run kubectl by hand. values-production.yaml carried FOUR separate
-        # "applied manually once" comments to that effect -- for
-        # integrationroutes, for Agent.initContainers, and for
-        # IntegrationRoute.match.labelName. Every one of those was a deploy that
+        # "applied manually once" comments to that effect -- for a
+        # since-retired routing CRD (twice: the CRD, then a field added to it)
+        # and for Agent.initContainers. Every one of those was a deploy that
         # looked green and shipped a cluster the charts did not describe.
         #
         # --server-side: the target cluster's CRDs have INCONSISTENT provenance,
@@ -326,9 +499,9 @@ jobs:
         #       property would linger in the served schema indefinitely.
         #     - agentruns/agents -> "helm" AND "kubectl-client-side-apply":
         #       Helm-installed, then hand-patched later.
-        #     - integrationroutes -> "kubectl-client-side-apply" ONLY, with no
-        #       helm manager at all. That CRD was never installed by Helm on
-        #       this cluster; it arrived entirely by hand.
+        #     - the since-retired routing CRD -> "kubectl-client-side-apply"
+        #       ONLY, with no helm manager at all. It was never installed by
+        #       Helm on this cluster; it arrived entirely by hand.
         #   Those last two rows are the four "applied manually once" comments in
         #   values-production.yaml, still legible in the cluster's own field
         #   ownership. Server-side apply diffs against real field ownership
@@ -371,26 +544,32 @@ jobs:
           fi
 
           kubectl apply --server-side --force-conflicts \
-            -f controllers/core-controller/config/crd/bases/
+            -f orchestrator/controllers/core-controller/config/crd/bases/
 
           # An established CRD is the precondition for community-components'
-          # Tool/Skill/Agent/IntegrationRoute CRs below. Without the wait, a
+          # Tool/Skill/Agent/EventSource/EventTrigger CRs below. Without the wait, a
           # freshly-created CRD can still be un-established when Helm applies
           # the first CR against it, which surfaces as a "no matches for kind"
           # failure that succeeds on a re-run -- the shape of flake that gets
           # dismissed as infrastructure noise.
-          for crd in controllers/core-controller/config/crd/bases/*.yaml; do
+          for crd in orchestrator/controllers/core-controller/config/crd/bases/*.yaml; do
             name=$(kubectl get -f "$crd" -o jsonpath='{.metadata.name}')
             kubectl wait --for=condition=established --timeout=60s "crd/$name"
           done
 
-      - name: Fetch agent-controller chart dependencies
+      - name: Fetch aktis chart dependencies
         run: |
           # Helm doesn't recurse into file:// subchart dependencies, so the
           # agent-orchestrator subchart's own qdrant dependency needs its own
           # `dependency update` before the parent chart's.
-          helm dependency update charts/agent-controller/charts/agent-orchestrator
-          helm dependency update charts/agent-controller
+          helm dependency update orchestrator/charts/aktis/charts/agent-orchestrator
+          helm dependency update orchestrator/charts/aktis
+
+      # Pins the Deployments' `:latest` to the digest it names right now, in
+      # the release itself, so `helm rollback` restores the image as well as
+      # the chart (see the script's header for the incident behind this).
+      - name: Pin image digests
+        run: ./scripts/pin-image-digests.sh "$RUNNER_TEMP/image-pins.yaml"
 
       # --create-namespace on both: `-n controller-agent` does not create the
       # namespace, so on a cluster that has never had this stack the very first
@@ -399,26 +578,49 @@ jobs:
       - name: Helm upgrade agent-controller
         id: upgrade_agent
         run: |
-          helm upgrade --install agent-controller charts/agent-controller \
-            -f charts/agent-controller/values-production.yaml \
+          helm upgrade --install agent-controller orchestrator/charts/aktis \
+            -f orchestrator/charts/aktis/values-production.yaml \
+            -f "$RUNNER_TEMP/image-pins.yaml" \
             -n controller-agent --create-namespace --timeout 5m
 
       - name: Helm upgrade community-components
         id: upgrade_community
         run: |
-          helm upgrade --install community-components charts/community-components \
-            -f charts/community-components/values-production.yaml \
+          helm upgrade --install community-components orchestrator/charts/community-components \
+            -f orchestrator/charts/community-components/values-production.yaml \
             -n controller-agent --create-namespace --timeout 5m
+
+      # ADR 0048 retired the IntegrationRoute kind. "Apply CRDs" above only ever
+      # adds/updates, so the old CRD would linger on the cluster forever. It
+      # must go AFTER the community-components upgrade, never before: Helm
+      # rebuilds the previous release's manifest to diff it, and a kind the API
+      # server no longer serves fails that upgrade with "resource mapping not
+      # found". Idempotent; a no-op once the CRD is gone. Non-fatal: the runner's
+      # CRD ClusterRole (see "Apply CRDs") is not guaranteed to include
+      # `delete`, and a leftover CRD with no controller is inert -- not worth
+      # failing (and rolling back) an otherwise good deploy over.
+      - name: Remove retired CRDs
+        run: |
+          if kubectl auth can-i delete customresourcedefinitions.apiextensions.k8s.io -A >/dev/null; then
+            kubectl delete crd integrationroutes.core.controller-agent.dev --ignore-not-found
+          else
+            echo "::warning::Runner cannot delete CRDs; remove integrationroutes.core.controller-agent.dev by hand."
+          fi
 
       # Tool/Agent Jobs (recipe-scraper, web-search, web-fetch,
       # recipe-publisher, opencode-swe-agent) are launched fresh per-invocation
       # by core-controller and always pull `:latest` -- no restart needed.
-      # Only the long-running Deployments need one to pick up a new image.
+      # The long-running Deployments are pinned by digest ("Pin image
+      # digests"), so a new image already rolled them; the restart still
+      # picks up Secrets/ConfigMaps that changed without a template change.
       - name: Rollout restart
         id: rollout
         run: |
-          kubectl rollout restart deploy/agent-orchestrator deploy/core-controller deploy/agent-controller-integration-gateway -n controller-agent
-          kubectl rollout status deploy/agent-orchestrator deploy/core-controller deploy/agent-controller-integration-gateway -n controller-agent --timeout=5m
+          DEPLOYS="deploy/agent-orchestrator deploy/core-controller deploy/agent-controller-integration-gateway \
+            deploy/agent-controller-temporal-engine-worker deploy/agent-controller-temporal-engine-gateway \
+            deploy/agent-controller-temporal-engine-catalog-sync"
+          kubectl rollout restart $DEPLOYS -n controller-agent
+          kubectl rollout status $DEPLOYS -n controller-agent --timeout=5m
 
       # If any deploy step above failed, roll the affected workloads back to
       # their previous working revision and open an `ai-triage` ticket with the

@@ -1,0 +1,168 @@
+import type { ApprovalPending, SubAgentApprovalPending } from "../agent/graph.js";
+
+/**
+ * Session-scoped skill lifecycle (docs/adr/0012): a conversation keeps ONE
+ * active skill across turns so follow-up messages ("yes, publish it") don't
+ * re-run RAG skill selection with near-zero semantic signal. The record is a
+ * best-effort routing hint, never correctness-critical state — losing it
+ * (restart, TTL, eviction) just means the next turn falls back to full
+ * retrieval + selection.
+ *
+ * Extended for agent delegation: at most ONE of `activeSkillId` /
+ * `activeAgentRunId` is ever set for a given conversation at a time (a turn
+ * either continues a skill or continues a running agent, never both) —
+ * persisting one clears the other.
+ */
+export interface SessionRecord {
+  /**
+   * Identity subject the session belongs to. Conversation ids are
+   * caller-supplied (e.g. Open WebUI's chat id header) and guessable, so
+   * every read is checked against the freshly resolved identity — a
+   * mismatch is treated as "no session" (docs/adr/0012).
+   */
+  subject: string;
+  /**
+   * Id of the conversation's active skill. Only the id is stored — the
+   * skill content is re-fetched under the caller's CURRENT roles each turn
+   * (fail-closed), so role revocation takes effect on the next message.
+   */
+  activeSkillId?: string;
+  /**
+   * Id of the Agent CR the conversation delegated to. Re-fetched under the
+   * caller's CURRENT roles each turn (fail-closed), same discipline as
+   * `activeSkillId` — needed to re-verify access before continuing the run.
+   */
+  activeAgentId?: string;
+  /**
+   * Name of the specific `AgentRun` CR the conversation is continuing. This
+   * (not `activeAgentId`) is what a follow-up turn's `prompt` is published
+   * to — the run's NATS subjects are keyed by this id, not by the catalog
+   * Agent id, since one Agent can have many concurrent runs.
+   */
+  activeAgentRunId?: string;
+  /**
+   * True when `activeAgentRunId` is a run this conversation is still owed a
+   * REPLY from, rather than one parked on a question awaiting the user's next
+   * prompt.
+   *
+   * The distinction decides what the next turn does. Parked-on-a-question is
+   * the ordinary HITL case: the turn's message is the answer, so it gets
+   * published as a `prompt`. Owed-a-reply means the previous turn's wait was
+   * cut short while the agent was still working -- the orchestrator pod was
+   * rolled or lost its NATS channel -- and the run is very likely still going
+   * or already finished. Sending it a `prompt` in that state would be wrong
+   * twice over: the agent isn't waiting for input, and the text (e.g. "any
+   * update?") isn't an instruction. So the next turn re-attaches to the run's
+   * subject and waits for the reply the agent is still holding for us (see the
+   * protocol's `reply_ack`).
+   *
+   * Written EAGERLY, before the wait starts, precisely because the failure it
+   * covers can be a hard pod kill: an outcome persisted only after the graph
+   * returns is exactly what does not survive a SIGKILL.
+   */
+  activeAgentRunAwaitingReply?: boolean;
+  /**
+   * `activeAgentRunId` was launched read-only (`AgentRun.spec.readOnly`). Kept
+   * beside the anchor and cleared with it, because a read-only turn may only be
+   * forwarded into a read-only run (graph.ts `checkActiveAgentRun`): the pod of a
+   * run launched writable already holds write credentials. Absent means
+   * writable, so an anchor written without it fails closed.
+   */
+  activeAgentRunReadOnly?: boolean;
+  /**
+   * The most recent AgentRun id this conversation delegated to, kept even
+   * after the run concludes and `activeAgentRunId` is cleared (ADR 0026) --
+   * NOT used for routing/continuation (that's `activeAgentRunId`/
+   * `agentContinuations`), only as a hint for a live-session viewer to probe
+   * ("is this Pod still up and tunnelable?") via a real-time NATS round trip
+   * rather than trusting any cached liveness flag, which could go stale if
+   * the Pod crashed unexpectedly.
+   */
+  lastAgentRunId?: string;
+  /**
+   * Per-tool continuation tokens for this conversation, keyed by tool id
+   * (docs/adr/0016). When the orchestrator's `runTool` node extracts a
+   * `<!-- continuation: ... -->` marker from a tool's success output, the
+   * opaque token is stored here and re-injected into tool_args on the next
+   * turn for that same tool. The orchestrator stores/forwards the token
+   * without ever parsing its content — each tool encodes its own state
+   * (e.g. opencode-swe: repo/branch/pr/session; recipe-publisher: slug).
+   */
+  toolContinuations?: Record<string, string>;
+  /**
+   * Per-agent continuation tokens for this conversation, keyed by agent id
+   * (docs/adr/0017) — the AgentRun analogue of `toolContinuations`. An
+   * agent's `reply.result` (a structured, out-of-band field on the NATS
+   * `reply` message, never part of the chat transcript) carries the opaque
+   * token for the NEXT episode's `delegateToAgent` to prepend onto the new
+   * AgentRun's goal. Replaces the old `<!-- swe: ... -->` marker that used
+   * to round-trip this state through the conversation history itself.
+   */
+  agentContinuations?: Record<string, string>;
+  /**
+   * A device-flow identity-link attempt this conversation is waiting on
+   * (agent/graph.ts's `pendingIdentityLink` state field — see its doc
+   * comment). Persisted so the NEXT turn's `checkPendingIdentityLink` node
+   * can poll it without the caller having to repeat their request.
+   */
+  pendingIdentityLink?: { agentId: string; provider: string; flow: "device" | "authcode" | "page"; deviceCode?: string; expiresAt: number; subject?: string; request?: string };
+  /**
+   * A tool call this conversation paused awaiting human approval (ADR 0003 +
+   * ADR 0004 terminate-and-resume — agent/graph.ts's `approvalPending` state
+   * field, see {@link ApprovalPending}). Persisted so the NEXT turn's
+   * `checkPendingApproval` node can read the caller's decision and re-dispatch
+   * the exact same call without re-running retrieval/planning. Mutually
+   * exclusive with the active-skill/agent-run fields, like `pendingIdentityLink`.
+   */
+  approvalPending?: ApprovalPending;
+  /**
+   * A tool call a RUNNING SUB-AGENT (not the top-level graph) paused on,
+   * awaiting the caller's approval (ADR 0003 + sub-agent HITL — agent/graph.ts's
+   * `subAgentApprovalPending` state field). Unlike {@link approvalPending} this
+   * COEXISTS with the active-agent-run anchor (`activeAgentRunId` +
+   * `activeAgentRunAwaitingReply`): the sub-agent's AgentRun is still live and
+   * blocked on the orchestrator's unresolved `tool_result`, so the next turn
+   * reads the decision here, resolves the tool call, and re-attaches to the same
+   * run to collect its next reply. `expiresAt` bounds the hold for the
+   * background sweeper (see {@link SessionStore.listSubAgentApprovals}).
+   */
+  subAgentApprovalPending?: SubAgentApprovalPending;
+  /**
+   * The conversation ran a read-only turn (an EventTrigger with
+   * `target.readOnly`, docs/event-triggers.md §1), so every later turn in it is
+   * read-only too -- a session-page follow-up, a continuation, a re-attach.
+   * Monotonic: may become `true`, never back to `false`; every writer carries
+   * the existing value forward (server.ts `persistSession`, and the
+   * read-modify-write helpers in inflight-agent-run.ts spread the record).
+   *
+   * Unlike the rest of this record it is NOT a routing hint: it is honored
+   * regardless of `subject` (restricting a turn is never a leak) and written
+   * eagerly when the turn is accepted, before any run exists, so a pod killed
+   * mid-turn cannot leave a read-only conversation's next turn write-capable.
+   * Losing the record (TTL, Redis outage) still drops it -- the session store
+   * is soft-failing by contract -- which is why the trigger re-asserts it on
+   * every event it matches rather than relying on this alone.
+   */
+  readOnly?: boolean;
+  /** Last touch time (ms since epoch); used for sliding TTL expiry. */
+  updatedAt: number;
+}
+
+/**
+ * Port for conversation-session persistence. The default adapter is
+ * in-memory ({@link InMemorySessionStore}) which assumes a single
+ * orchestrator replica — a shared store (e.g. Redis) behind this same port
+ * is the follow-up if the deployment ever scales out (docs/adr/0012).
+ */
+export interface SessionStore {
+  get(sessionId: string): Promise<SessionRecord | undefined>;
+  set(sessionId: string, record: Omit<SessionRecord, "updatedAt">): Promise<void>;
+  /**
+   * Every session that currently carries a {@link SessionRecord.subAgentApprovalPending}
+   * pause, for the background sweeper that times out approvals nobody answered
+   * (index.ts). Optional and guarded so an adapter that predates sub-agent HITL
+   * (or one that can't scan) simply never times approvals out — a pending hold
+   * then lives until the sub-agent's AgentRun hits its own wall-clock deadline.
+   */
+  listSubAgentApprovals?(): Promise<Array<{ sessionId: string; pending: SubAgentApprovalPending }>>;
+}

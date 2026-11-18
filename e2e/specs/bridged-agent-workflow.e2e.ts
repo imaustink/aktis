@@ -8,6 +8,7 @@ import { withPortForward } from "../support/k8s.js";
 import { issueLabeledPayload, postGithubWebhook } from "../support/webhook.js";
 import { fakeGithubRequests, resetFakeGithub, webhookSecret } from "../support/fixtures.js";
 import { seedAllClaudeCredentials } from "../support/credential-store.js";
+import { isTemporal } from "../support/engine.js";
 
 /**
  * `support/k8s.ts`'s own `withPortForward` gates readiness on a plain HTTP
@@ -58,7 +59,7 @@ async function withTemporalPortForward<T>(localPort: number, body: () => Promise
  *
  * That fallback was a real, reproduced production bug: `stub-agent`/
  * `claude-code-swe-agent` missing the `durable-agents.dev/bridged` chart
- * annotation left `agentWorkflowNameFor` (engines/temporal/internal/temporal/
+ * annotation left `agentWorkflowNameFor` (orchestrator/engines/temporal/internal/temporal/
  * workflows/agent_workflow.go) defaulting to the declarative loop, which has
  * no real tools at all -- the planner then guessed at tool names ("gh",
  * "gh_repo_clone", "call_tool") and every guess was refused. The annotation
@@ -69,9 +70,9 @@ async function withTemporalPortForward<T>(localPort: number, body: () => Promise
  * (temporal-engine.nats.url, .qdrant.host, .gateway.identity.defaultSubject/
  * defaultRoles, .identityLink.gatewayUrl -- all in values-e2e.yaml), plus a
  * code fix for a claude-remote credential response-shape mismatch
- * (engines/temporal/internal/identitylink/identitylink.go) and a Job-name
+ * (orchestrator/engines/temporal/internal/identitylink/identitylink.go) and a Job-name
  * double-prefix bug that broke Job creation for ANY AgentRun this engine
- * launches (controllers/core-controller/internal/controller/
+ * launches (orchestrator/controllers/core-controller/internal/controller/
  * agentrun_controller.go).
  *
  * This spec is the actual proof point for all of that: it drives the same
@@ -106,7 +107,9 @@ const STUB_REPLY_MARKER = "stub-agent-reply";
  */
 const CANONICAL = `github:${SENDER}`;
 
-describe("Temporal engine: a bridged pod agent actually runs as BridgedAgentWorkflow", () => {
+// Temporal-only by construction: it asks the Temporal server which workflow
+// ran. Under E2E_ENGINE=langgraph there is no workflow to find.
+describe.skipIf(!isTemporal())("Temporal engine: a bridged pod agent actually runs as BridgedAgentWorkflow", () => {
   let secret: string;
   let suiteStartedAt: Date;
 
@@ -125,7 +128,7 @@ describe("Temporal engine: a bridged pod agent actually runs as BridgedAgentWork
     await cleanupAgentRunsSince(suiteStartedAt);
   });
 
-  it("launches a real BridgedAgentWorkflow execution for the bridged agent an IntegrationRoute names", async () => {
+  it("launches a real BridgedAgentWorkflow execution for the bridged agent an EventTrigger names", async () => {
     const startedAt = new Date();
     const issueNumber = Date.now() % 100000;
 
@@ -153,8 +156,13 @@ describe("Temporal engine: a bridged pod agent actually runs as BridgedAgentWork
     const comment = await waitFor(
       "the stub agent's reply to be posted back to the issue",
       async () => {
+        // The trigger's ack ("Starting work on this now") is posted first;
+        // the reply is the comment carrying the stub's marker.
         const posted = (await fakeGithubRequests()).filter(
-          (r) => r.method === "POST" && r.path === `/repos/${OWNER}/${REPO}/issues/${issueNumber}/comments`,
+          (r) =>
+            r.method === "POST" &&
+            r.path === `/repos/${OWNER}/${REPO}/issues/${issueNumber}/comments` &&
+            String(r.body ?? "").includes(STUB_REPLY_MARKER),
         );
         return posted.length > 0 ? posted[posted.length - 1] : undefined;
       },
@@ -164,8 +172,8 @@ describe("Temporal engine: a bridged pod agent actually runs as BridgedAgentWork
 
     // Mechanism proof: Temporal itself, not a log line, says a
     // BridgedAgentWorkflow execution actually ran and completed for the
-    // route's target Agent (`stub-agent`, per the `github-issue-labeled-
-    // triage` IntegrationRoute this webhook matches) -- the only way that's
+    // trigger's target Agent (`stub-agent`, per the `github-issue-triage`
+    // EventTrigger this webhook matches) -- the only way that's
     // true is if `agentWorkflowNameFor` resolved the bridged branch,
     // LaunchAgentRun actually created the Job (which needed the
     // core-controller Job-name fix), and the pod ran to completion.

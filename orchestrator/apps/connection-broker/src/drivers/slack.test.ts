@@ -1,0 +1,908 @@
+import { describe, expect, it, vi } from "vitest";
+import { renderText, SlackDriver, titleOf } from "./slack.js";
+import { PermanentError, PermissionDeniedError, TransientError } from "./types.js";
+import type { FetchLike } from "./confluence.js";
+
+const SCOPE = { channel: "C123ABC" };
+
+function respond(body: unknown, status = 200): Awaited<ReturnType<FetchLike>> {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    json: async () => body,
+    text: async () => JSON.stringify(body),
+  };
+}
+
+const message = (ts: string, overrides: Record<string, unknown> = {}) => ({
+  ts,
+  text: "How do we rotate the signing key?",
+  user: "U1",
+  ...overrides,
+});
+
+const driver = (http: FetchLike) =>
+  new SlackDriver({ fetch: http, workspaceUrl: "https://bitovi.slack.com" });
+
+describe("scope validation", () => {
+  const d = driver(vi.fn());
+
+  it("requires a channel", () => {
+    expect(() => d.validateScope({})).toThrow(/exactly one of scope.channel or scope.all/);
+  });
+
+  it("rejects a scope naming another provider's unit", () => {
+    expect(() => d.validateScope({ channel: "C1", space: "GLOBEX" })).toThrow(/nothing else/);
+  });
+
+  it("rejects a channel id that is not one", () => {
+    // The id reaches a query parameter, so it is constrained, not trusted.
+    expect(() => d.validateScope({ channel: "../../admin" })).toThrow(/illegal/);
+  });
+});
+
+describe("probe granularity", () => {
+  it("is per CONNECTION, because Slack authorizes the channel", () => {
+    // Probing per message would issue one request per thread to ask a question
+    // Slack answers once per channel.
+    expect(driver(vi.fn()).probeGranularity()).toBe("connection");
+  });
+});
+
+describe("list", () => {
+  it("returns thread parents, not every message", async () => {
+    const http = vi.fn().mockResolvedValue(
+      respond({
+        ok: true,
+        messages: [
+          message("1700000001.0001"),
+          // A reply: belongs to its thread, not to the index separately.
+          message("1700000002.0002", { thread_ts: "1700000001.0001" }),
+          message("1700000003.0003"),
+        ],
+      }),
+    );
+
+    const { resources } = await driver(http).list(SCOPE, { service: "xoxb" }, undefined);
+
+    expect(resources.map((r) => r.id)).toEqual(["1700000001.0001", "1700000003.0003"]);
+  });
+
+  it("uses the message ts as the version", async () => {
+    const http = vi.fn().mockResolvedValue(respond({ ok: true, messages: [message("1700000001.0001")] }));
+    const { resources } = await driver(http).list(SCOPE, { service: "x" }, undefined);
+
+    // Any edit produces a new ts on the message that changed.
+    expect(resources[0]!.version).toBe("1700000001.0001");
+  });
+
+  it("marks membership-governed chunks permissive rather than guessing", async () => {
+    const http = vi.fn().mockResolvedValue(respond({ ok: true, messages: [message("1.1")] }));
+    const { resources } = await driver(http).list(SCOPE, { service: "x" }, undefined);
+
+    expect(resources[0]!.acl).toEqual({ principals: [], permissive: true });
+  });
+
+  it("ends the walk when Slack reports no more", async () => {
+    const http = vi.fn().mockResolvedValue(respond({ ok: true, messages: [message("1.1")], has_more: false }));
+    const { cursor } = await driver(http).list(SCOPE, { service: "x" }, undefined);
+    expect(cursor).toBeUndefined();
+  });
+
+  it("wildcard: enumerates the bot's channels and lists each", async () => {
+    const http = vi.fn(async (url: string) => {
+      if (url.includes("users.conversations")) {
+        return respond({ ok: true, channels: [{ id: "C1" }, { id: "C2" }] });
+      }
+      // conversations.history for whichever channel
+      const channel = new URL(url).searchParams.get("channel");
+      return respond({ ok: true, messages: [message(`${channel}.1`)] });
+    }) as unknown as FetchLike;
+    const { resources, cursor } = await driver(http).list({ all: true }, { service: "x" }, undefined);
+    expect(resources.map((r) => r.id).sort()).toEqual(["C1.1", "C2.1"]);
+    expect(cursor).toBeUndefined();
+  });
+});
+
+describe("fetch", () => {
+  it("returns the WHOLE thread as one document", async () => {
+    const http = vi.fn().mockResolvedValue(
+      respond({
+        ok: true,
+        messages: [
+          message("1.1", { text: "How do we rotate the signing key?" }),
+          message("1.2", { user: "U2", text: "Run the rotate script, then restart." }),
+        ],
+      }),
+    );
+
+    const doc = await driver(http).fetch(SCOPE, { service: "x" }, "1.1");
+
+    // A question and its answer belong together; splitting them is what makes
+    // a chat corpus useless.
+    expect(doc.markdown).toContain("How do we rotate the signing key?");
+    expect(doc.markdown).toContain("Run the rotate script");
+  });
+
+  it("prefers the delegated token when a user is reading", async () => {
+    const http = vi.fn().mockResolvedValue(respond({ ok: true, messages: [message("1.1")] }));
+    await driver(http).fetch(SCOPE, { service: "svc", delegated: "user" }, "1.1");
+
+    expect(http.mock.calls[0]![1]).toEqual(
+      expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer user" }) }),
+    );
+  });
+});
+
+describe("probe", () => {
+  it("asks about the channel and needs no message id", async () => {
+    const http = vi.fn().mockResolvedValue(respond({ ok: true, channel: { name: "globex-eng" } }));
+
+    const result = await driver(http).probe(SCOPE, { delegated: "xoxp" });
+
+    expect(result).toEqual({
+      allowed: true,
+      title: "#globex-eng",
+      url: "https://bitovi.slack.com/archives/C123ABC",
+      version: undefined,
+    });
+  });
+
+  it("refuses to probe without a delegated token", async () => {
+    await expect(driver(vi.fn()).probe(SCOPE, { service: "svc" })).rejects.toThrow(/delegated token/);
+  });
+});
+
+describe("error classification", () => {
+  it("treats a 200 with ok:false as the real answer", async () => {
+    // Slack answers 200 for most failures, so the HTTP status is not the answer.
+    const http = vi.fn().mockResolvedValue(respond({ ok: false, error: "channel_not_found" }));
+    await expect(driver(http).probe(SCOPE, { delegated: "u" })).rejects.toBeInstanceOf(
+      PermissionDeniedError,
+    );
+  });
+
+  it.each(["not_in_channel", "is_archived", "thread_not_found"])(
+    "treats %s as a denial",
+    async (error) => {
+      const http = vi.fn().mockResolvedValue(respond({ ok: false, error }));
+      await expect(driver(http).probe(SCOPE, { delegated: "u" })).rejects.toBeInstanceOf(
+        PermissionDeniedError,
+      );
+    },
+  );
+
+  it.each(["invalid_auth", "token_revoked", "missing_scope"])(
+    "treats %s as permanent, not transient",
+    async (error) => {
+      // Retrying cannot help: the token or app is wrong, not busy.
+      const http = vi.fn().mockResolvedValue(respond({ ok: false, error }));
+      await expect(driver(http).probe(SCOPE, { delegated: "u" })).rejects.toBeInstanceOf(PermanentError);
+    },
+  );
+
+  it("treats rate limiting as transient", async () => {
+    const http = vi.fn().mockResolvedValue(respond({}, 429));
+    await expect(driver(http).probe(SCOPE, { delegated: "u" })).rejects.toBeInstanceOf(TransientError);
+  });
+
+  it("treats an unrecognised slack error as transient, not a denial", async () => {
+    // Counting an unknown failure as a denial would silently shrink an answer.
+    const http = vi.fn().mockResolvedValue(respond({ ok: false, error: "something_new" }));
+    await expect(driver(http).probe(SCOPE, { delegated: "u" })).rejects.toBeInstanceOf(TransientError);
+  });
+});
+
+describe("auto join", () => {
+  const joining = (http: FetchLike) =>
+    new SlackDriver({ fetch: http, workspaceUrl: "https://bitovi.slack.com", autoJoin: true });
+
+  /** Refuses the first read for want of membership, then succeeds. */
+  function refuseThenAllow() {
+    let joined = false;
+    const calls: string[] = [];
+    const http = vi.fn(async (url: string) => {
+      calls.push(new URL(url).pathname.split("/").pop()!);
+      if (url.includes("conversations.join")) {
+        joined = true;
+        return respond({ ok: true, channel: { id: "C123ABC" } });
+      }
+      if (!joined) return respond({ ok: false, error: "not_in_channel" });
+      return respond({ ok: true, messages: [message("1.1")] });
+    });
+    return { http: http as unknown as FetchLike, calls };
+  }
+
+  it("joins and retries when a read is refused for want of membership", async () => {
+    const { http, calls } = refuseThenAllow();
+
+    const { resources } = await joining(http).list(SCOPE, { service: "xoxb" }, undefined);
+
+    expect(resources).toHaveLength(1);
+    expect(calls).toEqual(["conversations.history", "conversations.join", "conversations.history"]);
+  });
+
+  it("does not join when the read already works", async () => {
+    const http = vi.fn().mockResolvedValue(respond({ ok: true, messages: [message("1.1")] }));
+    await joining(http).list(SCOPE, { service: "xoxb" }, undefined);
+
+    // Lazy on purpose: the ordinary path stays read-only, so a connection whose
+    // channel we are already in never writes anything.
+    expect(http.mock.calls.some(([url]) => (url as string).includes("conversations.join"))).toBe(false);
+  });
+
+  it("does not join at all when the Connection did not ask for it", async () => {
+    const { http, calls } = refuseThenAllow();
+
+    await expect(driver(http).list(SCOPE, { service: "xoxb" }, undefined)).rejects.toBeInstanceOf(
+      PermissionDeniedError,
+    );
+    expect(calls).toEqual(["conversations.history"]);
+  });
+
+  it("retries exactly once, then gives up", async () => {
+    // Still refused after a successful join: the refusal is about something
+    // else, and repeating would spin against Slack with a credential that is
+    // not going to start working.
+    const http = vi.fn(async (url: string) =>
+      url.includes("conversations.join")
+        ? respond({ ok: true })
+        : respond({ ok: false, error: "not_in_channel" }),
+    );
+
+    await expect(
+      joining(http as unknown as FetchLike).list(SCOPE, { service: "xoxb" }, undefined),
+    ).rejects.toBeInstanceOf(PermissionDeniedError);
+    expect(http.mock.calls.filter(([url]) => (url as string).includes("conversations.join"))).toHaveLength(1);
+  });
+
+  it("never joins on a PROBE, whatever the Connection says", async () => {
+    const http = vi.fn(async (url: string) =>
+      url.includes("conversations.join")
+        ? respond({ ok: true })
+        : respond({ ok: false, error: "not_in_channel" }),
+    );
+
+    // A probe asks whether a USER may read something. Joining on their behalf
+    // changes the answer rather than reporting it, adds them to a channel they
+    // never asked to join, and announces it to everyone in it.
+    await expect(
+      joining(http as unknown as FetchLike).probe(SCOPE, { delegated: "xoxp" }),
+    ).rejects.toBeInstanceOf(PermissionDeniedError);
+    expect(http.mock.calls.some(([url]) => (url as string).includes("conversations.join"))).toBe(false);
+  });
+
+  it("does not try to join a channel it cannot see", async () => {
+    // channel_not_found covers both "does not exist" and "private, invisible to
+    // us". Joining either is a request that cannot succeed.
+    const http = vi.fn().mockResolvedValue(respond({ ok: false, error: "channel_not_found" }));
+
+    await expect(
+      joining(http).list(SCOPE, { service: "xoxb" }, undefined),
+    ).rejects.toBeInstanceOf(PermissionDeniedError);
+    expect(http.mock.calls.some(([url]) => (url as string).includes("conversations.join"))).toBe(false);
+  });
+
+  it("joins only the channel in scope", async () => {
+    const { http, calls } = refuseThenAllow();
+    await joining(http).list(SCOPE, { service: "xoxb" }, undefined);
+    void calls;
+
+    // The id comes from the Connection CR, never from a caller, so this cannot
+    // be steered into joining anything else.
+    const joinCall = (http as unknown as ReturnType<typeof vi.fn>).mock.calls.find(([url]) =>
+      (url as string).includes("conversations.join"),
+    );
+    expect(new URL(joinCall![0] as string).searchParams.get("channel")).toBe("C123ABC");
+  });
+});
+
+
+describe("system messages", () => {
+  /** What conversations.history actually returns for a join. */
+  const joined = (ts: string) =>
+    message(ts, { subtype: "channel_join", text: "<@U1> has joined the channel" });
+
+  it("does not index a join as a document", async () => {
+    // Found against a real channel: this was the FIRST indexed document,
+    // because a join event is a message like any other to Slack. A busy
+    // channel is mostly these.
+    const http = vi.fn().mockResolvedValue(
+      respond({ ok: true, messages: [joined("1.1"), message("2.2")] }),
+    );
+
+    const { resources } = await driver(http).list(SCOPE, { service: "x" }, undefined);
+
+    expect(resources.map((r) => r.id)).toEqual(["2.2"]);
+  });
+
+  it.each(["channel_join", "channel_leave", "channel_topic", "channel_purpose", "channel_name"])(
+    "drops %s",
+    async (subtype) => {
+      const http = vi.fn().mockResolvedValue(
+        respond({ ok: true, messages: [message("1.1", { subtype, text: "something" })] }),
+      );
+      const { resources } = await driver(http).list(SCOPE, { service: "x" }, undefined);
+      expect(resources).toEqual([]);
+    },
+  );
+
+  it("KEEPS a bot message, which is real content", async () => {
+    // A bot posting a deploy summary or an alert is often exactly what
+    // somebody later searches for.
+    const http = vi.fn().mockResolvedValue(
+      respond({
+        ok: true,
+        messages: [message("1.1", { subtype: "bot_message", text: "Deploy 4.2 finished" })],
+      }),
+    );
+
+    const { resources } = await driver(http).list(SCOPE, { service: "x" }, undefined);
+    expect(resources).toHaveLength(1);
+  });
+
+  it("drops a message with no text, which would embed as an empty chunk", async () => {
+    const http = vi.fn().mockResolvedValue(
+      respond({ ok: true, messages: [message("1.1", { text: "   " }), message("2.2")] }),
+    );
+    const { resources } = await driver(http).list(SCOPE, { service: "x" }, undefined);
+    expect(resources.map((r) => r.id)).toEqual(["2.2"]);
+  });
+
+  it("tests for the PRESENCE of a subtype rather than denylisting known ones", async () => {
+    // A denylist silently starts indexing whatever subtype Slack adds next.
+    const http = vi.fn().mockResolvedValue(
+      respond({ ok: true, messages: [message("1.1", { subtype: "some_future_subtype" })] }),
+    );
+    const { resources } = await driver(http).list(SCOPE, { service: "x" }, undefined);
+    expect(resources).toEqual([]);
+  });
+
+  it("strips system messages out of a thread body but keeps its parent", async () => {
+    const http = vi.fn().mockResolvedValue(
+      respond({
+        ok: true,
+        messages: [
+          message("1.1", { text: "How do we rotate the key?" }),
+          joined("1.2"),
+          message("1.3", { user: "U2", text: "Run the rotate script." }),
+        ],
+      }),
+    );
+
+    const doc = await driver(http).fetch(SCOPE, { service: "x" }, "1.1");
+
+    expect(doc.markdown).toContain("How do we rotate the key?");
+    expect(doc.markdown).toContain("Run the rotate script.");
+    expect(doc.markdown).not.toContain("has joined the channel");
+  });
+
+  it("keeps the parent even when it is itself a system message", async () => {
+    // Dropping it would leave a thread with no opening. Listing already
+    // prevents such a thread from being indexed at all; this is about not
+    // producing a headless document if one is fetched directly.
+    const http = vi.fn().mockResolvedValue(respond({ ok: true, messages: [joined("1.1")] }));
+
+    const doc = await driver(http).fetch(SCOPE, { service: "x" }, "1.1");
+    expect(doc.markdown).toContain("has joined the channel");
+  });
+});
+
+
+describe("renderText", () => {
+  it("keeps the label AND the url from a Slack link", () => {
+    // Found against a real channel: this went into the vector as written, so
+    // the URL dominated the embedding and the word a human would search for
+    // was buried inside the markup.
+    expect(renderText("<https://github.com/org/repo/pull/259|PR>")).toBe(
+      "[PR](https://github.com/org/repo/pull/259)",
+    );
+  });
+
+  it("renders a bare link as the url", () => {
+    expect(renderText("<https://example.com/x>")).toBe("https://example.com/x");
+  });
+
+  it("falls back to the url when the label is empty", () => {
+    expect(renderText("<https://example.com/x|>")).toBe("https://example.com/x");
+  });
+
+  it("strips the markup from mentions", () => {
+    // The id is all there is without a users.info lookup, but the brackets are
+    // markup either way.
+    expect(renderText("<@U123ABC> shipped it")).toBe("@U123ABC shipped it");
+    expect(renderText("<@U123ABC|austin> shipped it")).toBe("@austin shipped it");
+  });
+
+  it("strips the markup from channel and group references", () => {
+    expect(renderText("see <#C123ABC|general>")).toBe("see #general");
+    expect(renderText("see <#C123ABC>")).toBe("see #C123ABC");
+    expect(renderText("<!here> please")).toBe("@here please");
+    expect(renderText("<!subteam^S123|@platform> please")).toBe("@platform please");
+  });
+
+  it("unescapes the three characters Slack escapes", () => {
+    expect(renderText("a &lt; b &amp;&amp; c &gt; d")).toBe("a < b && c > d");
+  });
+
+  it("parses entities BEFORE unescaping, not after", () => {
+    // Slack escapes what a person typed but leaves its own entity brackets
+    // literal. Unescaping first turns a quoted "&lt;http://x|y&gt;" into an
+    // entity we would then mangle.
+    expect(renderText("he wrote &lt;https://x.test|y&gt; in chat")).toBe(
+      "he wrote <https://x.test|y> in chat",
+    );
+  });
+
+  it("leaves ordinary prose alone", () => {
+    expect(renderText("Deploy 4.2 finished in 3m12s")).toBe("Deploy 4.2 finished in 3m12s");
+  });
+});
+
+describe("rendering reaches the title too", () => {
+  it("does not put raw markup in a resource title", async () => {
+    // The title is what a citation renders and what the planner reads.
+    const http = vi.fn().mockResolvedValue(
+      respond({
+        ok: true,
+        messages: [message("1.1", { text: "<@U1> opened <https://x.test/1|the PR>" })],
+      }),
+    );
+
+    const { resources } = await driver(http).list(SCOPE, { service: "x" }, undefined);
+
+    expect(resources[0]!.title).toBe("@U1 opened [the PR](https://x.test/1)");
+  });
+});
+
+describe("author and mention names", () => {
+  /** conversations.replies once, then a users.info per distinct id. */
+  function routed(messages: unknown[], users: Record<string, unknown>) {
+    return vi.fn(async (url: string) => {
+      if (url.includes("conversations.replies")) return respond({ ok: true, messages });
+      const id = new URL(url).searchParams.get("user")!;
+      const user = users[id];
+      return user ? respond({ ok: true, user }) : respond({ ok: false, error: "user_not_found" });
+    }) as unknown as FetchLike;
+  }
+
+  it("resolves the author and any bare mention to display names", async () => {
+    const http = routed(
+      [message("1.1", { user: "U1", text: "ask <@U2> about the key" })],
+      {
+        U1: { profile: { display_name: "ada" } },
+        U2: { profile: { display_name: "grace" } },
+      },
+    );
+
+    const doc = await driver(http).fetch(SCOPE, { service: "t" }, "1.1");
+
+    expect(doc.markdown).toContain("**@ada**");
+    expect(doc.markdown).toContain("@grace");
+    expect(doc.markdown).not.toMatch(/U[12]\b/);
+  });
+
+  it("falls back to real_name, then to the handle", async () => {
+    const http = routed([message("1.1", { user: "U1", text: "hi" })], {
+      U1: { profile: { real_name: "Ada Lovelace" } },
+    });
+    const doc = await driver(http).fetch(SCOPE, { service: "t" }, "1.1");
+    expect(doc.markdown).toContain("**@Ada Lovelace**");
+  });
+
+  it("keeps the raw id when the token lacks users:read, rather than failing", async () => {
+    // This is the LIVE case: both workspace tokens return missing_scope, which
+    // this driver classifies as PERMANENT. Letting that propagate would make a
+    // decoration fail the read it was decorating, so every thread in a
+    // workspace without `users:read` would be unreadable.
+    const http = vi.fn(async (url: string) => {
+      if (url.includes("conversations.replies")) {
+        return respond({ ok: true, messages: [message("1.1", { user: "U1", text: "hi" })] });
+      }
+      return respond({ ok: false, error: "missing_scope" });
+    }) as unknown as FetchLike;
+
+    const doc = await driver(http).fetch(SCOPE, { service: "t" }, "1.1");
+
+    expect(doc.markdown).toContain("**@U1**");
+    expect(doc.markdown).toContain("hi");
+  });
+
+  it("asks Slack once per author across several fetches", async () => {
+    const http = routed([message("1.1", { user: "U1", text: "hi" })], {
+      U1: { profile: { display_name: "ada" } },
+    });
+    const d = driver(http);
+
+    await d.fetch(SCOPE, { service: "t" }, "1.1");
+    await d.fetch(SCOPE, { service: "t" }, "1.1");
+
+    const lookups = (http as unknown as ReturnType<typeof vi.fn>).mock.calls.filter(
+      (call: unknown[]) => String(call[0]).includes("users.info"),
+    );
+    expect(lookups).toHaveLength(1);
+  });
+
+  it("does not retry an author Slack refused to name", async () => {
+    // Caching the failure is the point: without it, a workspace missing
+    // `users:read` pays a doomed lookup for every message in the corpus.
+    const http = routed([message("1.1", { user: "U1", text: "hi" })], {});
+    const d = driver(http);
+
+    await d.fetch(SCOPE, { service: "t" }, "1.1");
+    await d.fetch(SCOPE, { service: "t" }, "1.1");
+
+    const lookups = (http as unknown as ReturnType<typeof vi.fn>).mock.calls.filter(
+      (call: unknown[]) => String(call[0]).includes("users.info"),
+    );
+    expect(lookups).toHaveLength(1);
+  });
+
+  it("leaves the <@U1|name> form alone, which already carries its name", () => {
+    expect(renderText("ask <@U2|grace> about it")).toBe("ask @grace about it");
+  });
+});
+
+describe("searchAsUser", () => {
+  const match = (over = {}) => ({
+    ts: "1.1",
+    text: "the deploy runbook lives in confluence",
+    channel: { id: "C123ABC", name: "globex-eng" },
+    permalink: "https://bitovi.slack.com/archives/C123ABC/p11",
+    ...over,
+  });
+
+  /** conversations.info for the name, then search.messages. */
+  const routed = (matches, name = "globex-eng") =>
+    vi.fn(async (url: string) => {
+      if (url.includes("conversations.info")) return respond({ ok: true, channel: { name } });
+      return respond({ ok: true, messages: { matches } });
+    }) as unknown as FetchLike;
+
+  it("bounds the query to the channel by name", async () => {
+    const http = routed([match()]);
+    await driver(http).searchAsUser({ delegated: "u" }, SCOPE, "deploy runbook");
+
+    const search = (http as unknown as ReturnType<typeof vi.fn>).mock.calls
+      .map((c: unknown[]) => String(c[0]))
+      .find((u: string) => u.includes("search.messages"))!;
+    expect(decodeURIComponent(search).replace(/\+/g, " ")).toContain("in:#globex-eng deploy runbook");
+  });
+
+  it("filters results by channel ID, because `in:` matches a mutable NAME", async () => {
+    // The whole reason the scope stores an id. If another channel is renamed
+    // into ours, or our cached name is stale, `in:` stops being a boundary —
+    // so the id comparison is the actual one.
+    const http = routed([match(), match({ channel: { id: "C_OTHER", name: "globex-eng" } })]);
+
+    const hits = await driver(http).searchAsUser({ delegated: "u" }, SCOPE, "deploy");
+
+    expect(hits).toHaveLength(1);
+    expect(hits[0].id).toBe("C123ABC/1.1");
+  });
+
+  it("strips operators out of the caller's words", async () => {
+    // A caller's own `in:` would widen the search past this channel.
+    const http = routed([match()]);
+    await driver(http).searchAsUser({ delegated: "u" }, SCOPE, "in:#exec-private salary");
+
+    const search = (http as unknown as ReturnType<typeof vi.fn>).mock.calls
+      .map((c: unknown[]) => String(c[0]))
+      .find((u: string) => u.includes("search.messages"))!;
+    const decoded = decodeURIComponent(search).replace(/\+/g, " ");
+    expect(decoded).not.toContain("exec-private");
+    expect(decoded).toContain("salary");
+  });
+
+  it("cites the THREAD parent, not the matched reply", async () => {
+    // The read face indexes threads; a reply's own ts would fetch a
+    // one-message thread instead of the conversation holding the answer.
+    const http = routed([match({ ts: "9.9", thread_ts: "1.1" })]);
+    const hits = await driver(http).searchAsUser({ delegated: "u" }, SCOPE, "deploy");
+    expect(hits[0].id).toBe("C123ABC/1.1");
+  });
+
+  it("searches anyway when the channel name cannot be resolved", async () => {
+    const http = vi.fn(async (url: string) => {
+      if (url.includes("conversations.info")) return respond({ ok: false, error: "channel_not_found" });
+      return respond({ ok: true, messages: { matches: [match()] } });
+    }) as unknown as FetchLike;
+
+    // Degrades to a wider search that the id filter still narrows.
+    const hits = await driver(http).searchAsUser({ delegated: "u" }, SCOPE, "deploy");
+    expect(hits).toHaveLength(1);
+  });
+
+  it("refuses the service credential", async () => {
+    await expect(
+      driver(vi.fn() as unknown as FetchLike).searchAsUser({ service: "s" }, SCOPE, "x"),
+    ).rejects.toThrow(/delegated token/);
+  });
+
+  it("returns nothing for an empty query rather than searching for nothing", async () => {
+    const http = vi.fn() as unknown as FetchLike;
+    expect(await driver(http).searchAsUser({ delegated: "u" }, SCOPE, "   ")).toEqual([]);
+    expect(http).not.toHaveBeenCalled();
+  });
+});
+
+describe("queryAsUser", () => {
+  const match = (ts: string, over = {}) => ({
+    ts,
+    text: `message ${ts}`,
+    channel: { id: "C123ABC", name: "team-snc" },
+    ...over,
+  });
+
+  const routed = (matches: unknown[], name: string | null = "team-snc") =>
+    vi.fn(async (url: string) => {
+      if (url.includes("conversations.info")) {
+        return name ? respond({ ok: true, channel: { name } }) : respond({ ok: false, error: "channel_not_found" });
+      }
+      return respond({ ok: true, messages: { matches } });
+    }) as unknown as FetchLike;
+
+  const searchParams = (http: FetchLike) =>
+    new URL(
+      (http as unknown as ReturnType<typeof vi.fn>).mock.calls
+        .map((c: unknown[]) => String(c[0]))
+        .find((u: string) => u.includes("search.messages"))!,
+    ).searchParams;
+
+  const searched = (http: FetchLike) =>
+    (http as unknown as ReturnType<typeof vi.fn>).mock.calls.some((c: unknown[]) =>
+      String(c[0]).includes("search.messages"),
+    );
+
+  it("with no filters, asks for the channel's messages newest first, and nothing else", async () => {
+    const http = routed([]);
+    await driver(http).queryAsUser({ delegated: "u" }, SCOPE, { limit: 5 });
+
+    const params = searchParams(http);
+    expect(params.get("query")).toBe("in:#team-snc");
+    expect(params.get("sort")).toBe("timestamp");
+    expect(params.get("sort_dir")).toBe("desc");
+    expect(params.get("count")).toBe("5");
+  });
+
+  it("writes every filter as a Slack modifier, after: moved back a day to stay inclusive", async () => {
+    const http = routed([]);
+    await driver(http).queryAsUser({ delegated: "u" }, SCOPE, {
+      text: "deploy freeze",
+      author: " @Ana Lopez ",
+      after: "2026-03-01",
+      before: "2026-04-01",
+      type: "message",
+      sort: "oldest",
+    });
+
+    const params = searchParams(http);
+    // Slack's after: EXCLUDES its day, so "on or after March 1" is after:Feb 28
+    // (and the month boundary is crossed correctly). before: is exclusive
+    // already and goes as-is.
+    expect(params.get("query")).toBe(
+      "in:#team-snc deploy freeze from:@AnaLopez after:2026-02-28 before:2026-04-01",
+    );
+    expect(params.get("sort")).toBe("timestamp");
+    expect(params.get("sort_dir")).toBe("asc");
+  });
+
+  it("crosses a year boundary when moving after: back a day", async () => {
+    const http = routed([]);
+    await driver(http).queryAsUser({ delegated: "u" }, SCOPE, { after: "2026-01-01" });
+    expect(searchParams(http).get("query")).toBe("in:#team-snc after:2025-12-31");
+  });
+
+  it("sorts by relevance when there are words and no sort was asked for", async () => {
+    const http = routed([]);
+    await driver(http).queryAsUser({ delegated: "u" }, SCOPE, { text: "deploy" });
+
+    const params = searchParams(http);
+    expect(params.get("sort")).toBe("score");
+    expect(params.get("sort_dir")).toBeNull();
+  });
+
+  it("treats relevance without words as newest", async () => {
+    const http = routed([]);
+    await driver(http).queryAsUser({ delegated: "u" }, SCOPE, { sort: "relevance", author: "ana" });
+
+    const params = searchParams(http);
+    expect(params.get("sort")).toBe("timestamp");
+    expect(params.get("sort_dir")).toBe("desc");
+  });
+
+  it("strips the caller's own operators, which would widen or override ours", async () => {
+    const http = routed([]);
+    await driver(http).queryAsUser({ delegated: "u" }, SCOPE, { text: "in:#exec-private salary" });
+
+    const query = searchParams(http).get("query")!;
+    expect(query).not.toContain("exec-private");
+    expect(query).toContain("salary");
+  });
+
+  it("answers nothing when the words were ALL operators, rather than dropping the filter", async () => {
+    const http = routed([match("1.1")]);
+    const result = await driver(http).queryAsUser({ delegated: "u" }, SCOPE, { text: "in:#exec-private" });
+
+    expect(result).toEqual({ hits: [] });
+    expect(searched(http)).toBe(false);
+  });
+
+  it.each([
+    [{ title: "Runbook" }, ["title"]],
+    [{ type: "page" }, ["type"]],
+    [{ type: "document", title: "x" }, ["title", "type"]],
+  ])("refuses %j rather than ignoring it, without calling Slack", async (query, unsupported) => {
+    const http = routed([match("1.1")]);
+
+    const result = await driver(http).queryAsUser({ delegated: "u" }, SCOPE, query);
+
+    expect(result).toEqual({ hits: [], unsupported });
+    expect(http).not.toHaveBeenCalled();
+  });
+
+  it("rejects a malformed date rather than sending it to Slack", async () => {
+    const http = routed([]);
+    await expect(
+      driver(http).queryAsUser({ delegated: "u" }, SCOPE, { after: "2026-13-01" }),
+    ).rejects.toThrow(/YYYY-MM-DD/);
+    expect(searched(http)).toBe(false);
+  });
+
+  it("filters results by channel ID, because `in:` matches a mutable NAME", async () => {
+    const http = routed([
+      match("1700000002.000200", { channel: { id: "C_OTHER", name: "team-snc" } }),
+      match("1700000001.000100"),
+    ]);
+
+    const { hits } = await driver(http).queryAsUser({ delegated: "u" }, SCOPE, {});
+
+    expect(hits.map((h) => h.id)).toEqual(["C123ABC/1700000001.000100"]);
+  });
+
+  it("stamps every hit with the MESSAGE's own time, not its thread's", async () => {
+    // A recent reply in an old thread is recent; the citation still points at
+    // the thread so the read face fetches the whole conversation.
+    const http = routed([match("1700000500.123456", { thread_ts: "1600000000.000001" })]);
+
+    const { hits } = await driver(http).queryAsUser({ delegated: "u" }, SCOPE, {});
+
+    expect(hits[0]!.id).toBe("C123ABC/1600000000.000001");
+    expect(hits[0]!.updatedAt).toBe(new Date(1700000500123).toISOString());
+  });
+
+  it("returns nothing when the channel name cannot be resolved, rather than searching everywhere", async () => {
+    const http = routed([match("1.1")], null);
+
+    expect(await driver(http).queryAsUser({ delegated: "u" }, SCOPE, { text: "deploy" })).toEqual({ hits: [] });
+    expect(searched(http)).toBe(false);
+  });
+
+  it("refuses the service credential", async () => {
+    const http = vi.fn() as unknown as FetchLike;
+    await expect(driver(http).queryAsUser({ service: "s" }, SCOPE, {})).rejects.toThrow(/delegated token/);
+    expect(http).not.toHaveBeenCalled();
+  });
+});
+
+describe("searchAsUser hits carry a time", () => {
+  it("derives updatedAt from the matched message's ts", async () => {
+    const http = vi.fn(async (url: string) => {
+      if (url.includes("conversations.info")) return respond({ ok: true, channel: { name: "x" } });
+      return respond({
+        ok: true,
+        messages: { matches: [{ ts: "1700000000.500000", text: "hi", channel: { id: "C123ABC" } }] },
+      });
+    }) as unknown as FetchLike;
+
+    const [hit] = await driver(http).searchAsUser({ delegated: "u" }, SCOPE, "hi");
+    expect(hit!.updatedAt).toBe("2023-11-14T22:13:20.500Z");
+  });
+});
+
+describe("live hits read as people wrote them", () => {
+  /**
+   * The live shape: the caller's token is scoped for search alone, so
+   * `users.info` refuses it; only the bot token can name anyone.
+   */
+  function workspace(users: Record<string, string>, matches: unknown[]) {
+    return vi.fn(async (url: string, init?: { headers?: Record<string, string> }) => {
+      if (url.includes("conversations.info")) return respond({ ok: true, channel: { name: "team-snc" } });
+      if (url.includes("search.messages")) return respond({ ok: true, messages: { matches } });
+      if (url.includes("users.info")) {
+        if (init?.headers?.Authorization !== "Bearer bot") return respond({ ok: false, error: "missing_scope" });
+        const name = users[new URL(url).searchParams.get("user")!];
+        return name
+          ? respond({ ok: true, user: { profile: { display_name: name } } })
+          : respond({ ok: false, error: "user_not_found" });
+      }
+      return respond({ ok: false, error: "unknown_method" });
+    }) as unknown as FetchLike;
+  }
+
+  const calls = (http: FetchLike) =>
+    (http as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c: unknown[]) => ({
+      url: String(c[0]),
+      auth: (c[1] as { headers?: Record<string, string> } | undefined)?.headers?.Authorization,
+    }));
+
+  const withDirectory = (http: FetchLike) =>
+    new SlackDriver({ fetch: http, workspaceUrl: "https://bitovi.slack.com", directoryToken: "bot" });
+
+  const leadership = {
+    ts: "1791175943.784319",
+    text: "<@U4YSZEZFG> given the information provided by Dan and Jason - how do you want to proceed?",
+    user: "U9",
+    channel: { id: "C123ABC" },
+  };
+
+  it("names a mention in a query hit's title and excerpt, through the directory token", async () => {
+    const http = workspace({ U4YSZEZFG: "Brad" }, [leadership]);
+
+    const { hits } = await withDirectory(http).queryAsUser({ delegated: "user" }, SCOPE, {});
+
+    expect(hits[0]!.title).toMatch(/^@Brad given the information/);
+    expect(hits[0]!.excerpt).toMatch(/^@Brad given/);
+    expect(JSON.stringify(hits)).not.toContain("U4YSZEZFG");
+  });
+
+  it("names a mention in a search hit too", async () => {
+    const http = workspace({ U4YSZEZFG: "Brad" }, [leadership]);
+    const [hit] = await withDirectory(http).searchAsUser({ delegated: "user" }, SCOPE, "proceed");
+    expect(hit!.title).toMatch(/^@Brad /);
+  });
+
+  it("spends the directory token on name lookups and nothing else", async () => {
+    // The boundary: content is read as the caller, always.
+    const http = workspace({ U4YSZEZFG: "Brad" }, [leadership]);
+    await withDirectory(http).queryAsUser({ delegated: "user" }, SCOPE, { text: "proceed" });
+
+    const botCalls = calls(http).filter((c) => c.auth === "Bearer bot");
+    expect(botCalls.length).toBeGreaterThan(0);
+    expect(botCalls.every((c) => c.url.includes("/users.info?"))).toBe(true);
+  });
+
+  it("asks the caller's token first, and only falls back when it cannot answer", async () => {
+    const http = workspace({ U4YSZEZFG: "Brad" }, [leadership]);
+    await withDirectory(http).queryAsUser({ delegated: "user" }, SCOPE, {});
+
+    const lookups = calls(http).filter((c) => c.url.includes("users.info"));
+    expect(lookups.map((c) => c.auth)).toEqual(["Bearer user", "Bearer bot"]);
+  });
+
+  it("keeps the raw id without a directory token, rather than failing the query", async () => {
+    const http = workspace({ U4YSZEZFG: "Brad" }, [leadership]);
+    const { hits } = await driver(http).queryAsUser({ delegated: "user" }, SCOPE, {});
+    expect(hits[0]!.title).toMatch(/^@U4YSZEZFG /);
+  });
+
+  it("drops emoji shortcodes from a title, so a citation link does not read ':thread:'", async () => {
+    const http = workspace({}, [
+      { ts: "1791201611.387989", text: ":thread: for Evening Updates October 5, 2026", channel: { id: "C123ABC" } },
+    ]);
+
+    const { hits } = await withDirectory(http).queryAsUser({ delegated: "user" }, SCOPE, {});
+
+    expect(hits[0]!.title).toBe("for Evening Updates October 5, 2026");
+    // The excerpt is prose, not a link name, and keeps what was written.
+    expect(hits[0]!.excerpt).toContain(":thread:");
+  });
+});
+
+describe("titleOf", () => {
+  it("skips a line that is only emoji and takes the next one with words", () => {
+    expect(titleOf(":tada::tada:\nWe shipped it")).toBe("We shipped it");
+  });
+
+  it("drops skin-toned shortcodes and collapses the gap they leave", () => {
+    expect(titleOf("Thanks :wave::skin-tone-2: all")).toBe("Thanks all");
+  });
+
+  it("leaves a clock time alone", () => {
+    expect(titleOf("Standup moved to 12:00:11 UTC")).toBe("Standup moved to 12:00:11 UTC");
+  });
+
+  it("is empty for a message with no words, so the caller's fallback applies", () => {
+    expect(titleOf(":+1:")).toBe("");
+  });
+});

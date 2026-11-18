@@ -1,0 +1,14 @@
+## Append samples of your project ##
+resources:
+- tool_v1alpha1_tool.yaml
+- tool_v1alpha1_skill.yaml
+- tool_v1alpha1_toolrun.yaml
+- tool_v1alpha1_agent.yaml
+- tool_v1alpha1_agentrun.yaml
+- core_v1alpha1_connection.yaml
+- core_v1alpha1_knowledgebase.yaml
+- core_v1alpha1_mcpserver.yaml
+- core_v1alpha1_mcptool.yaml
+- core_v1alpha1_eventsource.yaml
+- core_v1alpha1_eventtrigger.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

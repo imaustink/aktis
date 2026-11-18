@@ -28,7 +28,7 @@ CTX="kind-${CLUSTER}"
 NS=controller-agent
 SANDBOX_VERSION=v1.0.4
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONTROLLER_DIR="${REPO_ROOT}/controllers/core-controller"
+CONTROLLER_DIR="${REPO_ROOT}/orchestrator/controllers/core-controller"
 LOG=/tmp/${CLUSTER}-controller.log
 CONTROLLER_PID=""
 
@@ -102,7 +102,7 @@ ok "core-controller reconciling (pid ${CONTROLLER_PID})"
 # --------------------------------------------------------------- fixtures --
 
 kn apply -f - >/dev/null <<'YAML'
-apiVersion: core.controller-agent.dev/v1alpha1
+apiVersion: core.aktis.ai/v1alpha1
 kind: Tool
 metadata:
   name: echo-tool
@@ -119,7 +119,7 @@ spec:
     requests: {cpu: "50m", memory: "32Mi"}
     limits: {cpu: "200m", memory: "128Mi"}
 ---
-apiVersion: core.controller-agent.dev/v1alpha1
+apiVersion: core.aktis.ai/v1alpha1
 kind: Tool
 metadata:
   name: slow-tool
@@ -142,7 +142,7 @@ kn delete toolrun on-job on-sandbox parked --ignore-not-found --wait=true >/dev/
 
 run_manifest() { # $1=name  $2=toolRef  $3=extra annotations block
   cat <<YAML
-apiVersion: core.controller-agent.dev/v1alpha1
+apiVersion: core.aktis.ai/v1alpha1
 kind: ToolRun
 metadata:
   name: $1
@@ -160,7 +160,7 @@ YAML
 }
 
 SANDBOX_ANN='  annotations:
-    core.controller-agent.dev/execution-backend: sandbox'
+    core.aktis.ai/execution-backend: sandbox'
 
 wait_phase() { # $1=toolrun  $2=phase  $3=timeout seconds
   local deadline=$(( SECONDS + $3 )) got
@@ -202,7 +202,7 @@ ok "Sandbox backend reached Succeeded through the same ToolRun contract"
 
 act "Act 3 — both backends produced the same hardened pod"
 
-JOB_POD=$(kn get pods -l core.controller-agent.dev/toolrun=on-job -o jsonpath='{.items[0].metadata.name}')
+JOB_POD=$(kn get pods -l core.aktis.ai/toolrun=on-job -o jsonpath='{.items[0].metadata.name}')
 SB_POD=toolrun-on-sandbox
 
 FIELDS='{.spec.serviceAccountName}{"\n"}{.spec.securityContext.runAsUser}{"\n"}{.spec.securityContext.runAsGroup}{"\n"}{.spec.securityContext.runAsNonRoot}{"\n"}{.spec.securityContext.seccompProfile.type}{"\n"}{.spec.restartPolicy}{"\n"}{.spec.containers[0].image}{"\n"}{.spec.containers[0].args}{"\n"}{.spec.containers[0].securityContext.readOnlyRootFilesystem}{"\n"}{.spec.containers[0].securityContext.allowPrivilegeEscalation}{"\n"}{.spec.containers[0].securityContext.capabilities.drop}{"\n"}{range .spec.containers[0].env[*]}{.name}={.value}{.valueFrom.secretKeyRef.name}/{.valueFrom.secretKeyRef.key}{"\n"}{end}'

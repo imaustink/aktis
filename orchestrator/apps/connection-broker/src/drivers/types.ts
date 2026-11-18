@@ -1,0 +1,358 @@
+/**
+ * The provider driver contract (docs/adr/0038 §1, extended by 0040).
+ *
+ * This is the generalization the whole design rests on. Confluence, Slack and
+ * Drive differ in perhaps 150 lines each; pagination, incremental diffing,
+ * chunking, embedding, RBAC, webhook plumbing, retries and status reporting are
+ * written once around this interface. Adding Jira or Notion later is an
+ * implementation of it, not a new service.
+ */
+
+/**
+ * The bounded set of resources a Connection reaches. Exactly one of
+ * `space`/`channel`/`folderID`/`jobID`/`all` is set.
+ *
+ * `all` is the wildcard: "every unit this Connection permits" rather than one
+ * named space/channel/folder/job. It exists because a connection commonly wants
+ * ONE corpus covering its whole account — every JazzHR job, every Drive folder
+ * the credential sees — without an operator enumerating and maintaining a
+ * corpus per unit by hand. It is bounded by the Connection's `allowedScopes`:
+ * when that cap is set, a wildcard reaches exactly the capped units (passed to
+ * the driver as `allowedUnits`); when it is absent, the driver enumerates
+ * everything the service credential can reach.
+ */
+export interface Scope {
+  space?: string;
+  channel?: string;
+  folderID?: string;
+  /** A JazzHR job id — the candidates attached to one opening. */
+  jobID?: string;
+  /**
+   * Wildcard: every unit this Connection permits (see the type doc). A driver
+   * MUST implement it by enumerating units and listing each, and such a corpus
+   * reconciles in full each pass — the per-unit cursors do not compose into one
+   * opaque incremental cursor, and the reconcile pass is the source of truth
+   * (ADR 0038 §4) regardless.
+   */
+  all?: boolean;
+  /**
+   * The cap a wildcard is bounded to: the Connection's `allowedScopes` for this
+   * provider, or empty/undefined when it set none. Only meaningful with `all`.
+   * Carried on the scope so the enumeration bound reaches the driver, which is
+   * the security boundary (the same reason `validateScope` is re-checked there).
+   */
+  allowedUnits?: string[];
+}
+
+/**
+ * An opaque per-driver cursor. A Slack `ts`, a Confluence version marker, a
+ * Drive changes token — nothing above the driver interprets it, which is what
+ * lets each provider express "changed since" in its own terms.
+ */
+export type Cursor = string | undefined;
+
+/** One resource the driver knows about, before its body is fetched. */
+export interface ResourceRef {
+  id: string;
+  title: string;
+  url: string;
+  /** Provider-defined version; compared against an indexed chunk's to detect staleness. */
+  version?: string;
+  updatedAt?: string;
+  /**
+   * The principals the mirror should pre-filter on — group ids, account ids,
+   * whatever the provider uses (docs/adr/0040).
+   *
+   * **Tuned to over-include.** Where effective permissions cannot be confidently
+   * resolved, a driver returns `permissive: true` rather than guessing a
+   * restrictive set. Over-inclusion costs one wasted probe; under-inclusion
+   * silently suppresses results the user was entitled to see, and is the only
+   * direction that causes user-visible harm.
+   */
+  acl?: { principals: string[]; permissive?: boolean };
+}
+
+/** A resource with its body, normalized to Markdown. */
+export interface Document extends ResourceRef {
+  markdown: string;
+}
+
+export interface ListPage {
+  resources: ResourceRef[];
+  cursor: Cursor;
+}
+
+/**
+ * The unit a provider authorizes at (docs/adr/0040).
+ *
+ * Confluence and Drive authorize a page or a file. Slack authorizes a CHANNEL —
+ * membership is the access unit, and there is no per-message permission to
+ * check — so one probe settles every candidate from that connection, which is
+ * cheaper than the per-resource case rather than harder.
+ */
+export type ProbeGranularity = "resource" | "connection";
+
+export interface ProbeResult {
+  allowed: boolean;
+  title: string;
+  url: string;
+  version?: string;
+}
+
+/** The source says this user may not read it. Drop the candidate. */
+export class PermissionDeniedError extends Error {
+  readonly name = "PermissionDeniedError";
+}
+
+/**
+ * We could not find out — a 429, a 5xx, a timeout.
+ *
+ * Deliberately NOT a denial. Treating it as one silently shrinks an answer in a
+ * way nobody can see, and makes the same question return different evidence
+ * depending on whether the source was busy.
+ */
+export class TransientError extends Error {
+  readonly name = "TransientError";
+}
+
+/**
+ * The source will never answer this call, however many times we ask.
+ *
+ * Distinct from `TransientError` for one reason: a transient failure is retried
+ * and a permanent one must not be. Confluence's v1 content endpoints now return
+ * `410 Gone`, and classifying that as transient means a sync loop that retries
+ * a removed endpoint forever, reporting "temporarily unavailable" about
+ * something that is never coming back.
+ *
+ * It is not a denial either — the caller is not being refused, the call no
+ * longer exists — so it must not be swallowed the way a drop is. It should
+ * reach an operator.
+ */
+export class PermanentError extends Error {
+  readonly name = "PermanentError";
+}
+
+/** How a driver is told which credential to act with. */
+export interface Credentials {
+  /** The connection's shared service credential — ingestion only. */
+  service?: string;
+  /**
+   * The calling user's delegated token. Required for anything a user will see:
+   * probes, the GET face, and live fetches (docs/adr/0040).
+   */
+  delegated?: string;
+}
+
+/** A provider's change notification, once verified and understood. */
+export interface WebhookEvent {
+  /**
+   * WHICH subset this delivery is about — a channel id, a space key, a folder
+   * id — so the broker can route it to the Corpora that cover it (ADR 0043 §4).
+   *
+   * Reported rather than filtered against, because one Connection serves many
+   * Corpora and a driver no longer knows which subsets exist. Absent means the
+   * provider said something changed without saying where, which escalates to a
+   * full pass rather than to nothing.
+   */
+  scopeKey?: string;
+
+  /**
+   * The resources this notification says changed.
+   *
+   * EMPTY is meaningful and common: Drive's push notifications name a channel
+   * rather than a file, and Slack's events can arrive for things this
+   * connection does not index. An empty list means "something changed, we do
+   * not know what", which callers turn into a full pass rather than into
+   * nothing.
+   */
+  sourceIds: string[];
+}
+
+/** The raw request a provider delivered, before any interpretation. */
+export interface WebhookRequest {
+  headers: Record<string, string | undefined>;
+  /**
+   * The body EXACTLY as received.
+   *
+   * Signatures are computed over the bytes, so a parsed-and-restringified body
+   * verifies against nothing. This has to arrive unmodified from the socket.
+   */
+  rawBody: string;
+}
+
+export interface Driver {
+  readonly provider: string;
+
+  /**
+   * Rejects a scope this driver cannot honour. Called at admission-time on the
+   * CRD too, but re-checked here: scope is the security boundary, and a driver
+   * that accepts an unvalidated one silently widens a client boundary.
+   */
+  validateScope(scope: Scope): void;
+
+  /** Incremental listing, service-credentialled. Ingestion deliberately ignores permissions. */
+  list(scope: Scope, credentials: Credentials, since: Cursor): Promise<ListPage>;
+
+  /** One resource, normalized. Service-credentialled during sync; delegated when a user reads it. */
+  fetch(scope: Scope, credentials: Credentials, id: string): Promise<Document>;
+
+  /** Which unit `probe` applies to. */
+  probeGranularity(): ProbeGranularity;
+
+  /**
+   * Asks the source, as the calling user, whether a resource is readable —
+   * returning the title, URL and version a citation must be built from.
+   *
+   * MUST throw `PermissionDeniedError`, `TransientError` or `PermanentError`
+   * rather than a bare Error: the caller cannot tell which an unclassified
+   * failure meant, and guessing is how a leak gets introduced.
+   */
+  probe(scope: Scope, credentials: Credentials, id?: string): Promise<ProbeResult>;
+
+  /**
+   * Verifies a provider's change notification and says what it refers to.
+   *
+   * Optional: a provider without push notifications simply does not implement
+   * it, and that connection stays on its reconcile interval — which is the
+   * source of truth regardless (ADR 0038 §4). Webhooks only make it faster.
+   *
+   * This runs on an endpoint reachable WITHOUT a bearer token, because the
+   * provider is the caller. The signature is therefore the only thing standing
+   * between a stranger and the ability to make this broker spend a client's
+   * credential on demand, so an implementation MUST throw rather than return
+   * for anything it cannot verify.
+   *
+   * Returning `undefined` means "verified, but not something to act on" — a
+   * Slack URL-verification handshake, a Drive sync ping. Distinct from
+   * throwing, which means the request was not trustworthy, and from reporting a
+   * scopeKey nothing covers, which is the ordinary case and is the broker's to
+   * decide.
+   */
+  parseWebhook?(request: WebhookRequest, secret: string): WebhookEvent | undefined;
+
+  /**
+   * Reads one resource as the calling user, bounded by THEIR access rather
+   * than by the corpus's scope.
+   *
+   * This is the one read that deliberately leaves the scope behind, so it is
+   * worth saying why rather than letting it look like an oversight.
+   *
+   * A knowledge base's material cites other pages, and those citations lead
+   * out of whatever space was indexed. An agent that can read a page but not
+   * the page it references is not much use, and the alternative — indexing
+   * every space so the links resolve — is both enormous and wrong.
+   *
+   * What bounds it instead is identity. The read runs on the caller's own
+   * delegated token, so the source returns exactly what that person would see
+   * by opening it themselves: it grants no access they lack, it only lets the
+   * agent act with the access they already have.
+   *
+   * The scope check stays on `fetch`, which is the INGESTION path — a sync
+   * pass has no user, runs on a shared credential, and must never wander
+   * outside the subset its Corpus declares.
+   *
+   * A separate method rather than a flag on `fetch`, because "passing a
+   * delegated token silently disables the scope check" is exactly the kind of
+   * implicit behaviour nobody notices until it is wrong.
+   */
+  readAsUser?(credentials: Credentials, id: string): Promise<Document>;
+
+  /**
+   * Searches the SOURCE as the calling user, bounded by the corpus's scope.
+   *
+   * The deliberate asymmetry with `readAsUser` is the whole design, so it is
+   * worth stating plainly: search is bounded by scope AND identity, a read is
+   * bounded by identity alone.
+   *
+   * They differ because discovery and retrieval are different acts. A read
+   * follows a citation the user is already looking at, so leaving the scope
+   * behind lets an agent follow a link out of the indexed space — useful, and
+   * safe, because the caller's own token decides what comes back. Search has no
+   * such anchor: an unbounded one turns "what does this knowledge base know"
+   * into "everything this person can see anywhere", which is a different
+   * question and not the one a knowledge base was asked. Verified against the
+   * live tenant: dropping the space term returns pages from ANOTHER client's
+   * space, so the bound is doing real work rather than decoration.
+   *
+   * This complements vector search rather than replacing it. The index answers
+   * "what do we know about X" over a snapshot; this answers "what is there NOW",
+   * which is what a stale snapshot cannot.
+   *
+   * Optional: a provider whose search needs a scope or token type we do not
+   * hold simply does not implement it, and that corpus keeps vector search.
+   *
+   * MUST throw the classified errors, for the same reason `probe` must.
+   */
+  searchAsUser?(credentials: Credentials, scope: Scope, query: string, limit?: number): Promise<SearchHit[]>;
+
+  /**
+   * A structured query over the scope's items, as the calling user: filter by
+   * words, title, author, time window and type, and order by relevance or time.
+   *
+   * Bounded exactly as `searchAsUser` is — by the corpus's scope AND the
+   * caller's identity, for the reasons given there. It answers what neither the
+   * index (a snapshot, ranked by similarity, holding no metadata it can filter
+   * or sort on) nor a keyword search (ranked by relevance, and needing words)
+   * can: "the latest in #channel", "what did Ana write last month", "the
+   * oldest runbook here".
+   *
+   * Every hit carries `updatedAt` (ISO 8601) wherever the provider has one: a
+   * time-ordered answer is only as good as the times it can show.
+   *
+   * Refuse, don't fake. A filter this provider cannot apply is reported in
+   * `unsupported` with EMPTY `hits`, and the provider is NOT called. Results
+   * that silently ignored a filter would be confidently wrong — "Ana's pages"
+   * answered with everyone's — which is worse than no answer, because nothing
+   * downstream could tell the difference.
+   *
+   * Optional: a provider that cannot filter or sort by metadata simply does not
+   * implement it, and that corpus keeps search and the index.
+   *
+   * MUST throw the classified errors, for the same reason `probe` and
+   * `searchAsUser` must. An invalid query (a malformed date) throws a plain
+   * `QueryValidationError` (drivers/query.ts), which is the caller's mistake
+   * rather than the source's answer.
+   */
+  queryAsUser?(credentials: Credentials, scope: Scope, query: SourceQuery): Promise<QueryResult>;
+}
+
+/** A provider-neutral structured query over a corpus's items. Every field optional. */
+export interface SourceQuery {
+  /** Keywords matched against content. */
+  text?: string;
+  /** Substring of the item's title/name. */
+  title?: string;
+  /** Who wrote/owns the item — a person's name (Slack handle-ish, Confluence full name) or, for Drive, an email. */
+  author?: string;
+  /** Inclusive lower bound on when the item last changed (or was posted), YYYY-MM-DD. */
+  after?: string;
+  /** Exclusive upper bound, YYYY-MM-DD. */
+  before?: string;
+  /** "page" | "blogpost" | "message" | "document" | "spreadsheet" | "presentation" | "pdf" */
+  type?: string;
+  /** Default: "relevance" when `text` is set, otherwise "newest". "relevance" without text behaves as "newest". */
+  sort?: "relevance" | "newest" | "oldest";
+  /** Default 10, max 25. */
+  limit?: number;
+}
+
+export interface QueryResult {
+  hits: SearchHit[];
+  /**
+   * Filter names this provider cannot apply. When non-empty, `hits` is EMPTY:
+   * a provider must refuse rather than return results that silently ignore a
+   * filter.
+   */
+  unsupported?: string[];
+}
+
+/**
+ * One live search result.
+ *
+ * A `ResourceRef` plus the provider's own `excerpt`, which is worth carrying:
+ * it is the source's answer to "why did this match", and it lets an agent
+ * decide whether a hit is worth a read rather than reading all of them.
+ */
+export interface SearchHit extends ResourceRef {
+  excerpt?: string;
+}

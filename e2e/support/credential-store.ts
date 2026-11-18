@@ -15,7 +15,7 @@ import { kubectl, kubectlApplyStdin } from "./k8s.js";
 
 /**
  * Object names are `<prefix>-<sha256(subject)[:16]>`, mirroring
- * `SecretRecordStore.nameFor` (apps/integration-gateway/src/credential-store/).
+ * `SecretRecordStore.nameFor` (orchestrator/apps/integration-gateway/src/credential-store/).
  *
  * Duplicated here deliberately, rather than imported from the app: this is a
  * black-box suite against a deployed image, and computing the name INDEPENDENTLY
@@ -29,12 +29,15 @@ function nameFor(prefix: string, subject: string): string {
 
 const PREFIX = {
   identityLink: "identity-link-github",
+  // Provider-scoped, the same scheme one prefix up. Atlassian is what a
+  // knowledge base over Confluence probes with (docs/adr/0040).
+  identityLinkAtlassian: "identity-link-atlassian",
   "setup-token": "claude-auth-setup-token",
   login: "claude-auth-login",
 } as const;
 
 /** Label every credential Secret carries, so a sweep can find them all. */
-const CREDENTIAL_LABEL = "controller-agent.io/credential";
+const CREDENTIAL_LABEL = "aktis.ai/credential";
 
 /** Field carrying a record's exact plaintext subject -- see `RECORD_KEY_FIELD` in the app. */
 const RECORD_KEY_FIELD = "_recordKey";
@@ -72,7 +75,7 @@ async function putRecord(prefix: string, subject: string, fields: Record<string,
       name: nameFor(prefix, subject),
       labels: {
         [CREDENTIAL_LABEL]: prefix.startsWith("identity-link") ? "identity-link" : "claude-auth",
-        "controller-agent.io/e2e-seeded": "true",
+        "aktis.ai/e2e-seeded": "true",
       },
     },
     stringData: { ...fields, [RECORD_KEY_FIELD]: subject },
@@ -200,6 +203,35 @@ export async function seedGithubLink(
           refreshExpiresAt: new Date(Date.now() + 180 * 24 * 60 * 60 * 1000).toISOString(),
         }
       : {}),
+  });
+}
+
+/**
+ * Seeds an `atlassian` identity link, carrying the token the fake accepts.
+ *
+ * This is the caller's OWN credential, and it is what every knowledge-base
+ * probe and live read spends (docs/adr/0040). Seeding is unavoidable — the
+ * real thing is an OAuth round trip with a human at a browser — but nothing
+ * downstream is stubbed: the orchestrator resolves this record exactly as it
+ * would a real link, and the fake Confluence decides what the token can see.
+ *
+ * Which token a caller holds IS the thing under test, so the two the fake
+ * distinguishes are both available here: `e2e-user-full` sees every page,
+ * `e2e-user-limited` is refused the one that proves the probe is load-bearing.
+ *
+ * `accountId` feeds the ACL mirror's principal (`user:<id>`), which is a
+ * pre-filter and never the authorization decision.
+ */
+export async function seedAtlassianLink(
+  subject: string,
+  token: "e2e-user-full" | "e2e-user-limited",
+  accountId = "full-access-account",
+): Promise<void> {
+  const encrypt = await fieldEncrypter();
+  await putRecord(PREFIX.identityLinkAtlassian, subject, {
+    accountId,
+    expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString(),
+    token: encrypt(token),
   });
 }
 

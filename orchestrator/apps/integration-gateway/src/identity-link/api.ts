@@ -1,0 +1,433 @@
+import type { IncomingMessage, ServerResponse } from "node:http";
+import type { GithubDeviceFlowLinker } from "./device-flow-linker.js";
+import type { OAuthAuthCodeLinker } from "./oauth-authcode-linker.js";
+
+/**
+ * `github` is served by the device-flow linker; every other provider comes from
+ * the authcode linkers this API was constructed with (docs/adr/0040 needs
+ * Atlassian). An unknown `:provider` segment is still a 400 rather than a 404,
+ * since the route itself matched.
+ */
+const DEVICE_FLOW_PROVIDER = "github";
+
+/**
+ * Human-facing provider names for the callback result pages. The `:provider`
+ * path segment is lowercase (the CR name, e.g. `atlassian`), which title-cases
+ * cleanly for every provider except `github`'s brand capitalisation. Anything
+ * not listed falls back to title-casing the segment, so a newly registered
+ * provider still renders a reasonable name without a code change here.
+ */
+const PROVIDER_DISPLAY_NAMES: Readonly<Record<string, string>> = {
+  github: "GitHub",
+};
+
+function providerDisplayName(provider: string): string {
+  return PROVIDER_DISPLAY_NAMES[provider] ?? provider.charAt(0).toUpperCase() + provider.slice(1);
+}
+
+/** Hard ceiling on `/wait`'s `timeoutMs`, matching the authcode `state` TTL -- a caller can't hold this route open longer than a link attempt could possibly still be valid for. */
+const MAX_WAIT_MS = 10 * 60 * 1000;
+
+/** Checks `Authorization: Bearer <expectedToken>`. Mirrors `orchestrator-client.ts`'s `Bearer ${token}` framing, but this gateway is the one checking it here (not sending it). */
+export function checkBearer(req: IncomingMessage, expectedToken: string): boolean {
+  const header = req.headers.authorization;
+  if (!header || !expectedToken) return false;
+  const match = /^Bearer (.+)$/.exec(header);
+  return match !== null && match[1] === expectedToken;
+}
+
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
+
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
+}
+
+function sendHtml(res: ServerResponse, status: number, html: string): void {
+  res.writeHead(status, { "content-type": "text/html; charset=utf-8" }).end(html);
+}
+
+function escapeHtml(raw: string): string {
+  return raw.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function htmlPage(title: string, message: string): string {
+  title = escapeHtml(title);
+  message = escapeHtml(message);
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${title}</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 32rem; margin: 4rem auto; padding: 0 1rem; color: #1a1a1a; }
+  h1 { font-size: 1.25rem; }
+</style>
+</head>
+<body>
+<h1>${title}</h1>
+<p>${message}</p>
+</body>
+</html>`;
+}
+
+/**
+ * Internal API (orchestrator -> this gateway) for linking/using a chat user's
+ * own GitHub identity via OAuth Device Flow (see docs on
+ * `GithubDeviceFlowLinker`). Every route requires
+ * `Authorization: Bearer <identityLinkToken>` -- a separate token from
+ * `orchestratorToken`, since that one flows the opposite direction
+ * (gateway -> orchestrator).
+ */
+export class IdentityLinkApi {
+  constructor(
+    private readonly linker: GithubDeviceFlowLinker,
+    private readonly identityLinkToken: string,
+    /**
+     * Authorization-code providers, keyed by name. Empty in a deployment that
+     * links only GitHub, which is why this is optional rather than required —
+     * the existing behaviour is exactly what it was.
+     */
+    private readonly authCodeLinkers: ReadonlyMap<string, OAuthAuthCodeLinker> = new Map(),
+  ) {}
+
+  /**
+   * Set by the Connections page (docs/adr/0046): where to send the browser
+   * once a link it started completes. `undefined` keeps the result page below.
+   */
+  completionRedirect?: (req: IncomingMessage, res: ServerResponse, provider: string) => string | undefined;
+
+  /** The same, for a link the user declined at the provider. */
+  cancelRedirect?: (req: IncomingMessage, res: ServerResponse, provider: string) => string | undefined;
+
+  /** A provider this gateway can actually link. */
+  private supports(provider: string): boolean {
+    return provider === DEVICE_FLOW_PROVIDER || this.authCodeLinkers.has(provider);
+  }
+
+  private unsupported(res: ServerResponse, provider: string): void {
+    sendJson(res, 400, { error: `Unsupported identity provider: ${provider}` });
+  }
+
+  /**
+   * Routes the unauthenticated `GET /identity-link/:provider/callback`
+   * redirect target for the OAuth authorization-code flow. This is hit
+   * directly by the end user's browser (via GitHub's redirect), which
+   * cannot carry our internal bearer token -- so, unlike `handle`, this
+   * method does NOT check `Authorization`. Callers must dispatch to this
+   * BEFORE the bearer-gated `handle` above, since that one would otherwise
+   * 401 every request to this path. Returns `false` if the path didn't match
+   * this route at all.
+   */
+  async handleCallback(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
+    const segments = url.pathname.split("/").filter(Boolean);
+    if (req.method !== "GET" || segments[0] !== "identity-link" || segments.length !== 3 || segments[2] !== "callback") {
+      return false;
+    }
+    const provider = segments[1]!;
+    if (!this.supports(provider)) {
+      res.writeHead(400, { "content-type": "text/plain" }).end(`Unsupported identity provider: ${provider}`);
+      return true;
+    }
+    const displayName = providerDisplayName(provider);
+
+    const state = url.searchParams.get("state");
+    if (!state) {
+      sendHtml(
+        res,
+        400,
+        htmlPage("Link request malformed", "This link is missing required information. Please try again from chat."),
+      );
+      return true;
+    }
+
+    const error = url.searchParams.get("error");
+    if (error) {
+      // The provider's denial redirect (e.g. the user clicked "Cancel"). This is
+      // a completed-but-declined flow, not really an error condition, so 200.
+      //
+      // A link the Connections page started goes back to the page instead --
+      // and, mid-way through a one-click chain, stops the chain there rather
+      // than moving on to the next provider (docs/adr/0046).
+      const back = this.cancelRedirect?.(req, res, provider);
+      if (back) {
+        res.writeHead(303, { location: back }).end();
+        return true;
+      }
+      sendHtml(
+        res,
+        200,
+        htmlPage(`${displayName} link cancelled`, "You declined the request. You can try again whenever you're ready."),
+      );
+      return true;
+    }
+
+    const code = url.searchParams.get("code");
+    if (!code) {
+      sendHtml(
+        res,
+        400,
+        htmlPage("Link request malformed", "This link is missing required information. Please try again from chat."),
+      );
+      return true;
+    }
+
+    const authCode = this.authCodeLinkers.get(provider);
+    const completed = authCode
+      ? await authCode.completeAuthCode(state, code)
+      : await this.linker.completeAuthCode(state, code);
+    if (!completed) {
+      sendHtml(
+        res,
+        400,
+        htmlPage("Link expired", "This link may have expired or already been used -- please try again from chat."),
+      );
+      return true;
+    }
+
+    const back = this.completionRedirect?.(req, res, provider);
+    if (back) {
+      res.writeHead(303, { location: back }).end();
+      return true;
+    }
+    sendHtml(
+      res,
+      200,
+      htmlPage(`${displayName} account linked`, "You can close this tab and return to your chat."),
+    );
+    return true;
+  }
+
+  /**
+   * Routes a request whose path matches `/identity-link/:provider/...`.
+   * Returns `false` if the path didn't match this API at all (caller should
+   * fall through to its own 404), otherwise handles the request (including
+   * writing any error response) and returns `true`.
+   */
+  async handle(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
+    const segments = url.pathname.split("/").filter(Boolean);
+    if (segments[0] !== "identity-link" || segments.length !== 3) return false;
+    const [, provider, action] = segments as [string, string, string];
+
+    if (!checkBearer(req, this.identityLinkToken)) {
+      res.writeHead(401).end();
+      return true;
+    }
+
+    if (req.method === "POST" && action === "start") {
+      await this.handleStart(req, res, provider!);
+      return true;
+    }
+    if (req.method === "POST" && action === "poll") {
+      await this.handlePoll(req, res, provider!);
+      return true;
+    }
+    if (req.method === "GET" && action === "identity") {
+      await this.handleIdentity(res, url, provider);
+      return true;
+    }
+    if (req.method === "GET" && action === "token") {
+      await this.handleToken(res, url, provider!);
+      return true;
+    }
+    if (req.method === "POST" && action === "wait") {
+      await this.handleWait(req, res, provider!);
+      return true;
+    }
+    res.writeHead(404).end();
+    return true;
+  }
+
+  private async handleStart(req: IncomingMessage, res: ServerResponse, provider: string): Promise<void> {
+    if (!this.supports(provider)) {
+      this.unsupported(res, provider);
+      return;
+    }
+    const body = await parseJsonBody(req);
+    if (!body || typeof (body as { subject?: unknown }).subject !== "string") {
+      sendJson(res, 400, { error: "Request body must be JSON with a string `subject` field" });
+      return;
+    }
+    const { subject } = body as { subject: string };
+
+    const rawFlow = (body as { flow?: unknown }).flow;
+    if (rawFlow !== undefined && rawFlow !== "device" && rawFlow !== "authcode") {
+      sendJson(res, 400, { error: '`flow` must be "device" or "authcode" if present' });
+      return;
+    }
+    // This API-layer default ("device") is intentionally independent of
+    // whatever default agent-orchestrator itself applies -- this API has no
+    // opinion about caller context.
+    const flow = rawFlow ?? "device";
+
+    const authCode = this.authCodeLinkers.get(provider);
+    if (authCode) {
+      // An authcode provider has exactly one flow, so an explicit `device`
+      // request is a caller error rather than something to silently
+      // reinterpret as the flow it happens to support.
+      if (rawFlow === "device") {
+        sendJson(res, 400, { error: `${provider} supports the authcode flow only` });
+        return;
+      }
+      // Stamp the `flow` discriminator, like the device branch below. The
+      // IdentityLinkAuthCodeStart type declares it, and a strict client (the
+      // Temporal engine's Go client) rejects a start response without it — which
+      // silently broke KB account-linking on that engine.
+      sendJson(res, 200, { flow: "authcode", ...authCode.startAuthCode(subject) });
+      return;
+    }
+
+    if (flow === "authcode") {
+      // The generic linker's startAuthCode already carries `flow`; only the
+      // per-provider authCode.startAuthCode above omitted it.
+      const started = await this.linker.startAuthCode(subject);
+      sendJson(res, 200, started);
+      return;
+    }
+    const started = await this.linker.start(subject);
+    sendJson(res, 200, { flow: "device", ...started });
+  }
+
+  private async handlePoll(req: IncomingMessage, res: ServerResponse, provider: string): Promise<void> {
+    if (!this.supports(provider)) {
+      this.unsupported(res, provider);
+      return;
+    }
+    const body = await parseJsonBody(req);
+    if (
+      !body ||
+      typeof (body as { subject?: unknown }).subject !== "string" ||
+      typeof (body as { deviceCode?: unknown }).deviceCode !== "string"
+    ) {
+      sendJson(res, 400, { error: "Request body must be JSON with string `subject` and `deviceCode` fields" });
+      return;
+    }
+    const { subject, deviceCode } = body as { subject: string; deviceCode: string };
+    if (this.authCodeLinkers.has(provider)) {
+      // Polling is the device flow's mechanism. An authcode link completes at
+      // the callback and is awaited through `wait`.
+      sendJson(res, 400, { error: `${provider} does not use the device flow; poll does not apply` });
+      return;
+    }
+    const polled = await this.linker.poll(subject, deviceCode);
+    sendJson(res, 200, polled);
+  }
+
+  /**
+   * Long-held route: blocks (up to `timeoutMs`, capped at `MAX_WAIT_MS`)
+   * until a token lands for `subject`, letting agent-orchestrator hold a
+   * streaming chat turn open across the OAuth browser round-trip instead of
+   * requiring the caller to send a follow-up chat message.
+   */
+  private async handleWait(req: IncomingMessage, res: ServerResponse, provider: string): Promise<void> {
+    if (!this.supports(provider)) {
+      this.unsupported(res, provider);
+      return;
+    }
+    const body = await parseJsonBody(req);
+    if (!body || typeof (body as { subject?: unknown }).subject !== "string") {
+      sendJson(res, 400, { error: "Request body must be JSON with a string `subject` field" });
+      return;
+    }
+    const { subject } = body as { subject: string };
+    const rawTimeout = (body as { timeoutMs?: unknown }).timeoutMs;
+    const timeoutMs = typeof rawTimeout === "number" && rawTimeout > 0 ? Math.min(rawTimeout, MAX_WAIT_MS) : MAX_WAIT_MS;
+
+    const authCode = this.authCodeLinkers.get(provider);
+    if (authCode) {
+      const landed = await authCode.waitForCompletion(subject, timeoutMs);
+      sendJson(res, 200, landed ? { status: "complete", token: { token: landed.token } } : { status: "timeout" });
+      return;
+    }
+
+    const token = await this.linker.waitForCompletion(subject, timeoutMs);
+    if (!token) {
+      sendJson(res, 200, { status: "timeout" });
+      return;
+    }
+    sendJson(res, 200, { status: "complete", token: { token: token.token, githubLogin: token.githubLogin } });
+  }
+
+  /**
+   * WHO a subject has linked, without requiring that link's access token to
+   * still be usable -- the login only, never a credential.
+   *
+   * Distinct from `token` below because the questions are distinct
+   * (docs/adr/0031): the orchestrator resolves a caller's principal from the
+   * account they proved control of, and an access token that expired overnight
+   * does not unprove it. Answering that question with `getValidToken` made an
+   * expired link read as "no GitHub identity", so the orchestrator re-prompted
+   * for a link it already had, on every turn -- while `wait` resolved the same
+   * login moments later, because it reads the stored record raw.
+   *
+   * 404 means "nothing linked", the same shape `token` uses for it.
+   */
+  private async handleIdentity(res: ServerResponse, url: URL, provider: string): Promise<void> {
+    if (!this.supports(provider)) {
+      this.unsupported(res, provider);
+      return;
+    }
+    const subject = url.searchParams.get("subject");
+    if (!subject) {
+      sendJson(res, 400, { error: "Query parameter `subject` is required" });
+      return;
+    }
+    const authCode = this.authCodeLinkers.get(provider);
+    if (authCode) {
+      // A non-GitHub provider has no login to report; its own account id is
+      // the equivalent answer, and is provenance only — nothing keys on it
+      // (docs/adr/0029).
+      const accountId = await authCode.getLinkedAccountId(subject);
+      if (!accountId) {
+        res.writeHead(404).end();
+        return;
+      }
+      sendJson(res, 200, { accountId });
+      return;
+    }
+
+    const githubLogin = await this.linker.getLinkedLogin(subject);
+    if (!githubLogin) {
+      res.writeHead(404).end();
+      return;
+    }
+    sendJson(res, 200, { githubLogin });
+  }
+
+  private async handleToken(res: ServerResponse, url: URL, provider: string): Promise<void> {
+    if (!this.supports(provider)) {
+      this.unsupported(res, provider);
+      return;
+    }
+    const subject = url.searchParams.get("subject");
+    if (!subject) {
+      sendJson(res, 400, { error: "Query parameter `subject` is required" });
+      return;
+    }
+    const authCode = this.authCodeLinkers.get(provider);
+    const token = authCode
+      ? await authCode.getValidToken(subject)
+      : await this.linker.getValidToken(subject);
+    if (!token) {
+      res.writeHead(404).end();
+      return;
+    }
+    sendJson(res, 200, token);
+  }
+}
+
+async function parseJsonBody(req: IncomingMessage): Promise<unknown> {
+  const raw = await readBody(req);
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+}

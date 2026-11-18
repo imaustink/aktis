@@ -9,14 +9,14 @@ import { kubectl, kubectlJson, waitFor, NAMESPACE } from "./k8s.js";
  * this is asserting on recovery, and should say so.
  */
 
-/** Pacing knobs on the stub Agent CR — see apps/stub-agent/src/pacing.ts. */
+/** Pacing knobs on the stub Agent CR — see catalog/agents/stub-agent/src/pacing.ts. */
 export interface StubPacing {
   narrateForMs?: number;
   narrateEveryMs?: number;
   silentForMs?: number;
   /**
    * How often the runtime RE-OFFERS a concluding reply nobody has acked yet
-   * (`AGENT_REPLY_ACK_RETRY_MS`, packages/agent-runtime). Production default is
+   * (`AGENT_REPLY_ACK_RETRY_MS`, framework/agent-runtime). Production default is
    * 10s, which is a sensible cadence for a real run and too slow for a spec that
    * has to observe a recovery inside the gateway's poll budget.
    *
@@ -181,6 +181,21 @@ export async function rollOrchestrator(): Promise<void> {
   // receives SIGTERM as soon as the restart is recorded, which is the moment
   // that matters for an in-flight turn.
   await kubectl(["rollout", "status", "deploy/agent-orchestrator", "--timeout=300s"]);
+}
+
+/**
+ * Rolls the integration-gateway Deployment and waits for the rollout to
+ * complete.
+ *
+ * This is the disruption the DURABLE label self-heal has to survive: the
+ * gateway holds its label-removal `finally` in-process for the whole turn, so a
+ * pod rolled (or OOM-killed) mid-turn loses it and strands the trigger label.
+ * The replacement's startup sweep + periodic reconciler
+ * (orchestrator/apps/integration-gateway/src/label-reconciler.ts) is what removes it anyway.
+ */
+export async function rollGateway(): Promise<void> {
+  await kubectl(["rollout", "restart", "deploy/agent-controller-integration-gateway"]);
+  await kubectl(["rollout", "status", "deploy/agent-controller-integration-gateway", "--timeout=300s"]);
 }
 
 /**

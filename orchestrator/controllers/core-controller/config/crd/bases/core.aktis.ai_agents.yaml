@@ -1,0 +1,558 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: agents.core.aktis.ai
+spec:
+  group: core.aktis.ai
+  names:
+    kind: Agent
+    listKind: AgentList
+    plural: agents
+    singular: agent
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Agent is the Schema for the agents API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of Agent
+            properties:
+              agentPrompt:
+                description: |-
+                  agentPrompt is the system prompt the SUB-AGENT's own internal loop runs
+                  with (loaded by the agent process itself, not the orchestrator). Defines
+                  the agent's persona, method, and constraints. Optional: absent -> the
+                  agent image's built-in default prompt applies.
+                type: string
+              allowedIdentities:
+                description: |-
+                  allowedIdentities restricts which modes an EventTrigger's
+                  target.identity may select for this agent. Unset allows all three.
+                  Setting it lets an agent author forbid, e.g., a trigger downgrading a
+                  delegated agent to agent mode, which would widen what it can reach.
+                items:
+                  description: |-
+                    IdentityMode is the identity an agent run acts as on the external systems
+                    its resource providers reach (docs/adr/0049).
+                  enum:
+                  - agent
+                  - delegated
+                  - hybrid
+                  type: string
+                maxItems: 3
+                type: array
+                x-kubernetes-list-type: set
+              allowedRoles:
+                description: allowedRoles gates RAG retrieval (RBAC filter), same
+                  semantics as Tool.
+                items:
+                  type: string
+                minItems: 1
+                type: array
+              approvalDefault:
+                description: |-
+                  approvalDefault is the fallback tool-approval policy (ADR 0003) for tools
+                  this agent calls that do not set their own `approval`. "never" (and the
+                  empty default) runs tools silently; "always" requires human approval;
+                  "auto" consults an optional evaluator. A tool's own `approval` always wins
+                  over this default (most-specific-wins).
+                enum:
+                - never
+                - always
+                - auto
+                type: string
+              approvalTimeoutSeconds:
+                description: |-
+                  approvalTimeoutSeconds bounds how long this agent's tool calls wait for a
+                  human approval decision (ADR 0003) before degrading gracefully — a timed-out
+                  approval becomes a failed tool result the agent reasons over, never a hang.
+                  Zero (unset) uses the engine default (15 minutes).
+                format: int32
+                minimum: 1
+                type: integer
+              defaultIdentity:
+                description: |-
+                  defaultIdentity is the identity this agent acts as on the systems its
+                  resource providers (e.g. "github") reach (docs/adr/0049):
+                    - agent: the agent's own credential (e.g. the GitHub App) for reads
+                      and writes; the caller needs no provider link.
+                    - delegated: the caller's own linked credential for reads and writes.
+                    - hybrid: the caller's credential for reads, the agent's for writes
+                      (docs/adr/0041).
+                  Runtime providers (the model credential: "claude", "claude-remote")
+                  resolve the same way in every mode. Unset infers the pre-0049
+                  behaviour: hybrid when "github" is declared, agent otherwise. An
+                  EventTrigger's target.identity may override it within
+                  allowedIdentities. Honoured by the Temporal engine only; the LangGraph
+                  engine refuses a launch that sets it.
+                enum:
+                - agent
+                - delegated
+                - hybrid
+                type: string
+              description:
+                description: description is fed to the orchestrator's embedder for
+                  RAG retrieval.
+                minLength: 1
+                type: string
+              env:
+                description: env are static, non-secret environment variables for
+                  the Job container.
+                items:
+                  description: |-
+                    EnvVar is a plain name/value pair injected into the tool's Job container.
+                    Values that must come from Secrets belong on `secretEnv` below (or the
+                    ToolRun's callback secretRef) — never a literal here.
+                  properties:
+                    name:
+                      description: name of the environment variable.
+                      type: string
+                    value:
+                      description: value of the environment variable.
+                      type: string
+                  required:
+                  - name
+                  - value
+                  type: object
+                type: array
+              identityProviders:
+                description: |-
+                  identityProviders declares which external identity providers (e.g.
+                  "github") must be linked for the calling user before this Agent can be
+                  launched. This controller does not consume the field itself — it is
+                  read by the agent-orchestrator when deciding whether/how to launch an
+                  AgentRun for a given user (e.g. resolving and injecting a per-user
+                  token via AgentRunSpec.SecretEnv) — but it belongs on the CRD as the
+                  source of truth an operator deploys alongside the rest of the Agent
+                  catalog entry.
+                items:
+                  type: string
+                type: array
+              image:
+                description: |-
+                  image is the agent-loop container the AgentRun controller launches as a
+                  Job (e.g. the agent-orchestrator image running in scoped sub-agent mode).
+                type: string
+              initContainers:
+                description: |-
+                  initContainers are Job pod init containers run before the main "run"
+                  container starts (e.g. to seed a shared /tmp volume with a credential
+                  file a later phase's controller needs). Each gets the same tmp
+                  emptyDir mount the main container has, at /tmp, automatically -- no
+                  volume config needed on this struct itself.
+                items:
+                  description: |-
+                    InitContainer is a narrow, opt-in Job pod init container run before the
+                    main "run" container starts. Kept deliberately minimal (name/image/
+                    command/args/env) rather than importing corev1.Container wholesale --
+                    same narrow-mirror convention as EnvVar/SecretEnvVar/ResourceRequirements
+                    above. Always gets the same "tmp" emptyDir mounted at /tmp as the main
+                    container (buildRunJob wires the VolumeMount; there is nothing to
+                    configure here), so an init container can write into the same path the
+                    main container's HOME lives under (e.g. seeding a credentials file).
+                  properties:
+                    args:
+                      description: args are passed to the entrypoint/command.
+                      items:
+                        type: string
+                      type: array
+                    command:
+                      description: command overrides the image's entrypoint, if set.
+                      items:
+                        type: string
+                      type: array
+                    env:
+                      description: env are static, non-secret environment variables
+                        for the init container.
+                      items:
+                        description: |-
+                          EnvVar is a plain name/value pair injected into the tool's Job container.
+                          Values that must come from Secrets belong on `secretEnv` below (or the
+                          ToolRun's callback secretRef) — never a literal here.
+                        properties:
+                          name:
+                            description: name of the environment variable.
+                            type: string
+                          value:
+                            description: value of the environment variable.
+                            type: string
+                        required:
+                        - name
+                        - value
+                        type: object
+                      type: array
+                    image:
+                      description: image the init container runs.
+                      type: string
+                    name:
+                      description: name of the init container.
+                      type: string
+                    secretEnv:
+                      description: |-
+                        secretEnv are environment variables sourced from Secret keys (same
+                        namespace), resolved via secretKeyRef at Job-build time — same
+                        discipline as AgentSpec.SecretEnv.
+                      items:
+                        description: |-
+                          SecretEnvVar names a Job container environment variable whose value comes
+                          from a Secret key in the SAME namespace as the Tool/ToolRun, resolved via
+                          corev1.EnvVarSource.SecretKeyRef at Job-build time. Only the reference
+                          (secret name + key) lives in the Tool spec — never the secret value
+                          itself, same discipline as ToolRunCallback.SecretRef for the callback
+                          HMAC secret. Needed because ordinary tool containers (e.g. recipe-scraper's
+                          OPENAI_API_KEY, recipe-publisher's GITHUB_TOKEN) require real secrets that
+                          `env` (non-secret, catalog metadata) cannot carry.
+                        properties:
+                          name:
+                            description: name of the environment variable to set in
+                              the tool's Job container.
+                            type: string
+                          secretRef:
+                            description: secretRef selects the Secret key providing
+                              the value.
+                            properties:
+                              key:
+                                description: key within the Secret's data.
+                                type: string
+                              name:
+                                description: name of the Secret.
+                                type: string
+                            required:
+                            - key
+                            - name
+                            type: object
+                        required:
+                        - name
+                        - secretRef
+                        type: object
+                      type: array
+                  required:
+                  - image
+                  - name
+                  type: object
+                type: array
+              input:
+                description: input describes the goal contract this agent expects,
+                  in plain language.
+                type: string
+              maxIterations:
+                description: maxIterations bounds the agent's internal loop as a cost/runaway
+                  guard.
+                format: int32
+                minimum: 1
+                type: integer
+              model:
+                description: |-
+                  model is the LLM model id the agent loop should use (advisory; the
+                  agent image decides how to interpret it).
+                type: string
+              observability:
+                description: observability tunes this agent's traces (docs/adr/0050).
+                  Optional.
+                properties:
+                  capture:
+                    default: metadata
+                    description: |-
+                      capture opts this agent's runs in to recording prompt and output text
+                      on their traces ("content"), up to the deployment's ceiling. Default
+                      "metadata": structure, timing, model and token counts, no text. A run
+                      that acts with a caller's credentials (delegated/hybrid) or can reach a
+                      knowledge base or MCP tool is always metadata, whatever this says.
+                    enum:
+                    - metadata
+                    - content
+                    type: string
+                type: object
+              orchestratorPrompt:
+                description: |-
+                  orchestratorPrompt is guidance injected into the PARENT orchestrator's
+                  planner when this agent is a retrieval candidate — how and when to
+                  delegate to it, what to pass as the goal, how to interpret its replies.
+                  It shapes the orchestrator's behavior, NOT the sub-agent's own loop
+                  (that's agentPrompt below). Trusted, catalog-authored (same trust model
+                  as a Skill's markdown). Optional: absent -> the orchestrator relies on
+                  description/input/output alone.
+                type: string
+              output:
+                description: output describes the final response shape the agent reports.
+                type: string
+              resources:
+                description: resources are the Job container's compute resource requirements.
+                properties:
+                  limits:
+                    additionalProperties:
+                      type: string
+                    type: object
+                  requests:
+                    additionalProperties:
+                      type: string
+                    type: object
+                type: object
+              runtimeClassName:
+                description: |-
+                  runtimeClassName selects the container runtime this Agent's pod runs
+                  under -- a sandboxed runtime such as gVisor (`runsc`) or Kata, named by
+                  a RuntimeClass the operator has installed. Passed through to the pod
+                  spec verbatim; this controller does not interpret it, validate that the
+                  class exists, or have an opinion about which isolation technology is
+                  right for a cluster (ADR 0052).
+
+                  Three states, following corev1.PodSpec.RuntimeClassName:
+                    - unset (nil): inherit AGENT_DEFAULT_RUNTIME_CLASS, if the operator set one
+                    - "": explicitly the cluster's default runtime, overriding that default
+                    - "<name>": that RuntimeClass
+
+                  An Agent runs model-directed code and is the workload most worth
+                  isolating, so a cluster-wide default is usually the right control and
+                  this field the exception -- for an agent whose tooling does not survive
+                  a sandboxed runtime.
+                type: string
+              secretEnv:
+                description: |-
+                  secretEnv are environment variables sourced from Secret keys (same
+                  namespace), resolved via secretKeyRef at Job-build time — same
+                  discipline as ToolSpec.SecretEnv (never a literal secret in the CR).
+                items:
+                  description: |-
+                    SecretEnvVar names a Job container environment variable whose value comes
+                    from a Secret key in the SAME namespace as the Tool/ToolRun, resolved via
+                    corev1.EnvVarSource.SecretKeyRef at Job-build time. Only the reference
+                    (secret name + key) lives in the Tool spec — never the secret value
+                    itself, same discipline as ToolRunCallback.SecretRef for the callback
+                    HMAC secret. Needed because ordinary tool containers (e.g. recipe-scraper's
+                    OPENAI_API_KEY, recipe-publisher's GITHUB_TOKEN) require real secrets that
+                    `env` (non-secret, catalog metadata) cannot carry.
+                  properties:
+                    name:
+                      description: name of the environment variable to set in the
+                        tool's Job container.
+                      type: string
+                    secretRef:
+                      description: secretRef selects the Secret key providing the
+                        value.
+                      properties:
+                        key:
+                          description: key within the Secret's data.
+                          type: string
+                        name:
+                          description: name of the Secret.
+                          type: string
+                      required:
+                      - key
+                      - name
+                      type: object
+                  required:
+                  - name
+                  - secretRef
+                  type: object
+                type: array
+              serviceAccountName:
+                description: serviceAccountName the Job pod runs as. Must already
+                  exist in-cluster.
+                type: string
+              skillRefs:
+                description: |-
+                  skillRefs are the names of Skill CRs this agent may load into its own
+                  loop (same trust model as the parent orchestrator's skill layer).
+                items:
+                  type: string
+                type: array
+              skills:
+                description: |-
+                  skills are file-based skill bundles (e.g. a Claude Code skill: a
+                  SKILL.md plus any files it references) mounted read-only into the run
+                  container, each from its own ConfigMap, at
+                  /etc/aktis/skills/<name>/ -- the run container's AKTIS_SKILLS_DIR env
+                  points at the parent directory (docs/adr/0051). The agent image decides
+                  what to do with them (claude-code-swe-agent copies them into
+                  ~/.claude/skills at startup).
+
+                  Not to be confused with skillRefs: those name platform Skill CRs --
+                  planner prompt material plus toolRefs/agentRefs, resolved by the
+                  orchestrator. These are opaque files handed to the agent's own engine.
+                items:
+                  description: |-
+                    AgentSkill is one file-based skill bundle mounted into an agent's run pod
+                    from a ConfigMap in the Agent's namespace (see AgentSpec.Skills).
+                  properties:
+                    configMapName:
+                      description: |-
+                        configMapName is the ConfigMap (same namespace as the run) holding the
+                        skill's files.
+                      minLength: 1
+                      type: string
+                    files:
+                      description: |-
+                        files maps ConfigMap keys to paths within the skill's directory.
+                        ConfigMap keys can't contain "/", so a skill with nested files (e.g.
+                        references/api.md) lists them here; same semantics as a configMap
+                        volume's items. When empty, every key is projected flat under its own
+                        name -- enough for a skill that is a lone SKILL.md.
+                      items:
+                        description: |-
+                          SkillFile maps one ConfigMap key to a relative path inside a skill's
+                          mounted directory -- a narrow mirror of corev1.KeyToPath.
+                        properties:
+                          key:
+                            description: key in the ConfigMap's data or binaryData.
+                            minLength: 1
+                            type: string
+                          path:
+                            description: |-
+                              path, relative to the skill's directory, the key is projected at. May
+                              not be absolute or contain "..".
+                            minLength: 1
+                            pattern: ^[^/]
+                            type: string
+                        required:
+                        - key
+                        - path
+                        type: object
+                      type: array
+                    name:
+                      description: |-
+                        name is the skill's directory name under AKTIS_SKILLS_DIR, and so
+                        (for Claude Code) its `/<name>` slash command.
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                  required:
+                  - configMapName
+                  - name
+                  type: object
+                maxItems: 64
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              tier:
+                description: tier is an operator-defined cost/trust classification.
+                type: string
+              toolRefs:
+                description: |-
+                  toolRefs are the names of Tool CRs this agent's OWN internal loop may
+                  call at run time — mirrors Skill.spec.toolRefs, but scopes the
+                  sub-agent's callable set instead of the parent orchestrator's planner.
+                  Dispatched via the tool_call/tool_result protocol pair
+                  (@aktis/agent-runtime's AgentSession.callTool()), re-validated
+                  against this list by the orchestrator at call time — like skillRefs,
+                  this CRD-level check is a static-config sanity check, not the
+                  authorization boundary itself (docs/adr/0028).
+                items:
+                  type: string
+                type: array
+            required:
+            - allowedRoles
+            - description
+            - image
+            - input
+            - output
+            - serviceAccountName
+            type: object
+            x-kubernetes-validations:
+            - message: defaultIdentity must be one of allowedIdentities
+              rule: '!has(self.defaultIdentity) || !has(self.allowedIdentities) ||
+                self.defaultIdentity in self.allowedIdentities'
+          status:
+            description: status defines the observed state of Agent
+            properties:
+              conditions:
+                description: |-
+                  conditions represent the current state of the Agent resource.
+                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
+
+                  Standard condition types include:
+                  - "Available": the resource is fully functional
+                  - "Progressing": the resource is being created or updated
+                  - "Degraded": the resource failed to reach or maintain its desired state
+
+                  The status of each condition is one of True, False, or Unknown.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

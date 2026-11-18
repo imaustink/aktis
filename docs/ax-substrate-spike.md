@@ -196,13 +196,16 @@ Implemented on this branch, against agent-sandbox **v1.0.4** on kind:
 | `internal/sandboxapi/types.go` | Minimal mirror of `agents.x-k8s.io/v1beta1` Sandbox (see the package doc for why it is a mirror rather than the real dependency) |
 | `internal/controller/run_sandbox.go` | `buildRunSandbox`, `sandboxPhase`, and the backend resolver |
 | `internal/controller/run_job.go` | `buildRunPodSpec` extracted so both backends build the *same* pod |
-| `internal/controller/toolrun_controller.go` | `createWorkload` dispatches on backend; `syncSandboxStatus` mirrors conditions |
-| `api/v1alpha1/toolrun_types.go` | `status.executionBackend`, recorded at creation |
+| `internal/controller/toolrun_controller.go`, `agentrun_controller.go` | `createWorkload` dispatches on backend; `syncSandboxStatus` mirrors conditions through the shared `observeSandbox` |
+| `api/v1alpha1/toolrun_types.go`, `agentrun_types.go` | `status.executionBackend`, recorded at creation |
 | `scripts/sandbox-backend-demo.sh` | The five-act demo |
 
+Paths are under `orchestrator/controllers/core-controller/`.
+
 Selecting a backend, most specific first: a
-`core.controller-agent.dev/execution-backend` annotation on the ToolRun, then
-the same annotation on the Tool, then `AGENT_EXECUTION_BACKEND`. **Anything
+`core.aktis.ai/execution-backend` annotation on the ToolRun or AgentRun, then
+the same annotation on its Tool or Agent, then `AGENT_EXECUTION_BACKEND` (the
+chart's `core-controller.runJob.executionBackend`). **Anything
 unrecognised means Job**, so a typo cannot silently move production onto the
 experimental path. Nothing changes for existing runs: the default is Job, and
 `make test` passes unmodified.
@@ -284,9 +287,17 @@ it for parked turns — has to get this ordering right.
    an assumption; check ARM support against the node hardware; expect a
    performance cost on syscall-heavy work. Kata is the stronger boundary but
    wants nested virtualization, which homelab hardware often lacks.
-2. **`AgentRun`.** Only `ToolRun` has the backend switch. AgentRun is the case
-   that actually wants suspend/resume (ADR 0033), and it is a larger change
-   because of the NATS bridge in `engines/temporal/internal/agentrun`.
+2. **`AgentRun` suspend/resume.** AgentRun now has the same backend switch as
+   ToolRun: an agent (sub-agent delegation included) runs as a Sandbox with the
+   pod the Job backend would have built -- init containers, skill mounts and
+   per-run `secretEnv` included -- and a failed one records its pod's reason
+   (`OOMKilled`, ...) the way a failed Job does. That needed nothing in either
+   engine: both follow a run through `AgentRun.status` and the NATS bridge,
+   never through the Job. What is still missing is the part AgentRun actually
+   wants a Sandbox for (ADR 0033): nothing suspends a parked agent yet, and the
+   agent's working state lives in an `emptyDir`, which a suspend discards, so a
+   resumed agent would restart from nothing until the workspace is a
+   `volumeClaimTemplate`. Unit-tested only; not yet run on a cluster.
 3. **`SandboxWarmPool`** — untouched, no Job equivalent at any price, and per
    the comparison above the strongest single reason to adopt any of this. If
    only one more thing gets proved, it should be warm-pool provisioning latency
