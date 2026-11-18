@@ -39,7 +39,7 @@ set -uo pipefail
 # --- configuration (env-overridable, defaults match the deploy job) ----------
 NAMESPACE="${NAMESPACE:-controller-agent}"
 # Long-running Deployments restarted by the deploy job's "Rollout restart" step.
-DEPLOYMENTS="${DEPLOYMENTS:-agent-orchestrator core-controller agent-controller-integration-gateway}"
+DEPLOYMENTS="${DEPLOYMENTS:-agent-orchestrator core-controller agent-controller-integration-gateway agent-controller-temporal-engine-worker agent-controller-temporal-engine-gateway agent-controller-temporal-engine-catalog-sync}"
 
 UPGRADE_AGENT_OUTCOME="${UPGRADE_AGENT_OUTCOME:-}"
 UPGRADE_COMMUNITY_OUTCOME="${UPGRADE_COMMUNITY_OUTCOME:-}"

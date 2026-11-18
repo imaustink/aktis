@@ -91,7 +91,12 @@ fi
 install_new_crds() {
   echo "── Installing $NEW_GROUP CRDs from $CRD_DIR"
   [[ -d "$CRD_DIR" ]] || { echo "✗ $CRD_DIR not found; run from a checkout of the new version" >&2; exit 1; }
-  run kubectl apply --server-side --field-manager="$FIELD_MANAGER" -f "$CRD_DIR"
+  # --force-conflicts: these CRDs may already exist under another field manager
+  # (release.yml's "Apply CRDs" step writes them as "kubectl" on every deploy,
+  # including one that then failed). Once the schema has moved on, a plain
+  # server-side apply stops on the conflict before anything is copied. Every
+  # writer applies the same generated files, so there is nothing to lose.
+  run kubectl apply --server-side --force-conflicts --field-manager="$FIELD_MANAGER" -f "$CRD_DIR"
   if ! $DRY_RUN; then
     for plural in "${AUTHORED[@]}" "${RUNTIME[@]}"; do
       kubectl wait --for=condition=Established --timeout=60s "crd/$plural.$NEW_GROUP" >/dev/null

@@ -616,8 +616,11 @@ jobs:
       - name: Rollout restart
         id: rollout
         run: |
-          kubectl rollout restart deploy/agent-orchestrator deploy/core-controller deploy/agent-controller-integration-gateway -n controller-agent
-          kubectl rollout status deploy/agent-orchestrator deploy/core-controller deploy/agent-controller-integration-gateway -n controller-agent --timeout=5m
+          DEPLOYS="deploy/agent-orchestrator deploy/core-controller deploy/agent-controller-integration-gateway \
+            deploy/agent-controller-temporal-engine-worker deploy/agent-controller-temporal-engine-gateway \
+            deploy/agent-controller-temporal-engine-catalog-sync"
+          kubectl rollout restart $DEPLOYS -n controller-agent
+          kubectl rollout status $DEPLOYS -n controller-agent --timeout=5m
 
       # If any deploy step above failed, roll the affected workloads back to
       # their previous working revision and open an `ai-triage` ticket with the
