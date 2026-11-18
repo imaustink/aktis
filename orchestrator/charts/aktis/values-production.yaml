@@ -334,6 +334,15 @@ core-controller:
   imagePullSecrets:
     - name: docker-registry-credentials
 
+  # The Aktis rename migration is finished on this cluster (migrate-to-aktis.sh
+  # copy + cleanup, 2026-11-18), so the hook has nothing left to do. It also
+  # cannot stay on: it ships a ClusterRole and ClusterRoleBinding
+  # (core-controller-migrate-aktis), and the CI deployer may only touch the
+  # one named "core-controller". With it enabled every deploy fails on
+  # `cannot get resource "clusterroles"` before changing anything.
+  migrateAktis:
+    enabled: false
+
 # GitHub Issues adapter (phase 1 of the integrations-gateway proposal) —
 # relays GitHub issue/comment webhooks into agent-orchestrator's existing
 # conversational /invoke API, one session per issue.
