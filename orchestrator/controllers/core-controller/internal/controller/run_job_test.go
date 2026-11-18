@@ -19,6 +19,8 @@ package controller
 import (
 	"testing"
 
+	batchv1 "k8s.io/api/batch/v1"
+
 	toolv1alpha1 "github.com/aktisai/orchestrator/controllers/core-controller/api/v1alpha1"
 )
 
@@ -65,6 +67,103 @@ func TestBuildRunJobAnnotations(t *testing.T) {
 	}
 	if job.Spec.Template.Annotations[SessionIDAnnotation] != "chat-42" {
 		t.Errorf("PodTemplateSpec.Annotations[%s] = %q, want %q", SessionIDAnnotation, job.Spec.Template.Annotations[SessionIDAnnotation], "chat-42")
+	}
+}
+
+// TestBuildRunJobSkills covers AgentSpec.Skills (docs/adr/0051): one
+// read-only ConfigMap volume per skill, mounted into the run container only,
+// plus AKTIS_SKILLS_DIR -- and none of it when no skills are configured.
+func TestBuildRunJobSkills(t *testing.T) {
+	base := runJobParams{
+		jobName:   "agentrun-abc",
+		namespace: "default",
+		image:     "example/agent:latest",
+		callback:  toolv1alpha1.ToolRunCallback{NatsSubject: "callbacks.abc"},
+		initContainers: []toolv1alpha1.InitContainer{
+			{Name: "seed", Image: "example/agent:latest"},
+		},
+	}
+	hasSkillsEnv := func(job *batchv1.Job) bool {
+		for _, e := range job.Spec.Template.Spec.Containers[0].Env {
+			if e.Name == "AKTIS_SKILLS_DIR" {
+				return e.Value == skillsMountDir
+			}
+		}
+		return false
+	}
+
+	t.Run("no skills leaves the pod as before", func(t *testing.T) {
+		job, err := buildRunJob(base)
+		if err != nil {
+			t.Fatalf("buildRunJob: %v", err)
+		}
+		pod := job.Spec.Template.Spec
+		if len(pod.Volumes) != 1 || len(pod.Containers[0].VolumeMounts) != 1 {
+			t.Errorf("volumes = %+v, mounts = %+v; want only tmp", pod.Volumes, pod.Containers[0].VolumeMounts)
+		}
+		if hasSkillsEnv(job) {
+			t.Error("AKTIS_SKILLS_DIR set without any skills")
+		}
+	})
+
+	t.Run("mounts each skill read-only with its file mappings", func(t *testing.T) {
+		p := base
+		p.skills = []toolv1alpha1.AgentSkill{
+			{Name: "tdd", ConfigMapName: "skill-tdd", Files: []toolv1alpha1.SkillFile{
+				{Key: "SKILL.md", Path: "SKILL.md"},
+				{Key: "agents__openai.yaml", Path: "agents/openai.yaml"},
+			}},
+			{Name: "implement", ConfigMapName: "skill-implement"},
+		}
+		job, err := buildRunJob(p)
+		if err != nil {
+			t.Fatalf("buildRunJob: %v", err)
+		}
+		pod := job.Spec.Template.Spec
+		if len(pod.Volumes) != 3 {
+			t.Fatalf("got %d volumes, want tmp + 2 skills", len(pod.Volumes))
+		}
+		tdd := pod.Volumes[1].ConfigMap
+		if tdd == nil || tdd.Name != "skill-tdd" || len(tdd.Items) != 2 || tdd.Items[1].Path != "agents/openai.yaml" {
+			t.Errorf("tdd volume = %+v", pod.Volumes[1])
+		}
+		if impl := pod.Volumes[2].ConfigMap; impl == nil || impl.Name != "skill-implement" || impl.Items != nil {
+			t.Errorf("implement volume = %+v", pod.Volumes[2])
+		}
+		mounts := pod.Containers[0].VolumeMounts
+		if len(mounts) != 3 {
+			t.Fatalf("run mounts = %+v", mounts)
+		}
+		if m := mounts[1]; m.Name != pod.Volumes[1].Name || m.MountPath != "/etc/aktis/skills/tdd" || !m.ReadOnly {
+			t.Errorf("tdd mount = %+v", m)
+		}
+		if m := mounts[2]; m.MountPath != "/etc/aktis/skills/implement" || !m.ReadOnly {
+			t.Errorf("implement mount = %+v", m)
+		}
+		if got := pod.InitContainers[0].VolumeMounts; len(got) != 1 {
+			t.Errorf("init container mounts = %+v, want only tmp", got)
+		}
+		if !hasSkillsEnv(job) {
+			t.Error("AKTIS_SKILLS_DIR not set on the run container")
+		}
+	})
+
+	for name, skills := range map[string][]toolv1alpha1.AgentSkill{
+		"duplicate name":     {{Name: "tdd", ConfigMapName: "a"}, {Name: "tdd", ConfigMapName: "b"}},
+		"path-like name":     {{Name: "../x", ConfigMapName: "a"}},
+		"missing configmap":  {{Name: "tdd"}},
+		"absolute file path": {{Name: "tdd", ConfigMapName: "a", Files: []toolv1alpha1.SkillFile{{Key: "k", Path: "/etc/passwd"}}}},
+		"parent dir segment": {{Name: "tdd", ConfigMapName: "a", Files: []toolv1alpha1.SkillFile{{Key: "k", Path: "refs/../../x"}}}},
+		"empty path segment": {{Name: "tdd", ConfigMapName: "a", Files: []toolv1alpha1.SkillFile{{Key: "k", Path: "refs//x"}}}},
+		"empty file key":     {{Name: "tdd", ConfigMapName: "a", Files: []toolv1alpha1.SkillFile{{Path: "x"}}}},
+	} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			p := base
+			p.skills = skills
+			if _, err := buildRunJob(p); err == nil {
+				t.Error("buildRunJob accepted invalid skills")
+			}
+		})
 	}
 }
 

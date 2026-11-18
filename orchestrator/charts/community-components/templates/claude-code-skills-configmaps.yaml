@@ -1,0 +1,20 @@
+{{- /*
+  One ConfigMap per vendored Claude Code skill in claudeCodeSweAgent.skills
+  (docs/adr/0051), mounted into the agent's run pod by the core-controller via
+  the Agent's spec.skills (agent-claude-code-swe.yaml).
+*/ -}}
+{{- if .Values.claudeCodeSweAgent.enabled }}
+{{- range $name := .Values.claudeCodeSweAgent.skills }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "claudeCodeSkills.configMapName" $name }}
+  labels:
+    {{- include "tools.labels" $ | nindent 4 }}
+data:
+  {{- range $file := include "claudeCodeSkills.files" (dict "Files" $.Files "name" $name) | fromJsonArray }}
+  {{ $file.key | quote }}: {{ $file.content | toJson }}
+  {{- end }}
+{{- end }}
+{{- end }}

@@ -32,7 +32,7 @@ import {
 } from "./identityDelegation.js";
 import { GH_READ_TOKEN_ENV, GH_WRITE_TOKEN_ENV, installGhShim } from "./ghShim.js";
 import { clip } from "./security/redact.js";
-import { listInstalledSkills, splitSkillInvocation } from "./skills.js";
+import { installMountedSkills, listInstalledSkills, splitSkillInvocation } from "./skills.js";
 
 const toolConfig = loadToolConfig();
 
@@ -56,6 +56,7 @@ async function handler(session: AgentSession): Promise<AgentReply> {
 
   await ensureDir(toolConfig.homeDir);
   await ensureDir(toolConfig.workdir);
+  await installMountedSkills(toolConfig.skillsSourceDir, toolConfig.homeDir);
   const installedSkills = await listInstalledSkills(toolConfig.homeDir);
 
   if (toolConfig.remoteControlEnabled) {

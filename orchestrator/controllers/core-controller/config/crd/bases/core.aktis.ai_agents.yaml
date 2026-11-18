@@ -360,6 +360,75 @@ spec:
                 items:
                   type: string
                 type: array
+              skills:
+                description: |-
+                  skills are file-based skill bundles (e.g. a Claude Code skill: a
+                  SKILL.md plus any files it references) mounted read-only into the run
+                  container, each from its own ConfigMap, at
+                  /etc/aktis/skills/<name>/ -- the run container's AKTIS_SKILLS_DIR env
+                  points at the parent directory (docs/adr/0051). The agent image decides
+                  what to do with them (claude-code-swe-agent copies them into
+                  ~/.claude/skills at startup).
+
+                  Not to be confused with skillRefs: those name platform Skill CRs --
+                  planner prompt material plus toolRefs/agentRefs, resolved by the
+                  orchestrator. These are opaque files handed to the agent's own engine.
+                items:
+                  description: |-
+                    AgentSkill is one file-based skill bundle mounted into an agent's run pod
+                    from a ConfigMap in the Agent's namespace (see AgentSpec.Skills).
+                  properties:
+                    configMapName:
+                      description: |-
+                        configMapName is the ConfigMap (same namespace as the run) holding the
+                        skill's files.
+                      minLength: 1
+                      type: string
+                    files:
+                      description: |-
+                        files maps ConfigMap keys to paths within the skill's directory.
+                        ConfigMap keys can't contain "/", so a skill with nested files (e.g.
+                        references/api.md) lists them here; same semantics as a configMap
+                        volume's items. When empty, every key is projected flat under its own
+                        name -- enough for a skill that is a lone SKILL.md.
+                      items:
+                        description: |-
+                          SkillFile maps one ConfigMap key to a relative path inside a skill's
+                          mounted directory -- a narrow mirror of corev1.KeyToPath.
+                        properties:
+                          key:
+                            description: key in the ConfigMap's data or binaryData.
+                            minLength: 1
+                            type: string
+                          path:
+                            description: |-
+                              path, relative to the skill's directory, the key is projected at. May
+                              not be absolute or contain "..".
+                            minLength: 1
+                            pattern: ^[^/]
+                            type: string
+                        required:
+                        - key
+                        - path
+                        type: object
+                      type: array
+                    name:
+                      description: |-
+                        name is the skill's directory name under AKTIS_SKILLS_DIR, and so
+                        (for Claude Code) its `/<name>` slash command.
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                  required:
+                  - configMapName
+                  - name
+                  type: object
+                maxItems: 64
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
               tier:
                 description: tier is an operator-defined cost/trust classification.
                 type: string

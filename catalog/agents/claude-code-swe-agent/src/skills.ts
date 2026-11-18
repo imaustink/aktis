@@ -1,11 +1,46 @@
-import { readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { cp, mkdir, readdir } from "node:fs/promises";
+import { basename, join } from "node:path";
 
 /**
- * Names of the Claude Code skills installed under `$HOME/.claude/skills`.
- * They're put there before this process starts, by the Agent CR's
- * `install-claude-skills` init container (see the community-components
- * chart's `claudeCodeSweAgent.skills`); a missing directory just means none.
+ * Copies the skills the core-controller mounted from the Agent CR's
+ * `spec.skills` (ADR 0051: one read-only ConfigMap directory per skill under
+ * `AKTIS_SKILLS_DIR`) into `$HOME/.claude/skills`, where the Claude Code CLI
+ * looks for user skills. Copied rather than mounted there directly: a mount
+ * nested in the tmp emptyDir would leave `~/.claude` root-owned and unwritable.
+ *
+ * A ConfigMap volume exposes each key as a symlink into a hidden `..data`
+ * directory (the kubelet's atomic-writer layout), so the copy dereferences
+ * links and skips the `..*` bookkeeping entries. Returns the names copied;
+ * an unset or missing source just means no skills were configured.
+ */
+export async function installMountedSkills(sourceDir: string, homeDir: string): Promise<string[]> {
+  if (!sourceDir) return [];
+  let entries;
+  try {
+    entries = await readdir(sourceDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const dest = join(homeDir, ".claude", "skills");
+  const installed: string[] = [];
+  for (const entry of entries) {
+    if (entry.name.startsWith(".") || !entry.isDirectory()) continue;
+    await mkdir(dest, { recursive: true });
+    await cp(join(sourceDir, entry.name), join(dest, entry.name), {
+      recursive: true,
+      dereference: true,
+      force: true,
+      filter: (src) => !basename(src).startsWith(".."),
+    });
+    installed.push(entry.name);
+  }
+  return installed;
+}
+
+/**
+ * Names of the Claude Code skills installed under `$HOME/.claude/skills`
+ * (by installMountedSkills above, or baked into the image); a missing
+ * directory just means none.
  */
 export async function listInstalledSkills(homeDir: string): Promise<string[]> {
   try {

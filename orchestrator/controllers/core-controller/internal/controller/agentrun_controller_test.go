@@ -251,6 +251,79 @@ var _ = Describe("AgentRun Controller", func() {
 			Expect(anthropicEnv.ValueFrom.SecretKeyRef.Name).To(Equal("opencode-swe-secrets"))
 			Expect(anthropicEnv.ValueFrom.SecretKeyRef.Key).To(Equal("ANTHROPIC_API_KEY"))
 		})
+
+		It("mounts the Agent's file-based skills into the run container (docs/adr/0051)", func() {
+			By("creating an Agent with spec.skills, through the real CRD schema")
+			skillsAgentName := fmt.Sprintf("%s-skills-agent", resourceName)
+			skillsAgent := &toolv1alpha1.Agent{
+				ObjectMeta: metav1.ObjectMeta{Name: skillsAgentName, Namespace: "default"},
+				Spec: toolv1alpha1.AgentSpec{
+					Description:        "skills test agent",
+					Input:              "a natural-language goal",
+					Output:             "a final response payload",
+					AllowedRoles:       []string{"writer"},
+					Image:              "example.com/agent-loop:latest",
+					ServiceAccountName: "agent-loop",
+					Skills: []toolv1alpha1.AgentSkill{{
+						Name:          "tdd",
+						ConfigMapName: "claude-code-skill-tdd",
+						Files: []toolv1alpha1.SkillFile{
+							{Key: "SKILL.md", Path: "SKILL.md"},
+							{Key: "agents__openai.yaml", Path: "agents/openai.yaml"},
+						},
+					}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, skillsAgent)).To(Succeed())
+			defer func() {
+				Expect(k8sClient.Delete(ctx, skillsAgent)).To(Succeed())
+			}()
+
+			By("rejecting a skill name that isn't a DNS label at admission")
+			bad := skillsAgent.DeepCopy()
+			bad.ObjectMeta = metav1.ObjectMeta{Name: skillsAgentName + "-bad", Namespace: "default"}
+			bad.Spec.Skills = []toolv1alpha1.AgentSkill{{Name: "../escape", ConfigMapName: "x"}}
+			Expect(k8sClient.Create(ctx, bad)).NotTo(Succeed())
+
+			skillsRunName := fmt.Sprintf("%s-skills-run", resourceName)
+			skillsRunKey := types.NamespacedName{Name: skillsRunName, Namespace: "default"}
+			skillsRun := &toolv1alpha1.AgentRun{
+				ObjectMeta: metav1.ObjectMeta{Name: skillsRunName, Namespace: "default"},
+				Spec: toolv1alpha1.AgentRunSpec{
+					AgentRef: skillsAgentName,
+					Goal:     "/tdd add a parser",
+					Callback: toolv1alpha1.ToolRunCallback{NatsSubject: "agent.callbacks." + skillsRunName},
+				},
+			}
+			Expect(k8sClient.Create(ctx, skillsRun)).To(Succeed())
+			defer func() {
+				Expect(k8sClient.Delete(ctx, skillsRun)).To(Succeed())
+			}()
+
+			controllerReconciler := &AgentRunReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: skillsRunKey})
+			Expect(err).NotTo(HaveOccurred())
+
+			var updated toolv1alpha1.AgentRun
+			Expect(k8sClient.Get(ctx, skillsRunKey, &updated)).To(Succeed())
+			Expect(updated.Status.JobName).NotTo(BeEmpty())
+			var job batchv1.Job
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: updated.Status.JobName, Namespace: "default"}, &job)).To(Succeed())
+
+			pod := job.Spec.Template.Spec
+			var skillVol *corev1.Volume
+			for i := range pod.Volumes {
+				if pod.Volumes[i].ConfigMap != nil && pod.Volumes[i].ConfigMap.Name == "claude-code-skill-tdd" {
+					skillVol = &pod.Volumes[i]
+				}
+			}
+			Expect(skillVol).NotTo(BeNil())
+			Expect(skillVol.ConfigMap.Items).To(ContainElement(corev1.KeyToPath{Key: "agents__openai.yaml", Path: "agents/openai.yaml"}))
+			Expect(pod.Containers[0].VolumeMounts).To(ContainElement(corev1.VolumeMount{
+				Name: skillVol.Name, MountPath: "/etc/aktis/skills/tdd", ReadOnly: true,
+			}))
+			Expect(pod.Containers[0].Env).To(ContainElement(corev1.EnvVar{Name: "AKTIS_SKILLS_DIR", Value: "/etc/aktis/skills"}))
+		})
 	})
 })
 

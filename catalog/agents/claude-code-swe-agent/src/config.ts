@@ -96,6 +96,12 @@ export interface AgentToolConfig {
    */
   homeDir: string;
   /**
+   * Where the core-controller mounted the Agent CR's `spec.skills` (one
+   * read-only directory per skill, ADR 0051); empty when none were
+   * configured. Copied into `$HOME/.claude/skills` at startup (./skills.ts).
+   */
+  skillsSourceDir: string;
+  /**
    * When true, run turns via `claude --bg --remote-control` (see
    * claude-runner.ts's `runClaudeTurnRemoteControlled`) instead of the default
    * one-shot `claude -p`. Requires a separate Go/Helm phase's init container
@@ -178,6 +184,7 @@ export function loadToolConfig(env: NodeJS.ProcessEnv = process.env): AgentToolC
     githubApiUrl: env.GITHUB_API_URL ?? "https://api.github.com",
     workdir: env.SWE_WORKDIR ?? `/tmp/swe-${randomUUID()}`,
     homeDir: env.SWE_HOME ?? "/tmp/home",
+    skillsSourceDir: env.AKTIS_SKILLS_DIR ?? "",
     remoteControlEnabled: env.CLAUDE_REMOTE_CONTROL === "true",
     remoteControlIdleTimeoutMs: positiveInt(env.CLAUDE_REMOTE_CONTROL_IDLE_TIMEOUT_MS),
     remoteControlIdleStatusGraceMs: positiveInt(env.CLAUDE_REMOTE_CONTROL_IDLE_STATUS_GRACE_MS),

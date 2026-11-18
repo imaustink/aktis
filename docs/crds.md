@@ -176,6 +176,7 @@ mirrors `Tool` so agents join the same RBAC-scoped retrieval
   - `agentPrompt` — the system prompt the **sub-agent's** own loop runs with.
   - `skillRefs` ([]string) — `Skill` CRs this agent may load.
   - `toolRefs` ([]string) — `Tool` CRs this agent's own loop may call ([ADR 0028](adr/0028-agent-tool-refs-sub-agent-tool-calls.md)).
+  - `skills` ([]`{name, configMapName, files[]}`) — file-based engine skills (e.g. Claude Code `SKILL.md` dirs), each a ConfigMap mounted read-only at `/etc/aktis/skills/<name>` in the run container (`AKTIS_SKILLS_DIR`). Not `Skill` CRs — see [ADR 0051](adr/0051-file-based-agent-skills.md).
   - `model` (advisory), `maxIterations`, `env` / `secretEnv` / `resources`, `initContainers`.
   - `identityProviders` ([]string) — providers this agent can use on the caller's behalf.
   - `defaultIdentity` (`agent` | `delegated` | `hybrid`) — whose credential the agent reads and writes with on its resource providers; unset infers `hybrid` when `github` is declared, else `agent`. `allowedIdentities` limits which modes an `EventTrigger` may override to; CEL requires `defaultIdentity ∈ allowedIdentities` ([ADR 0049](adr/0049-configurable-agent-identity-mode.md)). Temporal engine only.
