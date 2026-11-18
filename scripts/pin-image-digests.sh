@@ -33,6 +33,16 @@ IMAGES=(
   "integration-gateway integration-gateway"
 )
 
+# The Temporal engine's three Deployments (docs/adr/0036) sit one level down,
+# under the temporal-engine subchart: <component key> <image name under PREFIX>.
+# They must roll with agent-orchestrator, which speaks to the gateway on every
+# turn, so they are pinned in the same release.
+ENGINE_IMAGES=(
+  "worker temporal-engine-worker"
+  "gateway temporal-engine-gateway"
+  "catalogSync temporal-engine-catalog-sync"
+)
+
 ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json"
 
 digest_of() {
@@ -53,4 +63,12 @@ for entry in "${IMAGES[@]}"; do
   digest="$(digest_of "${PREFIX}/${image}" latest)"
   echo "${key}: ${REGISTRY}/${PREFIX}/${image}:latest@${digest}" >&2
   printf '%s:\n  image:\n    tag: "latest@%s"\n' "${key}" "${digest}" >> "${OUT}"
+done
+
+printf 'temporal-engine:\n' >> "${OUT}"
+for entry in "${ENGINE_IMAGES[@]}"; do
+  read -r key image <<<"${entry}"
+  digest="$(digest_of "${PREFIX}/${image}" latest)"
+  echo "temporal-engine.${key}: ${REGISTRY}/${PREFIX}/${image}:latest@${digest}" >&2
+  printf '  %s:\n    image:\n      tag: "latest@%s"\n' "${key}" "${digest}" >> "${OUT}"
 done

@@ -56,7 +56,9 @@ agent-orchestrator:
   #     --from-literal=IDENTITY_LINK_GATEWAY_TOKEN=<same value as
   #       integration-gateway-secrets' GATEWAY_IDENTITY_LINK_TOKEN below> \
   #     --from-literal=AGENT_SENDER_ASSERTION_SECRET=<same value as
-  #       integration-gateway-secrets' GATEWAY_SENDER_ASSERTION_SECRET below>
+  #       integration-gateway-secrets' GATEWAY_SENDER_ASSERTION_SECRET below> \
+  #     --from-literal=AGENT_TEMPORAL_ENGINE_TOKEN=<the token keyed in
+  #       temporal-engine-static-identities, see temporal-engine.gateway.identity>
   #   # (or `kubectl edit secret agent-orchestrator-secrets -n controller-agent`
   #   # / patch it if the Secret already exists)
   secrets:
@@ -85,16 +87,18 @@ agent-orchestrator:
     connectionsUrl: "https://gateway.kurpuis.com/connections"
 
   config:
-    # This cluster has no Temporal deployment at all (see temporal-engine.enabled
-    # below) -- clear the umbrella chart's own default of "temporal"
-    # (orchestrator/charts/aktis/values.yaml, docs/adr/0036's rollout default) so
-    # every turn runs the in-process LangGraph loop instead of being forwarded
-    # to a gateway Service backed by pods that were never buildable here.
-    # Helm deep-merges this `config` map key-by-key against that default, so
-    # omitting this key (rather than setting it) would silently inherit
-    # "temporal" -- which is exactly what had been happening.
-    agentEngine: ""
-    temporalEngineUrl: ""
+    # Every turn runs on the Temporal engine (docs/adr/0036): the orchestrator
+    # keeps /invoke, identity, RBAC and credentials, and forwards the agent loop
+    # to the temporal-engine gateway below. Both keys restate the umbrella
+    # chart's defaults on purpose, so the engine this cluster runs is readable
+    # here.
+    #
+    # TO ROLL BACK to the in-process LangGraph loop: set both to "". Helm
+    # deep-merges this map against the chart default, so deleting the keys
+    # would keep "temporal". temporal-engine.enabled can stay true; idle, it
+    # costs three small pods.
+    agentEngine: temporal
+    temporalEngineUrl: "http://agent-controller-temporal-engine-gateway:8080"
     # oidc against Pocket ID (kubernetes/manifests/services/pocket-id in
     # imaustink/homelab), not Google -- the 2026-07-19 outage was caused by
     # Google id_tokens: neither caller could present one (Open WebUI has no
@@ -208,17 +212,98 @@ agent-orchestrator:
   redis:
     enabled: true
 
-# No Temporal cluster exists in this environment (docs/adr/0036 "Assumes a
-# reachable Temporal cluster; no server is bundled") -- override the umbrella
-# chart's own default of enabled: true (orchestrator/charts/aktis/values.yaml)
-# so this release stops deploying the gateway/worker Deployments here. Without
-# this they run permanently in ImagePullBackOff (their image names have no
-# registry prefix, so containerd resolves them against Docker Hub, which has
-# never had them) while agent-orchestrator.config.agentEngine above still
-# forwarded every turn to the (nonexistent) gateway -- the underlying cause of
-# turns failing with a bare "fetch failed".
+# The Temporal agent engine (docs/adr/0036): worker, gateway and catalog-sync.
+# The Temporal server itself is not part of this release -- it is the
+# `temporal` Helm release in the `temporal` namespace, from imaustink/homelab's
+# kubernetes/helm/deployments/temporal. Install that first: without a reachable
+# frontend the worker and gateway crash-loop and every turn fails.
+#
+# Most of this block exists because the subchart's defaults assume names this
+# release does not use. Each one fails quietly rather than loudly, so none of
+# it is optional.
 temporal-engine:
-  enabled: false
+  enabled: true
+
+  temporal:
+    address: temporal-frontend.temporal.svc:7233
+    # The worker and gateway register this namespace on startup if it is missing.
+    namespace: default
+
+  # The subchart's image names have no registry, so containerd would look for
+  # them on Docker Hub. `Always` for the same reason as every other image here:
+  # `:latest` is mutable.
+  worker:
+    image:
+      repository: ghcr.io/imaustink/agent-controller/temporal-engine-worker
+      tag: latest
+      pullPolicy: Always
+  catalogSync:
+    image:
+      repository: ghcr.io/imaustink/agent-controller/temporal-engine-catalog-sync
+      tag: latest
+      pullPolicy: Always
+
+  # agent-orchestrator sets fullnameOverride, so its Secret is not the
+  # release-derived name the subchart defaults to. Same OPENAI_API_KEY and
+  # AGENT_CALLBACK_SECRET the orchestrator itself uses.
+  llm:
+    secretName: agent-orchestrator-secrets
+  callback:
+    secretName: agent-orchestrator-secrets
+
+  # The orchestrator's own Qdrant, over gRPC. Without a host the worker answers
+  # every turn conversationally and never reaches a tool, skill or agent. The
+  # prefix keeps the engine's collections apart from the orchestrator's, whose
+  # payload schemas differ.
+  qdrant:
+    host: agent-controller-qdrant
+    port: 6334
+    collectionPrefix: te-
+
+  # Same NATS as core-controller.nats.agentUrl above. Without it the worker
+  # cannot drive claude-code-swe-agent at all.
+  nats:
+    url: "nats://agent-controller-nats.controller-agent.svc.cluster.local:4222"
+
+  # Per-user credentials (docs/adr/0022/0027/0030), mirroring
+  # agent-orchestrator.identityLink above. Unset, the worker falls back to an
+  # in-memory fake that knows about none of the accounts already linked.
+  identityLink:
+    gatewayUrl: "http://agent-controller-integration-gateway:8090"
+    tokenSecretName: integration-gateway-secrets
+    tokenSecretKey: GATEWAY_IDENTITY_LINK_TOKEN
+    connectionsUrl: "https://gateway.kurpuis.com/connections"
+
+  gateway:
+    image:
+      repository: ghcr.io/imaustink/agent-controller/temporal-engine-gateway
+      tag: latest
+      pullPolicy: Always
+    # Verifies what the orchestrator signs for this hop: the GitHub sender of a
+    # webhook turn, the Open WebUI user of a chat turn, and a matched trigger's
+    # dispatch. Without it every ai-triage / ai-review turn is refused, and
+    # chat turns that carry a per-user identity are refused too.
+    senderAssertion:
+      secretName: agent-orchestrator-secrets
+      secretKey: AGENT_SENDER_ASSERTION_SECRET
+    # The orchestrator is this gateway's only caller. It presents
+    # agent-orchestrator-secrets' AGENT_TEMPORAL_ENGINE_TOKEN, which this map
+    # resolves to a subject and roles; a caller without it gets no capabilities.
+    # A token rather than defaultSubject/defaultRoles, which would hand the same
+    # roles to anything in the cluster that can reach this Service.
+    #
+    # Webhook turns run under this identity (the signed sender picks whose
+    # credentials they get), so it needs the role the SWE agent requires.
+    #
+    # Create both halves with the same token:
+    #   TOKEN="$(openssl rand -hex 32)"
+    #   kubectl create secret generic temporal-engine-static-identities -n controller-agent \
+    #     --from-literal=AGENT_STATIC_IDENTITIES="{\"$TOKEN\": {\"subject\": \"agent-orchestrator\", \"roles\": [\"reader\", \"writer\"]}}"
+    #   kubectl patch secret agent-orchestrator-secrets -n controller-agent \
+    #     --type merge -p "{\"stringData\": {\"AGENT_TEMPORAL_ENGINE_TOKEN\": \"$TOKEN\"}}"
+    identity:
+      staticIdentitiesExistingSecret: temporal-engine-static-identities
+      staticIdentitiesExistingSecretKey: AGENT_STATIC_IDENTITIES
 
 core-controller:
   enabled: true
