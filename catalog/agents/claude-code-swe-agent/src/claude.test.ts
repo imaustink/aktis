@@ -114,6 +114,18 @@ describe("buildPrompt", () => {
     expect(buildPrompt("the spec in #42", null)).toBe(prompt.slice("/implement ".length));
   });
 
+  it("tells the agent to drop --profile when no AWS profiles are declared", () => {
+    const prompt = buildPrompt("check bcp-dev", null);
+    expect(prompt).toContain("There are no named profiles, so drop any `--profile`.");
+  });
+
+  it("lists declared AWS profiles as usable with --profile", () => {
+    const prompt = buildPrompt("check bcp-dev", null, null, ["platform", "bitovi-platform"]);
+    expect(prompt).toContain("`platform`, `bitovi-platform`");
+    expect(prompt).toContain("A `--profile` with one of those names works as written");
+    expect(prompt).not.toContain("There are no named profiles");
+  });
+
   it("embeds the caller instruction as data under the Task heading", () => {
     const prompt = buildPrompt("add a health check", null);
     expect(prompt).toContain("## Task");

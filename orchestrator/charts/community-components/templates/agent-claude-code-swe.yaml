@@ -198,8 +198,30 @@ spec:
         name: {{ .Values.claudeCodeSweAgent.secretName }}
         key: {{ .Values.claudeCodeSweAgent.githubAppInstallationIdSecretKey }}
     {{- end }}
-  {{- if or .Values.claudeCodeSweAgent.githubAppSlug .Values.claudeCodeSweAgent.model .Values.claudeCodeSweAgent.remoteControl.enabled .Values.claudeCodeSweAgent.goMemLimit }}
+  {{- with .Values.claudeCodeSweAgent.aws }}
+  {{- range .profiles }}
+  {{- if not (regexMatch "^[A-Za-z0-9._-]+$" .) }}
+  {{- fail (printf "claudeCodeSweAgent.aws.profiles: %q is not a valid AWS profile name (letters, digits, '.', '_', '-')" .) }}
+  {{- end }}
+  {{- end }}
+  {{- if and .region (not (regexMatch "^[a-z0-9-]+$" .region)) }}
+  {{- fail (printf "claudeCodeSweAgent.aws.region: %q is not a valid AWS region" .region) }}
+  {{- end }}
+  {{- end }}
+  {{- if or .Values.claudeCodeSweAgent.githubAppSlug .Values.claudeCodeSweAgent.model .Values.claudeCodeSweAgent.remoteControl.enabled .Values.claudeCodeSweAgent.goMemLimit .Values.claudeCodeSweAgent.aws.profiles .Values.claudeCodeSweAgent.aws.region }}
   env:
+    {{- with .Values.claudeCodeSweAgent.aws.profiles }}
+    # Named AWS CLI profiles the agent declares in ~/.aws/config at startup,
+    # each resolving to the pod's own ServiceAccount credentials, so a task
+    # that says `aws --profile <name>` works as written
+    # (catalog/agents/claude-code-swe-agent/src/awsConfig.ts).
+    - name: SWE_AWS_PROFILES
+      value: {{ join "," . | quote }}
+    {{- end }}
+    {{- with .Values.claudeCodeSweAgent.aws.region }}
+    - name: SWE_AWS_REGION
+      value: {{ . | quote }}
+    {{- end }}
     {{- if .Values.claudeCodeSweAgent.goMemLimit }}
     # Inherited by every Go tool Claude runs in the repo (go build/test,
     # golangci-lint...), which otherwise size their heap to the NODE's memory

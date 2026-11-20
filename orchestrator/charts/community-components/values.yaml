@@ -355,6 +355,16 @@ claudeCodeSweAgent:
   # resources.limits.memory, leaving room for claude/node and non-Go
   # processes -- keep the two in step. Go syntax (GiB/MiB). "" omits it.
   goMemLimit: "3GiB"
+  # AWS CLI profiles for the agent's own `aws` use. Credentials always come
+  # from the pod's ServiceAccount (EKS Pod Identity / IRSA, granted by the
+  # deployment, not this chart); every name in `profiles` is declared in the
+  # run's ~/.aws/config as an alias for those same credentials, so a task
+  # written for a laptop (`aws --profile platform ...`) works unchanged.
+  # `region` is written into [default] and each profile. Both empty (the
+  # default) writes no config file.
+  aws:
+    profiles: []
+    region: ""
   # Per-user identity linking. `providers` may list "github" (docs/adr/0022,
   # same semantics as opencodeSweAgent.identityLink above -- a per-user
   # GitHub token gates/attributes writes) AND/OR "claude" (docs/adr/0027 --

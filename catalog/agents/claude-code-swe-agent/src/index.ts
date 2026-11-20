@@ -33,8 +33,10 @@ import {
 import { GH_READ_TOKEN_ENV, GH_WRITE_TOKEN_ENV, installGhShim } from "./ghShim.js";
 import { clip } from "./security/redact.js";
 import { installMountedSkills, listInstalledSkills, splitSkillInvocation } from "./skills.js";
+import { parseAwsProfiles, writeAwsConfig } from "./awsConfig.js";
 
 const toolConfig = loadToolConfig();
+const awsProfiles = parseAwsProfiles(toolConfig.awsProfiles);
 
 /**
  * Agent entry point. Uses the plain `runAgent()` contract (one goal in, one
@@ -57,6 +59,10 @@ async function handler(session: AgentSession): Promise<AgentReply> {
   await ensureDir(toolConfig.homeDir);
   await ensureDir(toolConfig.workdir);
   await installMountedSkills(toolConfig.skillsSourceDir, toolConfig.homeDir);
+  if (awsProfiles.rejected.length > 0) {
+    console.error(`[claude-code-swe-agent] ignoring invalid SWE_AWS_PROFILES entries: ${JSON.stringify(awsProfiles.rejected)}`);
+  }
+  await writeAwsConfig({ homeDir: toolConfig.homeDir, profiles: awsProfiles.profiles, region: toolConfig.awsRegion });
   const installedSkills = await listInstalledSkills(toolConfig.homeDir);
 
   if (toolConfig.remoteControlEnabled) {
@@ -265,7 +271,7 @@ async function handler(session: AgentSession): Promise<AgentReply> {
   }
 
   await session.progress("Running Claude Code…", { stage: "agent" });
-  const prompt = buildPrompt(instruction, marker, skill);
+  const prompt = buildPrompt(instruction, marker, skill, awsProfiles.profiles);
   const runOpts = {
     cwd: toolConfig.workdir,
     env: childEnv,
