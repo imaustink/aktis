@@ -101,7 +101,12 @@ export function buildClaudeSettings(readOnly = false): object {
  * else, since that's the only place the CLI expands it; the rest of the
  * prompt becomes the skill's arguments, unchanged.
  */
-export function buildPrompt(instruction: string, marker: SweMarker | null, skill: string | null = null): string {
+export function buildPrompt(
+  instruction: string,
+  marker: SweMarker | null,
+  skill: string | null = null,
+  awsProfiles: string[] = [],
+): string {
   const context = marker
     ? `You are CONTINUING work on an existing pull request.\n` +
       `- Repository: ${marker.repo}\n` +
@@ -124,7 +129,11 @@ export function buildPrompt(instruction: string, marker: SweMarker | null, skill
     `## Environment`,
     `This container already has the following installed -- use them directly, do not apt-get/install/download them yourself:`,
     `git, gh (GitHub CLI, authenticated), curl, python3 + pip, node + npm, go, make, build-essential (gcc/g++), jq, unzip, zip, ripgrep (rg), less, kubectl, aws (AWS CLI v2).`,
-    `kubectl and aws have no preconfigured kubeconfig, profiles, or credentials. If the deployment grants this pod AWS access (via its ServiceAccount), aws picks it up from the default credential chain -- there are no named profiles, so drop any \`--profile\`. Build a kubeconfig with \`aws eks update-kubeconfig --name <cluster> --region <region> --alias <context>\`. If aws reports no credentials or access is denied, treat that as a missing-access blocker (see Rules), not something to work around.`,
+    `kubectl and aws have no preconfigured kubeconfig or static credentials. If the deployment grants this pod AWS access (via its ServiceAccount), aws picks it up from the default credential chain. ` +
+      (awsProfiles.length > 0
+        ? `These named profiles are also declared, and every one of them uses that same pod credential: ${awsProfiles.map((p) => `\`${p}\``).join(", ")}. A \`--profile\` with one of those names works as written; for any other name, drop the \`--profile\`. `
+        : `There are no named profiles, so drop any \`--profile\`. `) +
+      `Build a kubeconfig with \`aws eks update-kubeconfig --name <cluster> --region <region> --alias <context>\`. If aws reports no credentials or access is denied, treat that as a missing-access blocker (see Rules), not something to work around.`,
     `A headless browser is also available for screenshots (e.g. to verify a UI change). Run \`screenshot <url> [out.png] [width] [height]\` -- it drives the bundled Chromium (also at \`$CHROME_BIN\` / \`/usr/bin/chromium\`, and used by Puppeteer/Playwright via \`executablePath\`) with the flags this sandboxed container needs, so prefer it over invoking Chromium yourself. Width/height are viewport CSS px (default 1280x800); pass a mobile size like \`390 844\` to audit mobile layouts.`,
     `If a task genuinely needs something outside this list, install it yourself, but check this list first.`,
     ``,

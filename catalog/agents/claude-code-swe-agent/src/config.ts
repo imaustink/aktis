@@ -156,6 +156,14 @@ export interface AgentToolConfig {
    */
   credentialsWritebackUrl: string;
   credentialsWritebackToken: string;
+  /**
+   * Raw `SWE_AWS_PROFILES` (comma-separated): AWS CLI profile names to declare
+   * in `$HOME/.aws/config`, each resolving to this pod's own credentials (see
+   * ./awsConfig.ts). Empty declares none.
+   */
+  awsProfiles: string;
+  /** Region written into every declared profile and `[default]` (`SWE_AWS_REGION`). */
+  awsRegion: string;
 }
 
 /**
@@ -193,5 +201,7 @@ export function loadToolConfig(env: NodeJS.ProcessEnv = process.env): AgentToolC
     loginCredentialsJson: env.CLAUDE_LOGIN_CREDENTIALS_JSON ?? "",
     credentialsWritebackUrl: env.CLAUDE_CREDENTIALS_WRITEBACK_URL ?? "",
     credentialsWritebackToken: env.CLAUDE_CREDENTIALS_WRITEBACK_TOKEN ?? "",
+    awsProfiles: env.SWE_AWS_PROFILES ?? "",
+    awsRegion: env.SWE_AWS_REGION ?? "",
   };
 }
