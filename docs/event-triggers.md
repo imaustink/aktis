@@ -255,6 +255,13 @@ trigger turn instead of sending it unsigned.
 create|merge|close|reopen|ready|edit`, mint a `contents:read` token) from
 `session.readOnly` alone.
 
+Params are free-form, but the SWE agents (claude-code-swe-agent,
+opencode-swe-agent) act on one by name:
+
+| Param | Effect |
+| --- | --- |
+| `closesIssue` (with `repository`) | On a write-capable run that ends with an open PR, the runner checks GitHub's `closingIssuesReferences` for that PR and, if `repository#closesIssue` isn't among them, appends `Closes #<n>` (`Closes owner/repo#<n>` for a PR in another repo) to the description, so merging the PR closes the issue. A mention like "fixes the bug in #12" that GitHub doesn't parse as closing doesn't count. Set it on issue-triage triggers: `closesIssue: body.issue.number`. |
+
 ## 7. Gateway endpoints
 
 - `POST /webhooks/:source` — `404` unknown or non-webhook source; `401` failed

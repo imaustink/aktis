@@ -35,6 +35,7 @@ import { GH_READ_TOKEN_ENV, GH_WRITE_TOKEN_ENV, installGhShim } from "./ghShim.j
 import { clip } from "./security/redact.js";
 import { installMountedSkills, listInstalledSkills, splitSkillInvocation } from "./skills.js";
 import { parseAwsProfiles, writeAwsConfig } from "./awsConfig.js";
+import { closingLine, ensureClosingReference, parseClosesIssue } from "./closingRef.js";
 
 const toolConfig = loadToolConfig();
 const awsProfiles = parseAwsProfiles(toolConfig.awsProfiles);
@@ -451,6 +452,29 @@ async function handler(session: AgentSession): Promise<AgentReply> {
     );
   }
 
+  // Link the PR to the issue that triggered this run (issue-triage
+  // EventTrigger's `closesIssue` param), so merging it closes the issue.
+  // Runner-owned rather than prompted: the model only sometimes wrote a
+  // closing keyword. A failure here doesn't fail the turn -- the PR is
+  // real work -- but it is reported rather than silently dropped.
+  let closingNote = "";
+  const closesIssue = parseClosesIssue(session.params);
+  if (!readOnly && closesIssue && discovered.pr) {
+    const linked = await ensureClosingReference({
+      prRepo: discovered.repo,
+      pr: discovered.pr,
+      issue: closesIssue,
+      env: childEnv,
+      signal: session.signal,
+    });
+    if (typeof linked === "object") {
+      console.error(`[claude-code-swe-agent] could not link PR to ${closesIssue.repo}#${closesIssue.number}: ${linked.error}`);
+      closingNote = `\n⚠️ Couldn't add \`${closingLine(closesIssue, discovered.repo)}\` to the pull request, so merging it won't close the issue automatically.`;
+    } else if (linked === "added") {
+      console.error(`[claude-code-swe-agent] added closing reference to ${closesIssue.repo}#${closesIssue.number}`);
+    }
+  }
+
   const nextMarker: SweMarker = {
     repo: discovered.repo,
     branch: discovered.branch,
@@ -468,7 +492,7 @@ async function handler(session: AgentSession): Promise<AgentReply> {
     markerHadPr: Boolean(marker?.pr),
   });
 
-  return { message: `${clip(summary, 1500)}${prLine}`, result: encodeSweContinuation(nextMarker) };
+  return { message: `${clip(summary, 1500)}${prLine}${closingNote}`, result: encodeSweContinuation(nextMarker) };
 }
 
 void runAgent(handler);

@@ -24,6 +24,7 @@ import {
   runCommand,
   setupGitAuth,
 } from "./git.js";
+import { closingLine, ensureClosingReference, parseClosesIssue } from "./closingRef.js";
 import { extractContinuationToken } from "./continuation.js";
 import { decodeSweContinuation, encodeSweContinuation, type SweMarker } from "./marker.js";
 import { loadToolConfig } from "./config.js";
@@ -61,6 +62,8 @@ interface TurnContext {
   attribution: { githubLogin: string; githubId?: number } | null;
   turnStartedAt: number;
   readOnly: boolean;
+  /** The run's structured params (AgentRun.spec.params; ADR 0048). */
+  params: Readonly<Record<string, string>>;
   signal: AbortSignal;
 }
 
@@ -176,6 +179,27 @@ async function runTurn(ctx: TurnContext, instruction: string, marker: SweMarker 
     );
   }
 
+  // Link the PR to the issue that triggered this run (issue-triage
+  // EventTrigger's `closesIssue` param), so merging it closes the issue.
+  // Runner-owned rather than prompted; a failure is reported, not fatal.
+  let closingNote = "";
+  const closesIssue = parseClosesIssue(ctx.params);
+  if (!ctx.readOnly && closesIssue && discovered.pr) {
+    const linked = await ensureClosingReference({
+      prRepo: discovered.repo,
+      pr: discovered.pr,
+      issue: closesIssue,
+      env: ctx.childEnv,
+      signal: ctx.signal,
+    });
+    if (typeof linked === "object") {
+      console.error(`[opencode-swe-agent] could not link PR to ${closesIssue.repo}#${closesIssue.number}: ${linked.error}`);
+      closingNote = `\n⚠️ Couldn't add \`${closingLine(closesIssue, discovered.repo)}\` to the pull request, so merging it won't close the issue automatically.`;
+    } else if (linked === "added") {
+      console.error(`[opencode-swe-agent] added closing reference to ${closesIssue.repo}#${closesIssue.number}`);
+    }
+  }
+
   const nextMarker: SweMarker = {
     repo: discovered.repo,
     branch: discovered.branch,
@@ -194,7 +218,7 @@ async function runTurn(ctx: TurnContext, instruction: string, marker: SweMarker 
   });
 
   return {
-    reply: `${clip(summary, 1500)}${prLine}`,
+    reply: `${clip(summary, 1500)}${prLine}${closingNote}`,
     nextMarker,
     succeeded: true,
   };
@@ -450,6 +474,7 @@ async function main(): Promise<void> {
         attribution,
         turnStartedAt,
         readOnly,
+        params: runtimeConfig.params,
         signal: abort.signal,
       },
       instruction,
