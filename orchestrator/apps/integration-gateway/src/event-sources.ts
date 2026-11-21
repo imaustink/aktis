@@ -42,7 +42,14 @@ export interface CompiledSender {
 
 export type CompiledEventSource =
   | { name: string; kind: "webhook"; webhook: WebhookSource; sender?: CompiledSender }
-  | { name: string; kind: "cron"; cron: CronSource };
+  | { name: string; kind: "cron"; cron: CronSource }
+  /**
+   * docs/adr/0052 §1: receives this gateway's own run-completion events. It
+   * has no route (no path, no verify) -- nothing outside this process can
+   * deliver to it, which is what lets a run event carry a sender the gateway
+   * re-verified itself rather than one a caller claimed.
+   */
+  | { name: string; kind: "run" };
 
 export type CompileSourceResult = { ok: true; source: CompiledEventSource } | { ok: false; error: string };
 
@@ -59,8 +66,16 @@ export function compileEventSource(resource: EventSourceResource): CompileSource
   const name = resource?.metadata?.name;
   if (!name) return { ok: false, error: "missing metadata.name" };
   const spec = resource.spec ?? {};
-  if (Boolean(spec.webhook) === Boolean(spec.cron)) {
-    return { ok: false, error: "exactly one of spec.webhook / spec.cron must be set" };
+  if ([spec.webhook, spec.cron, spec.run].filter(Boolean).length !== 1) {
+    return { ok: false, error: "exactly one of spec.webhook / spec.cron / spec.run must be set" };
+  }
+
+  if (spec.run) {
+    // A run event's sender is the chain's origin, re-verified by the gateway
+    // on every hop (server.ts), never something evaluated out of a body -- a
+    // sender block here could only be misread as a second gate.
+    if (spec.sender) return { ok: false, error: "spec.sender is only valid with spec.webhook" };
+    return { ok: true, source: { name, kind: "run" } };
   }
 
   if (spec.cron) {

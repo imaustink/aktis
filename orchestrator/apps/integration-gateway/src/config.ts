@@ -202,6 +202,13 @@ export interface AppConfig {
    * {@link LabelReconciler}'s own default.
    */
   labelReconcilerGraceMs: number | undefined;
+  /**
+   * The global cap on a run-event chain's depth (docs/adr/0052 §1): a run
+   * event whose `chain.depth` would exceed it is dropped (logged, and
+   * commented on the trigger's issue/PR). The backstop no trigger config can
+   * raise -- per-trigger caps live in CEL on `body.chain.counts`.
+   */
+  runEventMaxDepth: number;
 }
 
 function num(raw: string | undefined, fallback: number): number {
@@ -215,6 +222,13 @@ function numOrUndefined(raw: string | undefined): number | undefined {
   if (raw === undefined) return undefined;
   const value = Number(raw);
   return Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/** A positive integer, else `fallback` -- a cap of 2.5 or "twelve" is a typo, not a wish for no cap. */
+function positiveInt(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value > 0 ? value : fallback;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -267,6 +281,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     connectionsSessionTtlSeconds: num(env.GATEWAY_CONNECTIONS_SESSION_TTL_SECONDS, 8 * 60 * 60),
     labelReconcilerIntervalMs: numOrUndefined(env.GATEWAY_LABEL_RECONCILER_INTERVAL_MS),
     labelReconcilerGraceMs: numOrUndefined(env.GATEWAY_LABEL_RECONCILER_GRACE_MS),
+    runEventMaxDepth: positiveInt(env.RUN_EVENT_MAX_DEPTH, 12),
   };
 }
 

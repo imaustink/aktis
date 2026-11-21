@@ -95,6 +95,10 @@ spec:
               value: {{ .Values.config.pollTimeoutMs | quote }}
             - name: GATEWAY_RESUME_WAIT_MS
               value: {{ .Values.config.resumeWaitMs | quote }}
+            {{- if .Values.config.runEventMaxDepth }}
+            - name: RUN_EVENT_MAX_DEPTH
+              value: {{ .Values.config.runEventMaxDepth | quote }}
+            {{- end }}
             {{- if .Values.sessionPage.publicBaseUrl }}
             - name: GATEWAY_PUBLIC_URL
               value: {{ .Values.sessionPage.publicBaseUrl | quote }}

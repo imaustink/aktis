@@ -145,3 +145,61 @@ describe("GithubReplyClient.removeIssueLabel", () => {
     expect(sleep).not.toHaveBeenCalled();
   });
 });
+
+describe("GithubReplyClient.addIssueLabels / addIssueAssignees (docs/adr/0052 §3)", () => {
+  it.each([
+    ["addIssueLabels", "labels", ["ai-review", "factory"]],
+    ["addIssueAssignees", "assignees", ["alice"]],
+  ] as const)("%s POSTs { %s } to the issue's endpoint", async (method, field, values) => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true });
+    const client = new GithubReplyClient({ ...baseConfig, fetchImpl });
+
+    await client[method]("acme", "widgets", 12, [...values]);
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      `https://api.github.com/repos/acme/widgets/issues/12/${field}`,
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ authorization: "Bearer pat_123" }),
+        body: JSON.stringify({ [field]: values }),
+      }),
+    );
+  });
+
+  it("retries a transient failure (5xx, dropped connection) like removeIssueLabel, then succeeds", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false, status: 502, text: async () => "bad gateway" })
+      .mockRejectedValueOnce(new Error("ECONNRESET"))
+      .mockResolvedValueOnce({ ok: true });
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const client = new GithubReplyClient({ ...baseConfig, fetchImpl, sleep });
+
+    await expect(client.addIssueLabels("acme", "widgets", 12, ["ai-review"])).resolves.toBeUndefined();
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it("throws after exhausting retries", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: false, status: 503, text: async () => "unavailable" });
+    const client = new GithubReplyClient({ ...baseConfig, fetchImpl, sleep: vi.fn().mockResolvedValue(undefined) });
+
+    await expect(client.addIssueAssignees("acme", "widgets", 12, ["alice"])).rejects.toThrow(/503.*unavailable/s);
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([404, 422])("does not retry a %d (a deterministic refusal), and throws", async (status) => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: false, status, text: async () => "nope" });
+    const sleep = vi.fn().mockResolvedValue(undefined);
+    const client = new GithubReplyClient({ ...baseConfig, fetchImpl, sleep });
+
+    await expect(client.addIssueLabels("acme", "widgets", 12, ["x"])).rejects.toThrow(new RegExp(`${status}`));
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it("sends nothing for an empty list", async () => {
+    const fetchImpl = vi.fn();
+    await new GithubReplyClient({ ...baseConfig, fetchImpl }).addIssueLabels("acme", "widgets", 12, []);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+});

@@ -121,10 +121,10 @@ export class GithubReplyClient {
    */
   async removeIssueLabel(owner: string, repo: string, issueNumber: number, label: string): Promise<void> {
     const token = await resolveGithubToken(this.options);
-    let lastError: unknown;
-    for (let attempt = 1; attempt <= this.removeLabelRetryAttempts; attempt++) {
-      try {
-        const res = await this.fetchImpl(
+    await this.withRetry(
+      `remove label "${label}"`,
+      () =>
+        this.fetchImpl(
           `${this.options.githubApiUrl}/repos/${owner}/${repo}/issues/${issueNumber}/labels/${encodeURIComponent(label)}`,
           {
             method: "DELETE",
@@ -134,19 +134,83 @@ export class GithubReplyClient {
               "x-github-api-version": "2022-11-28",
             },
           },
-        );
-        // Success, or already-gone: either way the end state is reached.
-        if (res.ok || res.status === 404) return;
-        lastError = new Error(`Failed to remove label "${label}": ${res.status} ${await res.text()}`);
+        ),
+      // Success, or already-gone: either way the end state is reached.
+      (status) => (status === 404 ? "done" : "retry"),
+    );
+  }
+
+  /**
+   * Adds labels to an issue or PR (`reply.github.addLabels`, docs/adr/0052
+   * §3) -- the factory's status markers. Same bounded retry as
+   * {@link removeIssueLabel}: a lost add would leave the PR showing the wrong
+   * stage. Idempotent (re-adding a present label is a no-op), so retrying is
+   * safe. A 404/422 (no such issue, invalid input) is final and not retried.
+   */
+  async addIssueLabels(owner: string, repo: string, issueNumber: number, labels: string[]): Promise<void> {
+    await this.postIssueField(owner, repo, issueNumber, "labels", labels);
+  }
+
+  /**
+   * Assigns logins to an issue or PR (`reply.github.assignees`, docs/adr/0052
+   * §3), e.g. the factory's handoff to the human. Same retry policy as
+   * {@link addIssueLabels}. GitHub silently skips a login that can't be
+   * assigned, so a 2xx does not prove the assignment happened.
+   */
+  async addIssueAssignees(owner: string, repo: string, issueNumber: number, assignees: string[]): Promise<void> {
+    await this.postIssueField(owner, repo, issueNumber, "assignees", assignees);
+  }
+
+  private async postIssueField(owner: string, repo: string, issueNumber: number, field: "labels" | "assignees", values: string[]): Promise<void> {
+    if (values.length === 0) return;
+    const token = await resolveGithubToken(this.options);
+    await this.withRetry(
+      `add ${field} ${JSON.stringify(values)}`,
+      () =>
+        this.fetchImpl(`${this.options.githubApiUrl}/repos/${owner}/${repo}/issues/${issueNumber}/${field}`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            accept: "application/vnd.github+json",
+            "content-type": "application/json",
+            "x-github-api-version": "2022-11-28",
+          },
+          body: JSON.stringify({ [field]: values }),
+        }),
+      (status) => (status === 404 || status === 422 ? "fail" : "retry"),
+    );
+  }
+
+  /**
+   * The label calls' shared retry: up to {@link removeLabelRetryAttempts}
+   * attempts with linear backoff. A 2xx is success; any other status is
+   * classified by `onStatus` ("done" = treat as success, "fail" = throw now,
+   * "retry" = transient). A rejected fetch (connection reset/refused) is
+   * retryable too -- same transient-transport class the orchestrator poll
+   * already rides out.
+   */
+  private async withRetry(
+    what: string,
+    send: () => Promise<Response>,
+    onStatus: (status: number) => "done" | "fail" | "retry",
+  ): Promise<void> {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= this.removeLabelRetryAttempts; attempt++) {
+      let res: Response | undefined;
+      try {
+        res = await send();
       } catch (err) {
-        // A rejected fetch (connection reset/refused) is retryable too -- same
-        // transient-transport class the orchestrator poll already rides out.
         lastError = err;
+      }
+      if (res) {
+        if (res.ok) return;
+        const verdict = onStatus(res.status);
+        if (verdict === "done") return;
+        lastError = new Error(`Failed to ${what}: ${res.status} ${await res.text()}`);
+        if (verdict === "fail") throw lastError;
       }
       if (attempt < this.removeLabelRetryAttempts) await this.sleep(this.removeLabelRetryDelayMs * attempt);
     }
-    throw lastError instanceof Error
-      ? lastError
-      : new Error(`Failed to remove label "${label}": ${String(lastError)}`);
+    throw lastError instanceof Error ? lastError : new Error(`Failed to ${what}: ${String(lastError)}`);
   }
 }

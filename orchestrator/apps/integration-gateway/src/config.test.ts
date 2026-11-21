@@ -19,6 +19,17 @@ describe("loadConfig event sources (ADR 0048)", () => {
   });
 });
 
+describe("loadConfig RUN_EVENT_MAX_DEPTH (docs/adr/0052 §1)", () => {
+  it("defaults to 12 and reads a positive integer", () => {
+    expect(loadConfig({}).runEventMaxDepth).toBe(12);
+    expect(loadConfig({ RUN_EVENT_MAX_DEPTH: "5" }).runEventMaxDepth).toBe(5);
+  });
+
+  it.each(["0", "-3", "2.5", "twelve", ""])("falls back to the default for %j rather than disabling the cap", (raw) => {
+    expect(loadConfig({ RUN_EVENT_MAX_DEPTH: raw }).runEventMaxDepth).toBe(12);
+  });
+});
+
 describe("loadConfig GitHub host resolution", () => {
   it("defaults the OAuth host to github.com, so existing deployments are unaffected", () => {
     const config = loadConfig({});
