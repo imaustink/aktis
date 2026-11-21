@@ -126,6 +126,20 @@ describe("buildPrompt", () => {
     expect(prompt).not.toContain("There are no named profiles");
   });
 
+  it("tells the agent to build an EKS kubeconfig when it has no in-cluster access", () => {
+    const prompt = buildPrompt("check the cluster", null);
+    expect(prompt).toContain("Build a kubeconfig with `aws eks update-kubeconfig");
+    expect(prompt).not.toContain("already connected");
+  });
+
+  it("tells the agent kubectl already reaches its own cluster when in-cluster access is granted", () => {
+    const prompt = buildPrompt("check the cluster", null, null, [], true);
+    expect(prompt).toContain("kubectl is already connected, with no kubeconfig, to the Kubernetes cluster this pod runs in");
+    expect(prompt).toContain("Secrets are never readable");
+    expect(prompt).toContain("--kubeconfig $HOME/.kube/eks");
+    expect(prompt).not.toContain("--alias <context>");
+  });
+
   it("embeds the caller instruction as data under the Task heading", () => {
     const prompt = buildPrompt("add a health check", null);
     expect(prompt).toContain("## Task");

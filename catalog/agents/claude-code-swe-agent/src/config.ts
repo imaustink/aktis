@@ -164,6 +164,13 @@ export interface AgentToolConfig {
   awsProfiles: string;
   /** Region written into every declared profile and `[default]` (`SWE_AWS_REGION`). */
   awsRegion: string;
+  /**
+   * `SWE_KUBE_IN_CLUSTER=true`: the deployment granted this pod's
+   * ServiceAccount read access to the cluster it runs in (the chart's
+   * claudeCodeSweAgent.clusterRead), so the prompt tells the agent kubectl
+   * already works against it. Only shapes the prompt -- RBAC is the grant.
+   */
+  kubeInCluster: boolean;
 }
 
 /**
@@ -203,5 +210,6 @@ export function loadToolConfig(env: NodeJS.ProcessEnv = process.env): AgentToolC
     credentialsWritebackToken: env.CLAUDE_CREDENTIALS_WRITEBACK_TOKEN ?? "",
     awsProfiles: env.SWE_AWS_PROFILES ?? "",
     awsRegion: env.SWE_AWS_REGION ?? "",
+    kubeInCluster: env.SWE_KUBE_IN_CLUSTER === "true",
   };
 }

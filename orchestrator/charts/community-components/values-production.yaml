@@ -186,6 +186,44 @@ claudeCodeSweAgent:
   # the live cluster) rather than disabling this again.
   remoteControl:
     enabled: true
+  # Read-only kubectl access to this (homelab) cluster for debugging tasks,
+  # never Secrets -- see values.yaml's clusterRead. AWS needs no separate
+  # credential here: everything AWS-side on homelab is managed through the
+  # ACK controllers, so the ACK CRs below are the agent's view of it.
+  #
+  # One-time bootstrap (ci-deployer can't `create` cluster RBAC): the
+  # name-scoped ci-deployer grant in imaustink/homelab
+  # kubernetes/manifests/github-runner/009-claude-code-swe-agent-cluster-read-rbac.yaml,
+  # then the ClusterRole/Binding rendered and applied by hand -- see
+  # templates/clusterrole-claude-code-swe-agent-cluster-read.yaml.
+  #
+  # Left out on purpose: generators.external-secrets.io (generator state holds
+  # generated secret values) and helm.cattle.io (HelmChart valuesContent is
+  # free-form and can carry credentials).
+  clusterRead:
+    enabled: true
+    extraRules:
+      - apiGroups:
+          - core.aktis.ai
+          - argoproj.io
+          - cert-manager.io
+          - acme.cert-manager.io
+          - external-secrets.io
+          - externaldns.k8s.io
+          - longhorn.io
+          - postgresql.cnpg.io
+          - metallb.io
+          - monitoring.coreos.com
+          - traefik.io
+          - traefik.containo.us
+          - services.k8s.aws
+          - s3.services.k8s.aws
+          - iam.services.k8s.aws
+          - actions.github.com
+          - openfaas.com
+          - upgrade.cattle.io
+        resources: ["*"]
+        verbs: ["get", "list", "watch"]
 
 # github: single allowlisted gh CLI command tool (issue/pr/repo/release/
 # search/workflow/run), authenticated as the calling user's own linked

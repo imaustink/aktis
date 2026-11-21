@@ -271,7 +271,7 @@ async function handler(session: AgentSession): Promise<AgentReply> {
   }
 
   await session.progress("Running Claude Code…", { stage: "agent" });
-  const prompt = buildPrompt(instruction, marker, skill, awsProfiles.profiles);
+  const prompt = buildPrompt(instruction, marker, skill, awsProfiles.profiles, toolConfig.kubeInCluster);
   const runOpts = {
     cwd: toolConfig.workdir,
     env: childEnv,

@@ -106,6 +106,7 @@ export function buildPrompt(
   marker: SweMarker | null,
   skill: string | null = null,
   awsProfiles: string[] = [],
+  kubeInCluster = false,
 ): string {
   const context = marker
     ? `You are CONTINUING work on an existing pull request.\n` +
@@ -133,7 +134,10 @@ export function buildPrompt(
       (awsProfiles.length > 0
         ? `These named profiles are also declared, and every one of them uses that same pod credential: ${awsProfiles.map((p) => `\`${p}\``).join(", ")}. A \`--profile\` with one of those names works as written; for any other name, drop the \`--profile\`. `
         : `There are no named profiles, so drop any \`--profile\`. `) +
-      `Build a kubeconfig with \`aws eks update-kubeconfig --name <cluster> --region <region> --alias <context>\`. If aws reports no credentials or access is denied, treat that as a missing-access blocker (see Rules), not something to work around.`,
+      (kubeInCluster
+        ? `kubectl is already connected, with no kubeconfig, to the Kubernetes cluster this pod runs in, through this pod's ServiceAccount: read-only (get/list/watch, plus pod logs), and Secrets are never readable. Use it as is for that cluster. For any other (EKS) cluster, write its kubeconfig to a separate file outside the repository and point kubectl at it (\`aws eks update-kubeconfig --name <cluster> --region <region> --kubeconfig $HOME/.kube/eks\`, then \`kubectl --kubeconfig $HOME/.kube/eks ...\`), because a \`$HOME/.kube/config\` would replace the in-cluster connection. `
+        : `Build a kubeconfig with \`aws eks update-kubeconfig --name <cluster> --region <region> --alias <context>\`. `) +
+      `If aws or kubectl reports no credentials or access is denied, treat that as a missing-access blocker (see Rules), not something to work around.`,
     `A headless browser is also available for screenshots (e.g. to verify a UI change). Run \`screenshot <url> [out.png] [width] [height]\` -- it drives the bundled Chromium (also at \`$CHROME_BIN\` / \`/usr/bin/chromium\`, and used by Puppeteer/Playwright via \`executablePath\`) with the flags this sandboxed container needs, so prefer it over invoking Chromium yourself. Width/height are viewport CSS px (default 1280x800); pass a mobile size like \`390 844\` to audit mobile layouts.`,
     `If a task genuinely needs something outside this list, install it yourself, but check this list first.`,
     ``,

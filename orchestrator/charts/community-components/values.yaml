@@ -365,6 +365,32 @@ claudeCodeSweAgent:
   aws:
     profiles: []
     region: ""
+  # Read-only access to the cluster the agent's run pods live in, for
+  # debugging tasks. When enabled, the chart creates a ClusterRole
+  # "<serviceAccountName>-cluster-read" + a ClusterRoleBinding of the same name
+  # to the agent's ServiceAccount, and sets SWE_KUBE_IN_CLUSTER so the prompt
+  # tells the agent kubectl already reaches this cluster (the run pod mounts
+  # the SA token; kubectl falls back to in-cluster config with no kubeconfig).
+  #
+  # Built-in kinds only get/list/watch (plus pods/log), and NEVER Secrets --
+  # unlike kubectlReadonly above, this SA's token sits in a pod that runs
+  # arbitrary model-driven shell, so Secret values must not be one `kubectl
+  # get` away. Every run of this Agent gets the access, including GitHub
+  # triggered ones (ai-triage / ai-review).
+  #
+  # Custom resources are not included by default; add a get/list/watch rule
+  # per API group in `extraRules`, leaving out any whose objects carry secret
+  # material (e.g. generators.external-secrets.io state, inline Helm values).
+  #
+  # Cluster-scoped RBAC: a deployer with name-scoped rights (no `create`, as on
+  # the homelab cluster) needs both objects bootstrapped once by hand -- see
+  # templates/clusterrole-claude-code-swe-agent-cluster-read.yaml.
+  clusterRead:
+    enabled: false
+    extraRules: []
+    # - apiGroups: ["cert-manager.io"]
+    #   resources: ["*"]
+    #   verbs: ["get", "list", "watch"]
   # Per-user identity linking. `providers` may list "github" (docs/adr/0022,
   # same semantics as opencodeSweAgent.identityLink above -- a per-user
   # GitHub token gates/attributes writes) AND/OR "claude" (docs/adr/0027 --
