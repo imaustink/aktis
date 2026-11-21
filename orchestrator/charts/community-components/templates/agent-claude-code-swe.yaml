@@ -208,8 +208,15 @@ spec:
   {{- fail (printf "claudeCodeSweAgent.aws.region: %q is not a valid AWS region" .region) }}
   {{- end }}
   {{- end }}
-  {{- if or .Values.claudeCodeSweAgent.githubAppSlug .Values.claudeCodeSweAgent.model .Values.claudeCodeSweAgent.remoteControl.enabled .Values.claudeCodeSweAgent.goMemLimit .Values.claudeCodeSweAgent.aws.profiles .Values.claudeCodeSweAgent.aws.region }}
+  {{- if or .Values.claudeCodeSweAgent.githubAppSlug .Values.claudeCodeSweAgent.model .Values.claudeCodeSweAgent.remoteControl.enabled .Values.claudeCodeSweAgent.goMemLimit .Values.claudeCodeSweAgent.aws.profiles .Values.claudeCodeSweAgent.aws.region .Values.claudeCodeSweAgent.clusterRead.enabled }}
   env:
+    {{- if .Values.claudeCodeSweAgent.clusterRead.enabled }}
+    # The chart granted this Agent's ServiceAccount read-only access to this
+    # cluster (templates/clusterrole-claude-code-swe-agent-cluster-read.yaml);
+    # tells the prompt kubectl already works against it.
+    - name: SWE_KUBE_IN_CLUSTER
+      value: "true"
+    {{- end }}
     {{- with .Values.claudeCodeSweAgent.aws.profiles }}
     # Named AWS CLI profiles the agent declares in ~/.aws/config at startup,
     # each resolving to the pod's own ServiceAccount credentials, so a task

@@ -1,0 +1,136 @@
+{{- /*
+Read-only access to THIS cluster for claude-code-swe-agent's run pods
+(claudeCodeSweAgent.clusterRead in values.yaml), so a debugging task can run
+plain `kubectl` against the cluster it runs in: the run pod mounts the
+ServiceAccount token and kubectl falls back to in-cluster config.
+
+get/list/watch only (plus pods/log), never create/update/patch/delete/exec.
+Secrets are deliberately absent: the token sits in a pod running arbitrary
+model-driven shell, so RBAC -- not an application-layer filter like
+kubectlReadonly's -- is the only boundary. RBAC objects are readable so the
+agent can explain "why is X forbidden"; they hold no secret material.
+Custom resources come only from clusterRead.extraRules.
+
+"Never Secrets" is not "never secret material": pods' literal `env` values
+are readable via get/list pods, and ConfigMap data is readable unless
+clusterRead.configmaps is false. RBAC cannot filter fields, so a workload
+that keeps a credential in a plain env var or ConfigMap is exposed to every
+run, including GitHub-triggered ones on a public repo. Check before enabling.
+
+Bootstrap: a deployer limited to name-scoped get/update/patch/escalate/bind
+(no `create`, which RBAC cannot scope by name -- the homelab ci-deployer)
+cannot create these. Render them once and apply by hand with Helm's ownership
+annotations, after which `helm upgrade` reconciles them:
+
+  helm template community-components orchestrator/charts/community-components \
+    -n controller-agent -f <values> \
+    -s templates/clusterrole-claude-code-swe-agent-cluster-read.yaml \
+  | kubectl apply -f -
+  kubectl annotate clusterrole,clusterrolebinding <sa>-cluster-read \
+    meta.helm.sh/release-name=community-components \
+    meta.helm.sh/release-namespace=controller-agent
+  kubectl label clusterrole,clusterrolebinding <sa>-cluster-read \
+    app.kubernetes.io/managed-by=Helm --overwrite
+*/ -}}
+{{- if and .Values.claudeCodeSweAgent.enabled .Values.claudeCodeSweAgent.clusterRead.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Values.claudeCodeSweAgent.serviceAccountName }}-cluster-read
+  labels:
+    {{- include "tools.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - pods/status
+      - services
+      - endpoints
+      - events
+      - nodes
+      - namespaces
+      {{- if .Values.claudeCodeSweAgent.clusterRead.configmaps }}
+      - configmaps
+      {{- end }}
+      - persistentvolumes
+      - persistentvolumeclaims
+      - replicationcontrollers
+      - resourcequotas
+      - limitranges
+      - serviceaccounts
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets", "controllerrevisions"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "ingressclasses", "networkpolicies"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "volumeattachments", "csidrivers", "csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["scheduling.k8s.io"]
+    resources: ["priorityclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apiregistration.k8s.io"]
+    resources: ["apiservices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["mutatingwebhookconfigurations", "validatingwebhookconfigurations"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list"]
+  {{- range .Values.claudeCodeSweAgent.clusterRead.extraRules }}
+  {{- range .verbs }}
+  {{- if not (has . (list "get" "list" "watch")) }}
+  {{- fail (printf "claudeCodeSweAgent.clusterRead.extraRules: verb %q is not read-only (get, list, watch)" .) }}
+  {{- end }}
+  {{- end }}
+  {{- range .apiGroups }}
+  {{- if or (eq . "") (eq . "*") }}
+  {{- fail (printf "claudeCodeSweAgent.clusterRead.extraRules: apiGroup %q would expose Secrets; name custom-resource groups explicitly" .) }}
+  {{- end }}
+  {{- end }}
+  - {{ toYaml . | indent 4 | trim }}
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Values.claudeCodeSweAgent.serviceAccountName }}-cluster-read
+  labels:
+    {{- include "tools.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.claudeCodeSweAgent.serviceAccountName }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ .Values.claudeCodeSweAgent.serviceAccountName }}-cluster-read
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

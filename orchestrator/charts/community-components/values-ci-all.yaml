@@ -98,6 +98,14 @@ claudeCodeSweAgent:
     idleStatusGraceMs: "90000"
     waitingTimeoutMs: "300000"
     maxWaitMs: ""
+  # Renders the cluster-read ClusterRole/Binding, including an extraRules
+  # entry, so both are dry-run applied against the API server.
+  clusterRead:
+    enabled: true
+    extraRules:
+      - apiGroups: ["cert-manager.io"]
+        resources: ["*"]
+        verbs: ["get", "list", "watch"]
 
 # E2E-only test double. Validated here anyway: it is a real chart template that
 # renders a real Agent CR, and the acknowledgement flag below is exactly the
