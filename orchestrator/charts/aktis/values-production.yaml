@@ -842,7 +842,6 @@ extraManifests:
           repository: "{{`{{repository}}`}}"
           issueNumber: "{{`{{number}}`}}"
           ack: "🤖 Starting work on this now."
-          sessionPage: true
           result: true
           removeLabel: "{{`{{label}}`}}"
   # eventtrigger-github-issue-review
@@ -899,7 +898,6 @@ extraManifests:
           repository: "{{`{{repository}}`}}"
           issueNumber: "{{`{{number}}`}}"
           ack: "🤖 Starting work on this now."
-          sessionPage: true
           result: true
           removeLabel: "{{`{{label}}`}}"
   # eventtrigger-github-pr-triage
@@ -978,7 +976,6 @@ extraManifests:
           repository: "{{`{{repository}}`}}"
           issueNumber: "{{`{{number}}`}}"
           ack: "🤖 Starting work on this now."
-          sessionPage: true
           result: true
           removeLabel: "{{`{{label}}`}}"
   # eventtrigger-github-pr-review
@@ -1078,6 +1075,5 @@ extraManifests:
           repository: "{{`{{repository}}`}}"
           issueNumber: "{{`{{number}}`}}"
           ack: "🤖 Starting work on this now."
-          sessionPage: true
           result: true
           removeLabel: "{{`{{label}}`}}"

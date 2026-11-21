@@ -46,7 +46,12 @@ export class GithubReplyClient {
     this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   }
 
-  async postIssueComment(owner: string, repo: string, issueNumber: number, body: string): Promise<void> {
+  /**
+   * Posts a comment and returns its id, for a later
+   * {@link updateIssueComment}. The id is `undefined` when the response body
+   * doesn't carry one; the comment was still posted.
+   */
+  async postIssueComment(owner: string, repo: string, issueNumber: number, body: string): Promise<number | undefined> {
     const token = await resolveGithubToken(this.options);
     const res = await this.fetchImpl(
       `${this.options.githubApiUrl}/repos/${owner}/${repo}/issues/${issueNumber}/comments`,
@@ -63,6 +68,30 @@ export class GithubReplyClient {
     );
     if (!res.ok) {
       throw new Error(`Failed to post issue comment: ${res.status} ${await res.text()}`);
+    }
+    try {
+      const id = ((await res.json()) as { id?: unknown } | null)?.id;
+      return typeof id === "number" && Number.isSafeInteger(id) ? id : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Replaces the body of a comment this client posted (keeps the {@link REPLY_MARKER} loop guard). */
+  async updateIssueComment(owner: string, repo: string, commentId: number, body: string): Promise<void> {
+    const token = await resolveGithubToken(this.options);
+    const res = await this.fetchImpl(`${this.options.githubApiUrl}/repos/${owner}/${repo}/issues/comments/${commentId}`, {
+      method: "PATCH",
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: "application/vnd.github+json",
+        "content-type": "application/json",
+        "x-github-api-version": "2022-11-28",
+      },
+      body: JSON.stringify({ body: `${REPLY_MARKER}\n${body}` }),
+    });
+    if (!res.ok) {
+      throw new Error(`Failed to update issue comment ${commentId}: ${res.status} ${await res.text()}`);
     }
   }
 
