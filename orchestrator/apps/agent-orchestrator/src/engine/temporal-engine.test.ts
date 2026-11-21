@@ -437,6 +437,38 @@ describe("TemporalEngine", () => {
     expect(progressListener).toHaveBeenNthCalledWith(5, "", "clone: cloning the repo");
   });
 
+  // Webhook triggers run fire-and-forget: /invoke sets ONLY
+  // remoteControlUrlListener (never progressListener). Before this, the
+  // engine's remoteControlUrl was dropped on the floor and no "Watch live"
+  // link was ever posted to the triggering issue/PR on this engine.
+  it("relays the engine's remoteControlUrl to remoteControlUrlListener once, with no progressListener set", async () => {
+    const { impl } = scriptedFetch([
+      { id: "x", status: "pending" },
+      { id: "x", status: "pending", remoteControlUrl: "https://claude.ai/code/session_abc" },
+      { id: "x", status: "pending", remoteControlUrl: "https://claude.ai/code/session_abc" },
+      { id: "x", status: "succeeded", result: "done", remoteControlUrl: "https://claude.ai/code/session_abc" },
+    ]);
+    const remoteControlUrlListener = vi.fn();
+    const engine = new TemporalEngine({ baseUrl: BASE, fetchImpl: impl });
+
+    await engine.invoke(input({ remoteControlUrlListener }));
+
+    expect(remoteControlUrlListener).toHaveBeenCalledTimes(1);
+    expect(remoteControlUrlListener).toHaveBeenCalledWith("https://claude.ai/code/session_abc");
+  });
+
+  it("relays a remoteControlUrl that first appears on the terminal record", async () => {
+    const { impl } = scriptedFetch([
+      { id: "x", status: "succeeded", result: "done", remoteControlUrl: "https://claude.ai/code/session_late" },
+    ]);
+    const remoteControlUrlListener = vi.fn();
+    const engine = new TemporalEngine({ baseUrl: BASE, fetchImpl: impl });
+
+    await engine.invoke(input({ remoteControlUrlListener }));
+
+    expect(remoteControlUrlListener).toHaveBeenCalledWith("https://claude.ai/code/session_late");
+  });
+
   it("never calls progressListener when the caller has no live channel", async () => {
     const { impl } = scriptedFetch([
       { id: "x", status: "pending", progress: ["clone: cloning the repo"] },
