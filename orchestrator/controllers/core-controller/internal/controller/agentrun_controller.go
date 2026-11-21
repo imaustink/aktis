@@ -34,6 +34,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	toolv1alpha1 "github.com/aktisai/orchestrator/controllers/core-controller/api/v1alpha1"
+	"github.com/aktisai/orchestrator/controllers/core-controller/internal/sandboxapi"
 )
 
 // AgentRunReconciler reconciles a AgentRun object
@@ -71,14 +72,16 @@ type AgentNatsConfig struct {
 // +kubebuilder:rbac:groups=core.aktis.ai,resources=agents,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs/status,verbs=get
+// +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=agents.x-k8s.io,resources=sandboxes/status,verbs=get
 // +kubebuilder:rbac:groups="",resources=pods,verbs=list
 
 // Reconcile mirrors ToolRunReconciler exactly, but for Agent invocations:
-// resolves the referenced Agent, launches the same hardened one-shot Job
-// (shared buildRunJob), with the run's natural-language `goal` as the
-// container argument instead of tool args, and mirrors the Job's status
-// onto AgentRun.status. Result payloads flow over the same callback
-// protocol (ADR 0006/0010).
+// resolves the referenced Agent, launches the same hardened one-shot workload
+// (shared buildRunPodSpec, as a Job or -- opted in -- a Sandbox), with the
+// run's natural-language `goal` as the container argument instead of tool
+// args, and mirrors the workload's status onto AgentRun.status. Result
+// payloads flow over the same callback protocol (ADR 0006/0010).
 func (r *AgentRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -124,9 +127,12 @@ func (r *AgentRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	if run.Status.JobName == "" {
-		return r.createJob(ctx, &run)
+		return r.createWorkload(ctx, &run)
 	}
 
+	if ExecutionBackend(run.Status.ExecutionBackend) == BackendSandbox {
+		return r.syncSandboxStatus(ctx, &run)
+	}
 	return r.syncJobStatus(ctx, &run)
 }
 
@@ -145,7 +151,17 @@ func (r *AgentRunReconciler) retention() time.Duration {
 	return DefaultAgentRunRetention
 }
 
-func (r *AgentRunReconciler) createJob(ctx context.Context, run *toolv1alpha1.AgentRun) (ctrl.Result, error) {
+// createWorkload resolves the Agent, picks an execution backend, and creates
+// the corresponding workload owned by the AgentRun -- the same dispatch
+// ToolRunReconciler.createWorkload does, with the same rule that the chosen
+// backend is recorded in status so later reconciles read back the kind that
+// was actually launched.
+//
+// Nothing outside this controller has to know which backend ran: both engines
+// follow an agent run through AgentRun.status and the NATS bridge, never
+// through the Job, and the pod -- and so the agent-runtime SDK inside it -- is
+// identical on both.
+func (r *AgentRunReconciler) createWorkload(ctx context.Context, run *toolv1alpha1.AgentRun) (ctrl.Result, error) {
 	var agent toolv1alpha1.Agent
 	agentKey := types.NamespacedName{Namespace: run.Namespace, Name: run.Spec.AgentRef}
 	if err := r.Get(ctx, agentKey, &agent); err != nil {
@@ -155,7 +171,9 @@ func (r *AgentRunReconciler) createJob(ctx context.Context, run *toolv1alpha1.Ag
 		return ctrl.Result{}, err
 	}
 
-	job, err := buildRunJob(runJobParams{
+	backend := resolveExecutionBackend(run.Annotations, agent.Annotations)
+
+	params := runJobParams{
 		// run.Name IS the Job name directly, not "agentrun-"+run.Name: the
 		// Temporal engine (orchestrator/engines/temporal's BridgedAgentWorkflow) names
 		// AgentRun CRs "agentrun-<agentId>-<uuid>" itself, so prepending this
@@ -174,6 +192,7 @@ func (r *AgentRunReconciler) createJob(ctx context.Context, run *toolv1alpha1.Ag
 		},
 		image:              agent.Spec.Image,
 		serviceAccountName: agent.Spec.ServiceAccountName,
+		runtimeClassName:   agent.Spec.RuntimeClassName,
 		// The agent-runtime SDK reads the goal from AGENT_GOAL env (not argv),
 		// to avoid shell escaping issues with arbitrary natural-language goals.
 		args: nil,
@@ -186,27 +205,75 @@ func (r *AgentRunReconciler) createJob(ctx context.Context, run *toolv1alpha1.Ag
 		skills:         agent.Spec.Skills,
 		callback:       run.Spec.Callback,
 		timeoutSeconds: run.Spec.TimeoutSeconds,
-	})
+	}
+
+	var workload client.Object
+	var err error
+	if backend == BackendSandbox {
+		workload, err = buildRunSandbox(params)
+	} else {
+		workload, err = buildRunJob(params)
+	}
 	if err != nil {
 		return r.markFailed(ctx, run, "InvalidAgentRun", err.Error())
 	}
 
-	if err := controllerutil.SetControllerReference(run, job, r.Scheme); err != nil {
+	if err := controllerutil.SetControllerReference(run, workload, r.Scheme); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	if err := r.Create(ctx, job); err != nil {
+	if err := r.Create(ctx, workload); err != nil {
+		// Same as ToolRunReconciler.createWorkload: asking for the Sandbox
+		// backend on a cluster without agent-sandbox fails the run with the
+		// reason, since no retry can install a CRD.
+		if meta.IsNoMatchError(err) {
+			return r.markFailed(ctx, run, "ExecutionBackendUnavailable",
+				fmt.Sprintf("execution backend %q requires the agent-sandbox CRDs, which are not installed: %v", backend, err))
+		}
 		if !apierrors.IsAlreadyExists(err) {
 			return ctrl.Result{}, err
 		}
 	}
 
 	run.Status.Phase = toolv1alpha1.ToolRunPhasePending
-	run.Status.JobName = job.Name
+	run.Status.JobName = workload.GetName()
+	run.Status.ExecutionBackend = string(backend)
 	if err := r.Status().Update(ctx, run); err != nil {
 		return ctrl.Result{}, err
 	}
 
+	return ctrl.Result{}, nil
+}
+
+// syncSandboxStatus mirrors an owned Sandbox's conditions onto
+// AgentRun.status, the Sandbox-backend counterpart of syncJobStatus.
+func (r *AgentRunReconciler) syncSandboxStatus(ctx context.Context, run *toolv1alpha1.AgentRun) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	var sb sandboxapi.Sandbox
+	key := types.NamespacedName{Namespace: run.Namespace, Name: run.Status.JobName}
+	if err := r.Get(ctx, key, &sb); err != nil {
+		if apierrors.IsNotFound(err) {
+			return r.markFailed(ctx, run, "SandboxMissing", fmt.Sprintf("owned Sandbox %q no longer exists", run.Status.JobName))
+		}
+		return ctrl.Result{}, err
+	}
+
+	next, changed := observeSandbox(ctx, r.PodReader, &sb,
+		map[string]string{"core.aktis.ai/agentrun": run.Name},
+		runLifecycle{run.Status.Phase, run.Status.Message, run.Status.StartTime, run.Status.CompletionTime})
+	if !changed {
+		return ctrl.Result{}, nil
+	}
+
+	run.Status.Phase = next.phase
+	run.Status.Message = next.message
+	run.Status.StartTime = next.startTime
+	run.Status.CompletionTime = next.completionTime
+
+	if err := r.Status().Update(ctx, run); err != nil {
+		return ctrl.Result{}, err
+	}
+	log.Info("agentrun status synced", "agentrun", run.Name, "phase", next.phase, "backend", BackendSandbox)
 	return ctrl.Result{}, nil
 }
 
@@ -283,12 +350,20 @@ func (r *AgentRunReconciler) markFailed(ctx context.Context, run *toolv1alpha1.A
 }
 
 // SetupWithManager sets up the controller with the Manager.
+//
+// The Sandbox watch is conditional on the agent-sandbox CRD being served, for
+// the reason spelled out on ToolRunReconciler.SetupWithManager: an owned kind
+// with no CRD blocks the controller from ever starting its workers.
 func (r *AgentRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&toolv1alpha1.AgentRun{}).
-		Owns(&batchv1.Job{}).
-		Named("agentrun").
-		Complete(r)
+		Owns(&batchv1.Job{})
+
+	if sandboxAPIAvailable(mgr) {
+		b = b.Owns(&sandboxapi.Sandbox{})
+	}
+
+	return b.Named("agentrun").Complete(r)
 }
 
 // agentRuntimeEnv returns the env vars the @aktis/agent-runtime SDK

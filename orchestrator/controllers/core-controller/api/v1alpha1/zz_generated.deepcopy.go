@@ -294,6 +294,11 @@ func (in *AgentSpec) DeepCopyInto(out *AgentSpec) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.RuntimeClassName != nil {
+		in, out := &in.RuntimeClassName, &out.RuntimeClassName
+		*out = new(string)
+		**out = **in
+	}
 	if in.Env != nil {
 		in, out := &in.Env, &out.Env
 		*out = make([]EnvVar, len(*in))
@@ -2266,6 +2271,11 @@ func (in *ToolSpec) DeepCopyInto(out *ToolSpec) {
 		in, out := &in.AllowedRoles, &out.AllowedRoles
 		*out = make([]string, len(*in))
 		copy(*out, *in)
+	}
+	if in.RuntimeClassName != nil {
+		in, out := &in.RuntimeClassName, &out.RuntimeClassName
+		*out = new(string)
+		**out = **in
 	}
 	if in.Args != nil {
 		in, out := &in.Args, &out.Args

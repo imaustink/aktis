@@ -59,6 +59,14 @@ spec:
             - name: AGENT_IMAGE_PULL_POLICY
               value: {{ .Values.runJob.imagePullPolicy | quote }}
             {{- end }}
+            {{- if .Values.runJob.defaultRuntimeClassName }}
+            - name: AGENT_DEFAULT_RUNTIME_CLASS
+              value: {{ .Values.runJob.defaultRuntimeClassName | quote }}
+            {{- end }}
+            {{- if .Values.runJob.executionBackend }}
+            - name: AGENT_EXECUTION_BACKEND
+              value: {{ .Values.runJob.executionBackend | quote }}
+            {{- end }}
             {{- if .Values.corpusSync.enabled }}
             # What the sync CronJob a Corpus reconciles into will curl
             # (ADR 0043). The binary's own default is `http://connection-broker`,

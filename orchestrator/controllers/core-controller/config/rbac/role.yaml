@@ -29,6 +29,24 @@ rules:
   - update
   - watch
 - apiGroups:
+  - agents.x-k8s.io
+  resources:
+  - sandboxes
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - agents.x-k8s.io
+  resources:
+  - sandboxes/status
+  verbs:
+  - get
+- apiGroups:
   - batch
   resources:
   - cronjobs
