@@ -374,10 +374,10 @@ async function handler(session: AgentSession): Promise<AgentReply> {
   // turns), diff against it: an unchanged HEAD means no new commits. When we
   // did NOT (priorHeadSha === null -- the repo was cloned DURING the turn, as
   // on a first, marker-less chat turn), a non-null HEAD is just the clone's
-  // base commit and is NOT evidence of new work; instead ask whether HEAD
-  // moved past the clone's default-branch tip. This avoids the false "no open
-  // pull request was found" warning on a turn that only read the repo (e.g.
-  // to file an issue), which left HEAD exactly at origin/HEAD.
+  // base commit and is NOT evidence of new work. Neither is HEAD being ahead
+  // of origin/HEAD: a `gh pr checkout` of an existing PR branch puts HEAD
+  // there without committing anything (imaustink/aktis#343). So only commits
+  // dated inside this turn (countCommitsSince) count as new work.
   const madeNewCommits =
     priorHeadSha !== null
       ? headSha !== null && headSha !== priorHeadSha
