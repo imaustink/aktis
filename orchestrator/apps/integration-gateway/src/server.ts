@@ -872,6 +872,9 @@ export class GatewayServer {
       }
     };
     let httpSent = false;
+    // The posted ack, so the Remote Control link can be edited into it
+    // rather than posted as a second comment (see remoteControlHooks).
+    let ackComment: { id: number; body: string } | undefined;
     try {
       // Record the owed removal BEFORE polling (and before anything else that
       // can throw or outlive the pod), so the reconciler can self-heal it if
@@ -895,12 +898,17 @@ export class GatewayServer {
           });
         }
         const ack = [gh.ack, pageUrl ? `Follow along or send follow-ups: ${pageUrl}` : undefined].filter(Boolean).join("\n\n");
-        if (ack) await best(() => this.options.githubReplyClient.postIssueComment(gh.owner, gh.repo, gh.issueNumber, ack));
+        if (ack) {
+          await best(async () => {
+            const id = await this.options.githubReplyClient.postIssueComment(gh.owner, gh.repo, gh.issueNumber, ack);
+            if (id !== undefined) ackComment = { id, body: ack };
+          });
+        }
       }
 
       const turnLabel = `${envelope.source} event ${envelope.id} → ${trigger.name || "trigger"}`;
       let tracked = await this.trackTurn(sessionId, turnLabel);
-      const hooks = gh ? this.remoteControlHooks(gh) : {};
+      const hooks = gh ? this.remoteControlHooks(gh, () => ackComment) : {};
       let outcome = await this.options.orchestratorClient.poll(invocationId, hooks);
 
       // Unauthenticated turn: `result` is a "link your account" prompt, not
@@ -912,6 +920,10 @@ export class GatewayServer {
       if (outcome.status === "succeeded" && outcome.identityLinkPending && outcome.identityLink) {
         await this.completeTurn(sessionId, tracked, outcome);
         if (gh) await best(() => this.options.githubReplyClient.postIssueComment(gh.owner, gh.repo, gh.issueNumber, outcome.result ?? ""));
+        // The ack now sits above the prompt the human is acting on, and GitHub
+        // doesn't notify on edits: a Remote Control link that surfaces on the
+        // resumed turn is posted as its own comment instead.
+        ackComment = undefined;
         const resumed = await this.waitAndResume(outcome.identityLink, async () => {
           // The resumed turn stays in the delivery's trace.
           const hop = startSpan("event resubmit", traceparent, { kind: "client", attributes: { "aktis.event_source": envelope.source } });
@@ -979,15 +991,33 @@ export class GatewayServer {
     }
   }
 
-  /** Posts the Remote Control link (at most once) to the trigger's issue when the delegated agent surfaces one. */
-  private remoteControlHooks(gh: GithubReplyTarget): PollHooks {
+  /**
+   * Surfaces the Remote Control link (at most once) on the trigger's issue
+   * when the delegated agent reports one. The agent pod takes minutes to
+   * register its session, so the ack can't wait for it: instead the link is
+   * edited INTO the already-posted ack, keeping one "starting work" comment.
+   * With no ack to edit (none declared, its post failed, no id came back)
+   * or a failed edit, it falls back to posting the link as its own comment
+   * -- the link is the one thing a human needs to take over, so it must land.
+   */
+  private remoteControlHooks(gh: GithubReplyTarget, ack: () => { id: number; body: string } | undefined): PollHooks {
     let posted = false;
     return {
       onRemoteControlUrl: async (url) => {
         if (posted) return;
         posted = true;
+        const line = `🤖 Watch live or take over the session here: ${url}`;
+        const ackComment = ack();
+        if (ackComment) {
+          try {
+            await this.options.githubReplyClient.updateIssueComment(gh.owner, gh.repo, ackComment.id, `${ackComment.body}\n\n${line}`);
+            return;
+          } catch (error) {
+            this.report(error);
+          }
+        }
         try {
-          await this.options.githubReplyClient.postIssueComment(gh.owner, gh.repo, gh.issueNumber, `🤖 Watch live or take over the session here: ${url}`);
+          await this.options.githubReplyClient.postIssueComment(gh.owner, gh.repo, gh.issueNumber, line);
         } catch (error) {
           this.report(error);
         }

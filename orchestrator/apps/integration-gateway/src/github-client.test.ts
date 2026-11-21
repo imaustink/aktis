@@ -33,6 +33,38 @@ describe("GithubReplyClient.postIssueComment", () => {
 
     await expect(client.postIssueComment("acme", "widgets", 42, "hi")).rejects.toThrow(/403.*forbidden/s);
   });
+
+  it("returns the new comment's id, or undefined when the response has none", async () => {
+    const withId = new GithubReplyClient({ ...baseConfig, fetchImpl: vi.fn().mockResolvedValue({ ok: true, json: async () => ({ id: 987 }) }) });
+    expect(await withId.postIssueComment("acme", "widgets", 42, "hi")).toBe(987);
+    const noBody = new GithubReplyClient({ ...baseConfig, fetchImpl: vi.fn().mockResolvedValue({ ok: true }) });
+    expect(await noBody.postIssueComment("acme", "widgets", 42, "hi")).toBeUndefined();
+  });
+});
+
+describe("GithubReplyClient.updateIssueComment", () => {
+  it("PATCHes the comment with a marker-prefixed body", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: true });
+    const client = new GithubReplyClient({ ...baseConfig, fetchImpl });
+
+    await client.updateIssueComment("acme", "widgets", 987, "Starting.\n\nWatch live: x");
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "https://api.github.com/repos/acme/widgets/issues/comments/987",
+      expect.objectContaining({
+        method: "PATCH",
+        headers: expect.objectContaining({ authorization: "Bearer pat_123" }),
+        body: JSON.stringify({ body: `${REPLY_MARKER}\nStarting.\n\nWatch live: x` }),
+      }),
+    );
+  });
+
+  it("throws with response detail on a non-2xx response", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({ ok: false, status: 404, text: async () => "Not Found" });
+    const client = new GithubReplyClient({ ...baseConfig, fetchImpl });
+
+    await expect(client.updateIssueComment("acme", "widgets", 987, "hi")).rejects.toThrow(/987.*404.*Not Found/s);
+  });
 });
 
 describe("GithubReplyClient.removeIssueLabel", () => {
