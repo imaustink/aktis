@@ -17,6 +17,12 @@ export interface AgentTurnResult {
   /** false = the agent is asking a question / awaiting a further prompt; true = the agent is done and exiting. */
   final: boolean;
   result?: unknown;
+  /**
+   * The run's structured outcome (docs/adr/0052 §2), as the agent published it
+   * on the reply. Unvalidated here; the server checks shape and size before it
+   * reaches an invocation record.
+   */
+  outcome?: unknown;
   /** Progress/warning narration collected while waiting, oldest first (not streamed live in v1 — see graph.ts). */
   narration: string[];
 }
@@ -382,7 +388,13 @@ export class NatsAgentChannel implements AgentOrchestratorChannel {
             opts.onProgress?.("warning", msg.message);
             break;
           case "reply": {
-            const reply = { message: msg.message, final: msg.final, result: msg.result, narration };
+            const reply: AgentTurnResult = {
+              message: msg.message,
+              final: msg.final,
+              result: msg.result,
+              ...(msg.outcome !== undefined ? { outcome: msg.outcome } : {}),
+              narration,
+            };
             // PERSIST before acking, then ack before unsubscribing.
             //
             // The ack releases the agent's hold (docs/adr/0033): it stops

@@ -62,7 +62,9 @@ export function parseEnvelope(raw: unknown): Envelope | { error: string } {
   if (!isPlainObject(raw)) return { error: "event must be an object" };
   const { source, kind, id, time, headers, body, sender, repository } = raw;
   if (typeof source !== "string" || source === "") return { error: "event.source must be a non-empty string" };
-  if (kind !== "webhook" && kind !== "cron") return { error: 'event.kind must be "webhook" or "cron"' };
+  if (kind !== "webhook" && kind !== "cron" && kind !== "run") {
+    return { error: 'event.kind must be "webhook", "cron" or "run"' };
+  }
   if (typeof id !== "string" || id === "") return { error: "event.id must be a non-empty string" };
   if (typeof time !== "string" || time === "") return { error: "event.time must be a non-empty string" };
   if (headers !== undefined && !isPlainObject(headers)) return { error: "event.headers must be an object" };

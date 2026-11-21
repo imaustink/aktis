@@ -555,6 +555,7 @@ describe("InvokeServer /invoke with an event envelope (ADR 0048, docs/event-trig
         name: "github-pr-review",
         sessionId: "github:acme/widgets#7",
         reply: { github: { repository: "acme/widgets", issueNumber: 7, ack: "Reviewing…", result: true } },
+        params: { repo: "acme/widgets", number: "7" },
       },
     });
     expect(graph.invoke).toHaveBeenCalledTimes(1);

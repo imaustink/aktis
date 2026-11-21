@@ -1310,6 +1310,25 @@ describe("buildAgentGraph agent delegation continuation tokens (ADR 0017)", () =
     expect(final.agentAwaitingReply).toBe(true);
     expect(final.extractedAgentContinuation).toBeUndefined();
   });
+
+  // docs/adr/0052 §2
+  it("carries a final reply's outcome as agentOutcome, separate from the continuation token", async () => {
+    const outcome = { pullRequest: { number: 12, url: "u" }, madeNewCommits: true };
+    const deps = agentDelegationDeps({}, { final: true, result: "tok-1", outcome });
+    const final = await buildAgentGraph(deps).invoke({ request: "build me a hello world server", authToken: "tok" });
+
+    expect(final.error).toBeUndefined();
+    expect(final.agentOutcome).toEqual(outcome);
+    expect(final.extractedAgentContinuation).toEqual({ agentId: "opencode-swe", token: "tok-1" });
+  });
+
+  it("ignores an outcome on a non-final reply: only a finished run has one", async () => {
+    const deps = agentDelegationDeps({}, { final: false, outcome: { madeNewCommits: true } });
+    const final = await buildAgentGraph(deps).invoke({ request: "build me a hello world server", authToken: "tok" });
+
+    expect(final.agentAwaitingReply).toBe(true);
+    expect(final.agentOutcome).toBeUndefined();
+  });
 });
 
 describe("buildAgentGraph checkEventTrigger (EventTrigger-forced dispatch, ADR 0048)", () => {
