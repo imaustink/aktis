@@ -285,7 +285,10 @@ create|merge|close|reopen|ready|edit`, mint a `contents:read` token) from
   is what resolves a sender to the subject their links live under. The gateway
   signs `{login, accountId, subject?, subjectStatus}` into the sender assertion.
 - Reply adapters run only for the `reply` the orchestrator returned: `github.ack`
-  (+ session page link) before polling; `github.result` / `http` after;
+  (+ session page link) before polling. When the delegated agent reports a
+  Remote Control URL mid-run, it is edited into that ack comment (a separate
+  comment only if there is no ack to edit or the edit fails);
+  `github.result` / `http` after;
   `github.removeLabel` after, on every outcome, through the durable pending-action
   store so a crash mid-run still clears it.
 

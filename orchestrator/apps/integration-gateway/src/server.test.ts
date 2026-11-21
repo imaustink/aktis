@@ -128,6 +128,7 @@ interface Harness {
   poll: ReturnType<typeof vi.fn>;
   invoke: ReturnType<typeof vi.fn>;
   postIssueComment: ReturnType<typeof vi.fn>;
+  updateIssueComment: ReturnType<typeof vi.fn>;
   removeIssueLabel: ReturnType<typeof vi.fn>;
   replyFetch: ReturnType<typeof vi.fn>;
   secretsGet: ReturnType<typeof vi.fn>;
@@ -158,8 +159,13 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
     return { status: "succeeded", result: "Looks good." };
   });
   const invoke = vi.fn(async (): Promise<OrchestratorInvokeResult> => ({ status: "succeeded", result: "Follow-up done." }));
-  const postIssueComment = vi.fn(async (_o: string, _r: string, _n: number, body: string) => {
+  let nextCommentId = 1000;
+  const postIssueComment = vi.fn(async (_o: string, _r: string, _n: number, body: string): Promise<number | undefined> => {
     order.push(`comment:${body.split("\n")[0]}`);
+    return nextCommentId++;
+  });
+  const updateIssueComment = vi.fn(async (_o: string, _r: string, id: number) => {
+    order.push(`edit:${id}`);
   });
   const removeIssueLabel = vi.fn(async () => {
     order.push("removeLabel");
@@ -185,7 +191,7 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
     tickNamespace: "agents",
     identityResolver,
     orchestratorClient: { submitEvent, poll, invoke, checkLive: vi.fn().mockResolvedValue({ live: false }) } as unknown as OrchestratorClient,
-    githubReplyClient: { postIssueComment, removeIssueLabel } as unknown as GithubReplyClient,
+    githubReplyClient: { postIssueComment, updateIssueComment, removeIssueLabel } as unknown as GithubReplyClient,
     replyFetch: replyFetch as unknown as typeof fetch,
     log: (line) => logs.push(line),
     onBackgroundError,
@@ -207,6 +213,7 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
     poll,
     invoke,
     postIssueComment,
+    updateIssueComment,
     removeIssueLabel,
     replyFetch,
     secretsGet,
@@ -643,7 +650,7 @@ describe("/invoke outcomes drive exactly the declared side effects", () => {
     expect(h.replyFetch).toHaveBeenCalled();
   });
 
-  it("posts the Remote Control link at most once to the trigger's issue", async () => {
+  it("edits the Remote Control link into the ack (at most once) instead of posting a second comment", async () => {
     const h = await start();
     h.poll.mockImplementationOnce(async (_id: string, hooks?: PollHooks) => {
       await hooks?.onRemoteControlUrl?.("https://claude.ai/code/session_abc");
@@ -652,6 +659,42 @@ describe("/invoke outcomes drive exactly the declared side effects", () => {
     });
     await postGithub(h);
     await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
+    const ackBody = h.postIssueComment.mock.calls[0]?.[3] as string;
+    const ackId = await h.postIssueComment.mock.results[0]?.value;
+    expect(h.updateIssueComment).toHaveBeenCalledTimes(1);
+    expect(h.updateIssueComment).toHaveBeenCalledWith(
+      "acme",
+      "widgets",
+      ackId,
+      `${ackBody}\n\n🤖 Watch live or take over the session here: https://claude.ai/code/session_abc`,
+    );
+    expect(h.postIssueComment.mock.calls.filter((c) => String(c[3]).includes("Watch live"))).toEqual([]);
+  });
+
+  it("posts the Remote Control link as its own comment when there is no ack to edit", async () => {
+    const h = await start();
+    h.postIssueComment.mockRejectedValueOnce(new Error("github down")); // the ack
+    h.poll.mockImplementationOnce(async (_id: string, hooks?: PollHooks) => {
+      await hooks?.onRemoteControlUrl?.("https://claude.ai/code/session_abc");
+      return { status: "succeeded", result: "Done." };
+    });
+    await postGithub(h);
+    await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
+    expect(h.updateIssueComment).not.toHaveBeenCalled();
+    const rc = h.postIssueComment.mock.calls.filter((c) => String(c[3]).includes("Watch live"));
+    expect(rc).toEqual([["acme", "widgets", 7, "🤖 Watch live or take over the session here: https://claude.ai/code/session_abc"]]);
+  });
+
+  it("falls back to a separate Remote Control comment when editing the ack fails", async () => {
+    const h = await start();
+    h.updateIssueComment.mockRejectedValueOnce(new Error("422"));
+    h.poll.mockImplementationOnce(async (_id: string, hooks?: PollHooks) => {
+      await hooks?.onRemoteControlUrl?.("https://claude.ai/code/session_abc");
+      return { status: "succeeded", result: "Done." };
+    });
+    await postGithub(h);
+    await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
+    expect(h.updateIssueComment).toHaveBeenCalledTimes(1);
     const rc = h.postIssueComment.mock.calls.filter((c) => String(c[3]).includes("Watch live"));
     expect(rc).toEqual([["acme", "widgets", 7, "🤖 Watch live or take over the session here: https://claude.ai/code/session_abc"]]);
   });
