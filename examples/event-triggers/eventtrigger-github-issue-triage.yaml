@@ -64,3 +64,7 @@ spec:
       ack: "🤖 Starting work on this now."
       result: true
       removeLabel: "{{label}}"
+  # Publish the run's completion to the `runs` run source, where
+  # factory-review picks up the PR it opened (docs/adr/0052).
+  onComplete:
+    emitTo: runs

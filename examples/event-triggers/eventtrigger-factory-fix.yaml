@@ -1,0 +1,87 @@
+# Software factory, step 3a (docs/adr/0052 §4): a review that recorded
+# `aktis-verdict changes-requested` sends the PR to a fix run, which addresses
+# the review and syncs the branch (the github-pr-triage prompt). It runs on the
+# PR, not the issue: the review comments live there, and issue triage would
+# open a second PR. Its completion re-enters factory-review.
+#
+# Exactly the complement of factory-handoff among factory-review events: only
+# an explicit changes-requested verdict under the 3-review cap loops. No
+# verdict, "ready", a failed review or the cap all hand off to a human.
+apiVersion: core.aktis.ai/v1alpha1
+kind: EventTrigger
+metadata:
+  name: factory-fix
+spec:
+  sourceRef: runs
+  match:
+    cel: >-
+      source == "runs" && kind == "run" &&
+      body.trigger == "factory-review" &&
+      has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" &&
+      body.chain.counts["factory-review"] < 3
+  params:
+    repository: body.params.repository
+    number: body.params.number
+  sessionKey: "github:{{repository}}#{{number}}"
+  target:
+    agentRef: "opencode-swe-agent"
+    promptTemplate: |
+      Pull request {{repository}}#{{number}} just received an automated code
+      review that requested changes. Read its title and description with
+      `gh pr view {{number}}`.
+
+      Address the automated review's feedback on this pull request and get it
+      ready to merge. Work only in {{repository}} and only on this PR's
+      existing branch -- do not open a second pull request, do not create a
+      repository, and do not
+      substitute any other repository or branch.
+
+      1. Check out the PR's branch (`gh pr checkout {{number}}`).
+      2. Read ALL the feedback on it: the PR description, every review
+         (`gh pr view {{number}} --comments`, `gh api` for review
+         comments), and any failing checks (`gh pr checks {{number}}`).
+      3. Address that feedback in code. Where you disagree with a comment,
+         reply to it explaining why instead of silently ignoring it.
+      4. Make every failing check pass, on this branch. That includes
+         failures this PR did not cause -- a runner image or toolchain change,
+         a newly reported vulnerability in a dependency or the standard
+         library, a broken workflow or tool install step. A PR whose checks
+         cannot go green cannot merge, so these are in scope here, not "a
+         separate PR". Read the failing job's logs (`gh run view --log-failed`),
+         fix the cause (bump the toolchain or dependency, upgrade or pin the
+         tool, update the workflow), and put each such fix in its own commit.
+         Never skip, disable, or loosen a check to make it pass. Only if the
+         fix needs something you cannot do from here (a secret, a repository
+         setting, a permission you lack) stop and say exactly what.
+      5. Sync the branch with its base branch, resolving any conflicts
+         (`gh pr view {{number}} --json baseRefName`, then rebase or
+         merge the base in -- match whatever this repository's history already
+         does). Push the result to the same branch so the PR itself updates.
+      6. Update the PR description if what it says no longer matches what the
+         branch does, and post one comment summarizing what you changed in
+         response to which feedback, plus anything you deliberately did not do.
+
+      Resolve every review comment you addressed. If something is genuinely
+      blocking you -- a comment you cannot act on without a decision, a conflict
+      you cannot resolve safely, missing permission -- stop and post a comment
+      saying exactly what you need, rather than guessing or working around it
+      somewhere else.
+
+      You get exactly one turn to do this -- you cannot pause partway through
+      and wait for a CI check, build, or test run to finish, and nothing will
+      re-invoke you automatically when one does. Push your work and post your
+      summary now. If a check is still running when you finish, say so in one
+      line -- do not let it block or delay pushing and summarizing, and do not
+      say you'll "finalize" or "resume" later. (When this run ends, another
+      automated review of the PR starts on its own.)
+  reply:
+    github:
+      repository: "{{repository}}"
+      issueNumber: "{{number}}"
+      ack: "🤖 Addressing the automated review's feedback now."
+      sessionPage: true
+      result: true
+      addLabels: ["ai-triage"]
+      removeLabel: "ai-triage"
+  onComplete:
+    emitTo: runs

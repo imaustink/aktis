@@ -32,9 +32,18 @@ type EventTriggerMatch struct {
 // on the rendered prompt. It has no fields; its presence selects it.
 type OrchestratorTarget struct{}
 
-// EventTriggerTarget is exactly one of orchestrator/skillRef/agentRef/toolRef.
-// +kubebuilder:validation:XValidation:rule="(has(self.orchestrator)?1:0)+(has(self.skillRef)?1:0)+(has(self.agentRef)?1:0)+(has(self.toolRef)?1:0)==1",message="exactly one of orchestrator, skillRef, agentRef or toolRef must be set"
-// +kubebuilder:validation:XValidation:rule="has(self.toolRef) || (has(self.promptTemplate) && size(self.promptTemplate) > 0)",message="promptTemplate is required unless toolRef is set"
+// NoneTarget runs nothing: the trigger only executes its reply side effects
+// (labels, assignees, the ack). It has no fields; its presence selects it. It
+// is how a handoff such as "assign the PR to a human" is expressed
+// (docs/adr/0052 §3).
+type NoneTarget struct{}
+
+// EventTriggerTarget is exactly one of orchestrator/skillRef/agentRef/toolRef/none.
+// +kubebuilder:validation:XValidation:rule="(has(self.orchestrator)?1:0)+(has(self.skillRef)?1:0)+(has(self.agentRef)?1:0)+(has(self.toolRef)?1:0)+(has(self.none)?1:0)==1",message="exactly one of orchestrator, skillRef, agentRef, toolRef or none must be set"
+// +kubebuilder:validation:XValidation:rule="has(self.toolRef) || has(self.none) || (has(self.promptTemplate) && size(self.promptTemplate) > 0)",message="promptTemplate is required unless toolRef or none is set"
+// +kubebuilder:validation:XValidation:rule="!has(self.none) || !has(self.promptTemplate) || size(self.promptTemplate) == 0",message="promptTemplate cannot be set with none: nothing runs to receive it"
+// +kubebuilder:validation:XValidation:rule="!has(self.none) || !has(self.readOnly) || !self.readOnly",message="readOnly cannot be set with none: nothing runs to restrict"
+// +kubebuilder:validation:XValidation:rule="!has(self.none) || !has(self.identity)",message="identity cannot be set with none: nothing runs to authorize"
 // +kubebuilder:validation:XValidation:rule="!has(self.identity) || !has(self.toolRef)",message="identity applies to agent runs; it cannot be set with toolRef"
 type EventTriggerTarget struct {
 	// orchestrator runs a conversational turn on the rendered prompt.
@@ -53,6 +62,12 @@ type EventTriggerTarget struct {
 	// arguments, skipping the planner.
 	// +optional
 	ToolRef string `json:"toolRef,omitempty"`
+
+	// none runs nothing: the trigger is accepted and completes at once with an
+	// empty result, executing only its reply side effects. No AgentRun, no
+	// tool, no identity check.
+	// +optional
+	None *NoneTarget `json:"none,omitempty"`
 
 	// promptTemplate is the request, with {{param}} placeholders.
 	// +optional
@@ -101,6 +116,21 @@ type GitHubReply struct {
 	// +optional
 	RemoveLabel string `json:"removeLabel,omitempty"`
 
+	// addLabels are added when the run is accepted, alongside the ack. Each
+	// entry is a {{param}} template; one that renders empty is dropped. Labels
+	// the bot adds never re-enter routing (bot-authored events are dropped),
+	// so they are safe as status markers (docs/adr/0052 §3).
+	// +optional
+	// +kubebuilder:validation:MaxItems=10
+	AddLabels []string `json:"addLabels,omitempty"`
+
+	// assignees are logins assigned to the issue or pull request when the run
+	// is accepted. Each entry is a {{param}} template; one that renders empty
+	// is dropped. GitHub caps an issue at 10 assignees.
+	// +optional
+	// +kubebuilder:validation:MaxItems=10
+	Assignees []string `json:"assignees,omitempty"`
+
 	// onIdentityError posts the printable message of an identity error (the
 	// sender must link an account first, docs/adr/0049 §6) as a comment.
 	// GitHub never reads a webhook's response body, so without this nobody
@@ -129,6 +159,19 @@ type EventTriggerReply struct {
 
 	// +optional
 	HTTP *HTTPReply `json:"http,omitempty"`
+}
+
+// EventTriggerOnComplete publishes a run's completion as an event
+// (docs/adr/0052 §1).
+type EventTriggerOnComplete struct {
+	// emitTo names a run-kind EventSource (spec.run) in the same namespace.
+	// When a run this trigger started finishes, integration-gateway relays a
+	// kind "run" event on it carrying the run's status, params, outcome and
+	// chain counters, so other triggers can chain off it. The trigger is not
+	// Ready until the source exists and is a run source.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	EmitTo string `json:"emitTo"`
 }
 
 // EventTriggerSpec defines what a matching event dispatches.
@@ -160,6 +203,11 @@ type EventTriggerSpec struct {
 	// reply declares side effects around the run.
 	// +optional
 	Reply *EventTriggerReply `json:"reply,omitempty"`
+
+	// onComplete publishes the run's completion as an event. Absent, the
+	// trigger behaves as it always has: nothing is emitted.
+	// +optional
+	OnComplete *EventTriggerOnComplete `json:"onComplete,omitempty"`
 }
 
 // EventTriggerStatus defines the observed state of EventTrigger.
@@ -178,7 +226,8 @@ type EventTriggerStatus struct {
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
 
 // EventTrigger maps events matching a CEL predicate to an orchestrator turn,
-// Skill, Agent or Tool with CEL-derived params (docs/adr/0048).
+// Skill, Agent or Tool with CEL-derived params (docs/adr/0048), or to reply
+// side effects alone (target.none, docs/adr/0052).
 type EventTrigger struct {
 	metav1.TypeMeta `json:",inline"`
 

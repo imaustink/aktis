@@ -94,6 +94,15 @@ type CronSource struct {
 	Payload *runtime.RawExtension `json:"payload,omitempty"`
 }
 
+// RunSource is a run-completion source (docs/adr/0052 §1). It has no fields;
+// its presence selects it. Nothing outside the cluster delivers to it:
+// integration-gateway synthesizes one event on it whenever a run started by an
+// EventTrigger with onComplete.emitTo naming this source finishes, and feeds
+// that event through the same matching path as a webhook. So no Secret, no
+// CronJob and no sender block: the event carries the chain's originating
+// human, whom the gateway re-verifies on every hop.
+type RunSource struct{}
+
 // EventSenderProvider is how a sender's login is verified.
 // +kubebuilder:validation:Enum=github
 type EventSenderProvider string
@@ -138,8 +147,8 @@ type EventSender struct {
 	DropBots *bool `json:"dropBots,omitempty"`
 }
 
-// EventSourceSpec is exactly one of webhook / cron.
-// +kubebuilder:validation:XValidation:rule="(has(self.webhook)?1:0)+(has(self.cron)?1:0)==1",message="exactly one of webhook or cron must be set"
+// EventSourceSpec is exactly one of webhook / cron / run.
+// +kubebuilder:validation:XValidation:rule="(has(self.webhook)?1:0)+(has(self.cron)?1:0)+(has(self.run)?1:0)==1",message="exactly one of webhook, cron or run must be set"
 // +kubebuilder:validation:XValidation:rule="!has(self.sender) || has(self.webhook)",message="sender is only valid for webhook sources"
 type EventSourceSpec struct {
 	// webhook makes this an HTTP source.
@@ -150,7 +159,14 @@ type EventSourceSpec struct {
 	// +optional
 	Cron *CronSource `json:"cron,omitempty"`
 
-	// sender identifies who caused a webhook event.
+	// run makes this a run-completion source: triggers that set
+	// onComplete.emitTo to this source's name publish their runs' completions
+	// here (docs/adr/0052).
+	// +optional
+	Run *RunSource `json:"run,omitempty"`
+
+	// sender identifies who caused a webhook event. Never set on a run source:
+	// a run event's sender is the chain's origin, not something to extract.
 	// +optional
 	Sender *EventSender `json:"sender,omitempty"`
 }
@@ -175,7 +191,8 @@ type EventSourceStatus struct {
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
 
 // EventSource declares how events arrive and how far they are trusted
-// (docs/adr/0048): an authenticated webhook or a cron schedule. Every source
+// (docs/adr/0048): an authenticated webhook, a cron schedule, or the
+// completions of trigger-dispatched runs (docs/adr/0052). Every source
 // produces the same normalized envelope for EventTriggers to match.
 type EventSource struct {
 	metav1.TypeMeta `json:",inline"`
