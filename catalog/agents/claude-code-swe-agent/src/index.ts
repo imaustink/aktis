@@ -7,12 +7,13 @@ import { buildClaudeSettings, buildPrompt, isReadOnly } from "./claude.js";
 import { runClaudeTurn, runClaudeTurnRemoteControlled } from "./claude-runner.js";
 import {
   appendCoAuthorTrailer,
-  countCommitsAheadOfOriginHead,
+  countCommitsSince,
   discoverResult,
   ensureChangeDeliverable,
   ensureDir,
   ensurePullRequest,
   findRepoDir,
+  formatPrFooter,
   resolveGitIdentity,
   runCommand,
   setupGitAuth,
@@ -373,14 +374,14 @@ async function handler(session: AgentSession): Promise<AgentReply> {
   // turns), diff against it: an unchanged HEAD means no new commits. When we
   // did NOT (priorHeadSha === null -- the repo was cloned DURING the turn, as
   // on a first, marker-less chat turn), a non-null HEAD is just the clone's
-  // base commit and is NOT evidence of new work; instead ask whether HEAD
-  // moved past the clone's default-branch tip. This avoids the false "no open
-  // pull request was found" warning on a turn that only read the repo (e.g.
-  // to file an issue), which left HEAD exactly at origin/HEAD.
+  // base commit and is NOT evidence of new work. Neither is HEAD being ahead
+  // of origin/HEAD: a `gh pr checkout` of an existing PR branch puts HEAD
+  // there without committing anything (imaustink/aktis#343). So only commits
+  // dated inside this turn (countCommitsSince) count as new work.
   const madeNewCommits =
     priorHeadSha !== null
       ? headSha !== null && headSha !== priorHeadSha
-      : (await countCommitsAheadOfOriginHead(repoDir!, childEnv, session.signal)) > 0;
+      : (await countCommitsSince(repoDir!, turnStartedAt, childEnv, session.signal)) > 0;
 
   // FIX (deterministic deliverable): on a CHANGE turn that produced commits but
   // no open PR, the runner opens one itself rather than warning the user that
@@ -392,6 +393,7 @@ async function handler(session: AgentSession): Promise<AgentReply> {
     if (pr) {
       discovered.pr = pr.number;
       discovered.prUrl = pr.url;
+      discovered.prCreatedAt = pr.createdAt;
     }
   }
 
@@ -456,16 +458,15 @@ async function handler(session: AgentSession): Promise<AgentReply> {
     session: marker?.session ?? randomUUID(),
   };
 
-  // Only mention push/PR status when this turn actually produced new commits
-  // -- a read-only turn (e.g. an "ai-review" label trigger, which is
-  // explicitly told not to push) legitimately checks out a branch without
-  // committing anything, and slapping a "no open pull request was found"
-  // warning on that is a false positive, not a signal anything went wrong.
-  const prLine = !madeNewCommits
-    ? ""
-    : discovered.prUrl
-      ? `\n\n---\n✅ ${marker?.pr ? "Updated" : "Opened"} pull request: [${discovered.repo}#${discovered.pr}](${discovered.prUrl})`
-      : `\n\n---\n⚠️ Work is on \`${discovered.repo}\` branch \`${discovered.branch}\`, but no open pull request was found.`;
+  // Footer only when this turn pushed new commits; never on a read-only turn
+  // (e.g. "ai-review", which checks out the PR branch but cannot push).
+  const prLine = formatPrFooter({
+    readOnly,
+    madeNewCommits,
+    discovered,
+    turnStartedAt,
+    markerHadPr: Boolean(marker?.pr),
+  });
 
   return { message: `${clip(summary, 1500)}${prLine}`, result: encodeSweContinuation(nextMarker) };
 }
