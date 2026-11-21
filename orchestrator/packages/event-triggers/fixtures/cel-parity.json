@@ -182,6 +182,198 @@
       },
       "sender": {},
       "repository": ""
+    },
+    "factory_triage_pr": {
+      "source": "runs",
+      "kind": "run",
+      "id": "r-1",
+      "time": "2026-10-13T12:05:00Z",
+      "headers": {},
+      "body": {
+        "trigger": "github-issue-triage",
+        "status": "succeeded",
+        "params": {
+          "repository": "acme/widgets",
+          "number": "7"
+        },
+        "outcome": {
+          "pullRequest": {
+            "number": 12,
+            "url": "https://github.com/acme/widgets/pull/12"
+          },
+          "madeNewCommits": true
+        },
+        "chain": {
+          "id": "d-2",
+          "depth": 1,
+          "counts": {
+            "github-issue-triage": 1
+          },
+          "origin": {
+            "login": "octocat",
+            "repository": "acme/widgets"
+          }
+        }
+      },
+      "sender": {
+        "login": "octocat",
+        "isBot": false
+      },
+      "repository": "acme/widgets"
+    },
+    "factory_review_changes": {
+      "source": "runs",
+      "kind": "run",
+      "id": "r-2",
+      "time": "2026-10-13T12:05:00Z",
+      "headers": {},
+      "body": {
+        "trigger": "factory-review",
+        "status": "succeeded",
+        "params": {
+          "repository": "acme/widgets",
+          "number": "12"
+        },
+        "outcome": {
+          "pullRequest": {
+            "number": 12,
+            "url": "https://github.com/acme/widgets/pull/12"
+          },
+          "madeNewCommits": false,
+          "verdict": "changes-requested"
+        },
+        "chain": {
+          "id": "d-2",
+          "depth": 1,
+          "counts": {
+            "github-issue-triage": 1,
+            "factory-review": 2
+          },
+          "origin": {
+            "login": "octocat",
+            "repository": "acme/widgets"
+          }
+        }
+      },
+      "sender": {
+        "login": "octocat",
+        "isBot": false
+      },
+      "repository": "acme/widgets"
+    },
+    "factory_fix_capped": {
+      "source": "runs",
+      "kind": "run",
+      "id": "r-3",
+      "time": "2026-10-13T12:05:00Z",
+      "headers": {},
+      "body": {
+        "trigger": "factory-fix",
+        "status": "succeeded",
+        "params": {
+          "repository": "acme/widgets",
+          "number": "12"
+        },
+        "outcome": {
+          "pullRequest": {
+            "number": 12,
+            "url": "https://github.com/acme/widgets/pull/12"
+          },
+          "madeNewCommits": true
+        },
+        "chain": {
+          "id": "d-2",
+          "depth": 1,
+          "counts": {
+            "github-issue-triage": 1,
+            "factory-review": 3,
+            "factory-fix": 3
+          },
+          "origin": {
+            "login": "octocat",
+            "repository": "acme/widgets"
+          }
+        }
+      },
+      "sender": {
+        "login": "octocat",
+        "isBot": false
+      },
+      "repository": "acme/widgets"
+    },
+    "factory_triage_no_pr": {
+      "source": "runs",
+      "kind": "run",
+      "id": "r-4",
+      "time": "2026-10-13T12:05:00Z",
+      "headers": {},
+      "body": {
+        "trigger": "github-issue-triage",
+        "status": "succeeded",
+        "params": {
+          "repository": "acme/widgets",
+          "number": "7"
+        },
+        "outcome": {
+          "madeNewCommits": false
+        },
+        "chain": {
+          "id": "d-2",
+          "depth": 1,
+          "counts": {
+            "github-issue-triage": 1
+          },
+          "origin": {
+            "login": "octocat",
+            "repository": "acme/widgets"
+          }
+        }
+      },
+      "sender": {
+        "login": "octocat",
+        "isBot": false
+      },
+      "repository": "acme/widgets"
+    },
+    "factory_review_ready": {
+      "source": "runs",
+      "kind": "run",
+      "id": "r-5",
+      "time": "2026-10-13T12:05:00Z",
+      "headers": {},
+      "body": {
+        "trigger": "factory-review",
+        "status": "succeeded",
+        "params": {
+          "repository": "acme/widgets",
+          "number": "12"
+        },
+        "outcome": {
+          "pullRequest": {
+            "number": 12,
+            "url": "https://github.com/acme/widgets/pull/12"
+          },
+          "madeNewCommits": false,
+          "verdict": "ready"
+        },
+        "chain": {
+          "id": "d-2",
+          "depth": 1,
+          "counts": {
+            "github-issue-triage": 1,
+            "factory-review": 1
+          },
+          "origin": {
+            "login": "octocat",
+            "repository": "acme/widgets"
+          }
+        }
+      },
+      "sender": {
+        "login": "octocat",
+        "isBot": false
+      },
+      "repository": "acme/widgets"
     }
   },
   "cases": [
@@ -660,6 +852,220 @@
       "expr": "body.action ==",
       "expect": {
         "error": true
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): review gate: triage opened a PR, no review yet",
+      "envelope": "factory_triage_pr",
+      "expr": "source == \"runs\" && kind == \"run\" && body.trigger in [\"github-issue-triage\", \"factory-fix\"] && body.status == \"succeeded\" && has(body.outcome.pullRequest) && (!(\"factory-review\" in body.chain.counts) || body.chain.counts[\"factory-review\"] < 3)",
+      "expect": {
+        "value": true,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): review gate: fix under the review cap",
+      "envelope": "factory_review_changes",
+      "expr": "source == \"runs\" && kind == \"run\" && body.trigger in [\"factory-review\", \"factory-fix\"] && body.status == \"succeeded\" && has(body.outcome.pullRequest) && (!(\"factory-review\" in body.chain.counts) || body.chain.counts[\"factory-review\"] < 3)",
+      "expect": {
+        "value": true,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): review gate: review cap reached",
+      "envelope": "factory_fix_capped",
+      "expr": "source == \"runs\" && kind == \"run\" && body.trigger in [\"github-issue-triage\", \"factory-fix\"] && body.status == \"succeeded\" && has(body.outcome.pullRequest) && (!(\"factory-review\" in body.chain.counts) || body.chain.counts[\"factory-review\"] < 3)",
+      "expect": {
+        "value": false,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): review gate: no pull request",
+      "envelope": "factory_triage_no_pr",
+      "expr": "source == \"runs\" && kind == \"run\" && body.trigger in [\"github-issue-triage\", \"factory-fix\"] && body.status == \"succeeded\" && has(body.outcome.pullRequest) && (!(\"factory-review\" in body.chain.counts) || body.chain.counts[\"factory-review\"] < 3)",
+      "expect": {
+        "value": false,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): review gate: trigger not in list",
+      "envelope": "factory_review_changes",
+      "expr": "source == \"runs\" && kind == \"run\" && body.trigger in [\"github-issue-triage\", \"factory-fix\"] && body.status == \"succeeded\" && has(body.outcome.pullRequest) && (!(\"factory-review\" in body.chain.counts) || body.chain.counts[\"factory-review\"] < 3)",
+      "expect": {
+        "value": false,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): map key in: present",
+      "envelope": "factory_review_changes",
+      "expr": "\"factory-review\" in body.chain.counts",
+      "expect": {
+        "value": true,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): map key in: absent",
+      "envelope": "factory_triage_pr",
+      "expr": "\"factory-review\" in body.chain.counts",
+      "expect": {
+        "value": false,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): json integer < int literal: true",
+      "envelope": "factory_review_changes",
+      "expr": "body.chain.counts[\"factory-review\"] < 3",
+      "expect": {
+        "value": true,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): json integer < int literal: false",
+      "envelope": "factory_fix_capped",
+      "expr": "body.chain.counts[\"factory-review\"] < 3",
+      "expect": {
+        "value": false,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): json integer < int literal: absent key errors",
+      "envelope": "factory_triage_pr",
+      "expr": "body.chain.counts[\"factory-review\"] < 3",
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): chain count is an int",
+      "envelope": "factory_fix_capped",
+      "expr": "body.chain.counts[\"factory-review\"]",
+      "expect": {
+        "value": 3,
+        "type": "int"
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): has nested field: present",
+      "envelope": "factory_triage_pr",
+      "expr": "has(body.outcome.pullRequest)",
+      "expect": {
+        "value": true,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): has nested field: absent",
+      "envelope": "factory_triage_no_pr",
+      "expr": "has(body.outcome.pullRequest)",
+      "expect": {
+        "value": false,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): has nested field: verdict absent",
+      "envelope": "factory_triage_pr",
+      "expr": "has(body.outcome.verdict)",
+      "expect": {
+        "value": false,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): list in: member",
+      "envelope": "factory_fix_capped",
+      "expr": "body.trigger in [\"github-issue-triage\", \"factory-fix\"]",
+      "expect": {
+        "value": true,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): list in: not a member",
+      "envelope": "factory_review_ready",
+      "expr": "body.trigger in [\"github-issue-triage\", \"factory-fix\"]",
+      "expect": {
+        "value": false,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): verdict equality: changes-requested",
+      "envelope": "factory_review_changes",
+      "expr": "body.outcome.verdict == \"changes-requested\"",
+      "expect": {
+        "value": true,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): verdict equality: ready",
+      "envelope": "factory_review_ready",
+      "expr": "body.outcome.verdict == \"changes-requested\"",
+      "expect": {
+        "value": false,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): verdict equality: no verdict errors",
+      "envelope": "factory_triage_pr",
+      "expr": "body.outcome.verdict == \"changes-requested\"",
+      "expect": {
+        "error": true
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): negated compound: changes requested under cap",
+      "envelope": "factory_review_changes",
+      "expr": "!(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && body.chain.counts[\"factory-review\"] < 3)",
+      "expect": {
+        "value": false,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): negated compound: ready",
+      "envelope": "factory_review_ready",
+      "expr": "!(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && body.chain.counts[\"factory-review\"] < 3)",
+      "expect": {
+        "value": true,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): negated compound: no verdict short-circuits",
+      "envelope": "factory_triage_pr",
+      "expr": "!(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && body.chain.counts[\"factory-review\"] < 3)",
+      "expect": {
+        "value": true,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): param: pull request number is an int",
+      "envelope": "factory_triage_pr",
+      "expr": "body.outcome.pullRequest.number",
+      "expect": {
+        "value": 12,
+        "type": "int"
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): param: run params repository",
+      "envelope": "factory_triage_pr",
+      "expr": "body.params.repository",
+      "expect": {
+        "value": "acme/widgets",
+        "type": "string"
       }
     }
   ],
@@ -1454,6 +1860,153 @@
       ],
       "expect": {
         "error": true
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): run event picks the review trigger with int params",
+      "envelope": "factory_triage_pr",
+      "triggers": [
+        {
+          "name": "factory-review",
+          "sourceRef": "runs",
+          "match": {
+            "cel": "source == \"runs\" && kind == \"run\" && body.trigger in [\"github-issue-triage\", \"factory-fix\"] && body.status == \"succeeded\" && has(body.outcome.pullRequest) && (!(\"factory-review\" in body.chain.counts) || body.chain.counts[\"factory-review\"] < 3)"
+          },
+          "params": {
+            "number": "body.outcome.pullRequest.number",
+            "repository": "body.params.repository"
+          },
+          "sessionKey": "github:{{repository}}#{{number}}:review",
+          "target": {
+            "agentRef": "swe-agent",
+            "readOnly": true,
+            "promptTemplate": "Review {{repository}}#{{number}}"
+          },
+          "reply": {
+            "github": {
+              "repository": "{{repository}}",
+              "issueNumber": "{{number}}",
+              "ack": "Reviewing #{{number}}"
+            }
+          },
+          "onComplete": {
+            "emitTo": "runs"
+          }
+        },
+        {
+          "name": "factory-done",
+          "sourceRef": "runs",
+          "priority": -1,
+          "match": {
+            "cel": "kind == \"run\""
+          },
+          "target": {
+            "none": {}
+          }
+        }
+      ],
+      "expect": {
+        "trigger": "factory-review",
+        "params": {
+          "number": {
+            "value": 12,
+            "type": "int"
+          },
+          "repository": {
+            "value": "acme/widgets",
+            "type": "string"
+          }
+        },
+        "stringParams": {
+          "number": "12",
+          "repository": "acme/widgets"
+        },
+        "sessionId": "github:acme/widgets#12:review",
+        "prompt": "Review acme/widgets#12",
+        "reply": {
+          "github": {
+            "repository": "acme/widgets",
+            "issueNumber": 12,
+            "ack": "Reviewing #12"
+          }
+        }
+      }
+    },
+    {
+      "name": "factory (ADR 0052, TS): none target renders addLabels and assignees, dropping empties",
+      "envelope": "factory_review_ready",
+      "triggers": [
+        {
+          "name": "factory-ready",
+          "sourceRef": "runs",
+          "match": {
+            "cel": "!(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && body.chain.counts[\"factory-review\"] < 3)"
+          },
+          "params": {
+            "number": "body.outcome.pullRequest.number",
+            "repository": "body.params.repository",
+            "assignee": "sender.login",
+            "missing": "null"
+          },
+          "target": {
+            "none": {}
+          },
+          "reply": {
+            "github": {
+              "repository": "{{repository}}",
+              "issueNumber": "{{number}}",
+              "addLabels": [
+                "factory:ready",
+                "{{missing}}"
+              ],
+              "assignees": [
+                "{{assignee}}",
+                "{{missing}}"
+              ]
+            }
+          }
+        }
+      ],
+      "expect": {
+        "trigger": "factory-ready",
+        "params": {
+          "assignee": {
+            "value": "octocat",
+            "type": "string"
+          },
+          "missing": {
+            "value": null,
+            "type": "null"
+          },
+          "number": {
+            "value": 12,
+            "type": "int"
+          },
+          "repository": {
+            "value": "acme/widgets",
+            "type": "string"
+          }
+        },
+        "stringParams": {
+          "assignee": "octocat",
+          "missing": "",
+          "number": "12",
+          "repository": "acme/widgets"
+        },
+        "sessionId": "event:runs:r-5",
+        "prompt": "",
+        "reply": {
+          "github": {
+            "repository": "acme/widgets",
+            "issueNumber": 12,
+            "addLabels": [
+              "factory:ready"
+            ],
+            "assignees": [
+              "octocat"
+            ]
+          }
+        }
       }
     }
   ]

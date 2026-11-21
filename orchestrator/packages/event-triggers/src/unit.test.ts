@@ -298,3 +298,88 @@ describe("selectTrigger", () => {
     expect(r.status === "matched" && r.sessionId).toBe("event:ci:e-1");
   });
 });
+
+// docs/adr/0052
+describe("target.none / onComplete / addLabels+assignees (ADR 0052)", () => {
+  it("compiles target.none to kind none, with no prompt needed", () => {
+    const t = compileTrigger(trigger("n", { target: { none: {} } }));
+    expect(t.ready).toBe(true);
+    expect(t.target).toEqual({ kind: "none", readOnly: false });
+  });
+  it.each([
+    ["none + promptTemplate", { target: { none: {}, promptTemplate: "p" } }, /promptTemplate cannot be set with none/],
+    ["none + readOnly", { target: { none: {}, readOnly: true } }, /readOnly cannot be set with none/],
+    ["none + identity", { target: { none: {}, identity: "agent" } }, /identity cannot be set with none/],
+    ["none + agentRef", { target: { none: {}, agentRef: "a", promptTemplate: "p" } }, /exactly one of .*none/],
+    ["none + toolRef", { target: { none: {}, toolRef: "x" } }, /exactly one of .*none/],
+  ] as Array<[string, EventTriggerResource["spec"], RegExp]>)("is not ready: %s", (_, spec, error) => {
+    const t = compileTrigger(trigger("x", spec));
+    expect(t.ready).toBe(false);
+    expect(t.error).toMatch(error);
+  });
+  it("selects a none trigger with params and a rendered reply", () => {
+    const r = selectTrigger(
+      [
+        compileTrigger(
+          trigger("assign", {
+            params: { n: "body.n", who: "sender.login" },
+            target: { none: {} },
+            reply: { github: { repository: "a/b", issueNumber: "{{n}}", addLabels: ["factory"], assignees: ["{{who}}"] } },
+          }),
+        ),
+      ],
+      env({ n: 9 }, { sender: { login: "octocat", isBot: false } }),
+    );
+    if (r.status !== "matched") throw new Error(JSON.stringify(r));
+    expect(r.target).toEqual({ kind: "none", readOnly: false });
+    expect(r.prompt).toBe("");
+    expect(r.stringParams).toEqual({ n: "9", who: "octocat" });
+    expect(r.reply).toEqual({
+      github: { repository: "a/b", issueNumber: 9, addLabels: ["factory"], assignees: ["octocat"] },
+    });
+  });
+  it("drops list entries that render empty and omits an all-empty list", () => {
+    const r = selectTrigger(
+      [
+        compileTrigger(
+          trigger("t", {
+            params: { who: "body.who", lbl: "body.lbl" },
+            target: { orchestrator: {}, promptTemplate: "p" },
+            reply: {
+              github: {
+                repository: "a/b",
+                issueNumber: "1",
+                addLabels: ["{{lbl}}", "{{who}}", "x-{{lbl}}"],
+                assignees: ["{{who}}"],
+              },
+            },
+          }),
+        ),
+      ],
+      env({ who: null, lbl: "ready" }),
+    );
+    if (r.status !== "matched") throw new Error(JSON.stringify(r));
+    expect(r.reply).toEqual({ github: { repository: "a/b", issueNumber: 1, addLabels: ["ready", "x-ready"] } });
+    expect(r.reply?.github && "assignees" in r.reply.github).toBe(false);
+  });
+  it("echoes onComplete.emitTo on a match, and omits it when unset", () => {
+    const withEmit = selectTrigger(
+      [compileTrigger(trigger("t", { target: { orchestrator: {}, promptTemplate: "p" }, onComplete: { emitTo: "runs" } }))],
+      env({}),
+    );
+    expect(withEmit.status === "matched" && withEmit.onComplete).toEqual({ emitTo: "runs" });
+    const without = selectTrigger(
+      [compileTrigger(trigger("t", { target: { orchestrator: {}, promptTemplate: "p" }, onComplete: {} }))],
+      env({}),
+    );
+    if (without.status !== "matched") throw new Error(JSON.stringify(without));
+    expect("onComplete" in without).toBe(false);
+  });
+  it("matches a run-kind envelope", () => {
+    const r = selectTrigger(
+      [compileTrigger(trigger("t", { sourceRef: "runs", match: { cel: 'kind == "run"' }, target: { none: {} } }))],
+      env({ trigger: "x" }, { source: "runs", kind: "run" }),
+    );
+    expect(r.status).toBe("matched");
+  });
+});

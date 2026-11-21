@@ -40,6 +40,8 @@ export interface CompiledTrigger {
   sessionKey?: string;
   target?: TriggerTarget;
   reply?: EventTriggerReplySpec;
+  /** spec.onComplete when it names an emitTo source (docs/adr/0052 §1). */
+  onComplete?: { emitTo: string };
   resource: EventTriggerResource;
 }
 
@@ -66,6 +68,12 @@ export type SelectResult =
       /** Rendered promptTemplate, "" when absent. */
       prompt: string;
       reply: RenderedReply | null;
+      /**
+       * spec.onComplete (docs/adr/0052 §1), echoed so the engine can return
+       * it in the 202 and integration-gateway knows where to emit the run's
+       * completion event. Absent when the trigger does not set emitTo.
+       */
+      onComplete?: { emitTo: string };
     };
 
 export interface SelectOptions {
@@ -83,12 +91,22 @@ function resolveTarget(resource: EventTriggerResource): TriggerTarget | string {
   if (t.skillRef) kinds.push(["skill", t.skillRef]);
   if (t.agentRef) kinds.push(["agent", t.agentRef]);
   if (t.toolRef) kinds.push(["tool", t.toolRef]);
+  if (t.none !== undefined && t.none !== null) kinds.push(["none", undefined]);
   if (kinds.length !== 1) {
-    return "spec.target must set exactly one of orchestrator, skillRef, agentRef, toolRef";
+    return "spec.target must set exactly one of orchestrator, skillRef, agentRef, toolRef, none";
   }
   const [kind, ref] = kinds[0]!;
+  if (kind === "none") {
+    // A none target runs nothing (docs/adr/0052 §3): there is no prompt to
+    // render, no run to make read-only and no agent whose identity to pick.
+    // Setting any of them is a misconfiguration, so reject rather than ignore.
+    if (t.promptTemplate) return "spec.target.promptTemplate cannot be set with none";
+    if (t.readOnly) return "spec.target.readOnly cannot be set with none";
+    if (t.identity) return "spec.target.identity cannot be set with none";
+    return { kind, readOnly: false };
+  }
   if (kind !== "tool" && !t.promptTemplate) {
-    return "spec.target.promptTemplate is required unless toolRef is set";
+    return "spec.target.promptTemplate is required unless toolRef or none is set";
   }
   const target: TriggerTarget = { kind, readOnly: t.readOnly === true };
   if (ref !== undefined) target.ref = ref;
@@ -117,6 +135,7 @@ export function compileTrigger(resource: EventTriggerResource): CompiledTrigger 
   if (spec.sourceRef) compiled.sourceRef = spec.sourceRef;
   if (spec.sessionKey) compiled.sessionKey = spec.sessionKey;
   if (spec.reply) compiled.reply = spec.reply;
+  if (spec.onComplete?.emitTo) compiled.onComplete = { emitTo: spec.onComplete.emitTo };
 
   const notReady = (error: string): CompiledTrigger => {
     compiled.ready = false;
@@ -161,6 +180,22 @@ function byPrecedence(a: CompiledTrigger, b: CompiledTrigger): number {
 // "007" renders to 7 in both and "+7", "7.0", "1e3" or " 7" fail in both.
 const ISSUE_NUMBER = /^[0-9]+$/;
 
+/**
+ * Renders each template of a reply list (addLabels / assignees) and drops the
+ * ones that render to "": an absent param must not become an empty label or
+ * login, which GitHub rejects and which would fail the whole side effect.
+ */
+function renderList(templates: readonly string[] | undefined, params: Record<string, CelValue>): string[] {
+  if (!Array.isArray(templates)) return [];
+  const out: string[] = [];
+  for (const t of templates) {
+    if (typeof t !== "string") continue;
+    const v = renderTemplate(t, params);
+    if (v !== "") out.push(v);
+  }
+  return out;
+}
+
 function renderReply(
   spec: EventTriggerReplySpec | undefined,
   params: Record<string, CelValue>,
@@ -181,6 +216,10 @@ function renderReply(
     if (g.sessionPage) github.sessionPage = true;
     if (g.result) github.result = true;
     if (g.removeLabel) github.removeLabel = renderTemplate(g.removeLabel, params);
+    const addLabels = renderList(g.addLabels, params);
+    if (addLabels.length > 0) github.addLabels = addLabels;
+    const assignees = renderList(g.assignees, params);
+    if (assignees.length > 0) github.assignees = assignees;
     if (g.onIdentityError) github.onIdentityError = true;
     out.github = github;
   }
@@ -264,7 +303,7 @@ export function selectTrigger(
   const reply = renderReply(winner.reply, raw);
   if (typeof reply === "string") return fail(reply);
 
-  return {
+  const matched: Extract<SelectResult, { status: "matched" }> = {
     status: "matched",
     trigger: winner.name,
     target: { ...target },
@@ -276,4 +315,6 @@ export function selectTrigger(
     prompt,
     reply,
   };
+  if (winner.onComplete) matched.onComplete = { ...winner.onComplete };
+  return matched;
 }
