@@ -13,7 +13,17 @@ import {
   type OpencodeAuth,
   type OpencodeServerHandle,
 } from "./opencode-server.js";
-import { appendCoAuthorTrailer, discoverResult, ensureDir, findRepoDir, resolveGitIdentity, runCommand, setupGitAuth } from "./git.js";
+import {
+  appendCoAuthorTrailer,
+  countCommitsSince,
+  discoverResult,
+  ensureDir,
+  findRepoDir,
+  formatPrFooter,
+  resolveGitIdentity,
+  runCommand,
+  setupGitAuth,
+} from "./git.js";
 import { extractContinuationToken } from "./continuation.js";
 import { decodeSweContinuation, encodeSweContinuation, type SweMarker } from "./marker.js";
 import { loadToolConfig } from "./config.js";
@@ -50,6 +60,7 @@ interface TurnContext {
   delegating: boolean;
   attribution: { githubLogin: string; githubId?: number } | null;
   turnStartedAt: number;
+  readOnly: boolean;
   signal: AbortSignal;
 }
 
@@ -116,7 +127,13 @@ async function runTurn(ctx: TurnContext, instruction: string, marker: SweMarker 
     signal: ctx.signal,
   });
   if (headResAfter.code === 0) headSha = headResAfter.stdout.trim();
-  const madeNewCommits = headSha !== null && headSha !== priorHeadSha;
+  // With a prior HEAD, any movement is new work. Without one (the repo was
+  // cloned during this turn), only commits dated inside the turn count -- a
+  // clone that just checked out an existing PR branch made none.
+  const madeNewCommits =
+    priorHeadSha !== null
+      ? headSha !== null && headSha !== priorHeadSha
+      : (await countCommitsSince(repoDir!, ctx.turnStartedAt, ctx.childEnv, ctx.signal)) > 0;
 
   if (ctx.delegating && ctx.attribution) {
     if (!marker?.repo) {
@@ -166,16 +183,15 @@ async function runTurn(ctx: TurnContext, instruction: string, marker: SweMarker 
     session: marker?.session ?? ctx.sessionId,
   };
 
-  // Only mention push/PR status when this turn actually produced new commits
-  // -- a read-only turn (e.g. an "ai-review" label trigger, which is
-  // explicitly told not to push) legitimately checks out a branch without
-  // committing anything, and slapping a "no open pull request was found"
-  // warning on that is a false positive, not a signal anything went wrong.
-  const prLine = !madeNewCommits
-    ? ""
-    : discovered.prUrl
-      ? `\n\n---\n✅ ${marker?.pr ? "Updated" : "Opened"} pull request: [${discovered.repo}#${discovered.pr}](${discovered.prUrl})`
-      : `\n\n---\n⚠️ Work is on \`${discovered.repo}\` branch \`${discovered.branch}\`, but no open pull request was found.`;
+  // Footer only when this turn pushed new commits; never on a read-only turn
+  // (e.g. "ai-review", which checks out the PR branch but cannot push).
+  const prLine = formatPrFooter({
+    readOnly: ctx.readOnly,
+    madeNewCommits,
+    discovered,
+    turnStartedAt: ctx.turnStartedAt,
+    markerHadPr: Boolean(marker?.pr),
+  });
 
   return {
     reply: `${clip(summary, 1500)}${prLine}`,
@@ -433,6 +449,7 @@ async function main(): Promise<void> {
         delegating,
         attribution,
         turnStartedAt,
+        readOnly,
         signal: abort.signal,
       },
       instruction,

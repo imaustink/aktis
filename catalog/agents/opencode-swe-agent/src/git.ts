@@ -199,6 +199,8 @@ export interface RepoResult {
   branch: string;
   pr: string | null;
   prUrl: string | null;
+  /** The open PR's GitHub `createdAt` (ISO), or null when unknown/no PR. */
+  prCreatedAt: string | null;
 }
 
 /**
@@ -218,10 +220,10 @@ export async function discoverResult(
 
   const branchRes = await runCommand("git", ["-C", repoDir, "rev-parse", "--abbrev-ref", "HEAD"], { env, signal });
   const branch = branchRes.code === 0 ? branchRes.stdout.trim() : "";
-  if (!branch || branch === "HEAD") return { repo, branch: branch || "", pr: null, prUrl: null };
+  if (!branch || branch === "HEAD") return { repo, branch: branch || "", pr: null, prUrl: null, prCreatedAt: null };
 
   const pr = await findOpenPr(repo, branch, env, signal);
-  return { repo, branch, pr: pr?.number ?? null, prUrl: pr?.url ?? null };
+  return { repo, branch, pr: pr?.number ?? null, prUrl: pr?.url ?? null, prCreatedAt: pr?.createdAt ?? null };
 }
 
 async function findOpenPr(
@@ -229,21 +231,79 @@ async function findOpenPr(
   branch: string,
   env: NodeJS.ProcessEnv,
   signal?: AbortSignal,
-): Promise<{ number: string; url: string } | null> {
+): Promise<{ number: string; url: string; createdAt: string | null } | null> {
   const res = await runCommand(
     "gh",
-    ["pr", "list", "--repo", repo, "--head", branch, "--state", "open", "--json", "number,url", "--limit", "1"],
+    ["pr", "list", "--repo", repo, "--head", branch, "--state", "open", "--json", "number,url,createdAt", "--limit", "1"],
     { env, signal },
   );
   if (res.code !== 0) return null;
   try {
-    const arr = JSON.parse(res.stdout) as Array<{ number?: number; url?: string }>;
+    const arr = JSON.parse(res.stdout) as Array<{ number?: number; url?: string; createdAt?: string }>;
     const first = arr[0];
     if (first && typeof first.number === "number" && typeof first.url === "string") {
-      return { number: String(first.number), url: first.url };
+      return {
+        number: String(first.number),
+        url: first.url,
+        createdAt: typeof first.createdAt === "string" ? first.createdAt : null,
+      };
     }
   } catch {
     // ignore
   }
   return null;
+}
+
+/**
+ * Commits reachable from HEAD whose committer date is at or after `sinceMs`
+ * -- i.e. commits made during this turn. Used when the repo did not exist
+ * before the turn (no prior HEAD to diff against): a fresh clone that only
+ * checked out an existing branch (`gh pr checkout` for a review) sits many
+ * commits ahead of origin/HEAD without having committed anything, so
+ * "ahead of the default branch" is not evidence of new work, but a commit
+ * dated inside the turn is (the run pod's clock made it).
+ */
+export async function countCommitsSince(
+  repoDir: string,
+  sinceMs: number,
+  env: NodeJS.ProcessEnv,
+  signal?: AbortSignal,
+): Promise<number> {
+  // Committer dates have one-second resolution; floor so a commit in the
+  // turn's first second still counts (git's --since is inclusive).
+  const since = new Date(Math.floor(sinceMs / 1000) * 1000).toISOString();
+  const res = await runCommand("git", ["-C", repoDir, "rev-list", "--count", `--since=${since}`, "HEAD"], { env, signal });
+  if (res.code !== 0) return 0;
+  const n = Number.parseInt(res.stdout.trim(), 10);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * The "---" footer the turn's reply ends with, saying what happened to the
+ * pull request. Empty unless the turn pushed new commits, and ALWAYS empty
+ * for a read-only turn: its token cannot push, so it never opened or updated
+ * anything, even when it checked out a PR branch to review it.
+ *
+ * "Opened" vs "Updated" comes from whether GitHub created the PR during this
+ * turn, not from the continuation marker: a first-turn triage of an existing
+ * PR has no marker but must still say "Updated". Without a createdAt it falls
+ * back to the marker.
+ */
+export function formatPrFooter(opts: {
+  readOnly: boolean;
+  madeNewCommits: boolean;
+  discovered: RepoResult;
+  turnStartedAt: number;
+  markerHadPr: boolean;
+}): string {
+  const { readOnly, madeNewCommits, discovered, turnStartedAt, markerHadPr } = opts;
+  if (readOnly || !madeNewCommits) return "";
+  if (!discovered.prUrl) {
+    return `\n\n---\n⚠️ Work is on \`${discovered.repo}\` branch \`${discovered.branch}\`, but no open pull request was found.`;
+  }
+  const createdMs = discovered.prCreatedAt ? Date.parse(discovered.prCreatedAt) : Number.NaN;
+  const openedThisTurn = Number.isFinite(createdMs)
+    ? createdMs >= Math.floor(turnStartedAt / 1000) * 1000
+    : !markerHadPr;
+  return `\n\n---\n✅ ${openedThisTurn ? "Opened" : "Updated"} pull request: [${discovered.repo}#${discovered.pr}](${discovered.prUrl})`;
 }

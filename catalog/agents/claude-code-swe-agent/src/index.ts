@@ -7,12 +7,13 @@ import { buildClaudeSettings, buildPrompt, isReadOnly } from "./claude.js";
 import { runClaudeTurn, runClaudeTurnRemoteControlled } from "./claude-runner.js";
 import {
   appendCoAuthorTrailer,
-  countCommitsAheadOfOriginHead,
+  countCommitsSince,
   discoverResult,
   ensureChangeDeliverable,
   ensureDir,
   ensurePullRequest,
   findRepoDir,
+  formatPrFooter,
   resolveGitIdentity,
   runCommand,
   setupGitAuth,
@@ -380,7 +381,7 @@ async function handler(session: AgentSession): Promise<AgentReply> {
   const madeNewCommits =
     priorHeadSha !== null
       ? headSha !== null && headSha !== priorHeadSha
-      : (await countCommitsAheadOfOriginHead(repoDir!, childEnv, session.signal)) > 0;
+      : (await countCommitsSince(repoDir!, turnStartedAt, childEnv, session.signal)) > 0;
 
   // FIX (deterministic deliverable): on a CHANGE turn that produced commits but
   // no open PR, the runner opens one itself rather than warning the user that
@@ -392,6 +393,7 @@ async function handler(session: AgentSession): Promise<AgentReply> {
     if (pr) {
       discovered.pr = pr.number;
       discovered.prUrl = pr.url;
+      discovered.prCreatedAt = pr.createdAt;
     }
   }
 
@@ -456,16 +458,15 @@ async function handler(session: AgentSession): Promise<AgentReply> {
     session: marker?.session ?? randomUUID(),
   };
 
-  // Only mention push/PR status when this turn actually produced new commits
-  // -- a read-only turn (e.g. an "ai-review" label trigger, which is
-  // explicitly told not to push) legitimately checks out a branch without
-  // committing anything, and slapping a "no open pull request was found"
-  // warning on that is a false positive, not a signal anything went wrong.
-  const prLine = !madeNewCommits
-    ? ""
-    : discovered.prUrl
-      ? `\n\n---\n✅ ${marker?.pr ? "Updated" : "Opened"} pull request: [${discovered.repo}#${discovered.pr}](${discovered.prUrl})`
-      : `\n\n---\n⚠️ Work is on \`${discovered.repo}\` branch \`${discovered.branch}\`, but no open pull request was found.`;
+  // Footer only when this turn pushed new commits; never on a read-only turn
+  // (e.g. "ai-review", which checks out the PR branch but cannot push).
+  const prLine = formatPrFooter({
+    readOnly,
+    madeNewCommits,
+    discovered,
+    turnStartedAt,
+    markerHadPr: Boolean(marker?.pr),
+  });
 
   return { message: `${clip(summary, 1500)}${prLine}`, result: encodeSweContinuation(nextMarker) };
 }
