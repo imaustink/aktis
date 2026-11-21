@@ -8,7 +8,8 @@ import type { JsonValue } from "./values.js";
 // §2 envelope
 // ---------------------------------------------------------------------------
 
-export type EnvelopeKind = "webhook" | "cron";
+/** `run`: a trigger-dispatched run finished (docs/adr/0052 §1). */
+export type EnvelopeKind = "webhook" | "cron" | "run";
 
 export interface EnvelopeSender {
   login?: string;
@@ -90,9 +91,17 @@ export interface EventSender {
   dropBots?: boolean;
 }
 
+/**
+ * A `run` source (docs/adr/0052 §1) receives the gateway's synthetic
+ * run-completion events for triggers that set `onComplete.emitTo` to it. It
+ * has no configuration of its own.
+ */
+export type RunSource = Record<string, never>;
+
 export interface EventSourceSpec {
   webhook?: WebhookSource;
   cron?: CronSource;
+  run?: RunSource;
   sender?: EventSender;
 }
 
@@ -115,6 +124,8 @@ export interface EventTriggerMatch {
 
 export interface EventTriggerTargetSpec {
   orchestrator?: Record<string, unknown>;
+  /** Run nothing; only the trigger's reply side effects happen (docs/adr/0052 §3). */
+  none?: Record<string, unknown>;
   skillRef?: string;
   agentRef?: string;
   toolRef?: string;
@@ -131,6 +142,10 @@ export interface GitHubReplySpec {
   sessionPage?: boolean;
   result?: boolean;
   removeLabel?: string;
+  /** Labels added when the run is accepted, alongside the ack (docs/adr/0052 §3). */
+  addLabels?: string[];
+  /** Logins assigned when the run is accepted (docs/adr/0052 §3). */
+  assignees?: string[];
   /** Post an identity error's message as a comment (docs/adr/0049 §6). */
   onIdentityError?: boolean;
 }
@@ -153,6 +168,13 @@ export interface EventTriggerSpec {
   sessionKey?: string;
   target: EventTriggerTargetSpec;
   reply?: EventTriggerReplySpec;
+  onComplete?: EventTriggerOnComplete;
+}
+
+/** docs/adr/0052 §1. */
+export interface EventTriggerOnComplete {
+  /** A `run` EventSource (same namespace) that receives this trigger's run-completion events. */
+  emitTo?: string;
 }
 
 export interface EventTriggerStatus {
@@ -171,7 +193,7 @@ export interface EventTriggerResource {
 // Resolved dispatch (§4-§5)
 // ---------------------------------------------------------------------------
 
-export type TriggerTargetKind = "orchestrator" | "skill" | "agent" | "tool";
+export type TriggerTargetKind = "orchestrator" | "skill" | "agent" | "tool" | "none";
 
 export interface TriggerTarget {
   kind: TriggerTargetKind;
@@ -196,6 +218,8 @@ export interface RenderedReply {
     sessionPage?: boolean;
     result?: boolean;
     removeLabel?: string;
+    addLabels?: string[];
+    assignees?: string[];
     onIdentityError?: boolean;
   };
   http?: {

@@ -60,9 +60,15 @@ type AgentUpMessage struct {
 	Reason *string `protobuf:"bytes,16,opt,name=reason,proto3,oneof" json:"reason,omitempty"`
 	// tool_call: the agent's own loop calling a tool it was granted. Answered
 	// by a down `tool_result` with the same callId; several may be outstanding.
-	CallId        *string `protobuf:"bytes,17,opt,name=call_id,json=callId,proto3,oneof" json:"call_id,omitempty"`
-	Tool          *string `protobuf:"bytes,18,opt,name=tool,proto3,oneof" json:"tool,omitempty"`
-	Input         *string `protobuf:"bytes,19,opt,name=input,proto3,oneof" json:"input,omitempty"`
+	CallId *string `protobuf:"bytes,17,opt,name=call_id,json=callId,proto3,oneof" json:"call_id,omitempty"`
+	Tool   *string `protobuf:"bytes,18,opt,name=tool,proto3,oneof" json:"tool,omitempty"`
+	Input  *string `protobuf:"bytes,19,opt,name=input,proto3,oneof" json:"input,omitempty"`
+	// reply: machine-readable facts about the finished turn, produced by the
+	// agent's runner rather than its model (e.g. the pull request it ended
+	// with, a review verdict). Carried to the invocation record and delivered
+	// in the run-completion event (docs/adr/0052 §2). Distinct from `result`,
+	// which agents use as an opaque continuation token.
+	Outcome       *structpb.Struct `protobuf:"bytes,20,opt,name=outcome,proto3" json:"outcome,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -228,6 +234,13 @@ func (x *AgentUpMessage) GetInput() string {
 		return *x.Input
 	}
 	return ""
+}
+
+func (x *AgentUpMessage) GetOutcome() *structpb.Struct {
+	if x != nil {
+		return x.Outcome
+	}
+	return nil
 }
 
 // orchestrator -> agent.
@@ -418,7 +431,7 @@ var File_aktis_protocol_v1_agent_protocol_proto protoreflect.FileDescriptor
 
 const file_aktis_protocol_v1_agent_protocol_proto_rawDesc = "" +
 	"\n" +
-	"&aktis/protocol/v1/agent_protocol.proto\x12\x11aktis.protocol.v1\x1a\x1bbuf/validate/validate.proto\x1a\x1cgoogle/protobuf/struct.proto\"\xf0\x10\n" +
+	"&aktis/protocol/v1/agent_protocol.proto\x12\x11aktis.protocol.v1\x1a\x1bbuf/validate/validate.proto\x1a\x1cgoogle/protobuf/struct.proto\"\xa3\x11\n" +
 	"\x0eAgentUpMessage\x12/\n" +
 	"\fagent_run_id\x18\x01 \x01(\tB\x06\xbaH\x03\xc8\x01\x01H\x00R\fagent_run_id\x88\x01\x01\x12\x1d\n" +
 	"\x03seq\x18\x02 \x01(\rB\x06\xbaH\x03\xc8\x01\x01H\x01R\x03seq\x88\x01\x01\x12\x1b\n" +
@@ -442,7 +455,8 @@ const file_aktis_protocol_v1_agent_protocol_proto_rawDesc = "" +
 	"\x06reason\x18\x10 \x01(\tH\fR\x06reason\x88\x01\x01\x12\x1c\n" +
 	"\acall_id\x18\x11 \x01(\tH\rR\x06callId\x88\x01\x01\x12\x17\n" +
 	"\x04tool\x18\x12 \x01(\tH\x0eR\x04tool\x88\x01\x01\x12\x19\n" +
-	"\x05input\x18\x13 \x01(\tH\x0fR\x05input\x88\x01\x01:\xaf\t\xbaH\xab\t\x1aw\n" +
+	"\x05input\x18\x13 \x01(\tH\x0fR\x05input\x88\x01\x01\x121\n" +
+	"\aoutcome\x18\x14 \x01(\v2\x17.google.protobuf.StructR\aoutcome:\xaf\t\xbaH\xab\t\x1aw\n" +
 	"\"agent_up.progress_requires_message\x12#a progress message requires message\x1a,this.type != 'progress' || has(this.message)\x1at\n" +
 	"!agent_up.warning_requires_message\x12\"a warning message requires message\x1a+this.type != 'warning' || has(this.message)\x1a\x8f\x01\n" +
 	")agent_up.reply_requires_message_and_final\x12\"a reply requires message and final\x1a>this.type != 'reply' || (has(this.message) && has(this.final))\x1a\x97\x01\n" +
@@ -530,19 +544,21 @@ var file_aktis_protocol_v1_agent_protocol_proto_goTypes = []any{
 	(*AgentUpMessage)(nil),   // 0: aktis.protocol.v1.AgentUpMessage
 	(*AgentDownMessage)(nil), // 1: aktis.protocol.v1.AgentDownMessage
 	(*structpb.Value)(nil),   // 2: google.protobuf.Value
+	(*structpb.Struct)(nil),  // 3: google.protobuf.Struct
 }
 var file_aktis_protocol_v1_agent_protocol_proto_depIdxs = []int32{
 	2, // 0: aktis.protocol.v1.AgentUpMessage.result:type_name -> google.protobuf.Value
 	2, // 1: aktis.protocol.v1.AgentUpMessage.event:type_name -> google.protobuf.Value
 	2, // 2: aktis.protocol.v1.AgentUpMessage.body:type_name -> google.protobuf.Value
-	2, // 3: aktis.protocol.v1.AgentDownMessage.data:type_name -> google.protobuf.Value
-	2, // 4: aktis.protocol.v1.AgentDownMessage.body:type_name -> google.protobuf.Value
-	2, // 5: aktis.protocol.v1.AgentDownMessage.result:type_name -> google.protobuf.Value
-	6, // [6:6] is the sub-list for method output_type
-	6, // [6:6] is the sub-list for method input_type
-	6, // [6:6] is the sub-list for extension type_name
-	6, // [6:6] is the sub-list for extension extendee
-	0, // [0:6] is the sub-list for field type_name
+	3, // 3: aktis.protocol.v1.AgentUpMessage.outcome:type_name -> google.protobuf.Struct
+	2, // 4: aktis.protocol.v1.AgentDownMessage.data:type_name -> google.protobuf.Value
+	2, // 5: aktis.protocol.v1.AgentDownMessage.body:type_name -> google.protobuf.Value
+	2, // 6: aktis.protocol.v1.AgentDownMessage.result:type_name -> google.protobuf.Value
+	7, // [7:7] is the sub-list for method output_type
+	7, // [7:7] is the sub-list for method input_type
+	7, // [7:7] is the sub-list for extension type_name
+	7, // [7:7] is the sub-list for extension extendee
+	0, // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_aktis_protocol_v1_agent_protocol_proto_init() }

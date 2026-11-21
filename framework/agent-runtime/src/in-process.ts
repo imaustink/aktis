@@ -155,7 +155,7 @@ export interface LocalAgentOptions extends Omit<InProcessChannelOptions, "autoAc
 }
 
 export type LocalAgentOutcome =
-  | { status: "replied"; message: string; result?: unknown }
+  | { status: "replied"; message: string; result?: unknown; outcome?: Record<string, unknown> }
   | { status: "failed"; code: string; message: string }
   | { status: "cancelled" };
 
@@ -195,7 +195,9 @@ export function startLocalAgent(
   }).then((): LocalAgentOutcome => {
     for (let i = peer.up.length - 1; i >= 0; i--) {
       const msg = peer.up[i]!;
-      if (msg.type === "reply" && msg.final) return { status: "replied", message: msg.message, result: msg.result };
+      if (msg.type === "reply" && msg.final) {
+        return { status: "replied", message: msg.message, result: msg.result, ...(msg.outcome ? { outcome: msg.outcome } : {}) };
+      }
       if (msg.type === "failed") return { status: "failed", code: msg.code, message: msg.message };
     }
     return { status: "cancelled" };

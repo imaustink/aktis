@@ -149,6 +149,13 @@ message AgentUpMessage {
   optional string call_id = 17 [json_name = "callId"];
   optional string tool = 18 [json_name = "tool"];
   optional string input = 19 [json_name = "input"];
+
+  // reply: machine-readable facts about the finished turn, produced by the
+  // agent's runner rather than its model (e.g. the pull request it ended
+  // with, a review verdict). Carried to the invocation record and delivered
+  // in the run-completion event (docs/adr/0052 §2). Distinct from `result`,
+  // which agents use as an opaque continuation token.
+  google.protobuf.Struct outcome = 20 [json_name = "outcome"];
 }
 
 // orchestrator -> agent.

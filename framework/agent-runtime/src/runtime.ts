@@ -84,6 +84,13 @@ export interface AgentReply {
   message: string;
   /** Optional structured result for non-chat consumers (AgentRun status). */
   result?: unknown;
+  /**
+   * Runner-produced facts about the finished turn -- the pull request it ended
+   * with, a review verdict -- delivered to whatever the run's trigger chains
+   * to (docs/adr/0052 §2). A JSON object; set by the agent's code, never
+   * copied from the model's output.
+   */
+  outcome?: Record<string, unknown>;
 }
 
 /** The user-supplied agent implementation: given a session, do the work and return a reply. */
@@ -350,7 +357,13 @@ export async function runAgent(handler: AgentHandler, opts: RunAgentOptions = {}
   try {
     const res = await handler(session);
     const reply: AgentReply = typeof res === "string" ? { message: res } : res;
-    await publishHeld({ type: "reply", message: reply.message, final: true, result: reply.result });
+    await publishHeld({
+      type: "reply",
+      message: reply.message,
+      final: true,
+      result: reply.result,
+      ...(reply.outcome ? { outcome: reply.outcome } : {}),
+    });
   } catch (err) {
     if (!(err instanceof CancelledError) && !abort.signal.aborted) {
       // A handler-supplied `code` wins (see AgentFailure). Matched by `name`

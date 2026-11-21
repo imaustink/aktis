@@ -1,0 +1,192 @@
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  buildOutcome,
+  clearVerdict,
+  collectOutcome,
+  installVerdictCommand,
+  prNumber,
+  readVerdict,
+  VERDICT_COMMAND,
+  VERDICT_FILE_ENV,
+  VERDICT_PROMPT_SECTION,
+  VERDICTS,
+} from "./outcome.js";
+
+const pr = { pr: "42", prUrl: "https://github.com/acme/widgets/pull/42" };
+
+describe("buildOutcome", () => {
+  it("reports the PR the turn ended with, as an integer number", () => {
+    expect(buildOutcome({ discovered: pr, madeNewCommits: true })).toEqual({
+      pullRequest: { number: 42, url: "https://github.com/acme/widgets/pull/42" },
+      madeNewCommits: true,
+    });
+    expect(typeof buildOutcome({ discovered: pr, madeNewCommits: true }).pullRequest?.number).toBe("number");
+  });
+
+  it("omits pullRequest when no open PR was discovered", () => {
+    expect(buildOutcome({ discovered: null, madeNewCommits: false })).toEqual({ madeNewCommits: false });
+    expect(buildOutcome({ discovered: { pr: null, prUrl: null }, madeNewCommits: true })).toEqual({ madeNewCommits: true });
+    // A number with no URL isn't something a trigger can act on.
+    expect(buildOutcome({ discovered: { pr: "42", prUrl: null }, madeNewCommits: true })).toEqual({ madeNewCommits: true });
+  });
+
+  it("omits pullRequest when the number isn't a plain positive integer", () => {
+    for (const bad of ["", "0", "-1", "4.2", "42abc", "#42", "NaN", "99999999999999999999"]) {
+      expect(buildOutcome({ discovered: { pr: bad, prUrl: pr.prUrl }, madeNewCommits: true }).pullRequest).toBeUndefined();
+    }
+  });
+
+  it("includes verdict only when given", () => {
+    expect(buildOutcome({ discovered: pr, madeNewCommits: false, verdict: "none" }).verdict).toBe("none");
+    expect("verdict" in buildOutcome({ discovered: pr, madeNewCommits: false })).toBe(false);
+  });
+});
+
+describe("prNumber", () => {
+  it("coerces discovery's string to an integer and tolerates whitespace", () => {
+    expect(prNumber("7")).toBe(7);
+    expect(prNumber(" 7\n")).toBe(7);
+    expect(prNumber(7)).toBe(7);
+    expect(prNumber(null)).toBeNull();
+    expect(prNumber(undefined)).toBeNull();
+    expect(prNumber("1e3")).toBeNull();
+  });
+});
+
+describe("verdict file", () => {
+  let home: string;
+  let file: string;
+
+  beforeEach(async () => {
+    home = mkdtempSync(join(tmpdir(), "verdict-test-"));
+    ({ verdictFile: file } = await installVerdictCommand({ homeDir: home }));
+  });
+  afterEach(() => rmSync(home, { recursive: true, force: true }));
+
+  it("reads each valid verdict", async () => {
+    for (const v of VERDICTS) {
+      writeFileSync(file, `${v}\n`);
+      expect(await readVerdict(file)).toBe(v);
+    }
+  });
+
+  it("is none when nothing was recorded", async () => {
+    expect(existsSync(file)).toBe(false);
+    expect(await readVerdict(file)).toBe("none");
+  });
+
+  it("is none for anything outside the enum", async () => {
+    for (const bad of ["", "approve", "READY", "ready please", "changes_requested", "none", "ready\nchanges-requested"]) {
+      writeFileSync(file, bad);
+      expect(await readVerdict(file)).toBe("none");
+    }
+  });
+
+  it("clearVerdict drops a previous turn's verdict", async () => {
+    writeFileSync(file, "changes-requested\n");
+    await clearVerdict(file);
+    expect(await readVerdict(file)).toBe("none");
+    await clearVerdict(file); // idempotent when already absent
+  });
+
+  it("lives outside the working tree, under the home directory", () => {
+    expect(file.startsWith(home)).toBe(true);
+  });
+});
+
+describe("collectOutcome", () => {
+  let home: string;
+  let file: string;
+  beforeEach(async () => {
+    home = mkdtempSync(join(tmpdir(), "collect-test-"));
+    ({ verdictFile: file } = await installVerdictCommand({ homeDir: home }));
+  });
+  afterEach(() => rmSync(home, { recursive: true, force: true }));
+
+  it("reports the recorded verdict on a read-only run", async () => {
+    writeFileSync(file, "changes-requested\n");
+    expect(await collectOutcome({ discovered: pr, madeNewCommits: false, readOnly: true, verdictFile: file })).toEqual({
+      pullRequest: { number: 42, url: pr.prUrl },
+      madeNewCommits: false,
+      verdict: "changes-requested",
+    });
+  });
+
+  it("reports none on a read-only run that recorded nothing", async () => {
+    expect((await collectOutcome({ discovered: pr, madeNewCommits: false, readOnly: true, verdictFile: file })).verdict).toBe(
+      "none",
+    );
+  });
+
+  it("never reports a verdict on a write run, even if one was recorded", async () => {
+    writeFileSync(file, "ready\n");
+    const outcome = await collectOutcome({ discovered: pr, madeNewCommits: true, readOnly: false, verdictFile: file });
+    expect("verdict" in outcome).toBe(false);
+  });
+});
+
+describe(`the ${VERDICT_COMMAND} command`, () => {
+  let home: string;
+  let binDir: string;
+  let file: string;
+  const run = (args: string[], env: NodeJS.ProcessEnv = { ...process.env, [VERDICT_FILE_ENV]: file }) =>
+    spawnSync(join(binDir, VERDICT_COMMAND), args, { env, encoding: "utf8" });
+
+  beforeEach(async () => {
+    home = mkdtempSync(join(tmpdir(), "verdict-cli-"));
+    ({ binDir, verdictFile: file } = await installVerdictCommand({ homeDir: home }));
+  });
+  afterEach(() => rmSync(home, { recursive: true, force: true }));
+
+  it("records each valid verdict, which the runner then reads back", async () => {
+    for (const v of VERDICTS) {
+      const res = run([v]);
+      expect(res.status).toBe(0);
+      expect(readFileSync(file, "utf8")).toBe(`${v}\n`);
+      expect(await readVerdict(file)).toBe(v);
+    }
+  });
+
+  it("resolves by name once its directory is on PATH", () => {
+    const res = spawnSync(VERDICT_COMMAND, ["ready"], {
+      env: { ...process.env, PATH: `${binDir}:${process.env.PATH}`, [VERDICT_FILE_ENV]: file },
+      encoding: "utf8",
+    });
+    expect(res.status).toBe(0);
+    expect(readFileSync(file, "utf8")).toBe("ready\n");
+  });
+
+  it("rejects anything else with a usage message and writes nothing", () => {
+    for (const args of [[], ["approve"], ["READY"], ["ready", "extra"], ["none"], ["ready;touch x"], [""]]) {
+      const res = run(args);
+      expect(res.status, JSON.stringify(args)).not.toBe(0);
+      expect(res.stderr).toContain(`usage: ${VERDICT_COMMAND} changes-requested|ready`);
+      expect(existsSync(file), JSON.stringify(args)).toBe(false);
+    }
+  });
+
+  it("an invalid call doesn't overwrite a verdict already recorded this turn", () => {
+    expect(run(["ready"]).status).toBe(0);
+    expect(run(["approve"]).status).not.toBe(0);
+    expect(readFileSync(file, "utf8")).toBe("ready\n");
+  });
+
+  it("fails without the runner's file env rather than writing somewhere else", () => {
+    const env = { ...process.env };
+    delete env[VERDICT_FILE_ENV];
+    const res = run(["ready"], env);
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toContain(VERDICT_FILE_ENV);
+  });
+});
+
+describe("VERDICT_PROMPT_SECTION", () => {
+  it("names both commands", () => {
+    for (const v of VERDICTS) expect(VERDICT_PROMPT_SECTION).toContain(`\`${VERDICT_COMMAND} ${v}\``);
+    expect(VERDICT_PROMPT_SECTION).toContain("exactly once");
+  });
+});

@@ -15,6 +15,14 @@
       "valid": true,
       "json": { "agent_run_id": "r1", "seq": 4, "ts": "t", "type": "reply", "message": "Opened PR", "final": true, "result": { "pr": 12, "url": "https://x" } }
     },
+    {
+      "name": "final reply with a runner outcome",
+      "valid": true,
+      "json": {
+        "agent_run_id": "r1", "seq": 4, "ts": "t", "type": "reply", "message": "Reviewed", "final": true, "result": "tok",
+        "outcome": { "pullRequest": { "number": 12, "url": "https://x" }, "madeNewCommits": false, "verdict": "ready" }
+      }
+    },
     { "name": "failed", "valid": true, "json": { "agent_run_id": "r1", "seq": 5, "ts": "t", "type": "failed", "code": "AUTH", "message": "no token" } },
     { "name": "opencode_event with a payload", "valid": true, "json": { "agent_run_id": "r1", "seq": 6, "ts": "t", "type": "opencode_event", "event": { "type": "message.part", "n": 1 } } },
     { "name": "opencode_event with no payload", "valid": true, "json": { "agent_run_id": "r1", "seq": 6, "ts": "t", "type": "opencode_event" } },
