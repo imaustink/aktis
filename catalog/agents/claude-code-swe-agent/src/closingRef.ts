@@ -75,7 +75,12 @@ export async function ensureClosingReference(opts: {
   if (alreadyCloses(parsed, issue)) return "present";
 
   const body = (parsed.body ?? "").trimEnd();
-  const next = `${body}${body ? "\n\n" : ""}${closingLine(issue, prRepo)}`;
+  const line = closingLine(issue, prRepo);
+  // closingIssuesReferences stays empty when the PR's base isn't the default
+  // branch (GitHub ignores closing keywords there); don't re-append the same
+  // line on every later turn.
+  if (body.split(/\r?\n/).some((l) => l.trim().toLowerCase() === line.toLowerCase())) return "present";
+  const next = `${body}${body ? "\n\n" : ""}${line}`;
   const edit = await runCommand("gh", ["pr", "edit", pr, "--repo", prRepo, "--body", next], { env, signal });
   if (edit.code !== 0) return { error: `gh pr edit failed: ${edit.stderr.trim().slice(0, 300)}` };
   return "added";

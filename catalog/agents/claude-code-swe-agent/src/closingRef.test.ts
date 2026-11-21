@@ -126,6 +126,12 @@ describe("ensureClosingReference", () => {
     expect(readFileSync(editFile, "utf8")).toBe("Closes #12");
   });
 
+  it("doesn't re-append the line when it's already there but GitHub lists no refs (non-default base)", async () => {
+    writeFileSync(viewFile, JSON.stringify({ body: "Fix.\n\nCloses #12\n", closingIssuesReferences: [] }));
+    expect(await ensureClosingReference({ prRepo: "acme/widgets", pr: "7", issue, env })).toBe("present");
+    expect(existsSync(editFile)).toBe(false);
+  });
+
   it("reports (rather than throws) when the PR can't be read", async () => {
     const result = await ensureClosingReference({ prRepo: "acme/widgets", pr: "7", issue, env });
     expect(result).toEqual({ error: expect.stringContaining("gh pr view failed") });
