@@ -102,6 +102,5 @@ spec:
       repository: "{{repository}}"
       issueNumber: "{{number}}"
       ack: "🤖 Starting work on this now."
-      sessionPage: true
       result: true
       removeLabel: "{{label}}"
