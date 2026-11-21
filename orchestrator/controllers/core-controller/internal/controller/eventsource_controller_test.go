@@ -363,6 +363,71 @@ var _ = Describe("EventSource Controller", func() {
 		})
 	})
 
+	Context("a run source (docs/adr/0052)", func() {
+		runSource := func(name string) *corev1alpha1.EventSource {
+			return &corev1alpha1.EventSource{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+				Spec:       corev1alpha1.EventSourceSpec{Run: &corev1alpha1.RunSource{}},
+			}
+		}
+
+		It("is Ready with no Secret, CronJob or ServiceAccount", func() {
+			source := runSource("runs")
+			Expect(k8sClient.Create(ctx, source)).To(Succeed())
+			defer cleanup(source)
+
+			res := reconcileWith(reconciler(testTickURL), "runs")
+
+			cond := ready("runs")
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(cond.Reason).To(Equal("RunEvents"))
+			// Nothing external to re-check, so no requeue.
+			Expect(res.RequeueAfter).To(BeZero())
+			_, err := cronJob("runs")
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(), "a run source owns no CronJob")
+			_, err = serviceAccount("runs")
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(), "a run source owns no ServiceAccount")
+		})
+
+		It("deletes its CronJob when a cron source is switched to run", func() {
+			source := cronSource("cron-to-run", "0 7 * * *")
+			Expect(k8sClient.Create(ctx, source)).To(Succeed())
+			defer cleanup(source)
+			reconcileWith(reconciler(testTickURL), "cron-to-run")
+			_, err := cronJob("cron-to-run")
+			Expect(err).NotTo(HaveOccurred())
+
+			latest := stored("cron-to-run")
+			latest.Spec = runSource("cron-to-run").Spec
+			Expect(k8sClient.Update(ctx, &latest)).To(Succeed())
+			reconcileWith(reconciler(testTickURL), "cron-to-run")
+
+			_, err = cronJob("cron-to-run")
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(), "CronJob should be deleted, got %v", err)
+			Expect(stored("cron-to-run").Status.CronJobName).To(BeEmpty())
+			Expect(ready("cron-to-run").Reason).To(Equal("RunEvents"))
+		})
+
+		It("is rejected at admission alongside another kind", func() {
+			source := runSource("run-and-cron")
+			source.Spec.Cron = &corev1alpha1.CronSource{Schedule: "0 7 * * *"}
+			err := k8sClient.Create(ctx, source)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("exactly one of webhook, cron or run"))
+		})
+
+		It("is rejected at admission with a sender block", func() {
+			source := runSource("run-with-sender")
+			source.Spec.Sender = &corev1alpha1.EventSender{
+				Provider:  corev1alpha1.EventSenderProviderGitHub,
+				LoginFrom: "body.sender.login",
+			}
+			err := k8sClient.Create(ctx, source)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("sender is only valid for webhook sources"))
+		})
+	})
+
 	Context("a webhook source", func() {
 		It("is Ready when its secret and key exist, and re-checks later", func() {
 			secret := &corev1.Secret{

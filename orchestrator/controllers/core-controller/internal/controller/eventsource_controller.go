@@ -93,6 +93,8 @@ type EventSourceReconciler struct {
 
 // Reconcile reports whether an EventSource can deliver events, and for a cron
 // source materializes the CronJob that ticks it (docs/event-triggers.md §8).
+// A run source (docs/adr/0052) is always Ready: it has no external delivery to
+// verify.
 //
 // A webhook source is only Ready when the gateway could actually verify a
 // delivery with it: the Secret and key it names exist, and every sender CEL
@@ -134,11 +136,19 @@ func (r *EventSourceReconciler) reconcile(ctx context.Context, source *corev1alp
 	}
 	source.Status.CronJobName = ""
 
+	if source.Spec.Run != nil {
+		// A run source has nothing to verify or materialize: the gateway
+		// synthesizes its events itself (docs/adr/0052 §1). Admission already
+		// rejects a sender block on it.
+		return r.setReady(ctx, source, metav1.ConditionTrue, "RunEvents",
+			"receives completions of runs whose EventTrigger sets onComplete.emitTo: "+source.Name, 0)
+	}
+
 	if source.Spec.Webhook == nil {
 		// Admission's oneOf rule makes this unreachable; report it rather than
 		// guess.
 		return r.setReady(ctx, source, metav1.ConditionFalse, "InvalidSpec",
-			"exactly one of webhook or cron must be set", 0)
+			"exactly one of webhook, cron or run must be set", 0)
 	}
 
 	if msg := checkSenderCEL(source.Spec.Sender); msg != "" {

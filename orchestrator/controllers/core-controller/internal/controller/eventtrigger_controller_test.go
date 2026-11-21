@@ -322,9 +322,148 @@ var _ = Describe("EventTrigger Controller", func() {
 		DeferCleanup(func() { _ = k8sClient.Delete(ctx, other) })
 
 		agent := &corev1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{Name: agentName, Namespace: "default"}}
-		reqs := r.triggersReferencing(ctx, agent, func(t *corev1alpha1.EventTrigger) string { return t.Spec.Target.AgentRef })
+		reqs := r.triggersReferencing(ctx, agent, func(t *corev1alpha1.EventTrigger) []string { return []string{t.Spec.Target.AgentRef} })
 		Expect(reqs).To(ConsistOf(reconcile.Request{
 			NamespacedName: types.NamespacedName{Name: "maps-named", Namespace: "default"},
 		}))
+	})
+
+	Context("onComplete.emitTo (docs/adr/0052)", func() {
+		const runsName = "trigger-test-runs"
+
+		runSource := func() *corev1alpha1.EventSource {
+			return &corev1alpha1.EventSource{
+				ObjectMeta: metav1.ObjectMeta{Name: runsName, Namespace: "default"},
+				Spec:       corev1alpha1.EventSourceSpec{Run: &corev1alpha1.RunSource{}},
+			}
+		}
+
+		emitting := func(name, emitTo string) *corev1alpha1.EventTrigger {
+			t := validTrigger(name)
+			t.Spec.OnComplete = &corev1alpha1.EventTriggerOnComplete{EmitTo: emitTo}
+			return t
+		}
+
+		It("is Ready when emitTo names a run source", func() {
+			source := runSource()
+			Expect(k8sClient.Create(ctx, source)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, source) })
+
+			cond := readyAfterReconcile(emitting("emit-ok", runsName))
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(cond.Reason).To(Equal("Resolved"))
+		})
+
+		It("is EmitToNotFound until the run source exists, then Ready", func() {
+			trigger := emitting("emit-missing", runsName)
+			cond := readyAfterReconcile(trigger)
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal("EmitToNotFound"))
+			Expect(cond.Message).To(ContainSubstring(runsName))
+
+			// The source appearing maps back to the trigger (the watch), and
+			// the next reconcile clears it.
+			source := runSource()
+			Expect(k8sClient.Create(ctx, source)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, source) })
+
+			r := &EventTriggerReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			key := types.NamespacedName{Name: trigger.Name, Namespace: "default"}
+			Expect(r.triggersReferencing(ctx, source, eventSourceRefs)).To(ContainElement(reconcile.Request{NamespacedName: key}))
+
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			var got corev1alpha1.EventTrigger
+			Expect(k8sClient.Get(ctx, key, &got)).To(Succeed())
+			Expect(meta.FindStatusCondition(got.Status.Conditions, eventTriggerConditionReady).Status).To(Equal(metav1.ConditionTrue))
+		})
+
+		It("is EmitToNotRunSource when emitTo names a webhook or cron source", func() {
+			// sourceName is a cron source: it exists, but the gateway would
+			// never publish a completion to it.
+			cond := readyAfterReconcile(emitting("emit-to-cron", sourceName))
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal("EmitToNotRunSource"))
+		})
+
+		It("maps an EventSource back by sourceRef and by emitTo", func() {
+			r := &EventTriggerReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			bySource := validTrigger("maps-by-source")
+			byEmit := emitting("maps-by-emit", runsName)
+			byEmit.Spec.SourceRef = ""
+			Expect(k8sClient.Create(ctx, bySource)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, bySource) })
+			Expect(k8sClient.Create(ctx, byEmit)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, byEmit) })
+
+			runs := &corev1alpha1.EventSource{ObjectMeta: metav1.ObjectMeta{Name: runsName, Namespace: "default"}}
+			Expect(r.triggersReferencing(ctx, runs, eventSourceRefs)).To(ConsistOf(reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "maps-by-emit", Namespace: "default"},
+			}))
+			src := &corev1alpha1.EventSource{ObjectMeta: metav1.ObjectMeta{Name: sourceName, Namespace: "default"}}
+			Expect(r.triggersReferencing(ctx, src, eventSourceRefs)).To(ConsistOf(reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "maps-by-source", Namespace: "default"},
+			}))
+		})
+
+		It("rejects an empty emitTo at admission", func() {
+			err := k8sClient.Create(ctx, emitting("emit-empty", ""))
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("emitTo"))
+		})
+	})
+
+	Context("target.none (docs/adr/0052)", func() {
+		noneTrigger := func(name string) *corev1alpha1.EventTrigger {
+			t := validTrigger(name)
+			t.Spec.Target = corev1alpha1.EventTriggerTarget{None: &corev1alpha1.NoneTarget{}}
+			t.Spec.Reply = &corev1alpha1.EventTriggerReply{GitHub: &corev1alpha1.GitHubReply{
+				Repository:  "{{repo}}",
+				IssueNumber: "{{number}}",
+				Ack:         "Handing off.",
+				AddLabels:   []string{"ai-done"},
+				Assignees:   []string{"{{assignee}}"},
+			}}
+			return t
+		}
+
+		It("is Ready with no promptTemplate, and keeps addLabels/assignees", func() {
+			trigger := noneTrigger("none-ok")
+			Expect(readyAfterReconcile(trigger).Status).To(Equal(metav1.ConditionTrue))
+
+			var got corev1alpha1.EventTrigger
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "none-ok", Namespace: "default"}, &got)).To(Succeed())
+			Expect(got.Spec.Target.None).NotTo(BeNil())
+			Expect(got.Spec.Reply.GitHub.AddLabels).To(Equal([]string{"ai-done"}))
+			Expect(got.Spec.Reply.GitHub.Assignees).To(Equal([]string{"{{assignee}}"}))
+		})
+
+		DescribeTable("is rejected at admission when combined with a run-only field",
+			func(mutate func(*corev1alpha1.EventTriggerTarget), want string) {
+				trigger := noneTrigger("none-rejected")
+				mutate(&trigger.Spec.Target)
+				err := k8sClient.Create(ctx, trigger)
+				if err == nil {
+					_ = k8sClient.Delete(ctx, trigger)
+				}
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring(want))
+			},
+			Entry("another target", func(t *corev1alpha1.EventTriggerTarget) { t.AgentRef = agentName; t.PromptTemplate = "x" }, "exactly one of"),
+			Entry("promptTemplate", func(t *corev1alpha1.EventTriggerTarget) { t.PromptTemplate = "x" }, "promptTemplate cannot be set with none"),
+			Entry("readOnly", func(t *corev1alpha1.EventTriggerTarget) { t.ReadOnly = true }, "readOnly cannot be set with none"),
+			Entry("identity", func(t *corev1alpha1.EventTriggerTarget) { t.Identity = corev1alpha1.IdentityModeAgent }, "identity cannot be set with none"),
+		)
+
+		It("rejects more than 10 addLabels at admission", func() {
+			trigger := noneTrigger("none-too-many-labels")
+			trigger.Spec.Reply.GitHub.AddLabels = make([]string, 11)
+			for i := range trigger.Spec.Reply.GitHub.AddLabels {
+				trigger.Spec.Reply.GitHub.AddLabels[i] = "l"
+			}
+			err := k8sClient.Create(ctx, trigger)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("addLabels"))
+		})
 	})
 })

@@ -34,6 +34,14 @@ func TestCompile(t *testing.T) {
 		{"dyn body is accepted for a typed result", `body.repository.full_name`, cel.StringType, false},
 		{"macros and string ops", `body.labels.exists(l, l.name.startsWith("ai-"))`, cel.BoolType, false},
 		{"untyped param", `body.pull_request.number`, nil, false},
+		// The shipped factory triggers' expressions over a kind "run" envelope
+		// (docs/adr/0052 §4): body is dyn, so map membership, has() on nested
+		// fields and integer comparisons all type-check.
+		{"factory-review match", `source == "runs" && kind == "run" && body.trigger in ["github-issue-triage", "factory-fix"] && body.status == "succeeded" && has(body.outcome.pullRequest) && (!("factory-review" in body.chain.counts) || body.chain.counts["factory-review"] < 3)`, cel.BoolType, false},
+		{"factory-fix verdict", `body.outcome.verdict == "changes-requested"`, cel.BoolType, false},
+		{"factory-handoff not routed to fix", `!(has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" && body.chain.counts["factory-review"] < 3)`, cel.BoolType, false},
+		{"run param: pull request number", `body.outcome.pullRequest.number`, nil, false},
+		{"run param: chain origin login", `sender.login`, nil, false},
 		{"syntax error", `body.action ==`, nil, true},
 		{"undeclared variable", `request.body == "x"`, nil, true},
 		{"headers are strings", `headers["a"] == 1`, nil, true},
