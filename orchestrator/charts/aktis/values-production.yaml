@@ -808,6 +808,9 @@ extraManifests:
       params:
         repository: body.repository.full_name
         number: body.issue.number
+        # The SWE agent adds "Closes #<n>" to the PR it opens if the
+        # description doesn't already close this issue (docs/event-triggers.md §6).
+        closesIssue: body.issue.number
         title: body.issue.title
         description: body.issue.body
         label: body.label.name
