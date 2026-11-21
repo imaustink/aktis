@@ -938,14 +938,24 @@ extraManifests:
           2. Read ALL the feedback on it: the PR description, every review
              (`gh pr view {{`{{number}}`}} --comments`, `gh api` for review
              comments), and any failing checks (`gh pr checks {{`{{number}}`}}`).
-          3. Address that feedback in code. Fix the failing checks too. Where you
-             disagree with a comment, reply to it explaining why instead of silently
-             ignoring it.
-          4. Sync the branch with its base branch, resolving any conflicts
+          3. Address that feedback in code. Where you disagree with a comment,
+             reply to it explaining why instead of silently ignoring it.
+          4. Make every failing check pass, on this branch. That includes
+             failures this PR did not cause -- a runner image or toolchain change,
+             a newly reported vulnerability in a dependency or the standard
+             library, a broken workflow or tool install step. A PR whose checks
+             cannot go green cannot merge, so these are in scope here, not "a
+             separate PR". Read the failing job's logs (`gh run view --log-failed`),
+             fix the cause (bump the toolchain or dependency, upgrade or pin the
+             tool, update the workflow), and put each such fix in its own commit.
+             Never skip, disable, or loosen a check to make it pass. Only if the
+             fix needs something you cannot do from here (a secret, a repository
+             setting, a permission you lack) stop and say exactly what.
+          5. Sync the branch with its base branch, resolving any conflicts
              (`gh pr view {{`{{number}}`}} --json baseRefName`, then rebase or
              merge the base in -- match whatever this repository's history already
              does). Push the result to the same branch so the PR itself updates.
-          5. Update the PR description if what it says no longer matches what the
+          6. Update the PR description if what it says no longer matches what the
              branch does, and post one comment summarizing what you changed in
              response to which feedback, plus anything you deliberately did not do.
 

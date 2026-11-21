@@ -153,6 +153,13 @@ interface InvokeRecord {
    * it for auto-resume.
    */
   path?: string;
+  /**
+   * The delegated agent's live Remote Control session URL (invoke.go's
+   * invokeRecord.RemoteControlUrl), set on a "pending" record as soon as
+   * the episode reports one AND on the terminal record. Relayed to
+   * `remoteControlUrlListener` by poll() -- see its use there.
+   */
+  remoteControlUrl?: string;
 }
 
 export class TemporalEngine implements AgentGraphLike {
@@ -546,6 +553,7 @@ export class TemporalEngine implements AgentGraphLike {
     // TurnProgressQuery), not just what's new, so this is what keeps a
     // streaming caller from seeing every line repeated on every poll tick.
     let seen = 0;
+    let announcedRemoteControlUrl: string | undefined;
     for (;;) {
       // A REJECTED fetch is not the same as a non-ok response below: it means
       // the request never reached the engine gateway at all, which is what a
@@ -580,6 +588,20 @@ export class TemporalEngine implements AgentGraphLike {
         throw new Error(`temporal engine /invoke/${id} failed: ${res.status}`);
       }
       const record = (await res.json()) as InvokeRecord;
+
+      // The fire-and-forget /invoke path (webhook triggers) sets ONLY
+      // remoteControlUrlListener, never progressListener, so this can't ride
+      // on the progress relay below. Without it a Temporal-engine trigger run
+      // never recorded the URL on the invocation, and integration-gateway
+      // never posted the "Watch live or take over" link to the issue/PR --
+      // LangGraph's delegateToAgent fires the same listener (graph.ts).
+      // Checked before the terminal return: the engine also sets it on the
+      // finished record, so a short turn polled only once still reports it.
+      if (record.remoteControlUrl && record.remoteControlUrl !== announcedRemoteControlUrl) {
+        announcedRemoteControlUrl = record.remoteControlUrl;
+        input.remoteControlUrlListener?.(record.remoteControlUrl);
+      }
+
       if (record.status !== "pending") return record;
 
       // Surfaces as real SSE status events the moment they arrive, exactly
