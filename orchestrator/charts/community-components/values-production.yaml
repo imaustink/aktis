@@ -198,14 +198,21 @@ claudeCodeSweAgent:
   # templates/clusterrole-claude-code-swe-agent-cluster-read.yaml.
   #
   # Left out on purpose: generators.external-secrets.io (generator state holds
-  # generated secret values) and helm.cattle.io (HelmChart valuesContent is
-  # free-form and can carry credentials).
+  # generated secret values), helm.cattle.io (HelmChart valuesContent is
+  # free-form and can carry credentials) and argoproj.io (Argo CD
+  # Applications/ApplicationSets carry inline Helm values/parameters, Argo
+  # Workflows carry arbitrary parameters).
+  #
+  # configmaps: false -- this access reaches GitHub-triggered runs on a public
+  # repo, and no audit has confirmed that no homelab ConfigMap holds a
+  # credential. Pod env values stay readable (RBAC can't filter fields); see
+  # values.yaml's clusterRead for that residual risk.
   clusterRead:
     enabled: true
+    configmaps: false
     extraRules:
       - apiGroups:
           - core.aktis.ai
-          - argoproj.io
           - cert-manager.io
           - acme.cert-manager.io
           - external-secrets.io
