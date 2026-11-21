@@ -33,6 +33,18 @@ describe("compileEventSource", () => {
   });
 });
 
+describe("compileEventSource run sources (docs/adr/0052 §1)", () => {
+  it("compiles spec.run to a kind-run source with no route config", () => {
+    expect(compileEventSource({ metadata: { name: "runs" }, spec: { run: {} } } as never)).toEqual({ ok: true, source: { name: "runs", kind: "run" } });
+  });
+
+  it("rejects run combined with webhook or cron, and a sender block on a run source", () => {
+    expect(compileEventSource(webhook("x", { run: {} }) as never).ok).toBe(false);
+    expect(compileEventSource({ metadata: { name: "x" }, spec: { run: {}, cron: { schedule: "* * * * *" } } } as never).ok).toBe(false);
+    expect(compileEventSource({ metadata: { name: "x" }, spec: { run: {}, sender: { provider: "github", loginFrom: "''" } } } as never).ok).toBe(false);
+  });
+});
+
 describe("CrdEventSourceRegistry", () => {
   it("lists, applies watch events, and relists (dropping vanished sources) on reconnect", async () => {
     let items: unknown[] = [webhook("a"), webhook("b")];

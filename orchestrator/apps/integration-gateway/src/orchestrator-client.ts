@@ -41,6 +41,13 @@ export interface OrchestratorInvokeResult {
    * `InvocationRecord.remoteControlUrl`.
    */
   remoteControlUrl?: string;
+  /**
+   * The run's structured outcome (docs/adr/0052 §2) -- runner-produced, e.g.
+   * `{ pullRequest, madeNewCommits, verdict }` from the SWE agents. Only ever a
+   * JSON object (the engines bound it to 8 KiB); it becomes a run event's
+   * `body.outcome`. Separate from `result`, which stays the continuation token.
+   */
+  outcome?: Record<string, unknown>;
 }
 
 export interface OrchestratorClientOptions {
@@ -93,6 +100,14 @@ export interface AcceptedTrigger {
   sessionId: string;
   /** The trigger's `reply` with every template already rendered, or null. */
   reply: RenderedReply | null;
+  /**
+   * The string form of every rendered param (docs/event-triggers.md §4) --
+   * carried into this run's completion event as `body.params` (docs/adr/0052
+   * §1). Non-string values are dropped when parsed.
+   */
+  params?: Record<string, string>;
+  /** `spec.onComplete` (docs/adr/0052 §1): the run source this run's completion is published to. */
+  onComplete?: { emitTo: string };
 }
 
 /** Outcome of {@link OrchestratorClient.submitEvent}. */
@@ -139,6 +154,7 @@ interface InvokePollBody {
   identityLinkPending?: boolean;
   identityLink?: { provider: string; subject: string };
   remoteControlUrl?: string;
+  outcome?: unknown;
 }
 
 /** Result of `checkLive` (ADR 0026). */
@@ -174,11 +190,25 @@ export interface OpencodeForwardResult {
 
 export function parseAcceptedTrigger(raw: unknown): AcceptedTrigger {
   const t = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
+  // Absent from an engine that predates docs/adr/0052; a run event then
+  // carries `params: {}`.
+  let params: Record<string, string> | undefined;
+  if (isPlainObject(t.params)) {
+    params = {};
+    for (const [key, value] of Object.entries(t.params)) if (typeof value === "string") params[key] = value;
+  }
+  const emitTo = isPlainObject(t.onComplete) ? t.onComplete.emitTo : undefined;
   return {
     name: typeof t.name === "string" ? t.name : "",
     sessionId: typeof t.sessionId === "string" ? t.sessionId : "",
     reply: typeof t.reply === "object" && t.reply !== null ? (t.reply as RenderedReply) : null,
+    ...(params ? { params } : {}),
+    ...(typeof emitTo === "string" && emitTo ? { onComplete: { emitTo } } : {}),
   };
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function errorText(err: unknown): string {
@@ -446,6 +476,9 @@ export class OrchestratorClient {
           result: typeof polled.result === "string" ? polled.result : JSON.stringify(polled.result),
           identityLinkPending: polled.identityLinkPending,
           identityLink: polled.identityLink,
+          // Object only: an array or scalar can't be a run event's
+          // `body.outcome` (triggers read it as a map in CEL).
+          ...(isPlainObject(polled.outcome) ? { outcome: polled.outcome } : {}),
         };
       }
       if (polled.status === "failed") {

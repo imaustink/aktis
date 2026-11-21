@@ -101,6 +101,11 @@ config:
   # parked turn occupies a relay for this whole window, so a long hold delays
   # unrelated triggers behind it.
   resumeWaitMs: 600000
+  # Global cap on a run-event chain's depth (docs/adr/0052 §1): a trigger's
+  # `onComplete.emitTo` hop past it is dropped and commented on the issue/PR.
+  # Unset -> the gateway's default (12). Per-trigger caps belong in CEL on
+  # `body.chain.counts`; this is the backstop no trigger config can raise.
+  # runEventMaxDepth: 12
 
 # Automatic OIDC client_credentials token fetch/refresh for this gateway's
 # own /invoke calls to agent-orchestrator -- an opt-in alternative to

@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
-import { OrchestratorClient } from "./orchestrator-client.js";
+import { OrchestratorClient, parseAcceptedTrigger } from "./orchestrator-client.js";
 
 function noopSleep(): Promise<void> {
   return Promise.resolve();
@@ -583,5 +583,62 @@ describe("OrchestratorClient.submitEvent (docs/event-triggers.md §5)", () => {
     const noLogin = vi.fn().mockImplementation(async () => ok());
     await client(noLogin, "s3cret").submitEvent(envelope);
     expect(headerOf(noLogin)).toBeUndefined();
+  });
+});
+
+describe("run outcomes and accepted-trigger chaining fields (docs/adr/0052)", () => {
+  const pollClient = (polled: unknown): OrchestratorClient =>
+    new OrchestratorClient({
+      baseUrl: "http://orchestrator:8081",
+      token: "tok",
+      pollIntervalMs: 1,
+      pollTimeoutMs: 1000,
+      sleep: noopSleep,
+      fetchImpl: vi.fn().mockResolvedValue({ ok: true, json: async () => polled }) as unknown as typeof fetch,
+    });
+
+  it("passes a succeeded turn's object outcome through, next to the unchanged result", async () => {
+    const outcome = { pullRequest: { number: 12, url: "https://github.com/acme/widgets/pull/12" }, madeNewCommits: true };
+    expect(await pollClient({ status: "succeeded", result: "tok", outcome }).poll("inv-1")).toEqual({
+      status: "succeeded",
+      result: "tok",
+      outcome,
+    });
+  });
+
+  it.each([
+    ["an array", [1]],
+    ["a string", "ready"],
+    ["null", null],
+    ["a number", 3],
+  ])("drops an outcome that is %s", async (_, outcome) => {
+    const r = await pollClient({ status: "succeeded", result: "tok", outcome }).poll("inv-1");
+    expect(r).not.toHaveProperty("outcome");
+  });
+
+  it("parses params (strings only) and onComplete.emitTo off the accepted trigger", () => {
+    expect(
+      parseAcceptedTrigger({
+        name: "factory-review",
+        sessionId: "s",
+        reply: null,
+        params: { repository: "acme/widgets", number: "12", bogus: 12, nested: { a: "b" } },
+        onComplete: { emitTo: "runs" },
+      }),
+    ).toEqual({
+      name: "factory-review",
+      sessionId: "s",
+      reply: null,
+      params: { repository: "acme/widgets", number: "12" },
+      onComplete: { emitTo: "runs" },
+    });
+  });
+
+  it("omits params and onComplete when the engine sent none (or junk)", () => {
+    expect(parseAcceptedTrigger({ name: "t", sessionId: "s", reply: null, params: ["x"], onComplete: { emitTo: 7 } })).toEqual({
+      name: "t",
+      sessionId: "s",
+      reply: null,
+    });
   });
 });
