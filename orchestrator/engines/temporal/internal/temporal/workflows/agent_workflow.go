@@ -1,6 +1,7 @@
 package workflows
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -68,6 +69,10 @@ type AgentUp struct {
 	Message  string `json:"message"`
 	Result   string `json:"result,omitempty"` // opaque agent continuation token
 	Code     string `json:"code,omitempty"`
+	// Outcome is a bridged agent's runner-produced outcome object (docs/adr/
+	// 0052 §2), already checked by agentrun.ValidOutcome. Only ever set on a
+	// Final message; never confused with Result, the continuation token.
+	Outcome json.RawMessage `json:"outcome,omitempty"`
 }
 
 // AgentPrompt is one parent→child message (the HITL answer).

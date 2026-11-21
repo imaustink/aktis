@@ -126,3 +126,21 @@ func TestHandleInvokeStatusSucceededSurfacesTheLinkRequiredPath(t *testing.T) {
 		"path":"link-required"
 	}`, rec.Body.String())
 }
+
+// docs/adr/0052 §2: a forced agentRef turn's outcome is reported as
+// `outcome`, next to (never instead of) result.
+func TestHandleInvokeStatusSucceededCarriesTheOutcome(t *testing.T) {
+	handle := &fakeUpdateHandle{reply: "Reviewed.", path: "agent-routed", outcome: `{"verdict":"ready","madeNewCommits":false}`}
+	s := NewServer(&fakeTemporalClient{handle: handle}, "task-queue", nil)
+
+	rec := invokeStatusRequest(t, s, encodeInvocationID("conversation-abc", "6ba7b810-9dad-11d1-80b4-00c04fd430c8"))
+
+	require.Equal(t, 200, rec.Code)
+	require.JSONEq(t, `{
+		"id":"conversation-abc.6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+		"status":"succeeded",
+		"result":"Reviewed.",
+		"path":"agent-routed",
+		"outcome":{"verdict":"ready","madeNewCommits":false}
+	}`, rec.Body.String())
+}

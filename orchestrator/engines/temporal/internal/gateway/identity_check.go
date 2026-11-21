@@ -89,7 +89,7 @@ func refuseIdentity(c *gin.Context, ie *authz.IdentityError, match *catalog.Trig
 
 	body := identityRefusal{Status: invokeStatusFailed, Error: identityErrorReply{IdentityError: ie}}
 	if match != nil {
-		body.Error.Trigger = &invokeTrigger{Name: match.Trigger.Name, SessionID: sessionID, Reply: match.Reply}
+		body.Error.Trigger = newInvokeTrigger(match, sessionID)
 	}
 	c.JSON(http.StatusForbidden, body)
 }
@@ -113,8 +113,10 @@ func (s *Server) handleInvokeCheck(c *gin.Context) {
 		s.resolveInvokeCaller(c),
 		time.Now(),
 	)
-	if err != nil || shaped.ignored {
-		// Not this endpoint's to judge: /invoke itself answers these.
+	if err != nil || shaped.ignored || shaped.none {
+		// Not this endpoint's to judge: /invoke itself answers these. A
+		// target.none match runs nothing, so it never has an identity to
+		// refuse (docs/adr/0052 §3).
 		c.Status(http.StatusNoContent)
 		return
 	}

@@ -41,6 +41,7 @@
 package agentrun
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 
@@ -100,6 +101,14 @@ type UpMessage struct {
 	// non-final reply (a question) is exactly the one omitempty would strip.
 	Final  bool            `json:"final"`
 	Result json.RawMessage `json:"result,omitempty"`
+	// Outcome is the runner-produced facts about a finished turn (the pull
+	// request it ended with, a review verdict; docs/adr/0052 §2). Distinct
+	// from Result, which agents use as an opaque continuation token. Raw on
+	// purpose: this engine carries it, never interprets it, and trusts it only
+	// after ValidOutcome. The contract gate (messaging.CheckContract) decodes
+	// with DiscardUnknown, so the field reaches this struct even if the pinned
+	// protocol module predates proto field 20.
+	Outcome json.RawMessage `json:"outcome,omitempty"`
 
 	// tool_call
 	CallID string `json:"callId,omitempty"`
@@ -124,6 +133,35 @@ func (m UpMessage) ResultText() string {
 		return asString
 	}
 	return string(m.Result)
+}
+
+// MaxOutcomeBytes bounds a reply's outcome in compact form (docs/adr/0052 §2).
+// It rides workflow history, the invocation record and, from there, a
+// run-completion event, so one agent must not be able to inflate all three.
+const MaxOutcomeBytes = 8192
+
+// ValidOutcome returns raw in compact form when it is a JSON object whose
+// compact serialization fits MaxOutcomeBytes. Anything else -- an array, a
+// string, null, malformed JSON, an oversized object -- is an error, and the
+// caller drops the outcome rather than forwarding something a trigger's
+// `has(body.outcome.pullRequest)` would read wrongly. Empty input is
+// (nil, nil): most replies carry no outcome at all.
+func ValidOutcome(raw json.RawMessage) (json.RawMessage, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil, nil
+	}
+	if trimmed[0] != '{' {
+		return nil, fmt.Errorf("outcome must be a JSON object")
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, trimmed); err != nil {
+		return nil, fmt.Errorf("outcome is not valid JSON: %w", err)
+	}
+	if compact.Len() > MaxOutcomeBytes {
+		return nil, fmt.Errorf("outcome is %d bytes compact, over the %d-byte limit", compact.Len(), MaxOutcomeBytes)
+	}
+	return json.RawMessage(compact.Bytes()), nil
 }
 
 // DownMessage is one orchestrator → agent message.

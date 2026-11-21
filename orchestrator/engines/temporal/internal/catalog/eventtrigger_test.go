@@ -2,6 +2,7 @@ package catalog_test
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -224,6 +225,77 @@ func TestRunEventTriggerWatchKeepsTheRegistryCurrent(t *testing.T) {
 
 	cancel()
 	require.NoError(t, <-done)
+}
+
+// docs/adr/0052 §3: target.none decodes from the CR, needs no prompt, is a
+// target of its own (exclusive with the other four) and carries no run mode.
+func TestEventTriggerTargetNone(t *testing.T) {
+	d, err := catalog.DecodeEventTrigger(triggerCR("factory-done", map[string]any{
+		"match":      map[string]any{"cel": `kind == "run"`},
+		"target":     map[string]any{"none": map[string]any{}},
+		"onComplete": map[string]any{"emitTo": "runs"},
+	}, "True"))
+	require.NoError(t, err)
+	require.NoError(t, d.Invalid())
+	require.Equal(t, catalog.TargetNone, d.Spec.Target.Kind())
+	require.Equal(t, "runs", d.Spec.OnComplete.EmitTo)
+
+	run := catalog.Envelope{Source: "runs", Kind: "run", ID: "r-1", Body: map[string]any{}}
+	m, err := catalog.MatchEventTriggers([]*catalog.EventTriggerDescriptor{d}, run, "")
+	require.NoError(t, err)
+	require.NotNil(t, m, "a run-kind envelope matches like any other")
+	require.Equal(t, "", m.Prompt)
+
+	for name, target := range map[string]catalog.EventTriggerTarget{
+		"none + agentRef":       {None: &struct{}{}, AgentRef: "swe"},
+		"none + orchestrator":   {None: &struct{}{}, Orchestrator: &struct{}{}},
+		"none + readOnly":       {None: &struct{}{}, ReadOnly: true},
+		"none + identity":       {None: &struct{}{}, Identity: "agent"},
+		"none + promptTemplate": {None: &struct{}{}, PromptTemplate: "x"},
+	} {
+		bad := catalog.NewEventTriggerDescriptor(name, catalog.EventTriggerSpec{Target: target}, true)
+		require.Error(t, bad.Invalid(), name)
+	}
+
+	for want, target := range map[string]catalog.EventTriggerTarget{
+		catalog.TargetOrchestrator: {Orchestrator: &struct{}{}},
+		catalog.TargetSkill:        {SkillRef: "s"},
+		catalog.TargetAgent:        {AgentRef: "a"},
+		catalog.TargetTool:         {ToolRef: "t"},
+	} {
+		require.Equal(t, want, target.Kind())
+	}
+}
+
+// docs/adr/0052 §3: addLabels / assignees render like removeLabel; entries
+// that render empty are dropped, and an all-empty list is omitted.
+func TestEventTriggerReplyAddLabelsAndAssignees(t *testing.T) {
+	render := func(addLabels, assignees []string) *catalog.RenderedGitHubReply {
+		d := catalog.NewEventTriggerDescriptor("t", catalog.EventTriggerSpec{
+			Params: map[string]string{"repo": "body.repository.full_name", "number": "body.pull_request.number", "empty": `""`},
+			Target: catalog.EventTriggerTarget{None: &struct{}{}},
+			Reply: &catalog.EventTriggerReply{GitHub: &catalog.EventGitHubReply{
+				Repository: "{{repo}}", IssueNumber: "{{number}}", AddLabels: addLabels, Assignees: assignees,
+			}},
+		}, true)
+		require.NoError(t, d.Invalid())
+		m, err := catalog.MatchEventTriggers([]*catalog.EventTriggerDescriptor{d}, prEnvelope(), "")
+		require.NoError(t, err)
+		require.NotNil(t, m)
+		return m.Reply.GitHub
+	}
+
+	g := render([]string{"factory-review", "pr-{{number}}", "{{empty}}"}, []string{"{{empty}}", "octo"})
+	require.Equal(t, []string{"factory-review", "pr-42"}, g.AddLabels)
+	require.Equal(t, []string{"octo"}, g.Assignees)
+
+	g = render([]string{"{{empty}}"}, nil)
+	require.Nil(t, g.AddLabels)
+	require.Nil(t, g.Assignees)
+	raw, err := json.Marshal(g)
+	require.NoError(t, err)
+	require.NotContains(t, string(raw), "addLabels")
+	require.NotContains(t, string(raw), "assignees")
 }
 
 // docs/adr/0049: same rule as the CRD's admission CEL and @aktis/event-triggers.

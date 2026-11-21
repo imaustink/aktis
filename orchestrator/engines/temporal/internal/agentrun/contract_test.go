@@ -2,6 +2,7 @@ package agentrun_test
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -107,6 +108,62 @@ func TestEveryValidUpMessageTypePassesTheGate(t *testing.T) {
 			} else {
 				require.Empty(t, conn.acks(), "narration is never acked")
 			}
+		})
+	}
+}
+
+// docs/adr/0052 §2: a final reply's runner outcome (proto field 20) survives
+// the contract gate and the struct decode, and reaches the workflow signal
+// untouched -- distinct from result, the continuation token.
+func TestAReplyOutcomeIsSignalled(t *testing.T) {
+	_, conn, signaler, subjects := attached(t)
+	conn.deliverRaw(t, subjects.Up, `{"agent_run_id":"`+runID+`","seq":4,"ts":"t","type":"reply","message":"Reviewed","final":true,"result":"tok",`+
+		`"outcome":{"pullRequest":{"number":12,"url":"https://x"},"madeNewCommits":false,"verdict":"ready"}}`)
+
+	require.Equal(t, 1, signaler.count())
+	msg := signaler.signals[0].Msg
+	require.Equal(t, "tok", msg.ResultText())
+	require.JSONEq(t, `{"pullRequest":{"number":12,"url":"https://x"},"madeNewCommits":false,"verdict":"ready"}`, string(msg.Outcome))
+}
+
+func TestValidOutcome(t *testing.T) {
+	// Exactly at the limit, compact: {"p":"<pad>"} is 8 bytes of framing.
+	atLimit := `{"p":"` + strings.Repeat("x", agentrun.MaxOutcomeBytes-8) + `"}`
+	require.Len(t, atLimit, agentrun.MaxOutcomeBytes)
+	overLimit := `{"p":"` + strings.Repeat("x", agentrun.MaxOutcomeBytes-7) + `"}`
+
+	valid := map[string]struct{ in, want string }{
+		"object, compacted":      {` { "a" : 1, "b": [ true ] } `, `{"a":1,"b":[true]}`},
+		"empty object":           {`{}`, `{}`},
+		"exactly at the limit":   {atLimit, atLimit},
+		"whitespace not counted": {"{\n  \"p\": \"" + strings.Repeat("x", agentrun.MaxOutcomeBytes-8) + "\"\n}", atLimit},
+	}
+	for name, c := range valid {
+		t.Run(name, func(t *testing.T) {
+			got, err := agentrun.ValidOutcome(json.RawMessage(c.in))
+			require.NoError(t, err)
+			require.Equal(t, c.want, string(got))
+		})
+	}
+
+	got, err := agentrun.ValidOutcome(nil)
+	require.NoError(t, err)
+	require.Nil(t, got, "no outcome is not an error")
+
+	for name, in := range map[string]string{
+		"array":            `[{"a":1}]`,
+		"string":           `"ready"`,
+		"number":           `12`,
+		"null":             `null`,
+		"bool":             `true`,
+		"malformed":        `{"a":`,
+		"trailing garbage": `{"a":1} {"b":2}`,
+		"one byte over":    overLimit,
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := agentrun.ValidOutcome(json.RawMessage(in))
+			require.Error(t, err)
+			require.Nil(t, got)
 		})
 	}
 }
