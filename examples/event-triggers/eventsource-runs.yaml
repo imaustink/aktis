@@ -1,0 +1,12 @@
+# A run-completion source (docs/adr/0052, docs/event-triggers.md §9). Nothing
+# outside the cluster delivers to it: whenever a run started by a trigger with
+# `onComplete.emitTo: runs` finishes, integration-gateway synthesizes a
+# kind "run" event on it and feeds it through the same matching path as a
+# webhook. No Secret, no CronJob and no sender block -- the event carries the
+# chain's originating human, re-verified by the gateway on every hop.
+apiVersion: core.aktis.ai/v1alpha1
+kind: EventSource
+metadata:
+  name: runs
+spec:
+  run: {}

@@ -12,6 +12,7 @@ resources:
   - eventsource-ci.yaml
   - eventsource-generic-hmac.yaml
   - eventsource-nightly-sweep.yaml
+  - eventsource-runs.yaml
   - eventtrigger-github-issue-triage.yaml
   - eventtrigger-github-issue-review.yaml
   - eventtrigger-github-pr-triage.yaml
@@ -20,3 +21,6 @@ resources:
   - eventtrigger-ci-failure-skill.yaml
   - eventtrigger-generic-hmac-tool.yaml
   - eventtrigger-nightly-stale-sweep.yaml
+  - eventtrigger-factory-review.yaml
+  - eventtrigger-factory-fix.yaml
+  - eventtrigger-factory-handoff.yaml

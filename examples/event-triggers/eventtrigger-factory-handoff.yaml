@@ -1,0 +1,38 @@
+# Software factory, step 3b (docs/adr/0052 §4): every factory-review completion
+# that factory-fix does not take -- verdict "ready", no valid verdict ("none"),
+# a review run that did not succeed, or the 3-review cap reached -- assigns the
+# PR to the human who started the chain. target.none runs nothing: no agent,
+# no identity check, only the reply side effects.
+#
+# `assignee` is the run event's sender: the human who applied the original
+# `ai-triage`, re-verified by the gateway on every hop -- never the bot and
+# never a hard-coded login. `reason` spells out why it was handed off.
+apiVersion: core.aktis.ai/v1alpha1
+kind: EventTrigger
+metadata:
+  name: factory-handoff
+spec:
+  sourceRef: runs
+  match:
+    cel: >-
+      source == "runs" && kind == "run" &&
+      body.trigger == "factory-review" &&
+      !(has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" &&
+        body.chain.counts["factory-review"] < 3)
+  params:
+    repository: body.params.repository
+    number: body.params.number
+    assignee: sender.login
+    reason: >-
+      body.status != "succeeded" ? "the review run did not succeed" :
+      (has(body.outcome.verdict) && body.outcome.verdict == "ready") ? "the reviewer judged it ready to merge" :
+      (has(body.outcome.verdict) && body.outcome.verdict == "changes-requested") ? "it reached the limit of 3 automated review rounds with changes still requested" :
+      "the reviewer did not record a verdict"
+  target:
+    none: {}
+  reply:
+    github:
+      repository: "{{repository}}"
+      issueNumber: "{{number}}"
+      ack: "🤖 The automated review is done: {{reason}}. Handing this pull request to @{{assignee}} for a final review."
+      assignees: ["{{assignee}}"]
