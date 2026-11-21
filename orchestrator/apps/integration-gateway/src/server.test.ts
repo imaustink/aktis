@@ -727,6 +727,23 @@ describe("identity-link auto-resume on the event path", () => {
     ]);
   });
 
+  it("posts a Remote Control link from the resumed turn as a new comment, not an edit of the ack above the prompt", async () => {
+    const waitForCompletion = vi.fn().mockResolvedValue({ token: "t", createdAt: "x" });
+    const h = await start({
+      claudeAuthStore: { get: vi.fn(), set: vi.fn(), delete: vi.fn(), waitForCompletion } as unknown as ClaudeTokenStore,
+    });
+    h.poll.mockResolvedValueOnce(pending);
+    h.poll.mockImplementationOnce(async (_id: string, hooks?: PollHooks) => {
+      await hooks?.onRemoteControlUrl?.("https://claude.ai/code/session_abc");
+      return { status: "succeeded", result: "Looks good." };
+    });
+    await postGithub(h);
+    await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
+    expect(h.updateIssueComment).not.toHaveBeenCalled();
+    const rc = h.postIssueComment.mock.calls.filter((c) => String(c[3]).includes("Watch live"));
+    expect(rc).toEqual([["acme", "widgets", 7, "🤖 Watch live or take over the session here: https://claude.ai/code/session_abc"]]);
+  });
+
   it("leaves the prompt standing and reports failure over http when the link never completes", async () => {
     const waitForCompletion = vi.fn().mockResolvedValue(undefined);
     const h = await start({

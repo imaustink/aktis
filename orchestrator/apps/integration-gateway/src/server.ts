@@ -920,6 +920,10 @@ export class GatewayServer {
       if (outcome.status === "succeeded" && outcome.identityLinkPending && outcome.identityLink) {
         await this.completeTurn(sessionId, tracked, outcome);
         if (gh) await best(() => this.options.githubReplyClient.postIssueComment(gh.owner, gh.repo, gh.issueNumber, outcome.result ?? ""));
+        // The ack now sits above the prompt the human is acting on, and GitHub
+        // doesn't notify on edits: a Remote Control link that surfaces on the
+        // resumed turn is posted as its own comment instead.
+        ackComment = undefined;
         const resumed = await this.waitAndResume(outcome.identityLink, async () => {
           // The resumed turn stays in the delivery's trace.
           const hop = startSpan("event resubmit", traceparent, { kind: "client", attributes: { "aktis.event_source": envelope.source } });
