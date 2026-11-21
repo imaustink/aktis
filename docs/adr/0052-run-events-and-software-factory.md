@@ -4,8 +4,7 @@ Date: 2026-11-21
 
 ## Status
 
-Proposed. Extends [0048](0048-generic-event-triggers.md). Builds on the structured
-`AgentReply.result` the agent runtime already sends, and on the identity model in
+Proposed. Extends [0048](0048-generic-event-triggers.md) and the identity model in
 [0049](0049-configurable-agent-identity-mode.md).
 
 ## Context
@@ -39,9 +38,9 @@ that crosses GitHub.
 **A run reports nothing machine-readable.** A trigger-dispatched run ends as
 `{status, result: string}` on `/invoke/:id`. The gateway posts the text and
 removes the label; nothing downstream can read "which PR did this open?" or
-"what did the reviewer decide?". The runtime already carries a structured
-`AgentReply.result` on the wire (`framework/agent-runtime/src/runtime.ts`), but
-neither engine passes it through to the invocation record.
+"what did the reviewer decide?". The runtime's structured `AgentReply.result`
+is already taken: the SWE agents use it as an opaque continuation token, and the
+Temporal engine flattens it to a string for that purpose.
 
 **A review can't express its verdict through GitHub.** The App authored the PR,
 and GitHub doesn't let a PR's author approve or request changes. Every bot
@@ -128,8 +127,10 @@ path, which keeps working). A durable outbox in the style of
 
 ### 2. Structured run outcomes
 
-`AgentReply.result` becomes the run's **outcome**. It must be a JSON object of at
-most 8 KiB; anything else is dropped and logged. Both engines carry it to the
+A new reply field, `outcome` (`AgentReply.outcome` in the runtime;
+`google.protobuf.Struct outcome = 20` on `AgentUpMessage`), carries the run's
+**outcome**. It is separate from `result`, which stays the continuation token.
+It must be a JSON object of at most 8 KiB; anything else is dropped and logged. Both engines carry it to the
 invocation record, and `/invoke/:id` returns it as `outcome`. The gateway passes
 it into the run event's `body.outcome`.
 
@@ -243,8 +244,9 @@ Each step lands green on its own and is inert until the next one uses it.
 
 1. **This ADR.**
 2. **Outcome plumbing.**
-   - Both engines carry `AgentReply.result` to the invocation record and to
-     `/invoke/:id` as `outcome` (object, ≤ 8 KiB).
+   - The `outcome` reply field (proto, messaging schema, runtime).
+   - Both engines carry it to the invocation record and to `/invoke/:id` as
+     `outcome` (object, ≤ 8 KiB).
    - The gateway's `OrchestratorInvokeResult` gains `outcome`.
    - The SWE agents (both) report `pullRequest` and `madeNewCommits`.
 3. **Verdict.** `aktis-verdict` and runner validation in both SWE agents, so

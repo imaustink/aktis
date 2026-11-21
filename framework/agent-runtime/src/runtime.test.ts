@@ -93,6 +93,18 @@ describe("runAgent", () => {
     expect(ch.up[3]).toMatchObject({ type: "reply", final: true, result: { n: 1 } });
   });
 
+  it("carries a runner outcome on the final reply, separate from result", async () => {
+    const ch = new FakeChannel();
+    await runAgent(async () => ({ message: "ok", result: "tok", outcome: { verdict: "ready" } }), { channel: ch, config });
+    expect(ch.up.at(-1)).toMatchObject({ type: "reply", final: true, result: "tok", outcome: { verdict: "ready" } });
+  });
+
+  it("omits outcome from the final reply when the handler sets none", async () => {
+    const ch = new FakeChannel();
+    await runAgent(async () => "ok", { channel: ch, config });
+    expect(ch.up.at(-1)).not.toHaveProperty("outcome");
+  });
+
   it("ask() emits a non-final reply and resolves with the next prompt", async () => {
     const ch = new FakeChannel();
     const done = runAgent(
