@@ -14,6 +14,7 @@ import { resolveCallerTools, toCallerToolDescriptor } from "./caller-tools/resol
 import type { ToolDescriptor } from "./tool-descriptor.js";
 import type { SessionStore } from "./session/types.js";
 import { InMemoryInvocationStore, type InvocationStore } from "./invocation/types.js";
+import { checkOutcome } from "./invocation/outcome.js";
 import { parseEnvelope, type EventTriggerSelector } from "./routing/crd-event-trigger-registry.js";
 import type { Envelope, RenderedReply } from "@aktis/event-triggers";
 import {
@@ -94,6 +95,40 @@ export interface InvocationRecord {
    * full round trip is chat-facade-only.
    */
   pendingToolCalls?: PendingToolCall[];
+  /**
+   * The structured outcome (docs/adr/0052 §2) of an event turn's forced
+   * `agentRef` run, from the run's FINAL reply. integration-gateway copies it
+   * into the run-completion event's `body.outcome`, where the next trigger's
+   * CEL reads it (`has(body.outcome.pullRequest)`). Present only on a
+   * `succeeded` record, only when the run reported one, and only after
+   * `checkOutcome` accepted it (a JSON object, <= 8 KiB compact). Unrelated to
+   * `result`, which stays the turn's text answer.
+   */
+  outcome?: Record<string, unknown>;
+}
+
+/**
+ * The run outcome to put on an invocation record, or undefined. An outcome
+ * that fails `checkOutcome` is dropped and logged, never truncated or passed
+ * through: it feeds CEL predicates that decide what runs next.
+ */
+function acceptedOutcome(invocationId: string, raw: unknown): Record<string, unknown> | undefined {
+  if (raw === undefined) return undefined;
+  const checked = checkOutcome(raw);
+  if (checked.ok) return checked.outcome;
+  console.warn(`agent-orchestrator: dropping run outcome for invocation ${invocationId}: ${checked.reason}`);
+  return undefined;
+}
+
+/** The 202's `trigger` object for an event turn (docs/event-triggers.md §5, docs/adr/0052 §1/§3). */
+interface TriggerResponse {
+  name: string;
+  sessionId: string;
+  reply: RenderedReply | null;
+  /** Every rendered param in §4 string form; the gateway threads these into the run-completion event. */
+  params: Record<string, string>;
+  /** Present only when the trigger sets `onComplete.emitTo`. */
+  onComplete?: { emitTo: string };
 }
 
 /** How often to emit an SSE keep-alive comment while waiting on a slow graph step (e.g. a tool Job). */
@@ -1036,7 +1071,7 @@ export class InvokeServer {
     // modes run exactly the turn this process selected: the Temporal engine is
     // handed the resolved target, never the envelope.
     let trigger: TriggerTurn | undefined;
-    let triggerResponse: { name: string; sessionId: string; reply: RenderedReply | null } | undefined;
+    let triggerResponse: TriggerResponse | undefined;
     let targetRepository: string | undefined;
     if (envelope) {
       const selection = this.eventTriggerRegistry?.select(envelope, sessionId ? { callerSessionId: sessionId } : {}) ?? {
@@ -1057,6 +1092,17 @@ export class InvokeServer {
         return;
       }
       const { target } = selection;
+      triggerResponse = {
+        name: selection.trigger,
+        sessionId: selection.sessionId,
+        reply: selection.reply,
+        params: selection.stringParams,
+        ...(selection.onComplete ? { onComplete: selection.onComplete } : {}),
+      };
+      if (target.kind === "none") {
+        await this.acceptNoneTurn(res, span, triggerResponse);
+        return;
+      }
       // A toolRef trigger needs no promptTemplate, but the turn still needs a
       // request (it is what the session, run annotations and logs show), so it
       // gets a short descriptive one -- never text lifted from the event body.
@@ -1072,7 +1118,6 @@ export class InvokeServer {
         params: selection.stringParams,
         ...(target.identity ? { identity: target.identity } : {}),
       };
-      triggerResponse = { name: selection.trigger, sessionId: selection.sessionId, reply: selection.reply };
     }
 
     // `/invoke` has no prior-tool-call history to read: it takes a single
@@ -1203,12 +1248,14 @@ export class InvokeServer {
           // progress listener above -- this terminal write replaces the whole
           // record, so it would otherwise be dropped on a successful/failed turn.
           const remoteControlUrl = (await this.invocations.get(id))?.remoteControlUrl;
+          const outcome = !state.error && trigger?.forcedAgentId ? acceptedOutcome(id, state.agentOutcome) : undefined;
           await this.persistTerminalInvocation(id, {
             id,
             status: state.error ? "failed" : "succeeded",
             result: state.result,
             error: state.error,
             ...(remoteControlUrl ? { remoteControlUrl } : {}),
+            ...(outcome ? { outcome } : {}),
             // `?? []` for the same reason as the chat facade's read: a partial
             // `AgentGraphLike` implementation must not turn a successful turn
             // into a failed one.
@@ -1259,6 +1306,32 @@ export class InvokeServer {
     res.writeHead(202, { "content-type": "application/json", location: `/invoke/${id}` }).end(
       JSON.stringify({ id, status: "pending", ...(triggerResponse ? { trigger: triggerResponse } : {}) }),
     );
+  }
+
+  /**
+   * A `target.none` trigger (docs/adr/0052 §3): matched and accepted like any
+   * event turn, so integration-gateway applies its reply side effects (labels,
+   * assignees, ack) and, with `onComplete`, emits the completion event -- but
+   * NOTHING runs. No graph, LLM, AgentRun or tool, and so also no identity
+   * pre-flight: there is no agent to act as anyone, so a none trigger can never
+   * 403. The record is written already `succeeded` with an empty result, so
+   * the gateway's first poll finishes the turn.
+   */
+  private async acceptNoneTurn(res: ServerResponse, span: TraceSpan, trigger: TriggerResponse): Promise<void> {
+    if (this.draining) {
+      // Same reason as a real turn's 503: the record may live only in this
+      // process's memory, and the replacement pod would 404 its poll.
+      res
+        .writeHead(503, { "content-type": "application/json", "retry-after": "1" })
+        .end(JSON.stringify({ error: "orchestrator is shutting down; retry" }));
+      return;
+    }
+    const id = randomUUID();
+    await this.invocations.set(id, { id, status: "succeeded", result: "" });
+    span.set({ "aktis.invocation_id": id, "aktis.trigger": trigger.name, "aktis.trigger.target": "none" });
+    res
+      .writeHead(202, { "content-type": "application/json", location: `/invoke/${id}` })
+      .end(JSON.stringify({ id, status: "pending", trigger }));
   }
 
   private async handleGetInvocation(res: ServerResponse, id: string): Promise<void> {

@@ -76,6 +76,18 @@ describe("TemporalEngine", () => {
     expect(calls[1]!.url).toBe(`${BASE}/invoke/conversation-abc.upd-1`);
   });
 
+  // docs/adr/0052 §2: server.ts validates it; this hop must only not lose it.
+  it("passes a succeeded record's outcome through as agentOutcome", async () => {
+    const outcome = { pullRequest: { number: 12, url: "u" }, madeNewCommits: true };
+    const { impl } = scriptedFetch([{ id: "x", status: "succeeded", result: "reviewed", outcome }]);
+    const state = await new TemporalEngine({ baseUrl: BASE, fetchImpl: impl }).invoke(input());
+    expect(state.result).toBe("reviewed");
+    expect(state.agentOutcome).toEqual(outcome);
+
+    const { impl: bare } = scriptedFetch([{ id: "x", status: "succeeded", result: "reviewed" }]);
+    expect(await new TemporalEngine({ baseUrl: BASE, fetchImpl: bare }).invoke(input())).not.toHaveProperty("agentOutcome");
+  });
+
   it("reports a failed turn as an error rather than an empty result", async () => {
     const { impl } = scriptedFetch([{ id: "x", status: "failed", error: "the planner exploded" }]);
     const engine = new TemporalEngine({ baseUrl: BASE, fetchImpl: impl });

@@ -470,6 +470,17 @@ export const AgentStateAnnotation = Annotation.Root({
     default: () => undefined,
   }),
   /**
+   * The structured `outcome` (docs/adr/0052 §2) the delegated agent's FINAL
+   * reply carried, raw. Kept apart from `extractedAgentContinuation` (the
+   * reply's `result`), which is a resume token, not a run result. The server
+   * validates it and surfaces it on an event turn's invocation record, where
+   * integration-gateway turns it into the run-completion event.
+   */
+  agentOutcome: Annotation<unknown>({
+    reducer: (_current, update) => update,
+    default: () => undefined,
+  }),
+  /**
    * Per-request progress listener — set by the SSE streaming path so tool
    * Job progress/warning events (and, for agent delegation, the sub-agent's
    * own narration) are forwarded as Open WebUI status steps while the Job
@@ -1370,6 +1381,14 @@ function afterOrEnd(next: string) {
   return (state: AgentState): string => (state.error ? END : next);
 }
 
+/**
+ * The `agentOutcome` state update for a FINAL agent reply (docs/adr/0052 §2):
+ * only a final reply ends the run, so only it reports the run's outcome.
+ */
+function finalReplyOutcome(reply: AgentTurnResult): { agentOutcome?: unknown } {
+  return reply.outcome !== undefined ? { agentOutcome: reply.outcome } : {};
+}
+
 /** Normalizes an agent-turn failure (from awaitReply/sendPrompt) into a state.error message. */
 function agentTurnErrorMessage(err: unknown): string {
   if (err instanceof AgentTurnFailedError) return `agent failed (${err.code}): ${err.message}`;
@@ -2259,6 +2278,7 @@ export function buildAgentGraph(deps: AgentGraphDeps) {
                     agentId: found.agent.id,
                     token: typeof recorded.result === "string" ? recorded.result : "",
                   },
+                  ...finalReplyOutcome(recorded),
                 }
               : {}),
           };
@@ -2313,7 +2333,10 @@ export function buildAgentGraph(deps: AgentGraphDeps) {
           // episode, at which point `reply.result` becomes the continuation
           // token for whatever NEW episode comes next (ADR 0017).
           ...(reply.final
-            ? { extractedAgentContinuation: { agentId: found.agent.id, token: typeof reply.result === "string" ? reply.result : "" } }
+            ? {
+                extractedAgentContinuation: { agentId: found.agent.id, token: typeof reply.result === "string" ? reply.result : "" },
+                ...finalReplyOutcome(reply),
+              }
             : {}),
         };
       } catch (err) {
@@ -2639,7 +2662,10 @@ export function buildAgentGraph(deps: AgentGraphDeps) {
           // non-final reply (HITL question) continues this SAME run via
           // `checkActiveAgentRun`, which needs no continuation token at all.
           ...(reply.final
-            ? { extractedAgentContinuation: { agentId: agent.id, token: typeof reply.result === "string" ? reply.result : "" } }
+            ? {
+                extractedAgentContinuation: { agentId: agent.id, token: typeof reply.result === "string" ? reply.result : "" },
+                ...finalReplyOutcome(reply),
+              }
             : {}),
         };
       } catch (err) {

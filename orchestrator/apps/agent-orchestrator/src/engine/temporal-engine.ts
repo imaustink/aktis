@@ -160,6 +160,12 @@ interface InvokeRecord {
    * `remoteControlUrlListener` by poll() -- see its use there.
    */
   remoteControlUrl?: string;
+  /**
+   * The forced agentRef run's outcome (docs/adr/0052 §2) on a "succeeded"
+   * record. The Go engine applies the same object/8 KiB rule; server.ts
+   * re-checks it regardless, since this hop is a trust boundary of its own.
+   */
+  outcome?: unknown;
 }
 
 export class TemporalEngine implements AgentGraphLike {
@@ -210,7 +216,14 @@ export class TemporalEngine implements AgentGraphLike {
         })),
       } as AgentState;
     }
-    return { ...input, result: record.result } as AgentState;
+    // `outcome` (docs/adr/0052 §2) is the forced agentRef run's structured
+    // result as the engine recorded it; passed through raw because server.ts
+    // validates it (shape + size) for both engines in one place.
+    return {
+      ...input,
+      result: record.result,
+      ...(record.outcome !== undefined ? { agentOutcome: record.outcome } : {}),
+    } as AgentState;
   }
 
   /**
