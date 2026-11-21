@@ -25,6 +25,7 @@ import {
   setupGitAuth,
 } from "./git.js";
 import { closingLine, ensureClosingReference, parseClosesIssue } from "./closingRef.js";
+import { clearVerdict, collectOutcome, installVerdictCommand, VERDICT_FILE_ENV, type SweOutcome } from "./outcome.js";
 import { extractContinuationToken } from "./continuation.js";
 import { decodeSweContinuation, encodeSweContinuation, type SweMarker } from "./marker.js";
 import { loadToolConfig } from "./config.js";
@@ -49,6 +50,8 @@ interface TurnOutcome {
   reply: string;
   nextMarker: SweMarker | null;
   succeeded: boolean;
+  /** Runner-observed facts for chained triggers (docs/adr/0052 §2); set on a succeeded turn. */
+  outcome?: SweOutcome;
 }
 
 interface TurnContext {
@@ -64,6 +67,8 @@ interface TurnContext {
   readOnly: boolean;
   /** The run's structured params (AgentRun.spec.params; ADR 0048). */
   params: Readonly<Record<string, string>>;
+  /** Runner-owned file `aktis-verdict` writes to (outcome.ts). */
+  verdictFile: string;
   signal: AbortSignal;
 }
 
@@ -101,7 +106,10 @@ async function runTurn(ctx: TurnContext, instruction: string, marker: SweMarker 
   // Only the FIRST turn gets the full framing prompt (workflow rules,
   // environment description, continuation context) -- opencode already has
   // that context in the session's own history for every turn after.
-  const promptText = isFirstTurn ? buildPrompt(instruction, marker) : instruction;
+  const promptText = isFirstTurn ? buildPrompt(instruction, marker, ctx.readOnly) : instruction;
+  // Whatever is in the verdict file after the turn was written during THIS
+  // turn, never left over from an earlier one.
+  await clearVerdict(ctx.verdictFile);
   const result = await sendMessage(ctx.serverBaseUrl, ctx.sessionId, promptText, ctx.auth, ctx.signal);
 
   if (result.failed) {
@@ -221,6 +229,7 @@ async function runTurn(ctx: TurnContext, instruction: string, marker: SweMarker 
     reply: `${clip(summary, 1500)}${prLine}${closingNote}`,
     nextMarker,
     succeeded: true,
+    outcome: await collectOutcome({ discovered, madeNewCommits, readOnly: ctx.readOnly, verdictFile: ctx.verdictFile }),
   };
 }
 
@@ -411,6 +420,13 @@ async function main(): Promise<void> {
       GITHUB_TOKEN: token,
       GIT_TERMINAL_PROMPT: "0",
     };
+    // `aktis-verdict` (docs/adr/0052 §2): how a review records its decision in
+    // a runner-owned file. Set before `opencode serve` starts, since its bash
+    // tool inherits the server's environment. On PATH for every run, but only
+    // a read-only run's prompt mentions it and only its outcome reports it.
+    const verdict = await installVerdictCommand({ homeDir: toolConfig.homeDir });
+    childEnv.PATH = `${verdict.binDir}:${childEnv.PATH ?? ""}`;
+    childEnv[VERDICT_FILE_ENV] = verdict.verdictFile;
 
     const opencodeConfigDir = join(xdgConfigHome, "opencode");
     await mkdir(opencodeConfigDir, { recursive: true });
@@ -475,6 +491,7 @@ async function main(): Promise<void> {
         turnStartedAt,
         readOnly,
         params: runtimeConfig.params,
+        verdictFile: verdict.verdictFile,
         signal: abort.signal,
       },
       instruction,
@@ -493,6 +510,7 @@ async function main(): Promise<void> {
       message: outcome.reply,
       final: true,
       result: outcome.nextMarker ? encodeSweContinuation(outcome.nextMarker) : undefined,
+      ...(outcome.outcome ? { outcome: outcome.outcome } : {}),
     });
 
     // Stay resident instead of exiting immediately -- a live viewer can keep
