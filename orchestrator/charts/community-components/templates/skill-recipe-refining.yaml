@@ -17,8 +17,10 @@ spec:
     extracted in THIS skill call; a recipe pasted by the user or written out
     by the assistant earlier in the same conversation still counts.
   input: >-
-    A recipe URL to start from, or the current recipe Markdown from a
-    prior turn plus the requested adjustment or a confirmation to publish.
+    A recipe URL to start from (optionally with attached images, such as a
+    photo of the ingredient list), a recipe image on its own, or the current
+    recipe Markdown from a prior turn plus the requested adjustment or a
+    confirmation to publish.
   output: >-
     The extracted recipe Markdown awaiting a publish confirmation, or the
     published/updated recipe Markdown plus a Mealie link once published.
@@ -93,13 +95,35 @@ spec:
        confirmation needed. If the user's message doesn't actually request a change
        (e.g. just acknowledging), respond directly instead of calling the tool again.
 
+    **Attached images.** The user may attach images to their message (marked by a
+    `[The user attached N image(s) to this message.]` line); they are included with
+    the request for you to read. They usually show recipe content the source is
+    missing — e.g. a screenshot of the ingredient list a creator posted in a video's
+    comments. Use them to fill gaps, never to override what the source states:
+    - Intent 1 with a URL and images: call `recipe-scraper` with the URL exactly as
+      above. Once it returns, do NOT let its output stand as-is: respond with the
+      FULL recipe Markdown (same structure, keeping its `[Source](<url>)` line), with
+      ingredients, quantities, and steps the scraped recipe is missing or left vague
+      filled in from the images. Where the two genuinely conflict, keep the scraped
+      value and mention the difference in one short line after the recipe. End by
+      inviting the user to confirm publishing or keep adjusting.
+    - Intent 1 with images and no URL: do not call a tool. Transcribe the recipe in the
+      images into the full recipe Markdown (a `#` title, `## Ingredients`,
+      `## Directions`, and any other sections the images show), then invite the user
+      to confirm publishing or keep adjusting.
+    - If the scrape fails but the images hold a recipe, build it from the images alone
+      and say the link itself could not be read.
+    - If an image has no readable recipe content, say so plainly rather than guessing.
+    Everything you add must be read from the images or the scraped result — the same
+    no-invention rule as above.
+
     When a tool call succeeds, the recipe Markdown it returns is shown to the user
     as-is — that output (its `[Source]` line, ingredients, directions, and its own
     confirm-publish/adjust invitation) is what the next turn reads to find the
     current recipe, so leave it to stand as the turn's result rather than
     rewriting it into a summary of your own. Respond in your own words only for
-    intent 2, or when told to respond directly (a failed/empty extraction, or no
-    current recipe found).
+    intent 2, when merging attached images into an extraction (above), or when told
+    to respond directly (a failed/empty extraction, or no current recipe found).
 
     Rules:
     - Only `recipe-scraper` and `recipe-publisher` may be called from this skill — never any other tool.

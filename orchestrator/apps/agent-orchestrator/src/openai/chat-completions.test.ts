@@ -11,7 +11,54 @@ describe("buildAgentRequest", () => {
     expect(buildAgentRequest([{ role: "user", content: "hello" }])).toEqual({
       request: "hello",
       priorToolCalls: [],
+      images: [],
     });
+  });
+
+  // Open WebUI sends this shape whenever the user attaches an image. It used to
+  // read as an empty message and fail the turn with
+  // 'messages must include a non-empty "user" message'.
+  it("reads text and images from a multi-part user message", () => {
+    const dataUrl = "data:image/png;base64,iVBORw0KGgo=";
+    expect(
+      buildAgentRequest([
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Extract this recipe: https://www.tiktok.com/t/x/" },
+            { type: "text", text: "I also attached a photo of the ingredients." },
+            { type: "image_url", image_url: { url: dataUrl } },
+          ],
+        },
+      ]),
+    ).toEqual({
+      request: "Extract this recipe: https://www.tiktok.com/t/x/\nI also attached a photo of the ingredients.",
+      priorToolCalls: [],
+      images: [{ url: dataUrl }],
+    });
+  });
+
+  it("accepts an image with no text", () => {
+    const built = buildAgentRequest([
+      { role: "user", content: [{ type: "image_url", image_url: { url: "https://example.com/a.png" } }] },
+    ]);
+    expect(built).toEqual({ request: "", priorToolCalls: [], images: [{ url: "https://example.com/a.png" }] });
+  });
+
+  it("forwards only the latest user message's images, but folds earlier multi-part text", () => {
+    const built = buildAgentRequest([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "what is this?" },
+          { type: "image_url", image_url: { url: "https://example.com/old.png" } },
+        ],
+      },
+      { role: "assistant", content: "A shrimp orzo ingredient list." },
+      { role: "user", content: "convert it to metric" },
+    ]);
+    expect(built?.images).toEqual([]);
+    expect(built?.request).toContain('<message role="user">\nwhat is this?\n</message>');
   });
 
   it("returns undefined without a usable user message", () => {

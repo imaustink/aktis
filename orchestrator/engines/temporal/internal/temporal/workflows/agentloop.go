@@ -10,6 +10,7 @@ import (
 	"go.temporal.io/sdk/workflow"
 
 	"github.com/aktisai/orchestrator/engines/temporal/internal/approval"
+	"github.com/aktisai/orchestrator/engines/temporal/internal/attachments"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/callertools"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/catalog"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/continuation"
@@ -109,7 +110,16 @@ func runAgentTurn(ctx workflow.Context, actx workflow.Context, state *Conversati
 				state.ActiveAgentID)
 		}
 		note("Continuing with agent " + state.ActiveAgentID)
-		err := workflow.SignalExternalWorkflow(ctx, state.ActiveAgentWorkflowID, "", AgentPromptSignal, AgentPrompt{Message: in.Message}).Get(ctx, nil)
+		// Only THIS turn's images: the episode was already handed earlier ones.
+		var turnImages []attachments.Ref
+		if n := len(state.History); n > 0 && state.History[n-1].Role == "user" {
+			turnImages = state.History[n-1].Images
+		}
+		prompt, err := withImageLinks(ctx, actx, in.Message, turnImages)
+		if err != nil {
+			return "", meta, nil, err
+		}
+		err = workflow.SignalExternalWorkflow(ctx, state.ActiveAgentWorkflowID, "", AgentPromptSignal, AgentPrompt{Message: prompt}).Get(ctx, nil)
 		if err == nil {
 			meta.Path = "agent-continued"
 			meta.AgentID = state.ActiveAgentID
@@ -286,7 +296,7 @@ func runAgentTurn(ctx workflow.Context, actx workflow.Context, state *Conversati
 			needsCapability = true
 		}
 		if !needsCapability || in.Caller.Subject == "" {
-			reply, err := bareAnswer(ctx, actx, in.Message)
+			reply, err := bareAnswer(ctx, actx, in)
 			return reply, meta, nil, err
 		}
 
@@ -431,6 +441,7 @@ func runAgentTurn(ctx workflow.Context, actx workflow.Context, state *Conversati
 		var plan activities.PlannedAction
 		if err := workflow.ExecuteActivity(actx, activities.PlanActionActivityName, activities.PlanActionInput{
 			Request:            in.Message,
+			Images:             in.Images,
 			SkillMarkdown:      skillTools.Skill.Markdown,
 			Tools:              planCandidates,
 			History:            history,
@@ -855,6 +866,7 @@ func runAgentTurn(ctx workflow.Context, actx workflow.Context, state *Conversati
 		var final activities.PlannedAction
 		err := workflow.ExecuteActivity(actx, activities.PlanActionActivityName, activities.PlanActionInput{
 			Request:       in.Message,
+			Images:        in.Images,
 			SkillMarkdown: skillTools.Skill.Markdown,
 			Tools:         planCandidates,
 			History:       history,
@@ -901,7 +913,7 @@ func runAgentTurn(ctx workflow.Context, actx workflow.Context, state *Conversati
 		// a tool that worked of failing. (When an earlier record did have a
 		// result, lastHistoryResult above already returned it verbatim.)
 	}
-	reply, m, err := bareAnswerWithMeta(ctx, actx, in.Message, meta)
+	reply, m, err := bareAnswerWithMeta(ctx, actx, in, meta)
 	return reply, m, nil, err
 }
 
@@ -1128,18 +1140,20 @@ func runAgentBackedTool(
 }
 
 // bareAnswer is the true last resort (upstream's callBestEffort): only the
-// CURRENT request reaches the model, never the accumulated transcript.
-func bareAnswer(ctx workflow.Context, actx workflow.Context, request string) (string, error) {
+// CURRENT request (and its images) reaches the model, never the accumulated
+// transcript.
+func bareAnswer(ctx workflow.Context, actx workflow.Context, in TurnInput) (string, error) {
 	var reply string
 	err := workflow.ExecuteActivity(actx, activities.CompleteTurnActivityName, activities.CompleteTurnInput{
 		SystemPrompt: bareAnswerSystemPrompt,
-		Messages:     []llm.Message{{Role: "user", Content: request}},
+		Messages:     []llm.Message{{Role: "user", Content: in.Message}},
+		Images:       in.Images,
 	}).Get(ctx, &reply)
 	return reply, err
 }
 
-func bareAnswerWithMeta(ctx workflow.Context, actx workflow.Context, request string, meta TurnMeta) (string, TurnMeta, error) {
-	reply, err := bareAnswer(ctx, actx, request)
+func bareAnswerWithMeta(ctx workflow.Context, actx workflow.Context, in TurnInput, meta TurnMeta) (string, TurnMeta, error) {
+	reply, err := bareAnswer(ctx, actx, in)
 	return reply, meta, err
 }
 

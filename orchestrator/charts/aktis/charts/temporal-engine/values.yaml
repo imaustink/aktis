@@ -118,7 +118,9 @@ worker:
       cpu: 50m
       memory: 64Mi
     limits:
-      memory: 256Mi
+      # Headroom for image attachments: a vision call holds up to three
+      # base64-inlined images (attachments.MaxContextImages x 5 MB).
+      memory: 384Mi
 
 gateway:
   replicas: 1
@@ -170,7 +172,27 @@ gateway:
       cpu: 25m
       memory: 32Mi
     limits:
-      memory: 128Mi
+      # Headroom for image attachments: a request body may carry up to four
+      # base64 images (attachments.MaxRequestBytes, ~31 MB) while it uploads.
+      memory: 256Mi
+
+# Image attachments: images a user attaches to a chat message (Open WebUI sends
+# them inline). The gateway uploads each image once to S3 and only a reference
+# travels through Temporal; the worker inlines it for vision-model calls and
+# presigns it for agent pods. Off (empty) refuses image turns with a clear 400
+# rather than silently dropping the image.
+#
+# secretName names a Secret holding the full S3 connection profile, in the
+# image-gen tool's key shape: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
+# IMAGE_S3_BUCKET, IMAGE_S3_REGION, IMAGE_S3_ENDPOINT (empty = AWS),
+# IMAGE_S3_FORCE_PATH_STYLE, and optionally ATTACHMENTS_S3_PREFIX (default
+# "attachments"). The same Secret as image-gen works; its credentials need
+# s3:PutObject + s3:GetObject on the prefix. Omit the AWS keys to use the
+# default credential chain (e.g. IRSA). Objects are not deleted by the engine:
+# give the bucket a lifecycle rule expiring the prefix (e.g. after 30 days).
+attachments:
+  s3:
+    secretName: ""
 
 # Knowledge bases (docs/adr/0039), served out of the connection-broker. Off by
 # default, matching the broker's own default: the two are useless apart.

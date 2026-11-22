@@ -167,6 +167,37 @@ describe("TemporalEngine", () => {
     expect(body.priorCallerToolCalls).toEqual([{ name: "get_weather", arguments: '{"city":"Oslo"}', result: "rain" }]);
   });
 
+  it("forwards the user's images in the request body, and none when there are none", async () => {
+    const { impl, calls } = scriptedFetch([
+      { id: "x", status: "succeeded", result: "ok" },
+      { id: "y", status: "succeeded", result: "ok" },
+    ]);
+    const engine = new TemporalEngine({ baseUrl: BASE, fetchImpl: impl });
+
+    await engine.invoke(input({ images: [{ url: "data:image/png;base64,AAAA" }] }));
+    await engine.invoke(input());
+
+    const bodies = calls
+      .filter((c) => c.url === `${BASE}/invoke`)
+      .map((c) => JSON.parse(String(c.init?.body)) as Record<string, unknown>);
+    expect(bodies[0]!.images).toEqual([{ url: "data:image/png;base64,AAAA" }]);
+    expect(bodies[1]).not.toHaveProperty("images");
+  });
+
+  it("surfaces the engine's reason for a 400, so the user can fix it", async () => {
+    const impl = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ error: { message: "image attachments are not enabled on this deployment", type: "x" } }),
+          { status: 400 },
+        ),
+    ) as unknown as typeof fetch;
+    const engine = new TemporalEngine({ baseUrl: BASE, fetchImpl: impl });
+    await expect(engine.invoke(input({ images: [{ url: "data:image/png;base64,AAAA" }] }))).rejects.toThrow(
+      "temporal engine /invoke failed: 400 (image attachments are not enabled on this deployment)",
+    );
+  });
+
   it("sends no caller-tool fields for a turn without any", async () => {
     const { impl, calls } = scriptedFetch([{ id: "x", status: "succeeded", result: "ok" }]);
     const engine = new TemporalEngine({ baseUrl: BASE, fetchImpl: impl });

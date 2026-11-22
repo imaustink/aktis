@@ -124,6 +124,7 @@ spec:
             - name: OPENAI_EMBED_MODEL
               value: {{ .Values.llm.embedModel | quote }}
             {{- end }}
+          {{- include "temporal-engine.attachmentsEnvFrom" . | nindent 10 }}
           ports:
             - name: http
               containerPort: 8080

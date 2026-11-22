@@ -9,6 +9,7 @@ import (
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 
+	"github.com/aktisai/orchestrator/engines/temporal/internal/attachments"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/authz"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/callertools"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/llm"
@@ -110,10 +111,20 @@ const (
 type ChatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// Images are a user message's image attachments, as Refs (never bytes),
+	// kept so a follow-up turn can still show them to the model.
+	Images []attachments.Ref `json:"images,omitempty"`
 }
 
 type TurnInput struct {
 	Message string `json:"message"`
+
+	// Images are the user's image attachments for this turn, already uploaded
+	// by the gateway (package attachments): Refs only, so image bytes never
+	// enter workflow history. The update handler replaces this with the
+	// turn's CONTEXT images — these plus recent earlier ones (contextImages)
+	// — before anything downstream reads it.
+	Images []attachments.Ref `json:"images,omitempty"`
 
 	// Caller is the identity the gateway resolved for this turn; retrieval
 	// and tool access are scoped to it (fail closed on empty subject).
@@ -430,7 +441,14 @@ func ConversationWorkflow(ctx workflow.Context, state *ConversationState) error 
 		if len(state.History) == 0 && len(in.SeedHistory) > 0 {
 			state.History = append(state.History, in.SeedHistory...)
 		}
-		state.History = append(state.History, ChatMessage{Role: "user", Content: in.Message})
+		// An image-bearing message gets a deterministic text marker, so every
+		// text-only consumer (retrieval, routing, the transcript, a delegated
+		// agent's goal) knows the images exist even though it cannot see them.
+		if len(in.Images) > 0 {
+			in.Message = strings.TrimSpace(in.Message + "\n\n" + attachments.Note(len(in.Images)))
+		}
+		state.History = append(state.History, ChatMessage{Role: "user", Content: in.Message, Images: in.Images})
+		in.Images = contextImages(state.History)
 
 		// The conversation's read-only mode (see ConversationState.ReadOnly).
 		// Decided here, before anything in the turn reads in.ReadOnly, so no
@@ -591,6 +609,26 @@ func toLLMMessages(history []ChatMessage) []llm.Message {
 	out := make([]llm.Message, len(history))
 	for i, m := range history {
 		out[i] = llm.Message{Role: m.Role, Content: m.Content}
+	}
+	return out
+}
+
+// contextImages is the images a turn shows the model: the newest user
+// messages' attachments first (so this turn's own come first), bounded by
+// attachments.MaxContextImages. Earlier images stay visible only while their
+// message is still in the bounded transcript.
+func contextImages(history []ChatMessage) []attachments.Ref {
+	var out []attachments.Ref
+	for i := len(history) - 1; i >= 0 && len(out) < attachments.MaxContextImages; i-- {
+		if history[i].Role != "user" {
+			continue
+		}
+		for _, ref := range history[i].Images {
+			if len(out) == attachments.MaxContextImages {
+				break
+			}
+			out = append(out, ref)
+		}
 	}
 	return out
 }

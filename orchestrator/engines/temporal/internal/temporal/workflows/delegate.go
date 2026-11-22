@@ -6,6 +6,7 @@ import (
 
 	"go.temporal.io/sdk/workflow"
 
+	"github.com/aktisai/orchestrator/engines/temporal/internal/attachments"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/authz"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/catalog"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/continuation"
@@ -23,6 +24,21 @@ func agentActsOnGitHub(agent catalog.AgentDescriptor) bool {
 		}
 	}
 	return false
+}
+
+// withImageLinks appends download links for refs to an agent's text. An agent
+// pod receives its goal and follow-up prompts as text only, so this is how a
+// user's image reaches it. A presign failure fails the turn: an agent told
+// about images it cannot fetch would act as if it had seen them.
+func withImageLinks(ctx workflow.Context, actx workflow.Context, text string, refs []attachments.Ref) (string, error) {
+	if len(refs) == 0 {
+		return text, nil
+	}
+	var urls []string
+	if err := workflow.ExecuteActivity(actx, activities.PresignAttachmentsActivityName, refs).Get(ctx, &urls); err != nil {
+		return "", fmt.Errorf("prepare image attachments for the agent: %w", err)
+	}
+	return text + attachments.DownloadBlock(urls), nil
 }
 
 // delegateToAgent starts a fresh agent episode as a child workflow and
@@ -99,7 +115,10 @@ func delegateToAgent(ctx workflow.Context, actx workflow.Context, state *Convers
 
 	note("Delegating to agent " + agent.ID + "…")
 
-	goal := in.Message
+	goal, err := withImageLinks(ctx, actx, in.Message, in.Images)
+	if err != nil {
+		return "", *meta, err
+	}
 	if token := state.AgentContinuations[agent.ID]; token != "" {
 		goal = continuation.Prepend(token, goal)
 	}

@@ -19,6 +19,12 @@ export interface PriorToolCall {
 export interface TurnInput {
   request: string;
   /**
+   * Images attached to the user's message (`data:` or `https://` URLs). The
+   * engine uploads them to its attachment store and shows them to the model;
+   * a deployment without one refuses the turn (400) rather than dropping them.
+   */
+  images?: { url: string }[];
+  /**
    * Open WebUI's per-request signed user JWT (`X-OpenWebUI-User-Jwt`), if the
    * caller sent one -- see `OpenWebUiForwardedUserResolver`.
    */

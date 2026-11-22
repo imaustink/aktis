@@ -16,6 +16,7 @@ import (
 	"github.com/qdrant/go-client/qdrant"
 	"k8s.io/client-go/dynamic"
 
+	"github.com/aktisai/orchestrator/engines/temporal/internal/attachments"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/callertools"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/catalog"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/gateway"
@@ -118,6 +119,17 @@ func main() {
 	} else {
 		opts = append(opts, gateway.WithCallerTools(store, callerToolTopK()))
 		go prune()
+	}
+
+	// Image attachments (package attachments). Off without IMAGE_S3_BUCKET: a
+	// turn carrying a data: image is then refused with a clear 400.
+	if s3cfg, ok := attachments.S3ConfigFromEnv(); ok {
+		store, err := attachments.NewS3Store(ctx, s3cfg)
+		if err != nil {
+			log.Fatalf("image attachment store: %v", err)
+		}
+		opts = append(opts, gateway.WithAttachments(store, store.KeyPrefix()))
+		log.Printf("image attachments enabled: bucket=%s prefix=%s", s3cfg.Bucket, s3cfg.Prefix)
 	}
 
 	server := gateway.NewServer(c, cfg.TaskQueue, resolver, opts...)

@@ -17,7 +17,7 @@ type ResponseSchema struct {
 
 type structuredRequest struct {
 	Model          string         `json:"model"`
-	Messages       []Message      `json:"messages"`
+	Messages       []wireMessage  `json:"messages"`
 	ResponseFormat responseFormat `json:"response_format"`
 }
 
@@ -40,7 +40,7 @@ func (c *Client) CompleteJSON(ctx context.Context, messages []Message, schema Re
 
 	body, err := json.Marshal(structuredRequest{
 		Model:    c.model,
-		Messages: messages,
+		Messages: wireMessages(messages),
 		ResponseFormat: responseFormat{
 			Type:       "json_schema",
 			JSONSchema: jsonSchema{Name: schema.Name, Strict: true, Schema: schema.Schema},

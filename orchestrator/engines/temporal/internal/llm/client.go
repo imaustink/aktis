@@ -20,6 +20,47 @@ import (
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// Images are image URLs (data: or https://) shown to a vision model
+	// alongside Content. Never serialized as part of Message itself — a
+	// Message also travels in Temporal payloads, where image bytes must not —
+	// only folded into the wire request by wireMessages.
+	Images []string `json:"-"`
+}
+
+// wireMessage is one message as the chat-completions API takes it: Content
+// is a plain string, or the multi-part array when the message has images.
+type wireMessage struct {
+	Role    string `json:"role"`
+	Content any    `json:"content"`
+}
+
+type contentPart struct {
+	Type     string    `json:"type"`
+	Text     string    `json:"text,omitempty"`
+	ImageURL *imageURL `json:"image_url,omitempty"`
+}
+
+type imageURL struct {
+	URL string `json:"url"`
+}
+
+func wireMessages(messages []Message) []wireMessage {
+	out := make([]wireMessage, len(messages))
+	for i, m := range messages {
+		if len(m.Images) == 0 {
+			out[i] = wireMessage{Role: m.Role, Content: m.Content}
+			continue
+		}
+		parts := make([]contentPart, 0, len(m.Images)+1)
+		if m.Content != "" {
+			parts = append(parts, contentPart{Type: "text", Text: m.Content})
+		}
+		for _, u := range m.Images {
+			parts = append(parts, contentPart{Type: "image_url", ImageURL: &imageURL{URL: u}})
+		}
+		out[i] = wireMessage{Role: m.Role, Content: parts}
+	}
+	return out
 }
 
 type Client struct {
@@ -41,8 +82,8 @@ func New(baseURL, apiKey, model string) *Client {
 func (c *Client) Model() string { return c.model }
 
 type chatRequest struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
+	Model    string        `json:"model"`
+	Messages []wireMessage `json:"messages"`
 }
 
 type chatResponse struct {
@@ -66,7 +107,7 @@ func (c *Client) Complete(ctx context.Context, messages []Message) (_ string, er
 	ctx, span := c.startGeneration(ctx, "chat", "")
 	defer func() { endGeneration(span, err) }()
 
-	body, err := json.Marshal(chatRequest{Model: c.model, Messages: messages})
+	body, err := json.Marshal(chatRequest{Model: c.model, Messages: wireMessages(messages)})
 	if err != nil {
 		return "", fmt.Errorf("marshal chat request: %w", err)
 	}
