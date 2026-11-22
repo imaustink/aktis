@@ -156,6 +156,23 @@ func TestRenderSuppressesOnlyTheAccessDisclosure(t *testing.T) {
 	require.Contains(t, out, "could not be searched at all")
 }
 
+func TestRenderDisclosesMatchesTheMirrorExcluded(t *testing.T) {
+	// The e2e fixture's shape: the only passage that matched is restricted, the
+	// mirror knows it, and the caller's principals cover the restriction's
+	// kind -- so it is dropped before the probe and Denied stays 0. Silence here
+	// made a partial answer read as complete.
+	in := corpus.RenderInput{
+		Outcome:  corpus.RetrieveOutcome{PreFiltered: 1},
+		Disclose: true,
+	}
+	require.Equal(t, []string{"1 passage(s) matched but are outside your access."}, corpus.CaveatLines(in))
+	require.Contains(t, corpus.Render(in), "outside your access")
+
+	// Same flag as every other access disclosure.
+	in.Disclose = false
+	require.Empty(t, corpus.CaveatLines(in))
+}
+
 func TestRenderSaysSoWhenNothingMatched(t *testing.T) {
 	out := corpus.Render(corpus.RenderInput{
 		Outcome:  corpus.RetrieveOutcome{},

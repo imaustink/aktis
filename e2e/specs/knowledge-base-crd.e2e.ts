@@ -222,7 +222,7 @@ describe("every process that watches these kinds is granted them", () => {
         "get",
         "deploy",
         "-l",
-        `app.kubernetes.io/name=${app}`,
+        app.includes("=") ? app : `app.kubernetes.io/name=${app}`,
         "-o",
         "jsonpath={.items[0].spec.template.spec.serviceAccountName}",
       ])
@@ -266,11 +266,21 @@ describe("every process that watches these kinds is granted them", () => {
     expect([...granted]).toContain("corpora/status");
   });
 
-  it("grants the orchestrator all three kinds it derives a skill from", async () => {
+  it("grants the engine's catalog-sync all three kinds it derives a skill from", async () => {
+    // The Go catalog-sync owns the catalog (docs/adr/0053); before that the
+    // orchestrator's in-process engine watched these itself.
+    const granted = grantedKinds(await roleFor("app.kubernetes.io/component=catalog-sync"));
+
+    for (const kind of ["connections", "corpora", "knowledgebases"]) {
+      expect([...granted], `catalog-sync cannot watch ${kind}`).toContain(kind);
+    }
+  });
+
+  it("grants the orchestrator none of them: it only reads EventTriggers (docs/adr/0053)", async () => {
     const granted = grantedKinds(await roleFor("agent-orchestrator"));
 
     for (const kind of ["connections", "corpora", "knowledgebases"]) {
-      expect([...granted], `the orchestrator cannot watch ${kind}`).toContain(kind);
+      expect([...granted], `the orchestrator is still granted ${kind}`).not.toContain(kind);
     }
   });
 });
