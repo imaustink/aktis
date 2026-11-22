@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import { cleanupAgentRunsSince, kubectl } from "../support/k8s.js";
 import {
   agentRunDetailsSince,
@@ -24,7 +24,7 @@ import {
   slackUrlVerificationPayload,
 } from "../support/webhook.js";
 
-requireMinikubeContext();
+requireLocalClusterContext();
 
 /**
  * Ingress verification for every scheme the example EventSources use

@@ -11,7 +11,7 @@ import {
 /**
  * The chat harness, checked against the product code it has to agree with.
  *
- * Deliberately NO `requireMinikubeContext()`: this spec touches no cluster, so
+ * Deliberately NO `requireLocalClusterContext()`: this spec touches no cluster, so
  * it runs anywhere `npm run e2e` runs. That is the point. A harness's signing is
  * the part most likely to be quietly wrong, and when it is, every cluster spec
  * built on it fails with "could not resolve caller identity" -- which reads as a

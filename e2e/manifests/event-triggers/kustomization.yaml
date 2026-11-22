@@ -73,7 +73,7 @@ patches:
             url: http://fake-sink.controller-agent.svc.cluster.local/reply/ci-failure-skill
             secretRef: { name: e2e-event-reply, key: secret }
   # web-fetch is enabled by values-minikube-demo.yaml; its image is built into
-  # minikube by e2e/scripts/up.sh (the e2e skaffold profile does not build it).
+  # the cluster by e2e/scripts/up.sh (the e2e skaffold profile does not build it).
   - target: { kind: EventTrigger, name: generic-hmac-tool }
     patch: |
       - op: add

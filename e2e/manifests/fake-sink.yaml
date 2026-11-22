@@ -1,6 +1,6 @@
 # In-cluster HTTP recorder for the event-trigger specs (docs/event-triggers.md).
 #
-# Deployed only into the minikube e2e environment. It stands in for whatever a
+# Deployed only into the local e2e environment. It stands in for whatever a
 # `reply.http` side-effect would POST to in production (a CI bridge, a chat
 # relay): the example EventTriggers, as e2e/manifests/event-triggers patches them, point their literal
 # `reply.http.url` here, and per-test triggers do the same.

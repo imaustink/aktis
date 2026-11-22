@@ -8,9 +8,14 @@ metadata:
 # CRDs, optional infra) and `community-components` (the Tool/Skill/Agent
 # catalog) -- deployed from one `skaffold` invocation. Replaces the manual
 # build/dependency-update/apply/rollout sequence in scripts/dev-up.sh:
-#   skaffold dev     # build + deploy both releases, then watch files and redeploy on change
-#   skaffold run     # one-shot build + deploy (CI-style)
-#   skaffold delete  # tear down both releases this config created
+#   ./scripts/cluster/cluster.sh skaffold dev     # build + deploy both releases, then watch files and redeploy on change
+#   ./scripts/cluster/cluster.sh skaffold run     # one-shot build + deploy
+#   ./scripts/cluster/cluster.sh skaffold delete  # tear down both releases this config created
+#
+# Run it through scripts/cluster/cluster.sh rather than bare: which local
+# cluster this is (ferry, minikube, kind, your own) decides flags skaffold
+# needs -- ferry's registry as the default repo, for one -- and the wrapper is
+# what knows. See docs/local-cluster.md.
 #
 # Adding a new image to the stack = add one entry to build.artifacts (+ a
 # setValueTemplates line below if the relevant chart needs to know its tag).
@@ -19,7 +24,7 @@ metadata:
 # Prerequisites this file deliberately does NOT own -- scripts/dev-up.sh
 # still handles these before invoking skaffold, since Skaffold's helm
 # deployer has no before/after hook support (only its kubectl deployer does):
-#   - minikube start, the three bootstrap Secrets, the recipe-scraper/
+#   - starting the local cluster, the three bootstrap Secrets, the recipe-scraper/
 #     recipe-publisher/opencode-swe-agent ServiceAccounts
 #   - `helm dependency update` on the agent-orchestrator subchart itself
 #     (its own qdrant dependency; Helm doesn't recurse into file:// subcharts,
@@ -28,9 +33,23 @@ metadata:
 #     --server-side (Helm's crds/ dir is install-only; upgrades never touch it)
 
 build:
-  # No `local.push` -- Skaffold auto-detects the "minikube" kube-context and
-  # points the Docker client at minikube's own daemon (the eval $(minikube
-  # docker-env) dance in dev-up.sh, done automatically per build).
+  # Every artifact is a `custom` build running scripts/cluster/build-image.sh,
+  # not skaffold's own docker builder, because HOW an image is built and
+  # reaches the cluster depends on which local cluster it is: `ferry image
+  # build` with no Docker anywhere, minikube's own daemon, `docker build` +
+  # `kind load`, or a push to a registry. The script asks the selected
+  # provider (scripts/cluster/providers/); the flags after it are the same
+  # Dockerfile and build args the docker builder took, and `dependencies`
+  # repeats them so skaffold still knows what to watch and when to rebuild.
+  #
+  # buildCommand runs from the artifact's `context`, hence the ../../.. on the
+  # artifacts that set one.
+  #
+  # No `local.push`: skaffold recognises minikube and kind contexts as local
+  # and never pushes to them; for any other context it "pushes", which on
+  # ferry is a no-op (the build already landed in ferry's registry) and on a
+  # custom cluster is a real push to AKTIS_CLUSTER_REGISTRY. The `no-push`
+  # profile at the bottom is for a custom cluster with no registry.
   local:
     useDockerCLI: true
   # Unique tags per build (default gitCommit-based) so a Helm upgrade always
@@ -41,56 +60,89 @@ build:
       variant: AbbrevCommitSha
   artifacts:
     - image: agent-orchestrator
-      docker:
-        dockerfile: orchestrator/apps/agent-orchestrator/Dockerfile
+      custom:
+        buildCommand: ./scripts/cluster/build-image.sh -f orchestrator/apps/agent-orchestrator/Dockerfile
+        dependencies:
+          dockerfile:
+            path: orchestrator/apps/agent-orchestrator/Dockerfile
     - image: core-controller
       context: orchestrator/controllers/core-controller
-      docker:
-        dockerfile: Dockerfile
+      custom:
+        buildCommand: ../../../scripts/cluster/build-image.sh -f Dockerfile
+        dependencies:
+          dockerfile:
+            path: Dockerfile
     - image: recipe-scraper
-      docker:
-        dockerfile: catalog/tools/recipe-scraper/Dockerfile
+      custom:
+        buildCommand: ./scripts/cluster/build-image.sh -f catalog/tools/recipe-scraper/Dockerfile
+        dependencies:
+          dockerfile:
+            path: catalog/tools/recipe-scraper/Dockerfile
     - image: recipe-publisher
-      docker:
-        dockerfile: catalog/tools/recipe-publisher/Dockerfile
+      custom:
+        buildCommand: ./scripts/cluster/build-image.sh -f catalog/tools/recipe-publisher/Dockerfile
+        dependencies:
+          dockerfile:
+            path: catalog/tools/recipe-publisher/Dockerfile
     - image: web-search
-      docker:
-        dockerfile: catalog/tools/web-search/Dockerfile
+      custom:
+        buildCommand: ./scripts/cluster/build-image.sh -f catalog/tools/web-search/Dockerfile
+        dependencies:
+          dockerfile:
+            path: catalog/tools/web-search/Dockerfile
     - image: image-gen
-      docker:
-        dockerfile: catalog/tools/image-gen/Dockerfile
+      custom:
+        buildCommand: ./scripts/cluster/build-image.sh -f catalog/tools/image-gen/Dockerfile
+        dependencies:
+          dockerfile:
+            path: catalog/tools/image-gen/Dockerfile
     - image: opencode-swe-agent
-      docker:
-        dockerfile: catalog/agents/opencode-swe-agent/Dockerfile
+      custom:
+        buildCommand: ./scripts/cluster/build-image.sh -f catalog/agents/opencode-swe-agent/Dockerfile
+        dependencies:
+          dockerfile:
+            path: catalog/agents/opencode-swe-agent/Dockerfile
     # One Dockerfile, four runtimes via --build-arg (mirrors dev-up.sh).
     - image: localtool-executor-node
       context: orchestrator/sidecars/localtool-executor
-      docker:
-        dockerfile: Dockerfile
-        buildArgs:
-          BASE_IMAGE: node:24-bookworm-slim
-          RUNTIME: node
+      custom:
+        buildCommand: ../../../scripts/cluster/build-image.sh -f Dockerfile --build-arg BASE_IMAGE=node:24-bookworm-slim --build-arg RUNTIME=node
+        dependencies:
+          dockerfile:
+            path: Dockerfile
+            buildArgs:
+              BASE_IMAGE: node:24-bookworm-slim
+              RUNTIME: node
     - image: localtool-executor-python
       context: orchestrator/sidecars/localtool-executor
-      docker:
-        dockerfile: Dockerfile
-        buildArgs:
-          BASE_IMAGE: python:3.12-slim-bookworm
-          RUNTIME: python
+      custom:
+        buildCommand: ../../../scripts/cluster/build-image.sh -f Dockerfile --build-arg BASE_IMAGE=python:3.12-slim-bookworm --build-arg RUNTIME=python
+        dependencies:
+          dockerfile:
+            path: Dockerfile
+            buildArgs:
+              BASE_IMAGE: python:3.12-slim-bookworm
+              RUNTIME: python
     - image: localtool-executor-go
       context: orchestrator/sidecars/localtool-executor
-      docker:
-        dockerfile: Dockerfile
-        buildArgs:
-          BASE_IMAGE: golang:1.24-bookworm
-          RUNTIME: go
+      custom:
+        buildCommand: ../../../scripts/cluster/build-image.sh -f Dockerfile --build-arg BASE_IMAGE=golang:1.24-bookworm --build-arg RUNTIME=go
+        dependencies:
+          dockerfile:
+            path: Dockerfile
+            buildArgs:
+              BASE_IMAGE: golang:1.24-bookworm
+              RUNTIME: go
     - image: localtool-executor-shell
       context: orchestrator/sidecars/localtool-executor
-      docker:
-        dockerfile: Dockerfile
-        buildArgs:
-          BASE_IMAGE: debian:bookworm-slim
-          RUNTIME: shell
+      custom:
+        buildCommand: ../../../scripts/cluster/build-image.sh -f Dockerfile --build-arg BASE_IMAGE=debian:bookworm-slim --build-arg RUNTIME=shell
+        dependencies:
+          dockerfile:
+            path: Dockerfile
+            buildArgs:
+              BASE_IMAGE: debian:bookworm-slim
+              RUNTIME: shell
 
 manifests: {}
 
@@ -151,49 +203,79 @@ profiles:
     build:
       artifacts:
         - image: agent-orchestrator
-          docker:
-            dockerfile: orchestrator/apps/agent-orchestrator/Dockerfile
+          custom:
+            buildCommand: ./scripts/cluster/build-image.sh -f orchestrator/apps/agent-orchestrator/Dockerfile
+            dependencies:
+              dockerfile:
+                path: orchestrator/apps/agent-orchestrator/Dockerfile
         - image: core-controller
           context: orchestrator/controllers/core-controller
-          docker:
-            dockerfile: Dockerfile
+          custom:
+            buildCommand: ../../../scripts/cluster/build-image.sh -f Dockerfile
+            dependencies:
+              dockerfile:
+                path: Dockerfile
         - image: integration-gateway
-          docker:
-            dockerfile: orchestrator/apps/integration-gateway/Dockerfile
+          custom:
+            buildCommand: ./scripts/cluster/build-image.sh -f orchestrator/apps/integration-gateway/Dockerfile
+            dependencies:
+              dockerfile:
+                path: orchestrator/apps/integration-gateway/Dockerfile
         # values-e2e.yaml turns the broker on: the knowledge-base specs cannot
         # sync a corpus without it, and an unbuilt image sits in
         # ImagePullBackOff until up.sh times out.
         - image: connection-broker
-          docker:
-            dockerfile: orchestrator/apps/connection-broker/Dockerfile
+          custom:
+            buildCommand: ./scripts/cluster/build-image.sh -f orchestrator/apps/connection-broker/Dockerfile
+            dependencies:
+              dockerfile:
+                path: orchestrator/apps/connection-broker/Dockerfile
         # values-e2e.yaml turns the mcp-broker on so the MCP specs can discover
         # and call the fake MCP server below; an unbuilt image would sit in
         # ImagePullBackOff until up.sh times out (ADR 0045).
         - image: mcp-broker
-          docker:
-            dockerfile: orchestrator/apps/mcp-broker/Dockerfile
+          custom:
+            buildCommand: ./scripts/cluster/build-image.sh -f orchestrator/apps/mcp-broker/Dockerfile
+            dependencies:
+              dockerfile:
+                path: orchestrator/apps/mcp-broker/Dockerfile
         # The in-cluster MCP server the mcp-broker discovers and proxies to —
         # the only MCP stub, deterministic, built here so skaffold rewrites its
         # image in the community-components fixture.
         - image: fake-mcp-server
-          docker:
-            dockerfile: orchestrator/apps/fake-mcp-server/Dockerfile
+          custom:
+            buildCommand: ./scripts/cluster/build-image.sh -f orchestrator/apps/fake-mcp-server/Dockerfile
+            dependencies:
+              dockerfile:
+                path: orchestrator/apps/fake-mcp-server/Dockerfile
         - image: opencode-swe-agent
-          docker:
-            dockerfile: catalog/agents/opencode-swe-agent/Dockerfile
+          custom:
+            buildCommand: ./scripts/cluster/build-image.sh -f catalog/agents/opencode-swe-agent/Dockerfile
+            dependencies:
+              dockerfile:
+                path: catalog/agents/opencode-swe-agent/Dockerfile
         # Needed by the community-components release below: its Tool/Agent CRs
         # pin image tags, and a release deployed without freshly-built tags
         # leaves AgentRun pods stuck in ImagePullBackOff on a stale tag that
-        # no longer exists in minikube's daemon.
+        # no longer exists in the cluster.
         - image: recipe-scraper
-          docker:
-            dockerfile: catalog/tools/recipe-scraper/Dockerfile
+          custom:
+            buildCommand: ./scripts/cluster/build-image.sh -f catalog/tools/recipe-scraper/Dockerfile
+            dependencies:
+              dockerfile:
+                path: catalog/tools/recipe-scraper/Dockerfile
         - image: recipe-publisher
-          docker:
-            dockerfile: catalog/tools/recipe-publisher/Dockerfile
+          custom:
+            buildCommand: ./scripts/cluster/build-image.sh -f catalog/tools/recipe-publisher/Dockerfile
+            dependencies:
+              dockerfile:
+                path: catalog/tools/recipe-publisher/Dockerfile
         - image: web-search
-          docker:
-            dockerfile: catalog/tools/web-search/Dockerfile
+          custom:
+            buildCommand: ./scripts/cluster/build-image.sh -f catalog/tools/web-search/Dockerfile
+            dependencies:
+              dockerfile:
+                path: catalog/tools/web-search/Dockerfile
         # The e2e triage route targets this agent (see
         # orchestrator/charts/community-components/values-e2e.yaml): it declares the same
         # Claude identityProviders as claude-code-swe-agent, so the credential
@@ -201,60 +283,87 @@ profiles:
         # so a run can actually reach a terminal phase in a cluster holding no
         # Anthropic credential.
         - image: stub-agent
-          docker:
-            dockerfile: catalog/agents/stub-agent/Dockerfile
+          custom:
+            buildCommand: ./scripts/cluster/build-image.sh -f catalog/agents/stub-agent/Dockerfile
+            dependencies:
+              dockerfile:
+                path: catalog/agents/stub-agent/Dockerfile
         # Still built: its Agent CR stays enabled as the production-shaped
         # reference the stub's providers are kept in step with, and its CR pins
         # an image tag -- a release deployed without a freshly-built one leaves
-        # the tag dangling in minikube's daemon.
+        # the tag dangling in the cluster.
         - image: claude-code-swe-agent
-          docker:
-            dockerfile: catalog/agents/claude-code-swe-agent/Dockerfile
+          custom:
+            buildCommand: ./scripts/cluster/build-image.sh -f catalog/agents/claude-code-swe-agent/Dockerfile
+            dependencies:
+              dockerfile:
+                path: catalog/agents/claude-code-swe-agent/Dockerfile
         # The chart defaults route every turn through the Temporal engine, and
         # the demo values turn on the LocalTool executor sidecars, so neither
-        # set is optional here. Unbuilt, they only worked on a minikube whose
-        # daemon still held `:latest` copies from some earlier manual build; a
+        # set is optional here. Unbuilt, they only worked on a cluster that
+        # still held `:latest` copies from some earlier manual build; a
         # fresh cluster sat in ImagePullBackOff until `up.sh` timed out.
         - image: temporal-engine-worker
           context: orchestrator/engines/temporal
-          docker:
-            dockerfile: Dockerfile.worker
+          custom:
+            buildCommand: ../../../scripts/cluster/build-image.sh -f Dockerfile.worker
+            dependencies:
+              dockerfile:
+                path: Dockerfile.worker
         - image: temporal-engine-gateway
           context: orchestrator/engines/temporal
-          docker:
-            dockerfile: Dockerfile.gateway
+          custom:
+            buildCommand: ../../../scripts/cluster/build-image.sh -f Dockerfile.gateway
+            dependencies:
+              dockerfile:
+                path: Dockerfile.gateway
         - image: temporal-engine-catalog-sync
           context: orchestrator/engines/temporal
-          docker:
-            dockerfile: Dockerfile.catalog-sync
+          custom:
+            buildCommand: ../../../scripts/cluster/build-image.sh -f Dockerfile.catalog-sync
+            dependencies:
+              dockerfile:
+                path: Dockerfile.catalog-sync
         - image: localtool-executor-node
           context: orchestrator/sidecars/localtool-executor
-          docker:
-            dockerfile: Dockerfile
-            buildArgs:
-              BASE_IMAGE: node:24-bookworm-slim
-              RUNTIME: node
+          custom:
+            buildCommand: ../../../scripts/cluster/build-image.sh -f Dockerfile --build-arg BASE_IMAGE=node:24-bookworm-slim --build-arg RUNTIME=node
+            dependencies:
+              dockerfile:
+                path: Dockerfile
+                buildArgs:
+                  BASE_IMAGE: node:24-bookworm-slim
+                  RUNTIME: node
         - image: localtool-executor-python
           context: orchestrator/sidecars/localtool-executor
-          docker:
-            dockerfile: Dockerfile
-            buildArgs:
-              BASE_IMAGE: python:3.12-slim-bookworm
-              RUNTIME: python
+          custom:
+            buildCommand: ../../../scripts/cluster/build-image.sh -f Dockerfile --build-arg BASE_IMAGE=python:3.12-slim-bookworm --build-arg RUNTIME=python
+            dependencies:
+              dockerfile:
+                path: Dockerfile
+                buildArgs:
+                  BASE_IMAGE: python:3.12-slim-bookworm
+                  RUNTIME: python
         - image: localtool-executor-go
           context: orchestrator/sidecars/localtool-executor
-          docker:
-            dockerfile: Dockerfile
-            buildArgs:
-              BASE_IMAGE: golang:1.24-bookworm
-              RUNTIME: go
+          custom:
+            buildCommand: ../../../scripts/cluster/build-image.sh -f Dockerfile --build-arg BASE_IMAGE=golang:1.24-bookworm --build-arg RUNTIME=go
+            dependencies:
+              dockerfile:
+                path: Dockerfile
+                buildArgs:
+                  BASE_IMAGE: golang:1.24-bookworm
+                  RUNTIME: go
         - image: localtool-executor-shell
           context: orchestrator/sidecars/localtool-executor
-          docker:
-            dockerfile: Dockerfile
-            buildArgs:
-              BASE_IMAGE: debian:bookworm-slim
-              RUNTIME: shell
+          custom:
+            buildCommand: ../../../scripts/cluster/build-image.sh -f Dockerfile --build-arg BASE_IMAGE=debian:bookworm-slim --build-arg RUNTIME=shell
+            dependencies:
+              dockerfile:
+                path: Dockerfile
+                buildArgs:
+                  BASE_IMAGE: debian:bookworm-slim
+                  RUNTIME: shell
     deploy:
       helm:
         releases:
@@ -296,10 +405,10 @@ profiles:
               connection-broker.image.tag: "{{.IMAGE_TAG_connection_broker}}"
               # The chart defaults connection-broker to pullPolicy Always (its
               # production :latest tag needs freshness). skaffold builds a local,
-              # digest-tagged image that exists only in minikube's runtime and in
-              # no registry, so Always makes the kubelet try to pull it and fail
-              # ("can't be pulled"). Every other image here is IfNotPresent by
-              # default; override the broker to match for the e2e/minikube path.
+              # digest-tagged image that exists only in the local cluster and in
+              # no real registry, so Always makes the kubelet try to pull it and
+              # fail ("can't be pulled"). Every other image here is IfNotPresent
+              # by default; override the broker to match for the local path.
               connection-broker.image.pullPolicy: "IfNotPresent"
               mcp-broker.image.repository: "{{.IMAGE_REPO_mcp_broker}}"
               mcp-broker.image.tag: "{{.IMAGE_TAG_mcp_broker}}"
@@ -331,3 +440,14 @@ profiles:
               recipePublisher.image: "{{.IMAGE_FULLY_QUALIFIED_recipe_publisher}}"
               opencodeSweAgent.image: "{{.IMAGE_FULLY_QUALIFIED_opencode_swe_agent}}"
               webSearch.image: "{{.IMAGE_FULLY_QUALIFIED_web_search}}"
+
+  # no-push: for a `custom` cluster (docs/local-cluster.md) that has no
+  # registry to push to. Skaffold pushes to any context it does not recognise
+  # as minikube/kind; this turns that off, and the provider loads each image
+  # with AKTIS_CLUSTER_LOAD_CMD instead. Added by scripts/cluster/cluster.sh --
+  # not something to pass by hand.
+  - name: no-push
+    patches:
+      - op: add
+        path: /build/local/push
+        value: false

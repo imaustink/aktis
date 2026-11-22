@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import { kubectlJson } from "../support/k8s.js";
 
-requireMinikubeContext();
+requireLocalClusterContext();
 
 /**
  * The Temporal engine (docs/adr/0036) decides which workflow drives an Agent

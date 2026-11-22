@@ -16,7 +16,7 @@ import { agentRunsSince, waitFor } from "../support/k8s.js";
  * for eight silent minutes on exactly that, and reported nothing about which hop
  * stalled.
  *
- * Deliberately no `requireMinikubeContext()`: this touches nothing, so it runs
+ * Deliberately no `requireLocalClusterContext()`: this touches nothing, so it runs
  * anywhere and fails fast if the guarantee regresses.
  */
 describe("waitFor bounds every probe attempt", () => {

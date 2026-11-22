@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import {
   agentRunSecretEnvNames,
   agentRunsSince,
@@ -14,7 +14,7 @@ import { seedAllClaudeCredentials } from "../support/credential-store.js";
 
 // Module scope, before any fixture: a suite pointed at the wrong cluster must
 // fail on import, not after it has started creating objects.
-requireMinikubeContext();
+requireLocalClusterContext();
 
 const GATEWAY_PORT = 18090;
 const SENDER = "e2e-user";

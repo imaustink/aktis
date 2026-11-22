@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { requireMinikubeContext } from "./guard.js";
+import { requireLocalClusterContext } from "./guard.js";
 import { shouldRetainArtifacts } from "./retain-on-failure.js";
 
 const exec = promisify(execFile);
@@ -13,7 +13,7 @@ export const NAMESPACE = "controller-agent";
  * the guard would otherwise reach the cluster through this helper.
  */
 export async function kubectl(args: string[]): Promise<string> {
-  requireMinikubeContext();
+  requireLocalClusterContext();
   const { stdout } = await exec("kubectl", ["-n", NAMESPACE, ...args], { maxBuffer: 32 * 1024 * 1024 });
   return stdout;
 }
@@ -30,7 +30,7 @@ export async function kubectlJson<T = unknown>(args: string[]): Promise<T> {
  * temp file just to hand kubectl a path adds a cleanup path that can fail.
  */
 export async function kubectlApplyStdin(manifest: string): Promise<string> {
-  requireMinikubeContext();
+  requireLocalClusterContext();
   return new Promise((resolve, reject) => {
     const child = execFile(
       "kubectl",
@@ -225,7 +225,7 @@ export async function openPortForward(
   remotePort: number,
   localPort: number,
 ): Promise<PortForward> {
-  requireMinikubeContext();
+  requireLocalClusterContext();
   const child = execFile("kubectl", ["-n", NAMESPACE, "port-forward", `svc/${service}`, `${localPort}:${remotePort}`]);
   // A forward that dies takes its listener with it, and a `fetch` already issued
   // against it can then wait forever on a socket nobody will answer -- the exact
