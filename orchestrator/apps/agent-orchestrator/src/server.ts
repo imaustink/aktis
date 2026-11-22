@@ -33,7 +33,7 @@ import {
   writeSseStatus,
 } from "./openai/chat-completions.js";
 import { SENDER_ASSERTION_HEADER, verifySenderClaims, type SenderClaims } from "./rbac/sender-assertion.js";
-import type { PriorToolCall, TurnEngine, TurnInput } from "./engine/types.js";
+import type { PriorToolCall, TurnEngine, TurnInput, TurnOutcome } from "./engine/types.js";
 import { TRACEPARENT_HEADER } from "./traceparent.js";
 import { startSpan, type TraceSpan } from "./telemetry.js";
 import type { TaskCompleter } from "./openai/task-completer.js";
@@ -89,6 +89,19 @@ export interface InvocationRecord {
    * `result`, which stays the turn's text answer.
    */
   outcome?: Record<string, unknown>;
+  /**
+   * The engine's own id for this turn (Temporal: workflow id + update id),
+   * recorded on a still-pending record the moment the engine accepts it.
+   * The engine's record IS the workflow, so with this id ANY orchestrator
+   * process can finish the turn -- not just the one whose in-memory poll
+   * started it. A rollout kills that poll; without this the record stayed
+   * `pending` forever and the caller (integration-gateway) never heard back,
+   * which is how a software-factory chain silently stopped mid-review.
+   * Internal: never returned to a caller.
+   */
+  engineInvocationId?: string;
+  /** Whether the turn was a forced `agentRef` dispatch -- the only kind whose `outcome` is reported -- so an adopting process finishes it the same way. Internal. */
+  forcedAgent?: boolean;
 }
 
 /**
@@ -209,6 +222,8 @@ export class InvokeServer {
    * from being handed a record nobody will complete.
    */
   private draining = false;
+  /** Invocations a poll in THIS process is driving to completion (see adoptInvocation). */
+  private readonly driving = new Set<string>();
 
   constructor(
     private readonly engine: TurnEngine,
@@ -455,6 +470,60 @@ export class InvokeServer {
    * initial `pending` write (in the request path, not the void-ed chain) still
    * surfaces its error as a 500 to the caller, who simply retries.
    */
+  /**
+   * Writes a settled turn's terminal record -- one mapping, shared by the
+   * process that ran the turn and one that adopted it. Carries forward the
+   * remoteControlUrl the listener recorded, since this write replaces the
+   * whole record.
+   */
+  private async persistTerminalOutcome(id: string, outcome: TurnOutcome, forcedAgent: boolean): Promise<void> {
+    const remoteControlUrl = (await this.invocations.get(id))?.remoteControlUrl;
+    const runOutcome = !outcome.error && forcedAgent ? acceptedOutcome(id, outcome.runOutcome) : undefined;
+    await this.persistTerminalInvocation(id, {
+      id,
+      status: outcome.error ? "failed" : "succeeded",
+      result: outcome.result,
+      error: outcome.error,
+      ...(remoteControlUrl ? { remoteControlUrl } : {}),
+      ...(runOutcome ? { outcome: runOutcome } : {}),
+      ...((outcome.pendingToolCalls ?? []).length > 0 ? { pendingToolCalls: outcome.pendingToolCalls } : {}),
+    });
+  }
+
+  /**
+   * Finishes a pending turn whose process died (a rollout, an OOM): the
+   * engine still holds the turn, so polling it by the engine id the dead
+   * process recorded gets the same answer. Started by a poll that finds the
+   * record pending with nobody here driving it. Two processes adopting the
+   * same turn while a rollout overlaps them is harmless: both poll the same
+   * engine record and write the same terminal record, and nothing else
+   * happens here -- every side effect of a finished turn is the caller's.
+   */
+  private adoptInvocation(record: InvocationRecord): void {
+    const { id, engineInvocationId } = record;
+    if (!engineInvocationId || !this.engine.adopt || this.driving.has(id)) return;
+    this.driving.add(id);
+    console.log(`agent-orchestrator: adopting orphaned invocation ${id} (engine ${engineInvocationId})`);
+    const input: TurnInput = {
+      request: "",
+      // As on the original turn: records a Remote Control link that surfaces
+      // after the takeover.
+      remoteControlUrlListener: (url: string) => {
+        void (async () => {
+          const current = await this.invocations.get(id);
+          if (current && current.status === "pending") await this.invocations.set(id, { ...current, remoteControlUrl: url });
+        })();
+      },
+    };
+    void this.engine
+      .adopt(engineInvocationId, input)
+      .then((outcome) => this.persistTerminalOutcome(id, outcome, record.forcedAgent === true))
+      .catch((err: unknown) =>
+        this.persistTerminalInvocation(id, { id, status: "failed", error: err instanceof Error ? err.message : String(err) }),
+      )
+      .finally(() => this.driving.delete(id));
+  }
+
   private async persistTerminalInvocation(id: string, record: InvocationRecord): Promise<void> {
     try {
       await this.invocations.set(id, record);
@@ -659,7 +728,10 @@ export class InvokeServer {
     }
 
     const id = randomUUID();
-    await this.invocations.set(id, { id, status: "pending" });
+    await this.invocations.set(id, { id, status: "pending", ...(trigger?.forcedAgentId ? { forcedAgent: true } : {}) });
+    // This process is driving the turn; until it settles, a poll must not
+    // adopt it (see handleGetInvocation).
+    this.driving.add(id);
 
     // Fire-and-forget: the HTTP response returns immediately; the engine poll
     // updates the record when the turn eventually settles.
@@ -697,23 +769,17 @@ export class InvokeServer {
       // (The Redis adapter swallows its own errors by contract, so this only
       // bites a store that actually throws.)
       if (sessionId && (turnInput.readOnly || trigger)) await this.setSessionReadOnly(sessionId, turnInput.readOnly === true);
+      // Recorded so another process can finish the turn if this one dies
+      // (see InvocationRecord.engineInvocationId). Only while still pending.
+      turnInput.reportEngineInvocation = async (engineInvocationId) => {
+        const current = await this.invocations.get(id);
+        if (current && current.status === "pending") {
+          await this.invocations.set(id, { ...current, engineInvocationId });
+        }
+      };
       return this.engine
         .invoke(turnInput)
-        .then(async (outcome) => {
-          // Carry forward any remoteControlUrl already recorded by the
-          // listener above -- this terminal write replaces the whole record.
-          const remoteControlUrl = (await this.invocations.get(id))?.remoteControlUrl;
-          const runOutcome = !outcome.error && trigger?.forcedAgentId ? acceptedOutcome(id, outcome.runOutcome) : undefined;
-          await this.persistTerminalInvocation(id, {
-            id,
-            status: outcome.error ? "failed" : "succeeded",
-            result: outcome.result,
-            error: outcome.error,
-            ...(remoteControlUrl ? { remoteControlUrl } : {}),
-            ...(runOutcome ? { outcome: runOutcome } : {}),
-            ...((outcome.pendingToolCalls ?? []).length > 0 ? { pendingToolCalls: outcome.pendingToolCalls } : {}),
-          });
-        })
+        .then((outcome) => this.persistTerminalOutcome(id, outcome, Boolean(trigger?.forcedAgentId)))
         .catch(async (err: unknown) => {
           const remoteControlUrl = (await this.invocations.get(id))?.remoteControlUrl;
           await this.persistTerminalInvocation(id, {
@@ -734,7 +800,7 @@ export class InvokeServer {
         status: "failed",
         error: err instanceof Error ? err.message : String(err),
       });
-    });
+    }).finally(() => this.driving.delete(id));
 
     // An event turn also tells the caller WHICH trigger it started and with
     // what already-rendered reply side-effects (docs/event-triggers.md §5) --
@@ -778,7 +844,11 @@ export class InvokeServer {
       res.writeHead(404).end();
       return;
     }
-    res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(record));
+    if (record.status === "pending" && !this.draining) this.adoptInvocation(record);
+    // The engine id and dispatch kind are this process's bookkeeping, not
+    // part of the contract.
+    const { engineInvocationId: _engine, forcedAgent: _forced, ...visible } = record;
+    res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(visible));
   }
 
   private async handleChatCompletions(req: IncomingMessage, res: ServerResponse): Promise<void> {

@@ -88,6 +88,36 @@ describe("TemporalEngine", () => {
     expect(await new TemporalEngine({ baseUrl: BASE, fetchImpl: bare }).invoke(input())).not.toHaveProperty("runOutcome");
   });
 
+  it("reports the engine's id for the turn before polling it", async () => {
+    const { impl } = scriptedFetch([{ id: "x", status: "succeeded", result: "ok" }]);
+    const reportEngineInvocation = vi.fn().mockResolvedValue(undefined);
+    await new TemporalEngine({ baseUrl: BASE, fetchImpl: impl }).invoke(input({ reportEngineInvocation }));
+    expect(reportEngineInvocation).toHaveBeenCalledWith("conversation-abc.upd-1");
+  });
+
+  it("still runs the turn when recording the engine id fails", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { impl } = scriptedFetch([{ id: "x", status: "succeeded", result: "ok" }]);
+    const state = await new TemporalEngine({ baseUrl: BASE, fetchImpl: impl }).invoke(
+      input({ reportEngineInvocation: vi.fn().mockRejectedValue(new Error("redis down")) }),
+    );
+    expect(state.result).toBe("ok");
+    warn.mockRestore();
+  });
+
+  // A turn whose orchestrator process died: polled by the id it recorded,
+  // never re-started.
+  it("adopt() polls an existing engine id and maps the result like invoke()", async () => {
+    const outcome = { verdict: "changes-requested" };
+    const { impl, calls } = scriptedFetch([
+      { id: "x", status: "pending" },
+      { id: "x", status: "succeeded", result: "reviewed", outcome },
+    ]);
+    const state = await new TemporalEngine({ baseUrl: BASE, fetchImpl: impl }).adopt("conversation-old.upd-9", input());
+    expect(state).toEqual({ result: "reviewed", runOutcome: outcome });
+    expect(calls.map((c) => c.url)).toEqual([`${BASE}/invoke/conversation-old.upd-9`, `${BASE}/invoke/conversation-old.upd-9`]);
+  });
+
   it("reports a failed turn as an error rather than an empty result", async () => {
     const { impl } = scriptedFetch([{ id: "x", status: "failed", error: "the planner exploded" }]);
     const engine = new TemporalEngine({ baseUrl: BASE, fetchImpl: impl });

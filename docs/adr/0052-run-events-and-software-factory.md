@@ -119,11 +119,22 @@ it is.
 events are never published for chat or session-page turns, only for
 trigger-dispatched runs.
 
-**Durability (v1).** The continuation lives in the gateway process, like the
-poll it follows. If the gateway restarts mid-run, the next hop is lost; the PR
-is simply left where it was, and a human re-applies the label (today's manual
-path, which keeps working). A durable outbox in the style of
-`pendingLabelStore` is a follow-up if this proves to matter.
+**Durability.** v1 kept the continuation in the gateway process, like the
+poll it follows, and a restart mid-run lost the next hop. It proved to matter:
+every merge deploys, and a review of glyph#99 that requested changes stalled
+because the rollout replaced both the gateway waiting on it and the
+orchestrator process running it. Neither had saved anything that would let
+its replacement pick the run up. Both hops are now durable:
+- The orchestrator records the engine's own id for a turn on its pending
+  invocation record. A poll that finds a turn pending with no process here
+  running it adopts it, re-polling the engine by that id (the engine's
+  record is the workflow, so any process gets the same answer).
+- The gateway records each accepted run in Redis (`inflight-runs.ts`) under a
+  lease it renews while polling. A sweep, on startup and every minute, takes
+  over a run whose lease lapsed and finishes it from the poll on: result
+  comment, label removal, run event. Steps already done are marked on the
+  record, and the run event is marked before it is sent, so a takeover never
+  starts a second next hop.
 
 ### 2. Structured run outcomes
 
@@ -213,9 +224,10 @@ Notes:
   No new ClusterRole, so homelab's ci-deployer bootstrap step isn't needed.
 - The one prompt-dependent step is the model running `aktis-verdict`, and it
   fails safe: no verdict means a human gets the PR.
-- Risk: in v1, a lost hop (gateway restart) silently stalls the chain at the
-  last label. Mitigated by labels showing where the PR stopped, and by the
-  manual label path.
+- Risk: in v1, a lost hop (gateway restart) silently stalled the chain at the
+  last label. Closed by the durability above; what remains is a gateway that
+  dies in the instant between marking a run event sent and sending it, which
+  stalls the chain rather than duplicating a step.
 
 ## Alternatives considered
 

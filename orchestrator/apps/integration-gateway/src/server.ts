@@ -1,4 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
+import { hostname } from "node:os";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import {
   buildCronEnvelope,
@@ -50,6 +51,7 @@ import { renderSessionPage } from "./session-page.js";
 import type { SessionPageStore } from "./session-page-store.js";
 import { tickUsername, type TokenAuthenticator } from "./tick-auth.js";
 import { LabelReconciler, type PendingLabelStore } from "./label-reconciler.js";
+import { DEFAULT_LEASE_MS, InflightRunRecovery, type InflightRun, type InflightRunStore } from "./inflight-runs.js";
 import { couldMatchBeforeSender, type EventTriggerLookup } from "./event-triggers.js";
 import {
   StaticEventSourceRegistry,
@@ -220,6 +222,17 @@ export interface GatewayServerOptions {
   /** How old an owed removal must be before the sweep acts on it; forwarded to {@link LabelReconciler}. */
   labelReconcilerGraceMs?: number;
   /**
+   * Durable record of accepted runs still owed their finish -- result comment,
+   * label removal, run-completion event (inflight-runs.ts). With it, a run
+   * whose gateway died mid-poll is taken over by another gateway; without
+   * it, a restart drops whatever was in flight, as before.
+   */
+  inflightRunStore?: InflightRunStore;
+  /** Lease on a running run; a gateway that stops renewing it for this long is presumed dead. */
+  inflightRunLeaseMs?: number;
+  /** How often to look for runs to take over. */
+  inflightRunSweepIntervalMs?: number;
+  /**
    * The global run-event chain depth cap (docs/adr/0052 §1,
    * `RUN_EVENT_MAX_DEPTH`). Absent -> {@link DEFAULT_RUN_EVENT_MAX_DEPTH}.
    */
@@ -319,6 +332,11 @@ export class GatewayServer {
   private readonly connectionsApi: ConnectionsApi | undefined;
   private readonly claudeCredentialSweeper: ClaudeCredentialSweeper | undefined;
   private readonly labelReconciler: LabelReconciler | undefined;
+  private readonly inflightRecovery: InflightRunRecovery | undefined;
+  /** This process's lease owner id (inflight-runs.ts). */
+  private readonly instanceId = `${hostname()}-${randomUUID().slice(0, 8)}`;
+  /** Runs this process is finishing right now, by key. */
+  private readonly runningRuns = new Set<string>();
   private readonly eventSources: EventSourceLookup;
   private readonly log: (line: string) => void;
   private readonly now: () => Date;
@@ -427,6 +445,17 @@ export class GatewayServer {
           ...(options.labelReconcilerGraceMs !== undefined ? { graceMs: options.labelReconcilerGraceMs } : {}),
         })
       : undefined;
+    this.inflightRecovery = options.inflightRunStore
+      ? new InflightRunRecovery({
+          store: options.inflightRunStore,
+          owner: this.instanceId,
+          resume: (run) => this.finishRun(run, true),
+          isRunning: (key) => this.runningRuns.has(key),
+          onError: this.report,
+          ...(options.inflightRunLeaseMs ? { leaseMs: options.inflightRunLeaseMs } : {}),
+          ...(options.inflightRunSweepIntervalMs ? { intervalMs: options.inflightRunSweepIntervalMs } : {}),
+        })
+      : undefined;
   }
 
   listen(port: number): Promise<void> {
@@ -442,6 +471,8 @@ export class GatewayServer {
       // Fires one sweep immediately -- the startup self-heal for any label
       // stranded by the previous pod dying mid-turn -- then on its interval.
       this.labelReconciler?.start();
+      // Likewise picks up, at once, any run a previous pod died finishing.
+      this.inflightRecovery?.start();
       this.server.listen(port, resolve);
     });
   }
@@ -450,6 +481,7 @@ export class GatewayServer {
     return new Promise((resolve, reject) => {
       this.claudeCredentialSweeper?.stop();
       this.labelReconciler?.stop();
+      this.inflightRecovery?.stop();
       if (!this.server) return resolve();
       this.server.close((err) => (err ? reject(err) : resolve()));
     });
@@ -928,6 +960,60 @@ export class GatewayServer {
     trigger: AcceptedTrigger,
     traceparent?: string,
   ): Promise<void> {
+    await this.finishRun(
+      {
+        key: invocationId,
+        invocationId,
+        envelope,
+        ...(sender ? { sender } : {}),
+        trigger,
+        ...(traceparent ? { traceparent } : {}),
+        recordedAt: this.now().getTime(),
+      },
+      false,
+    );
+  }
+
+  /**
+   * Runs an accepted event to its finish, recorded in the in-flight store
+   * (inflight-runs.ts) under a lease this process renews for as long as it
+   * runs, so that if this process dies another gateway takes it over.
+   * `takenOver` is that other gateway: the acceptance side effects (ack,
+   * labels, assignees, owed label removal) already happened, so it starts at
+   * the poll, and it skips whatever finishing steps the record says are done.
+   * The record is cleared when this returns, however the run ended -- only a
+   * process that died leaves one behind.
+   */
+  private async finishRun(run: InflightRun, takenOver: boolean): Promise<void> {
+    const store = this.options.inflightRunStore;
+    const leaseMs = this.options.inflightRunLeaseMs ?? DEFAULT_LEASE_MS;
+    this.runningRuns.add(run.key);
+    let renew: ReturnType<typeof setInterval> | undefined;
+    try {
+      if (store) {
+        // Lease BEFORE the record exists, so no sweep can see it unleased.
+        if (!takenOver) {
+          await store.lease(run.key, this.instanceId, leaseMs);
+          await store.save(run);
+        }
+        renew = setInterval(
+          () => void store.lease(run.key, this.instanceId, leaseMs).catch(this.report),
+          Math.max(1, Math.floor(leaseMs / 3)),
+        );
+        renew.unref?.();
+      }
+      await this.runAcceptedEventSteps(run, takenOver, async () => {
+        await store?.save(run);
+      });
+    } finally {
+      if (renew) clearInterval(renew);
+      await store?.clear(run.key);
+      this.runningRuns.delete(run.key);
+    }
+  }
+
+  private async runAcceptedEventSteps(run: InflightRun, takenOver: boolean, persist: () => Promise<void>): Promise<void> {
+    const { envelope, sender, trigger, traceparent } = run;
     const gh = this.githubReplyTarget(trigger);
     const http = trigger.reply?.http;
     const sessionId = trigger.sessionId;
@@ -944,19 +1030,19 @@ export class GatewayServer {
     let finished: FinishedRun | undefined;
     // The posted ack, so the Remote Control link can be edited into it
     // rather than posted as a second comment (see remoteControlHooks).
-    let ackComment: { id: number; body: string } | undefined;
+    let ackComment: { id: number; body: string } | undefined = run.ackComment;
     try {
       // Record the owed removal BEFORE polling (and before anything else that
       // can throw or outlive the pod), so the reconciler can self-heal it if
       // the `finally` below never runs.
-      if (gh && label && this.options.pendingLabelStore) {
+      if (!takenOver && gh && label && this.options.pendingLabelStore) {
         const store = this.options.pendingLabelStore;
         await best(() =>
           store.record({ owner: gh.owner, repo: gh.repo, issueNumber: gh.issueNumber, label, sessionId, recordedAt: Date.now() }),
         );
       }
 
-      if (gh) {
+      if (gh && !takenOver) {
         let pageUrl: string | undefined;
         if (gh.sessionPage && this.options.sessionPageStore && this.options.publicBaseUrl) {
           const store = this.options.sessionPageStore;
@@ -973,6 +1059,10 @@ export class GatewayServer {
             const id = await this.options.githubReplyClient.postIssueComment(gh.owner, gh.repo, gh.issueNumber, ack);
             if (id !== undefined) ackComment = { id, body: ack };
           });
+          if (ackComment) {
+            run.ackComment = ackComment;
+            await persist();
+          }
         }
         // docs/adr/0052 §3: status labels and assignees go on at acceptance,
         // with the ack. Bot-authored, so they never re-enter routing.
@@ -983,8 +1073,14 @@ export class GatewayServer {
 
       const turnLabel = `${envelope.source} event ${envelope.id} → ${trigger.name || "trigger"}`;
       let tracked = await this.trackTurn(sessionId, turnLabel);
-      const hooks = gh ? this.remoteControlHooks(gh, () => ackComment) : {};
-      let outcome = await this.options.orchestratorClient.poll(invocationId, hooks);
+      const hooks =
+        gh && !run.remoteControlPosted
+          ? this.remoteControlHooks(gh, () => ackComment, async () => {
+              run.remoteControlPosted = true;
+              await persist();
+            })
+          : {};
+      let outcome = await this.options.orchestratorClient.poll(run.invocationId, hooks);
 
       // Unauthenticated turn: `result` is a "link your account" prompt, not
       // finished work. It is posted whenever there is an issue to post to --
@@ -1016,6 +1112,9 @@ export class GatewayServer {
               again.kind === "ignored" ? "no trigger matched" : again.kind === "identity-required" ? again.body.error.code : again.error;
             return { status: "failed", error: `re-submitting the event after linking: ${why}` };
           }
+          // A takeover from here on polls the re-submitted turn.
+          run.invocationId = again.id;
+          await persist();
           return this.options.orchestratorClient.poll(again.id, hooks);
         });
         if (!resumed) {
@@ -1037,13 +1136,17 @@ export class GatewayServer {
         finished = { status: outcome.status, ...(outcome.outcome ? { outcome: outcome.outcome } : {}) };
       }
       await this.completeTurn(sessionId, tracked, outcome);
-      if (gh?.result) {
-        const text = outcome.status === "succeeded" ? (outcome.result ?? "") : `Something went wrong processing this: ${outcome.error ?? "unknown error"}`;
-        await best(() => this.options.githubReplyClient.postIssueComment(gh.owner, gh.repo, gh.issueNumber, text));
-      }
-      if (http) {
-        httpSent = true;
-        await best(() => this.postHttpReply(http, trigger, outcome));
+      if (!run.resultPosted) {
+        if (gh?.result) {
+          const text = outcome.status === "succeeded" ? (outcome.result ?? "") : `Something went wrong processing this: ${outcome.error ?? "unknown error"}`;
+          await best(() => this.options.githubReplyClient.postIssueComment(gh.owner, gh.repo, gh.issueNumber, text));
+        }
+        if (http) {
+          httpSent = true;
+          await best(() => this.postHttpReply(http, trigger, outcome));
+        }
+        run.resultPosted = true;
+        await persist();
       }
     } catch (error) {
       // Last line of defence: the run must not end in silence where the
@@ -1080,7 +1183,12 @@ export class GatewayServer {
     // completed (it returns above, inside the try), and not one that threw
     // before polling produced an outcome (`finished` unset) -- "the
     // gateway crashed mid-run" is not a run status a trigger should route on.
-    if (finished && trigger.onComplete?.emitTo) {
+    if (finished && trigger.onComplete?.emitTo && !run.emitted) {
+      // Marked BEFORE emitting: a gateway that dies mid-emit costs the chain
+      // its next step (a human still gets the run's result), where a
+      // takeover that re-emitted would start a second one.
+      run.emitted = true;
+      await persist();
       try {
         await this.emitRunEvent(envelope, sender, trigger, finished, gh, traceparent);
       } catch (error) {
@@ -1232,12 +1340,17 @@ export class GatewayServer {
    * or a failed edit, it falls back to posting the link as its own comment
    * -- the link is the one thing a human needs to take over, so it must land.
    */
-  private remoteControlHooks(gh: GithubReplyTarget, ack: () => { id: number; body: string } | undefined): PollHooks {
+  private remoteControlHooks(
+    gh: GithubReplyTarget,
+    ack: () => { id: number; body: string } | undefined,
+    onPosted?: () => Promise<void>,
+  ): PollHooks {
     let posted = false;
     return {
       onRemoteControlUrl: async (url) => {
         if (posted) return;
         posted = true;
+        await onPosted?.();
         const line = `🤖 Watch live or take over the session here: ${url}`;
         const ackComment = ack();
         if (ackComment) {

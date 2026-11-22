@@ -174,12 +174,35 @@ export class TemporalEngine implements TurnEngine {
     }
 
     const id = await this.start(input, caller);
+    // Best effort: a failure here only costs this turn its rollout
+    // survivability, never the turn itself.
+    try {
+      await input.reportEngineInvocation?.(id);
+    } catch (err) {
+      console.warn(`temporal engine: could not record engine invocation ${id}:`, err instanceof Error ? err.message : String(err));
+    }
     let record = await this.poll(id, input);
 
     if (record.status === "succeeded" && record.path === "link-required") {
       record = await this.autoResumeLink(input, record, caller);
     }
 
+    return this.toOutcome(record);
+  }
+
+  /**
+   * Finishes a turn a now-dead process started (see TurnEngine.adopt):
+   * the engine's record is the workflow, so polling the same id from here
+   * gets the same answer the original process would have. No link
+   * auto-resume -- that is gated on a live `progressListener`, which only a
+   * streaming chat caller has, and such a caller is gone with its process.
+   */
+  async adopt(engineInvocationId: string, input: TurnInput): Promise<TurnOutcome> {
+    return this.toOutcome(await this.poll(engineInvocationId, input));
+  }
+
+  /** Maps a terminal engine record to a turn outcome -- one place, for invoke() and adopt(). */
+  private toOutcome(record: InvokeRecord): TurnOutcome {
     if (record.status === "failed") {
       return { error: record.error ?? "the turn failed" };
     }

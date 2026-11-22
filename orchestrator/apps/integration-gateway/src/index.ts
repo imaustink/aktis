@@ -28,6 +28,7 @@ import { deriveKey } from "./connections/signed-token.js";
 import { GatewayServer, type GatewayServerOptions } from "./server.js";
 import { InMemorySessionPageStore, RedisSessionPageStore } from "./session-page-store.js";
 import { InMemoryPendingLabelStore, RedisPendingLabelStore } from "./label-reconciler.js";
+import { RedisInflightRunStore } from "./inflight-runs.js";
 import { CrdEventSourceRegistry, SecretKeyReader, type SecretReadApi } from "./event-sources.js";
 import { CrdEventTriggerRegistry } from "./event-triggers.js";
 import { JwksTokenAuthenticator, kubeIssuerKeySource, TICK_TOKEN_AUDIENCE } from "./tick-auth.js";
@@ -359,6 +360,15 @@ async function main(): Promise<void> {
   console.error(
     `Label reconciler enabled (${pendingLabelRedisUrl ? `Redis: ${pendingLabelRedisUrl}` : "in-memory (not durable across restarts)"})`,
   );
+  // Same Redis: accepted runs a restarted gateway takes over and finishes
+  // (result comment, label removal, run-completion event). Redis-only -- an
+  // in-memory record would die with the process it is meant to outlive.
+  const inflightRunStore = pendingLabelRedisUrl ? new RedisInflightRunStore(pendingLabelRedisUrl) : undefined;
+  console.error(
+    inflightRunStore
+      ? `In-flight run takeover enabled (Redis: ${pendingLabelRedisUrl})`
+      : "In-flight run takeover disabled (no Redis): a restart drops runs being polled",
+  );
 
   // Claude-auth (docs/adr/0027) is opt-in and layered on top of
   // identity-link's Redis/encryption-key/bearer-token config and
@@ -459,6 +469,7 @@ async function main(): Promise<void> {
     ...(identityLinkAuthCodeLinkers ? { identityLinkAuthCodeLinkers } : {}),
     ...(sessionPageStore ? { sessionPageStore, publicBaseUrl: config.publicUrl } : {}),
     pendingLabelStore,
+    ...(inflightRunStore ? { inflightRunStore } : {}),
     ...(config.labelReconcilerIntervalMs ? { labelReconcilerIntervalMs: config.labelReconcilerIntervalMs } : {}),
     ...(config.labelReconcilerGraceMs !== undefined ? { labelReconcilerGraceMs: config.labelReconcilerGraceMs } : {}),
     ...(claudeAuthFlows && claudeTokenStore ? { claudeAuthFlows, claudeAuthStore: claudeTokenStore } : {}),
@@ -489,6 +500,7 @@ async function main(): Promise<void> {
     // draining here went with them.
     if (sessionPageStore instanceof RedisSessionPageStore) await sessionPageStore.close();
     if (pendingLabelStore instanceof RedisPendingLabelStore) await pendingLabelStore.close();
+    await inflightRunStore?.close();
     await shutdownTelemetry();
     process.exit(0);
   };

@@ -52,6 +52,12 @@ export interface TurnInput {
    * URL without being treated as a live channel.
    */
   remoteControlUrlListener?: (url: string) => void;
+  /**
+   * Fired once the engine has accepted the turn, with the engine's own id for
+   * it. Set only by `/invoke`, which records it so another process can adopt
+   * the turn if this one dies (see `InvocationRecord.engineInvocationId`).
+   */
+  reportEngineInvocation?: (engineInvocationId: string) => Promise<void>;
   /** Id of a Skill CR an EventTrigger dispatches to directly (ADR 0048). At most one forced target is set. */
   forcedSkillId?: string;
   /** Id of an Agent CR an EventTrigger dispatches to directly — see `forcedSkillId`. */
@@ -110,4 +116,10 @@ export interface TurnEngine {
    * for a sender who cannot be acted as, or undefined for no objection.
    */
   checkIdentity(input: TurnInput): Promise<IdentityRefusal | undefined>;
+  /**
+   * Finishes a turn another process started, from the id it reported through
+   * `reportEngineInvocation`: waits for the engine's result and maps it
+   * exactly as `invoke` would. Optional so test doubles can omit it.
+   */
+  adopt?(engineInvocationId: string, input: TurnInput): Promise<TurnOutcome>;
 }
