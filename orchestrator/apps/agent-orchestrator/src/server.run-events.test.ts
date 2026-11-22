@@ -5,8 +5,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { SENDER_ASSERTION_HEADER, mintSenderAssertion } from "./rbac/sender-assertion.js";
 import { InMemoryInvocationStore } from "./invocation/types.js";
 import { MAX_OUTCOME_BYTES, checkOutcome } from "./invocation/outcome.js";
-import { InvokeServer, type AgentGraphLike, type InvocationRecord } from "./server.js";
-import type { AgentState } from "./agent/graph.js";
+import { InvokeServer, type InvocationRecord } from "./server.js";
+import type { TurnEngine, TurnOutcome } from "./engine/types.js";
 import type { Envelope, EventTriggerResource } from "@aktis/event-triggers";
 import { CrdEventTriggerRegistry } from "./routing/crd-event-trigger-registry.js";
 
@@ -47,8 +47,6 @@ async function triggerRegistry(triggers: EventTriggerResource[]): Promise<CrdEve
   return registry;
 }
 
-async function* noStream(): AsyncGenerator<Record<string, Partial<AgentState>>> {}
-
 const servers: InvokeServer[] = [];
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((s) => s.close()));
@@ -75,7 +73,7 @@ async function poll(port: number, id: string): Promise<InvocationRecord> {
   return (await res.json()) as InvocationRecord;
 }
 
-/** Polls until the record leaves "pending" (the graph runs fire-and-forget). */
+/** Polls until the record leaves "pending" (the turn runs fire-and-forget). */
 async function settled(port: number, id: string): Promise<InvocationRecord> {
   for (let i = 0; i < 100; i++) {
     const record = await poll(port, id);
@@ -85,10 +83,10 @@ async function settled(port: number, id: string): Promise<InvocationRecord> {
   throw new Error(`invocation ${id} never settled`);
 }
 
-function graphReturning(state: Partial<AgentState>): AgentGraphLike {
+function engineReturning(outcome: TurnOutcome): TurnEngine {
   return {
-    invoke: vi.fn().mockResolvedValue({ request: "x", authToken: "", skillCandidates: [], result: "done", ...state } as AgentState),
-    stream: vi.fn().mockResolvedValue(noStream()),
+    invoke: vi.fn().mockResolvedValue({ result: "done", ...outcome }),
+    checkIdentity: vi.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -118,7 +116,7 @@ const noneTrigger: EventTriggerResource = {
 
 describe("/invoke 202 trigger: params and onComplete (docs/adr/0052 §1)", () => {
   it("returns the string params, onComplete and the rendered addLabels", async () => {
-    const port = await start(new InvokeServer(graphReturning({}), undefined, undefined, await triggerRegistry([reviewTrigger])));
+    const port = await start(new InvokeServer(engineReturning({}), undefined, undefined, await triggerRegistry([reviewTrigger])));
     const res = await postEvent(port, runEnvelope());
     expect(res.status).toBe(202);
     expect(((await res.json()) as { trigger: unknown }).trigger).toEqual({
@@ -133,7 +131,7 @@ describe("/invoke 202 trigger: params and onComplete (docs/adr/0052 §1)", () =>
   it("omits onComplete when the trigger does not set it", async () => {
     const { onComplete: _drop, ...spec } = reviewTrigger.spec;
     const port = await start(
-      new InvokeServer(graphReturning({}), undefined, undefined, await triggerRegistry([{ metadata: reviewTrigger.metadata, spec }])),
+      new InvokeServer(engineReturning({}), undefined, undefined, await triggerRegistry([{ metadata: reviewTrigger.metadata, spec }])),
     );
     const body = (await (await postEvent(port, runEnvelope())).json()) as { trigger: Record<string, unknown> };
     expect(body.trigger).not.toHaveProperty("onComplete");
@@ -141,7 +139,7 @@ describe("/invoke 202 trigger: params and onComplete (docs/adr/0052 §1)", () =>
   });
 
   it("rejects an unknown envelope kind but accepts run", async () => {
-    const port = await start(new InvokeServer(graphReturning({}), undefined, undefined, await triggerRegistry([reviewTrigger])));
+    const port = await start(new InvokeServer(engineReturning({}), undefined, undefined, await triggerRegistry([reviewTrigger])));
     const bad = await postEvent(port, runEnvelope({ kind: "bogus" as Envelope["kind"] }));
     expect(bad.status).toBe(400);
     expect(((await bad.json()) as { error: string }).error).toContain('"run"');
@@ -150,8 +148,8 @@ describe("/invoke 202 trigger: params and onComplete (docs/adr/0052 §1)", () =>
 
 describe("/invoke target.none (docs/adr/0052 §3)", () => {
   it("accepts with 202 + id and runs nothing; the poll is already succeeded with an empty result", async () => {
-    const graph = graphReturning({});
-    const port = await start(new InvokeServer(graph, undefined, undefined, await triggerRegistry([noneTrigger])));
+    const engine = engineReturning({});
+    const port = await start(new InvokeServer(engine, undefined, undefined, await triggerRegistry([noneTrigger])));
     const res = await postEvent(port, runEnvelope());
     expect(res.status).toBe(202);
     const body = (await res.json()) as { id: string; status: string; trigger: Record<string, unknown> };
@@ -162,11 +160,10 @@ describe("/invoke target.none (docs/adr/0052 §3)", () => {
       reply: { github: { repository: "acme/widgets", issueNumber: 12, addLabels: ["factory:ready"], assignees: ["alice"] } },
       params: { assignee: "alice", number: "12", repository: "acme/widgets" },
     });
-    // Immediately terminal: no wait, no graph.
+    // Immediately terminal: no wait, no engine turn.
     expect(await poll(port, body.id)).toEqual({ id: body.id, status: "succeeded", result: "" });
     await new Promise((r) => setTimeout(r, 10));
-    expect(graph.invoke).not.toHaveBeenCalled();
-    expect(graph.stream).not.toHaveBeenCalled();
+    expect(engine.invoke).not.toHaveBeenCalled();
   });
 
   it("never runs the identity pre-flight, so a none trigger cannot 403", async () => {
@@ -175,25 +172,25 @@ describe("/invoke target.none (docs/adr/0052 §3)", () => {
       status: "failed",
       error: { code: "identity_link_required", message: "link first" },
     });
-    const graph: AgentGraphLike = { invoke: vi.fn(), stream: vi.fn(), checkIdentity };
-    const port = await start(new InvokeServer(graph, undefined, undefined, await triggerRegistry([noneTrigger]), undefined, SECRET));
+    const engine: TurnEngine = { invoke: vi.fn(), checkIdentity };
+    const port = await start(new InvokeServer(engine, undefined, undefined, await triggerRegistry([noneTrigger]), SECRET));
     const res = await postEvent(port, runEnvelope(), {
       [SENDER_ASSERTION_HEADER]: mintSenderAssertion(SECRET, { login: "alice", accountId: "1", subjectStatus: "unlinked" }),
     });
     expect(res.status).toBe(202);
     expect(checkIdentity).not.toHaveBeenCalled();
-    expect(graph.invoke).not.toHaveBeenCalled();
+    expect(engine.invoke).not.toHaveBeenCalled();
   });
 });
 
 describe("GET /invoke/:id outcome (docs/adr/0052 §2)", () => {
   const outcome = { pullRequest: { number: 12, url: "https://github.com/acme/widgets/pull/12" }, madeNewCommits: true };
 
-  async function runTurn(trigger: EventTriggerResource, state: Partial<AgentState>): Promise<InvocationRecord> {
+  async function runTurn(trigger: EventTriggerResource, turn: TurnOutcome): Promise<InvocationRecord> {
     const port = await start(
       new InvokeServer(
-        graphReturning(state), undefined, undefined, await triggerRegistry([trigger]),
-        undefined, undefined, undefined, 5, "authcode", new InMemoryInvocationStore(),
+        engineReturning(turn), undefined, undefined, await triggerRegistry([trigger]),
+        undefined, undefined, 5, "authcode", new InMemoryInvocationStore(),
       ),
     );
     const res = await postEvent(port, runEnvelope());
@@ -202,7 +199,7 @@ describe("GET /invoke/:id outcome (docs/adr/0052 §2)", () => {
   }
 
   it("surfaces a forced agentRef run's outcome next to the unchanged result", async () => {
-    const record = await runTurn(reviewTrigger, { result: "Reviewed.", agentOutcome: outcome });
+    const record = await runTurn(reviewTrigger, { result: "Reviewed.", runOutcome: outcome });
     expect(record).toMatchObject({ status: "succeeded", result: "Reviewed.", outcome });
   });
 
@@ -213,7 +210,7 @@ describe("GET /invoke/:id outcome (docs/adr/0052 §2)", () => {
   });
 
   it("omits outcome on a failed turn", async () => {
-    const record = await runTurn(reviewTrigger, { error: "boom", agentOutcome: outcome });
+    const record = await runTurn(reviewTrigger, { error: "boom", runOutcome: outcome });
     expect(record.status).toBe("failed");
     expect(record).not.toHaveProperty("outcome");
   });
@@ -223,7 +220,7 @@ describe("GET /invoke/:id outcome (docs/adr/0052 §2)", () => {
       metadata: { name: "skill" },
       spec: { target: { skillRef: "s", promptTemplate: "p" } },
     };
-    const record = await runTurn(skillTrigger, { agentOutcome: outcome });
+    const record = await runTurn(skillTrigger, { runOutcome: outcome });
     expect(record).not.toHaveProperty("outcome");
   });
 
@@ -235,7 +232,7 @@ describe("GET /invoke/:id outcome (docs/adr/0052 §2)", () => {
   ])("drops and logs an outcome that is %s", async (_, bad) => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      const record = await runTurn(reviewTrigger, { result: "Reviewed.", agentOutcome: bad });
+      const record = await runTurn(reviewTrigger, { result: "Reviewed.", runOutcome: bad });
       expect(record).toMatchObject({ status: "succeeded", result: "Reviewed." });
       expect(record).not.toHaveProperty("outcome");
       expect(warn).toHaveBeenCalledWith(expect.stringContaining("dropping run outcome"));

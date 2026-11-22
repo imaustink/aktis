@@ -42,19 +42,13 @@ global:
 agent-orchestrator:
   enabled: true
   # Pin the resource names to `agent-orchestrator-*` regardless of the umbrella
-  # release name, so the invoke/callback Service names stay stable -- the
-  # openwebui.openaiBaseApiUrl below and the in-cluster callback URL both
-  # depend on `agent-orchestrator-invoke` / `agent-orchestrator-callback`.
+  # release name, so the invoke Service name stays stable -- the
+  # openwebui.openaiBaseApiUrl below depends on `agent-orchestrator-invoke`.
   fullnameOverride: agent-orchestrator
   config:
-    # Route turns to the Temporal engine (docs/adr/0036).
+    # Every turn runs on the Temporal engine (docs/adr/0036, 0053); this is
+    # the temporal-engine subchart's gateway below.
     #
-    # BOTH halves are required and neither does anything alone: the
-    # `temporal-engine` subchart below deploys the worker and gateway, and this
-    # tells the orchestrator to use them. Setting only one is a no-op in either
-    # direction — which is deliberate, so the engine can be deployed and watched
-    # before any turn depends on it.
-    agentEngine: temporal
     # NOTE: this Service name is `<release>-temporal-engine-gateway`, so it is
     # coupled to the release being named `agent-controller`. The
     # agent-orchestrator subchart avoids that with `fullnameOverride` (see
@@ -82,22 +76,12 @@ core-controller:
 # ---------------------------------------------------------------------------
 # The Temporal-workflow agent engine (charts/temporal-engine, docs/adr/0036).
 #
-# ON as of docs/adr/0036's rollout. Enabling is TWO independent steps, and
-# this is the first:
-#   1. temporal-engine.enabled=true            -- deploy worker + gateway
-#   2. agent-orchestrator.config.agentEngine=temporal
-#                                              -- route turns to it (above)
-#
-# Step 1 alone changes no behaviour, which is what makes the rollout
-# reversible: the engine can be deployed, watched, and rolled back before any
-# turn depends on it. Everything outside the agent loop (the OpenAI facade,
-# /invoke, identity, RBAC, credentials, both launchers) stays in
-# agent-orchestrator either way.
-#
-# TO ROLL BACK: clear agent-orchestrator.config.agentEngine above. That alone
-# returns every turn to the in-process LangGraph loop; leaving this subchart
-# enabled costs two idle pods and nothing else. Rolling back the subchart too
-# is the slower, optional second step.
+# Required: agent-orchestrator forwards every turn to this engine's gateway
+# (agent-orchestrator.config.temporalEngineUrl above). The in-process
+# LangGraph loop it replaced was removed (docs/adr/0053), so there is no
+# engine to roll back to. Everything outside the agent loop (the OpenAI
+# facade, /invoke, trigger routing, identity forwarding) stays in
+# agent-orchestrator.
 #
 # Assumes a reachable Temporal cluster; no server is bundled.
 # ---------------------------------------------------------------------------

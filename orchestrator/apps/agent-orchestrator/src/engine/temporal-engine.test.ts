@@ -4,7 +4,7 @@ import { setupTelemetry } from "../telemetry.js";
 import { TemporalEngine } from "./temporal-engine.js";
 import { SENDER_ASSERTION_HEADER } from "../rbac/sender-assertion.js";
 import { verifySenderAssertion, verifySenderClaims } from "../rbac/sender-assertion.js";
-import type { AgentGraphInput } from "../server.js";
+import type { TurnInput } from "./types.js";
 import { SignJWT } from "jose";
 import { CALLER_IDENTITY_HEADER } from "../rbac/caller-identity-assertion.js";
 import { OpenWebUiForwardedUserResolver } from "../rbac/openwebui-forwarded-user-resolver.js";
@@ -14,8 +14,8 @@ import { createHmac } from "node:crypto";
 
 const BASE = "http://temporal-engine-gateway:8080";
 
-function input(overrides: Partial<AgentGraphInput> = {}): AgentGraphInput {
-  return { request: "what pods are running?", authToken: "caller-token", ...overrides };
+function input(overrides: Partial<TurnInput> = {}): TurnInput {
+  return { request: "what pods are running?", ...overrides };
 }
 
 /** Scripts the accept/poll pair: one POST /invoke, then the given GET responses in order. */
@@ -77,15 +77,15 @@ describe("TemporalEngine", () => {
   });
 
   // docs/adr/0052 §2: server.ts validates it; this hop must only not lose it.
-  it("passes a succeeded record's outcome through as agentOutcome", async () => {
+  it("passes a succeeded record's outcome through as runOutcome", async () => {
     const outcome = { pullRequest: { number: 12, url: "u" }, madeNewCommits: true };
     const { impl } = scriptedFetch([{ id: "x", status: "succeeded", result: "reviewed", outcome }]);
     const state = await new TemporalEngine({ baseUrl: BASE, fetchImpl: impl }).invoke(input());
     expect(state.result).toBe("reviewed");
-    expect(state.agentOutcome).toEqual(outcome);
+    expect(state.runOutcome).toEqual(outcome);
 
     const { impl: bare } = scriptedFetch([{ id: "x", status: "succeeded", result: "reviewed" }]);
-    expect(await new TemporalEngine({ baseUrl: BASE, fetchImpl: bare }).invoke(input())).not.toHaveProperty("agentOutcome");
+    expect(await new TemporalEngine({ baseUrl: BASE, fetchImpl: bare }).invoke(input())).not.toHaveProperty("runOutcome");
   });
 
   it("reports a failed turn as an error rather than an empty result", async () => {
@@ -112,6 +112,41 @@ describe("TemporalEngine", () => {
     const state = await engine.invoke(input());
     expect(state.pendingToolCalls).toEqual([{ id: "call_1", name: "web_search", arguments: '{"query":"x"}' }]);
     expect(state.result).toBeUndefined();
+  });
+
+  // docs/adr/0035: the engine's /invoke takes the resolved caller-tool
+  // definitions and prior client-executed calls; dropping either silently
+  // turns a tool-calling client into a plain chat.
+  it("forwards caller tools and prior caller-tool calls in the request body", async () => {
+    const { impl, calls } = scriptedFetch([{ id: "x", status: "succeeded", result: "ok" }]);
+    const engine = new TemporalEngine({ baseUrl: BASE, fetchImpl: impl });
+    const tool = { name: "get_weather", description: "Look up the weather", parametersJson: '{"type":"object"}', hash: "h1" };
+
+    await engine.invoke(
+      input({
+        callerTools: [tool],
+        callerToolChoiceRequired: true,
+        actionHistory: [{ toolId: "caller:get_weather", toolArgs: '{"city":"Oslo"}', result: "rain" }],
+      }),
+    );
+
+    const body = JSON.parse(String(calls[0]!.init?.body)) as Record<string, unknown>;
+    expect(body.callerTools).toEqual([tool]);
+    expect(body.callerToolRequired).toBe(true);
+    // The engine re-adds the `caller:` namespace itself, so it is stripped here.
+    expect(body.priorCallerToolCalls).toEqual([{ name: "get_weather", arguments: '{"city":"Oslo"}', result: "rain" }]);
+  });
+
+  it("sends no caller-tool fields for a turn without any", async () => {
+    const { impl, calls } = scriptedFetch([{ id: "x", status: "succeeded", result: "ok" }]);
+    const engine = new TemporalEngine({ baseUrl: BASE, fetchImpl: impl });
+
+    await engine.invoke(input());
+
+    const body = JSON.parse(String(calls[0]!.init?.body)) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("callerTools");
+    expect(body).not.toHaveProperty("callerToolRequired");
+    expect(body).not.toHaveProperty("priorCallerToolCalls");
   });
 
   // docs/event-triggers.md §5: the resolved turn crosses the hop as a signed
@@ -338,66 +373,6 @@ describe("TemporalEngine", () => {
     const engine = new TemporalEngine({ baseUrl: BASE, fetchImpl: impl });
 
     await expect(engine.invoke(input())).rejects.toThrow(/502/);
-  });
-
-  // The returned AsyncIterable itself still only ever yields one terminal
-  // update -- there are no LangGraph node transitions on this engine to
-  // report as separate updates. Live narration during the wait rides a
-  // different channel: progressListener, called as a side effect from
-  // poll() below, which is what a streaming caller's SSE writer actually
-  // listens to (see handleChatCompletionsStreaming).
-  it("streams a single terminal update", async () => {
-    const { impl } = scriptedFetch([{ id: "x", status: "succeeded", result: "done" }]);
-    const engine = new TemporalEngine({ baseUrl: BASE, fetchImpl: impl });
-
-    const updates: Record<string, unknown>[] = [];
-    for await (const update of await engine.stream(input(), { streamMode: "updates" })) {
-      updates.push(update);
-    }
-    expect(updates).toHaveLength(1);
-    expect(Object.values(updates[0]!)[0]).toMatchObject({ result: "done" });
-  });
-
-  // Regression: stream() used to `await this.invoke(input)` before returning
-  // the iterable, so its own Promise didn't settle until the whole turn had
-  // already finished. That left server.ts's withHeartbeat wrapper unable to
-  // do its job -- it can't race a source it doesn't have yet -- so a
-  // long-running turn's SSE connection had no keep-alive bytes at all and an
-  // idle-connection timeout upstream would cancel it even though the turn
-  // kept running server-side. stream() must resolve immediately; only
-  // iterating it should trigger the poll loop.
-  it("resolves the streamed iterable before the turn finishes polling", async () => {
-    let resolvePending!: () => void;
-    const pending = new Promise<void>((resolve) => {
-      resolvePending = resolve;
-    });
-    let released = false;
-    const impl = vi.fn(async (url: string | URL | Request) => {
-      const href = String(url);
-      if (href.endsWith("/invoke")) {
-        return new Response(JSON.stringify({ id: "x", status: "pending" }), { status: 202 });
-      }
-      await pending; // the turn "hangs" here until the test releases it
-      released = true;
-      return new Response(JSON.stringify({ id: "x", status: "succeeded", result: "done" }), { status: 200 });
-    }) as unknown as typeof fetch;
-    const engine = new TemporalEngine({ baseUrl: BASE, fetchImpl: impl });
-
-    const streamPromise = engine.stream(input(), { streamMode: "updates" });
-    const source = await Promise.race([
-      streamPromise,
-      new Promise((_, reject) => setTimeout(() => reject(new Error("stream() did not resolve promptly")), 50)),
-    ]);
-    expect(released).toBe(false); // the turn is still in-flight
-
-    const updates: Record<string, unknown>[] = [];
-    const drained = (async () => {
-      for await (const update of source as AsyncIterable<Record<string, unknown>>) updates.push(update);
-    })();
-    resolvePending();
-    await drained;
-    expect(updates).toHaveLength(1);
-    expect(Object.values(updates[0]!)[0]).toMatchObject({ result: "done" });
   });
 
   // Without this, a streaming chat caller on this engine saw nothing at all
@@ -651,7 +626,7 @@ describe("TemporalEngine", () => {
       expect(resolve).toHaveBeenCalledTimes(1);
     });
 
-    // Same refusal as the LangGraph engine's resolveIdentity. Before, an
+    // Refused rather than run as the shared bearer subject. Before, an
     // unverifiable JWT just dropped the header and the turn ran as the
     // gateway's shared bearer subject.
     it("refuses the turn, without reaching the engine, when the forwarded JWT does not verify", async () => {

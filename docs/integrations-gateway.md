@@ -245,7 +245,7 @@ turning a reply path into a new SSRF/exfil surface.
 | Concern | Reused as-is | New |
 | ------- | ------------ | --- |
 | Tool/Skill/Agent catalog, RBAC filtering | `Tool`/`Skill`/`Agent` CRs, `CrdToolRegistry`, `resolveIdentity` | — |
-| Skill retrieval, action planning | LangGraph graph, `VectorStore` | — |
+| Skill retrieval, action planning | Temporal engine agent loop | — |
 | Job launching, hardening | `ToolRun`/`AgentRun` + core-controller | — |
 | Container ↔ parent event protocol | `@aktis/messaging` (`Sink`, `CallbackSink`, `EventSchema`) | — |
 | Session continuity, continuation tokens | `SessionStore`, ADR 0012, ADR 0017 mechanism | New producer of `session_id` (external thread id) |

@@ -1,7 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { requireMinikubeContext } from "../support/guard.js";
 import { kubectl, kubectlJson } from "../support/k8s.js";
-import { deployedEngine } from "../support/engine.js";
 import {
   FIXTURE_LABEL,
   applyEventSource,
@@ -57,7 +56,7 @@ const EXAMPLE_TRIGGERS = [
   "nightly-stale-sweep",
 ];
 
-describe(`EventSource / EventTrigger status (engine: ${deployedEngine()})`, () => {
+describe("EventSource / EventTrigger status", () => {
   beforeAll(async () => {
     await ensureEventSecrets();
   });

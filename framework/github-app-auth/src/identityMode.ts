@@ -49,8 +49,7 @@ function isIdentityMode(value: string): value is IdentityMode {
  * token must not fall back to the App, whose reach is wider than the caller's.
  *
  * Not declared: a run no pre-flight decided — a nested sub-agent, the agent
- * behind an agent-backed tool, or anything the LangGraph engine launches —
- * keeps the pre-0049 inference. A caller token plus an App configuration is
+ * behind an agent-backed tool — keeps the pre-0049 inference. A caller token plus an App configuration is
  * `hybrid`, otherwise `agent`. That is exactly what the deleted
  * `GITHUB_IDENTITY_DELEGATION` flag gated: the charts set it only alongside
  * the `github` identity provider, and never wire a static PAT next to App

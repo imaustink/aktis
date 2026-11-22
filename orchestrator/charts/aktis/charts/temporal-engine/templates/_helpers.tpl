@@ -36,8 +36,7 @@ http://{{ .Release.Name }}-temporal-engine-gateway-callback.{{ .Release.Namespac
 Namespace the catalog-sync watches Corpus/KnowledgeBase CRs in. Precedence:
 knowledgeBases.namespace, then the umbrella chart's global.knowledgeBaseNamespace,
 then the catalog namespace (catalog.namespace, else the release namespace).
-Mirrors agent-orchestrator's KNOWLEDGE_BASE_NAMESPACE so both engines can read
-knowledge bases from a namespace of their own.
+Lets the engine read knowledge bases from a namespace of their own.
 */}}
 {{- define "temporal-engine.knowledgeBaseNamespace" -}}
 {{- $g := .Values.global | default dict -}}

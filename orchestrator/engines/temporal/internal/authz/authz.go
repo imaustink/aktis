@@ -1369,11 +1369,9 @@ func linkPromptText(started identitylink.StartResult, label string) string {
 // shape is the point: a caller authorizes once for everything the run needs
 // rather than discovering the next gap on the next trigger.
 //
-// Wording matches upstream's composeLinkRequiredMessage
-// (orchestrator/apps/agent-orchestrator/src/agent/authorization-service.ts) exactly,
-// including the "N accounts" count in the multi-link case — a caller-facing
-// string, not just an implementation detail, and one this port had drifted
-// from silently (no error, just different prose than upstream's).
+// Wording matches the retired TS engine's composeLinkRequiredMessage exactly
+// (docs/adr/0053), including the "N accounts" count in the multi-link case — a
+// caller-facing string, not just an implementation detail.
 func composeLinkRequired(pending []pendingEntry, failedToStart []string) string {
 	var parts []string
 

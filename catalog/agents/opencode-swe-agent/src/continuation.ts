@@ -1,10 +1,9 @@
 /**
  * Wire-level continuation marker (docs/adr/0017), matching the generic
- * `<!-- continuation: <token> -->` convention the orchestrator uses for
- * per-tool continuation tokens (orchestrator/apps/agent-orchestrator/src/continuation.ts).
- * For this agent, the orchestrator's `delegateToAgent` node prepends the
- * marker to the goal it hands a NEW AgentRun when the caller's session has a
- * saved token for this agent id — never to the chat transcript itself, so it
+ * `<!-- continuation: <token> -->` convention the engine uses for per-tool
+ * continuation tokens (orchestrator/engines/temporal/internal/continuation).
+ * For this agent, the engine prepends the marker to the goal it hands a NEW
+ * AgentRun when the conversation has a saved token for this agent id — never to the chat transcript itself, so it
  * never reaches the LLM planner (docs/security.md).
  *
  * Duplicated here rather than imported: this app ships as a standalone

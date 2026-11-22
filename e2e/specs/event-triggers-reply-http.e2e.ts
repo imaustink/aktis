@@ -2,7 +2,6 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { requireMinikubeContext } from "../support/guard.js";
 import { cleanupAgentRunsSince } from "../support/k8s.js";
 import { seedAllClaudeCredentials } from "../support/credential-store.js";
-import { deployedEngine } from "../support/engine.js";
 import {
   EVENT_SECRETS,
   applyEventTrigger,
@@ -67,7 +66,7 @@ const FIXTURE = "reply-http";
 /** The identity a sender-less source (slack, ci, generic-hmac, cron) runs as. */
 const SHARED_SUBJECT = "client-integration-gateway";
 
-describe(`reply.http from slack / ci / generic-hmac (engine: ${deployedEngine()})`, () => {
+describe("reply.http from slack / ci / generic-hmac", () => {
   let startedAt: Date;
   let replySecret: string;
 

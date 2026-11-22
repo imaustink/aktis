@@ -8,7 +8,8 @@ Proposed. Companion to [0049](0049-configurable-agent-identity-mode.md)
 (identity modes and the `agent-launch` audit record). Builds on the unified
 TurnEvent stream (Temporal engine [ADR 0004](../../orchestrator/engines/temporal/docs/adr/0004-unified-lifecycle-event-stream.md), carried in
 `framework/protocol/proto/aktis/protocol/v1/turn_event.proto`). Temporal
-engine only. The LangGraph engine is frozen (0049).
+engine only. The LangGraph engine was frozen (0049) and has since been removed
+([0053](0053-remove-langgraph-engine.md)).
 
 ## Context
 

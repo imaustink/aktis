@@ -21,17 +21,6 @@
 #
 # Idempotent: safe to re-run after a failure or a code change.
 #
-# ENGINE: E2E_ENGINE=temporal (default) or E2E_ENGINE=langgraph selects which
-# agent engine agent-orchestrator drives turns with (docs/adr/0036). The chart
-# and values-e2e.yaml deploy Temporal; for langgraph this script clears
-# agent-orchestrator.config.agentEngine on the release after skaffold deploys
-# it (temporal-engine stays deployed and idle -- the documented rollback shape).
-# Run the suite with the SAME E2E_ENGINE: e2e/support/engine.ts refuses to run
-# against a cluster serving the other one.
-#
-#   E2E_ENGINE=langgraph ./e2e/scripts/up.sh
-#   E2E_ENGINE=langgraph npm run e2e -w e2e
-#
 # E2E_SKIP_WEB_FETCH_BUILD=1 skips building the web-fetch Tool image (see below).
 
 set -euo pipefail
@@ -39,14 +28,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 NS="controller-agent"
 CTX="minikube"
-ENGINE="${E2E_ENGINE:-temporal}"
 
 step() { echo ""; echo "▶ $*"; }
-
-if [[ "$ENGINE" != "temporal" && "$ENGINE" != "langgraph" ]]; then
-  echo "✗ E2E_ENGINE must be 'temporal' or 'langgraph', got '$ENGINE'." >&2
-  exit 1
-fi
 
 CURRENT="$(kubectl config current-context 2>/dev/null || true)"
 if [[ "$CURRENT" != "$CTX" ]]; then
@@ -80,9 +63,8 @@ step "Creating throwaway secrets..."
 "$REPO_ROOT/e2e/scripts/bootstrap-secrets.sh"
 
 step "Deploying the Temporal dev server (e2e/manifests/temporal-dev-server.yaml)..."
-# The chart defaults `temporal-engine.enabled: true` +
-# `agent-orchestrator.config.agentEngine: temporal` (docs/adr/0036), so every
-# turn now routes through the Temporal engine's worker/gateway -- but no
+# Every turn routes through the Temporal engine's worker/gateway
+# (docs/adr/0036, 0053) -- but no
 # subchart bundles an actual Temporal server. Without one reachable BEFORE the
 # release below, the worker/gateway Pods crashloop on their first connection
 # attempt and every agent turn in the suite hangs. Applied idempotently, same
@@ -168,27 +150,6 @@ step "Applying the example EventSources/EventTriggers..."
 kubectl apply -n "$NS" -k "$REPO_ROOT/e2e/manifests/event-triggers" >/dev/null
 echo "  ✓ e2e/manifests/event-triggers"
 
-step "Selecting the agent engine: $ENGINE..."
-# skaffold just (re)applied values-e2e.yaml, which deploys Temporal -- so a
-# temporal run needs nothing here, and re-running up.sh without E2E_ENGINE
-# always puts a langgraph cluster back on Temporal.
-if [[ "$ENGINE" == "langgraph" ]]; then
-  # --reuse-values keeps every value skaffold set (image tags included);
-  # an empty agentEngine leaves AGENT_ENGINE unset, which IS LangGraph
-  # (orchestrator/charts/aktis/values.yaml "TO ROLL BACK").
-  helm -n "$NS" upgrade agent-controller "$REPO_ROOT/charts/aktis" \
-    --reuse-values --set-string agent-orchestrator.config.agentEngine= >/dev/null
-  kubectl -n "$NS" rollout status deploy/agent-orchestrator --timeout=300s >/dev/null
-fi
-DEPLOYED_ENGINE="$(kubectl -n "$NS" get deploy agent-orchestrator \
-  -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="AGENT_ENGINE")].value}')"
-[[ "$DEPLOYED_ENGINE" == "temporal" ]] && DEPLOYED_ENGINE=temporal || DEPLOYED_ENGINE=langgraph
-if [[ "$DEPLOYED_ENGINE" != "$ENGINE" ]]; then
-  echo "✗ asked for $ENGINE but agent-orchestrator runs $DEPLOYED_ENGINE." >&2
-  exit 1
-fi
-echo "  ✓ agent-orchestrator runs $ENGINE"
-
 step "Restarting integration-gateway to re-read its webhook secrets..."
 # bootstrap-secrets.sh regenerates GITHUB_WEBHOOK_SECRET on every run, and the
 # gateway now reads EventSource secrets through the API rather than from env.
@@ -251,5 +212,5 @@ kubectl -n "$NS" wait --for=condition=Available --timeout=300s \
   deploy/agent-orchestrator deploy/agent-controller-integration-gateway
 
 echo ""
-echo "✓ e2e stack is up ($ENGINE engine). Run the suite with:"
-echo "    E2E_ENGINE=$ENGINE npm run e2e -w e2e"
+echo "✓ e2e stack is up. Run the suite with:"
+echo "    npm run e2e -w e2e"

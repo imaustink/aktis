@@ -11,9 +11,9 @@ import (
 	"github.com/aktisai/orchestrator/engines/temporal/internal/llm"
 )
 
-// Activity names for the agent loop's LLM decision nodes — ports of
-// Aktis's capability-need-checker, skill-fit-checker,
-// skill-selector, action-planner, and response-composer.
+// Activity names for the agent loop's LLM decision nodes: capability-need
+// check, skill/tool fit checks, skill selection, action planning and response
+// composition.
 const (
 	CheckNeedsCapabilityActivityName = "CheckNeedsCapability"
 	CheckSkillFitActivityName        = "CheckSkillFit"

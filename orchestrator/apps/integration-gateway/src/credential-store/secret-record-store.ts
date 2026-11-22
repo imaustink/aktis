@@ -45,9 +45,7 @@ interface SecretLike {
 
 /**
  * The slice of `CoreV1Api` this store uses, named structurally rather than
- * imported as a class -- same approach as agent-orchestrator's `SecretApiLike`
- * (orchestrator/apps/agent-orchestrator/src/k8s/agentrun-launcher.ts), and for the same two
- * reasons: it documents exactly which API verbs the RBAC Role has to grant, and
+ * imported as a class, for two reasons: it documents exactly which API verbs the RBAC Role has to grant, and
  * it makes a test double an object literal rather than a mocked module.
  */
 export interface SecretApiLike {
@@ -273,8 +271,7 @@ export class SecretRecordStore {
    *
    * Create-then-replace-on-conflict rather than a server-side apply: the
    * install base spans client-node majors whose patch content-type defaults
-   * differ (the same trap documented at length in `agentrun-launcher.ts`'s
-   * ownerReference patch), and create/replace behaves identically on all of
+   * differ), and create/replace behaves identically on all of
    * them.
    */
   async put(key: string, fields: Record<string, string>, extraLabels: Record<string, string> = {}): Promise<void> {

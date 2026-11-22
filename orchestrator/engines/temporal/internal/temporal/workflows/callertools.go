@@ -59,7 +59,7 @@ func lastHistoryResult(history []activities.ActionRecord) string {
 // a Tool CR through this branch either.
 //
 // A non-nil error means the tool WAS found but its arguments are malformed
-// (upstream's callerToolArguments, graph.ts:805-820) — that fails the whole
+// — that fails the whole
 // turn rather than forwarding a call the caller's own client can't parse.
 func pendingCallerCall(
 	ctx workflow.Context,
@@ -96,8 +96,7 @@ func pendingCallerCall(
 }
 
 // callerToolArguments validates the planner's tool_args as the JSON-object
-// arguments a caller tool needs (upstream ADR 0035, graph.ts's
-// callerToolArguments). Every other dispatch kind takes a plain string
+// arguments a caller tool needs (ADR 0035). Every other dispatch kind takes a plain string
 // argument; this is the one place the planner's output has a structural
 // contract beyond "a string".
 //

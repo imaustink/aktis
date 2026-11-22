@@ -176,10 +176,10 @@ temporal-engine:
 
 agent-orchestrator:
   config:
-    agentEngine: temporal                         # 2. route turns to it
+    temporalEngineUrl: http://agent-controller-temporal-engine-gateway:8080  # 2. where turns go
 ```
 
-Step 1 alone changes no behaviour. Assumes a reachable Temporal cluster; no
+Both are required: agent-orchestrator has no other agent loop (ADR 0053). Assumes a reachable Temporal cluster; no
 server is bundled, so enabling this adds no stateful component.
 
 Consumers keep talking to agent-orchestrator either way — its OpenAI facade,

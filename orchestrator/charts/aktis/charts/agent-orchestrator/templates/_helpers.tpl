@@ -61,23 +61,11 @@ Name of the ServiceAccount to use.
 {{- end }}
 
 {{/*
-Namespace tools are discovered in / Jobs are launched into. Defaults to the
-release namespace when not explicitly set.
+Namespace the EventTrigger CRs are read from (AGENT_NAMESPACE). Defaults to
+the release namespace when not explicitly set.
 */}}
 {{- define "agent-orchestrator.toolNamespace" -}}
 {{- default .Release.Namespace .Values.namespace }}
-{{- end }}
-
-{{/*
-In-cluster callback base URL, used as AGENT_CALLBACK_BASE_URL when
-config.callbackBaseUrl is left empty.
-*/}}
-{{- define "agent-orchestrator.callbackBaseUrl" -}}
-{{- if .Values.config.callbackBaseUrl }}
-{{- .Values.config.callbackBaseUrl }}
-{{- else }}
-{{- printf "http://%s-callback.%s.svc.cluster.local:%d" (include "agent-orchestrator.fullname" .) .Release.Namespace (.Values.ports.callback | int) }}
-{{- end }}
 {{- end }}
 
 {{/*
@@ -103,27 +91,6 @@ Otherwise use config.qdrantUrl as-is (an existing/external instance).
 {{- end }}
 
 {{/*
-NATS URL: when nats.enabled, derive the in-cluster Service DNS name for the
-bundled subchart (same fullname pattern as qdrant: release name as-is if it
-already contains "nats", else "<release>-nats"; client port 4222). Otherwise
-use config.natsUrl as-is (an existing/external server).
-*/}}
-{{- define "agent-orchestrator.natsUrl" -}}
-{{- if .Values.nats.enabled }}
-{{- $name := "nats" }}
-{{- $fullname := "" }}
-{{- if contains $name .Release.Name }}
-{{- $fullname = .Release.Name }}
-{{- else }}
-{{- $fullname = printf "%s-%s" .Release.Name $name }}
-{{- end }}
-{{- printf "nats://%s.%s.svc.cluster.local:4222" $fullname .Release.Namespace }}
-{{- else }}
-{{- .Values.config.natsUrl }}
-{{- end }}
-{{- end }}
-
-{{/*
 Redis URL: when redis.enabled, derive the in-cluster Service DNS name for the
 custom Redis Deployment + Service created by templates/redis.yaml. The Service
 is named "<fullname>-redis" (using fullnameOverride when set, so it stays
@@ -136,17 +103,6 @@ stable regardless of release name). Otherwise use config.redisUrl as-is.
 {{- .Values.config.redisUrl }}
 {{- end }}
 {{- end }}
-
-{{/*
-Namespace the orchestrator reads KnowledgeBase/Corpus CRs from. Precedence:
-knowledgeBases.namespace, then the umbrella chart's global.knowledgeBaseNamespace,
-then toolNamespace. Separate from toolNamespace so knowledge bases can live in
-their own namespace while tools/agents and Jobs stay where they are.
-*/}}
-{{- define "agent-orchestrator.knowledgeBaseNamespace" -}}
-{{- $g := .Values.global | default dict -}}
-{{- .Values.knowledgeBases.namespace | default $g.knowledgeBaseNamespace | default (include "agent-orchestrator.toolNamespace" .) -}}
-{{- end -}}
 
 {{/*
 OpenTelemetry export (docs/adr/0050 §4): on when the umbrella chart's

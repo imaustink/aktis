@@ -1,7 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { requireMinikubeContext } from "../support/guard.js";
 import { cleanupAgentRunsSince } from "../support/k8s.js";
-import { deployedEngine } from "../support/engine.js";
 import {
   applyEventTrigger,
   deleteEventFixtures,
@@ -47,7 +46,7 @@ const caseEnvelope = (c: string, extra: Record<string, unknown> = {}) =>
 /** A turn that costs one short planner call and touches nothing. */
 const CHEAP_TARGET = { orchestrator: {}, promptTemplate: "Reply with the single word OK." };
 
-describe(`POST /invoke with an event envelope (engine: ${deployedEngine()})`, () => {
+describe("POST /invoke with an event envelope", () => {
   let startedAt: Date;
 
   beforeAll(async () => {

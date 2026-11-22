@@ -20,8 +20,8 @@ export const STUB_REPLY_MARKER = "stub-agent-reply";
  * base image happens to set, and could match a real secret the list never meant
  * to name.
  *
- * Kept in sync by hand with `PROVIDER_ENV_VAR` and `ACTOR_LOGIN_ENV` in
- * orchestrator/apps/agent-orchestrator/src/agent/graph.ts. A name that drifts shows up as a
+ * Kept in sync by hand with `ProviderEnvVar` and `ActorLoginEnv` in
+ * orchestrator/engines/temporal/internal/authz/authz.go. A name that drifts shows up as a
  * missing entry in the reply, not as a silent pass.
  */
 export const CREDENTIAL_ENV_NAMES = [

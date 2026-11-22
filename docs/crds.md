@@ -33,7 +33,7 @@ usually operator-authored but is also **derived** from each `KnowledgeBase`.
 | [Tool](#tool) | A catalog capability: a container Job or an agent-backed tool | operator | tool_controller + orchestrator | [0010](adr/0010-crd-catalog-and-tool-controller.md) |
 | [LocalTool](#localtool) | A catalog tool run as packaged code in an in-pod sidecar | operator | localtool_controller + orchestrator | [0014](adr/0014-local-tool-sidecar-execution.md) |
 | [ToolRun](#toolrun) | One tool invocation → a Job | system (orchestrator) | toolrun_controller | [0010](adr/0010-crd-catalog-and-tool-controller.md) |
-| [Agent](#agent) | A full agent loop launched as a Job | operator | agent_controller + orchestrator | [0002](adr/0002-langgraph-agent-loop.md) |
+| [Agent](#agent) | A full agent loop launched as a Job | operator | agent_controller + orchestrator | [0036](adr/0036-temporal-execution-engine.md) |
 | [AgentRun](#agentrun) | One agent invocation → a Job | system (orchestrator) | agentrun_controller | [0021](adr/0021-skill-agent-refs.md) |
 | [Skill](#skill) | Trusted markdown + an allowed tool/agent set | operator (or derived) | skill_controller + orchestrator | [0008](adr/0008-skill-mediated-tool-retrieval.md) |
 | [Connection](#connection) | An authenticated route to one external system | operator | connection_controller + connection-broker | [0043](adr/0043-connection-corpus-knowledgebase.md) |
@@ -112,7 +112,7 @@ former JS `manifest.json` ([ADR 0009](adr/0009-static-build-time-tool-manifests.
   - `image` + `serviceAccountName` (string) — container launch target (the SA must pre-exist).
   - `args` / `env` / `secretEnv` / `resources` / `timeoutSeconds` — Job container config; `secretEnv` sources from Secret keys, never literals.
   - `identityProviders` ([]string) — `IdentityProvider` CRs the caller must have linked.
-  - `defaultIdentity` (enum `agent;delegated`, default `delegated`) — whose credential a call presents on its resource providers: the caller's link, or each provider's `agentCredential` ([ADR 0049](adr/0049-configurable-agent-identity-mode.md) step 5). Temporal engine only; LangGraph refuses `agent`.
+  - `defaultIdentity` (enum `agent;delegated`, default `delegated`) — whose credential a call presents on its resource providers: the caller's link, or each provider's `agentCredential` ([ADR 0049](adr/0049-configurable-agent-identity-mode.md) step 5).
   - **CEL:** exactly one of `agentRef` **or** (`image` **and** `serviceAccountName`); `defaultIdentity` not with `agentRef`.
 - **Status:** `Ready` condition.
 - **Referenced by:** `Skill.toolRefs`, `Agent.toolRefs`, `EventTrigger.target.toolRef`, `ToolRun.toolRef`.

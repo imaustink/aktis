@@ -14,8 +14,8 @@ package executor
 
 import "encoding/json"
 
-// RunRequest is the POST /run body — mirrors the orchestrator's
-// LocalToolRunRequest (orchestrator/apps/agent-orchestrator/src/local/local-tool-executor.ts).
+// RunRequest is the POST /run body — mirrors the engine's RunRequest
+// (orchestrator/engines/temporal/internal/localtool/executor.go).
 type RunRequest struct {
 	Runtime        string            `json:"runtime"`
 	Package        string            `json:"package,omitempty"`

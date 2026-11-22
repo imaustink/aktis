@@ -135,8 +135,7 @@ func hasOutOfScopeToolMatch(ctx workflow.Context, actx workflow.Context, in Turn
 // + request into a concrete call, and neither may trust a hallucinated id.
 //
 // Caller-supplied tools (ADR 0035) are appended to the candidate list
-// UNFILTERED by the fit check (upstream's selectFallbackTool, graph.ts:
-// 1162-1196): that gate exists because a catalog-wide embedding search
+// UNFILTERED by the fit check: that gate exists because a catalog-wide embedding search
 // surfaces loose keyword overlap the caller never asked about, whereas a
 // caller tool was explicitly supplied for this very conversation and was
 // already relevance-ranked by the caller offering it.
@@ -303,10 +302,9 @@ func runToolCall(
 		return "I couldn't complete that: " + tool.ID + " failed (" + outcome.ErrorCode + ": " + outcome.ErrorMessage + ")." + footer, *meta, nil
 	}
 
-	// No compose step here: upstream's composeResponse no-ops without a
-	// selectedSkill (graph.ts:2058), which neither the fallback-tool nor the
-	// first-class tool path ever sets — so TS never lets an LLM add
-	// prefix/suffix narration around this result. Only the raw result plus
+	// No compose step here: composition needs a selected skill, which neither
+	// the fallback-tool nor the first-class tool path ever sets — so no LLM
+	// adds prefix/suffix narration around this result. Only the raw result plus
 	// whichever footer the caller chose (SelfImprovementFooter for the
 	// fallback path, none for the first-class one).
 	return outcome.Result + footer, *meta, nil

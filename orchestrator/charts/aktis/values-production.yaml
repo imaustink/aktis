@@ -87,17 +87,11 @@ agent-orchestrator:
     connectionsUrl: "https://gateway.kurpuis.com/connections"
 
   config:
-    # Every turn runs on the Temporal engine (docs/adr/0036): the orchestrator
-    # keeps /invoke, identity, RBAC and credentials, and forwards the agent loop
-    # to the temporal-engine gateway below. Both keys restate the umbrella
-    # chart's defaults on purpose, so the engine this cluster runs is readable
+    # Every turn runs on the Temporal engine (docs/adr/0036, 0053): the
+    # orchestrator keeps /invoke and identity forwarding, and sends the agent
+    # loop to the temporal-engine gateway below. Restates the umbrella
+    # chart's default on purpose, so the gateway this cluster uses is readable
     # here.
-    #
-    # TO ROLL BACK to the in-process LangGraph loop: set both to "". Helm
-    # deep-merges this map against the chart default, so deleting the keys
-    # would keep "temporal". temporal-engine.enabled can stay true; idle, it
-    # costs three small pods.
-    agentEngine: temporal
     temporalEngineUrl: "http://agent-controller-temporal-engine-gateway:8080"
     # oidc against Pocket ID (kubernetes/manifests/services/pocket-id in
     # imaustink/homelab), not Google -- the 2026-07-19 outage was caused by
@@ -154,45 +148,10 @@ agent-orchestrator:
 
   # Bundled Qdrant vector store (github.com/qdrant/qdrant-helm). No external
   # Qdrant exists in this cluster, so this single-replica dev/demo instance
-  # backs the RAG tool/skill selection. See charts/agent-orchestrator's
+  # backs both the temporal-engine's catalog index and the orchestrator's
+  # caller-tool index. See charts/agent-orchestrator's
   # values.yaml for the production caveats (no backup/DR story).
   qdrant:
-    enabled: true
-
-  # The orchestrator unconditionally lists LocalTool CRs at startup even
-  # though no LocalTool CRs are deployed by community-components today, so
-  # the Role needs the `localtools` grant that only ships when this is
-  # enabled (see charts/agent-orchestrator/templates/rbac.yaml).
-  #
-  # Executor sidecars for all 4 runtimes: this repo's release.yml CI
-  # builds+pushes ghcr.io/imaustink/agent-controller/localtool-executor-<runtime> on
-  # every merge to main, so point the chart's default `<runtime>:latest`
-  # images at those public GHCR packages instead of leaving runtimes empty.
-  # Requires unprivileged user namespaces enabled on every node (bubblewrap
-  # per-invocation sandboxing, see charts/agent-orchestrator's own
-  # values.yaml comment + docs/adr/0014) — the sidecar's
-  # securityContext.seccompProfile is Unconfined by chart default for
-  # exactly this reason.
-  localTool:
-    enabled: true
-    runtimes:
-      - name: node
-        image: ghcr.io/imaustink/agent-controller/localtool-executor-node:latest
-      - name: python
-        image: ghcr.io/imaustink/agent-controller/localtool-executor-python:latest
-      - name: go
-        image: ghcr.io/imaustink/agent-controller/localtool-executor-go:latest
-      - name: shell
-        image: ghcr.io/imaustink/agent-controller/localtool-executor-shell:latest
-    pullPolicy: Always
-
-  # Agent delegation (Agent CRs, e.g. opencode-swe-agent) only runs over NATS
-  # (ADR 0010/0017) -- without this, AGENT_NATS_URL is never set on the
-  # orchestrator and it silently degrades to skills-only: no "agents" Qdrant
-  # collection ever gets created, so it never finds an Agent CR to delegate
-  # to. The umbrella chart's top-level `nats.enabled` below deploys the NATS
-  # server itself; this just tells the orchestrator to use it.
-  nats:
     enabled: true
 
   # Conversation sessions (docs/adr/0016) and integration-gateway's session
@@ -534,8 +493,7 @@ integration-gateway:
       issuer: "https://pocket-id.kurpuis.com"
       clientId: "agent-connections"
 
-  # GitHub must reach this Service directly (unlike the orchestrator's
-  # in-cluster-only callback port).
+  # GitHub must reach this Service directly.
   ingress:
     enabled: true
     className: traefik
@@ -738,9 +696,9 @@ openwebui:
           name: agent-controller-openwebui-postgres-app
           key: password
 
-# Bundled NATS server (nats subchart) backing agent delegation's result
-# channel (agent-orchestrator.nats.enabled + core-controller.nats.agentUrl
-# above both depend on this actually running). Pinning explicitly rather
+# Bundled NATS server (nats subchart) backing agent delegation's channel
+# (the temporal-engine and core-controller.nats.agentUrl above both depend on
+# this actually running). Pinning explicitly rather
 # than relying on Helm's implicit "enabled if condition path is unset"
 # fallback, which is what let this stay on accidentally with no NATS wiring
 # actually pointed at it.

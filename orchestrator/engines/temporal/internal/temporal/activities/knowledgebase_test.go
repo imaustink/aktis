@@ -227,7 +227,7 @@ func TestSearchStartsLinksAndRendersClickablePrompts(t *testing.T) {
 	require.True(t, out.NeedsLink)
 	require.Equal(t, []string{"atlassian", "google"}, out.LinkProviders)
 	// The dead-end sentence now carries a clickable link per provider — the whole
-	// point of this fix for the Temporal engine (bitovi runs AGENT_ENGINE=temporal).
+	// point of this fix for the Temporal engine (the only engine, docs/adr/0053).
 	require.Contains(t, out.Result, "[link your atlassian account](https://example.invalid/link/atlassian)")
 	require.Contains(t, out.Result, "[link your google account](https://example.invalid/link/google)")
 	require.Contains(t, out.Result, "ask again")
@@ -236,7 +236,7 @@ func TestSearchStartsLinksAndRendersClickablePrompts(t *testing.T) {
 
 // With the Connections page configured, a chat caller gets ONE link naming
 // every missing source, and nothing is started at a provider (agent-controller
-// ADR 0046). PARITY: knowledgeBaseLinkPrompt in graph.ts.
+// ADR 0046).
 func TestSearchOffersOneConnectionsLinkForEveryMissingSource(t *testing.T) {
 	links, err := identitylink.NewFake("", "")
 	require.NoError(t, err)

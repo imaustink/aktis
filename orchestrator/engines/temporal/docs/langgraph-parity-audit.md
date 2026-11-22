@@ -1,5 +1,10 @@
 # LangGraph → Temporal parity audit
 
+> **Historical (2026-11-21).** The LangGraph engine and the `AGENT_ENGINE`
+> switch this document refers to were removed by
+> [ADR 0053](../../../../docs/adr/0053-remove-langgraph-engine.md). Kept as a
+> record; it no longer describes a live option.
+
 > Status: findings 2026-08-29, fix pass authorized 2026-08-29. Follow-on to
 > [upstream-catchup-plan.md](upstream-catchup-plan.md), which landed
 > workstreams A1–A9 and B1–B7 (the `AGENT_ENGINE` switch is now default

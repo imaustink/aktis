@@ -19,7 +19,6 @@ import {
   seedGithubLink,
 } from "../support/credential-store.js";
 import { deleteRedisKeys } from "../support/redis.js";
-import { isTemporal } from "../support/engine.js";
 import { bounceRedis } from "../support/resilience.js";
 import { issueLabeledPayload, postGithubWebhook } from "../support/webhook.js";
 import { fakeGithubRequests, resetFakeGithub, webhookSecret } from "../support/fixtures.js";
@@ -351,11 +350,8 @@ describe("chat and triage converge on one credential (ADR 0031)", () => {
     await expectCredentialAgent(startedAt, "an AgentRun launched from a stale-link caller's principal");
   });
 
-  // Temporal-only: this pins the Temporal port's own resume fix (re-check the
-  // SAME flow, poll on resume). On LangGraph the resume parks instead -- the
-  // orchestrator's long-poll to the gateway's /identity-link/github/wait ends
-  // in "fetch failed" -- an open LangGraph gap that predates event triggers.
-  it.skipIf(!isTemporal())("resumes a device-flow link by redeeming the SAME code instead of starting a new one", async () => {
+  // Pins the engine's resume fix: re-check the SAME flow, poll on resume.
+  it("resumes a device-flow link by redeeming the SAME code instead of starting a new one", async () => {
     // The reported bug, reproduced: a caller with no live channel gets the
     // DEVICE flow (a code to enter wherever they are), and "send any message
     // once you're done" is what resumes it. Two things had to be true for
@@ -602,8 +598,8 @@ describe("linked credentials survive a Redis restart (ADR 0034)", () => {
  * takes the chart's DEFAULT resources -- the same ones production was running --
  * and `claudeAuth.enabled` means the flows spawn real `claude` processes. So two
  * PTYs really do have to coexist here, and if the limit is ever squeezed back to
- * where one of them cannot start, this fails. The unit tests
- * (authorization-service.test.ts) cover the retry and the wording; only this
+ * where one of them cannot start, this fails. The engine's unit tests
+ * (internal/authz) cover the retry and the wording; only this
  * covers whether the environment can actually do it.
  *
  * Asserts on the POSTED COMMENT rather than a log line: what went wrong was what

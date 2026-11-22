@@ -15,7 +15,7 @@ import (
 
 // The shared cross-engine CEL-parity suite (docs/event-triggers.md §3–§4).
 // The SAME file runs in @aktis/event-triggers' tests against the
-// JS evaluator; both engines must produce every listed verdict/value, or one
+// JS evaluator; both evaluators must produce every listed verdict/value, or one
 // of them disagrees with the contract.
 
 type typedValue struct {

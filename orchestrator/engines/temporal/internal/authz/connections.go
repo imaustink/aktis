@@ -14,8 +14,7 @@ const connectionsLinkTTLSeconds = 10 * 60
 
 // UsesConnectionsPage reports whether integration-gateway's Connections page
 // (Aktis docs/adr/0046) stands in for a provider's own link flow for
-// this caller. PARITY: usesConnectionsPage in agent-orchestrator's
-// authorization-service.ts.
+// this caller.
 //
 // Only an Open WebUI chat caller qualifies: the page finds whose credentials to
 // manage by mapping its sign-in back to an `openwebui:<id>` subject, so a
@@ -53,7 +52,6 @@ func ConnectionsPageStart(connectionsURL string, providers []string) (identityli
 
 // ConnectionsLinkText is the prompt clause for a Connections-page link: the
 // ordinary wording for one provider, or one link naming all of them.
-// PARITY: connectionsLinkText in authorization-service.ts.
 func ConnectionsLinkText(started identitylink.StartResult, labels []string) string {
 	if len(labels) <= 1 {
 		return linkPromptText(started, strings.Join(labels, ""))

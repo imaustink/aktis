@@ -105,8 +105,7 @@ spec:
                   resolve the same way in every mode. Unset infers the pre-0049
                   behaviour: hybrid when "github" is declared, agent otherwise. An
                   EventTrigger's target.identity may override it within
-                  allowedIdentities. Honoured by the Temporal engine only; the LangGraph
-                  engine refuses a launch that sets it.
+                  allowedIdentities.
                 enum:
                 - agent
                 - delegated

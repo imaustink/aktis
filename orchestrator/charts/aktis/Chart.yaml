@@ -53,11 +53,10 @@ dependencies:
     version: "0.1.1"
     repository: "file://charts/core-controller"
     condition: core-controller.enabled
-  # The Temporal-workflow agent engine (orchestrator/engines/temporal), docs/adr/0036. ON,
-  # and paired with agent-orchestrator.config.agentEngine=temporal in values --
-  # deploying the subchart is only half the switch, since the orchestrator
-  # picks its loop independently. Takes a Temporal address rather than bundling
-  # a server, so it adds no stateful component.
+  # The Temporal-workflow agent engine (orchestrator/engines/temporal), docs/adr/0036.
+  # Required: agent-orchestrator forwards every turn to its gateway (the
+  # in-process LangGraph loop was removed, docs/adr/0053). Takes a Temporal
+  # address rather than bundling a server, so it adds no stateful component.
   - name: temporal-engine
     version: "0.2.1"
     repository: "file://charts/temporal-engine"
@@ -82,12 +81,8 @@ dependencies:
     version: "15.2.0"
     repository: https://helm.openwebui.com/
     condition: openwebui.enabled
-  # Optional NATS JetStream server for the queue-based tool-result channel.
-  # When nats.enabled=true the orchestrator deployment gets AGENT_NATS_URL
-  # pointing at this instance; tools publish their results via NatsSink and
-  # the orchestrator subscribes via NatsJobReceiver, replacing the HTTP
-  # callback Service on port 8080.  Off by default -- the HTTP callback path
-  # remains the backward-compatible default when this is disabled.
+  # Optional NATS JetStream server: the channel between the temporal-engine
+  # and delegated agent pods (and tools' NatsSink results).
   # Official chart: https://github.com/nats-io/k8s/tree/main/helm/charts/nats
   - name: nats
     version: "2.14.2"

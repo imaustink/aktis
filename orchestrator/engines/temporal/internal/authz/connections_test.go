@@ -16,7 +16,7 @@ import (
 // own link flow for chat callers, and only for them: one link per turn that
 // covers every missing provider, with every invariant a direct link has. The
 // principal still goes first, and each provider is anchored against the exact
-// subject it was read under. PARITY: authorization-service.test.ts.
+// subject it was read under.
 
 const connectionsPage = "https://gw.example/connections"
 

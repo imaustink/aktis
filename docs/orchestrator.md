@@ -2,7 +2,18 @@
 
 > **Status:** first implementation exists at
 > [orchestrator/apps/agent-orchestrator/](../orchestrator/apps/agent-orchestrator/) (see its README for
-> what's implemented vs. still a known gap). This document describes the
+> what's implemented vs. still a known gap).
+>
+> **The agent loop now runs in the Temporal engine**
+> ([orchestrator/engines/temporal](../orchestrator/engines/temporal/),
+> [ADR 0036](adr/0036-temporal-execution-engine.md)). The in-process LangGraph.js
+> loop described in component 1 was removed by
+> [ADR 0053](adr/0053-remove-langgraph-engine.md). agent-orchestrator keeps
+> the consumer-facing interfaces and identity, and forwards each turn to the
+> engine's gateway. The steps below (skills, RAG, planning, Job launch) are
+> what the engine's workflow does.
+>
+> This document describes the
 > target architecture referenced throughout [README.md](../README.md),
 > [messaging.md](messaging.md), and [security.md](security.md). See
 > [docs/adr/](adr/) for the individual decisions and their rationale/alternatives.
@@ -43,7 +54,7 @@ sequenceDiagram
     O->>O: conversation has an active skill? fit-check it (ADR 0012) — on fit, skip the two retrieval steps below
     O->>R: similarity search(query embedding, filter: role ∈ allowed_roles) [skills collection]
     R-->>O: ranked candidate skills (only ones caller may use)
-    O->>O: LangGraph step picks a skill, resolves its declared tool ids
+    O->>O: agent loop picks a skill, resolves its declared tool ids
     O->>O: action-planner (skill markdown as system prompt) decides: respond, or call one of the skill's tools
     O->>K: create Job (tool image, args, callback URL, resource limits) — only if a tool was chosen
     K-->>T: schedule + start container
@@ -63,9 +74,15 @@ than the callback receiver.
 
 ## Components
 
-### 1. Agent core — LangGraph.js
+### 1. Agent core
 
-The reasoning loop is a LangGraph.js graph, not a hand-rolled loop:
+> Originally a LangGraph.js graph ([ADR 0002](adr/0002-langgraph-agent-loop.md)).
+> It is now a Temporal workflow in
+> [orchestrator/engines/temporal](../orchestrator/engines/temporal/)
+> ([ADR 0036](adr/0036-temporal-execution-engine.md),
+> [0053](adr/0053-remove-langgraph-engine.md)). The steps are the same.
+
+The reasoning loop runs these steps:
 
 - Nodes (ADR 0008, 0012): resolve-identity → check-active-skill (session
   continuity — skipped straight past when the conversation has no active
@@ -104,7 +121,7 @@ tools:
 - **Skills carry no `allowedRoles` of their own** (ADR 0011 — skills aren't
   dangerous, tools are): a skill's retrieval audience is *derived* at index
   time as the intersection of its tools' `allowedRoles`
-  (`src/skills/derive-access.ts`). A caller sees a skill iff they can use
+  (`orchestrator/engines/temporal/internal/catalog`). A caller sees a skill iff they can use
   every tool it declares; a tool-less skill is visible to any caller with a
   resolved identity; a missing/disjoint tool reference fails closed (skill
   visible to no one, logged at startup).
@@ -246,12 +263,9 @@ How a caller actually reaches the agent (ADR 0006):
 A second, thin translation layer on the same port as component 6 (ADR 0007):
 `GET /v1/models` and `POST /v1/chat/completions` let any OpenAI-API-compatible
 chat client (e.g. Open WebUI) call the agent as if it were a chat model,
-without changing the agent graph itself. Streaming (`stream: true`) narrates
-LangGraph node transitions (`resolveIdentity → checkActiveSkill →
-retrieveSkills → selectSkill → loadSkillTools → planAction → runTool →
-composeResponse`) as
-chat deltas via `stream(..., { streamMode: "updates" })`, with
-an SSE heartbeat filling the gap while `runTool` blocks on the tool Job;
+without changing the agent loop itself. Streaming (`stream: true`) relays the
+engine's progress narration as chat deltas, with an SSE heartbeat filling the
+gap while a tool Job runs;
 non-streaming blocks like a plain `/invoke` call would. See ADR 0007 for why
 this needed resolving rather than being a drop-in: no multi-turn memory, no
 tool-internal progress, structured JSON rendered as a fenced code block, and

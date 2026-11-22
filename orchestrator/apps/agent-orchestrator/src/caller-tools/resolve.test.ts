@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { makeCallerTool } from "./parse.js";
-import { resolveCallerTools, toCallerToolDescriptor } from "./resolve.js";
+import { resolveCallerTools } from "./resolve.js";
 import type { CallerToolStore } from "./types.js";
 
 const tools = Array.from({ length: 8 }, (_, i) => makeCallerTool(`tool_${i}`, `does thing ${i}`, { type: "object" }));
@@ -77,26 +77,5 @@ describe("resolveCallerTools", () => {
 
   it("returns nothing for an empty tool list", async () => {
     expect(await resolveCallerTools("q", [], { kind: "auto" }, 5, fakeStore())).toEqual([]);
-  });
-});
-
-describe("toCallerToolDescriptor", () => {
-  it("namespaces the id so it can never collide with a catalog Tool", async () => {
-    const descriptor = toCallerToolDescriptor(tools[0]!);
-    expect(descriptor.id).toBe("caller:tool_0");
-    expect(descriptor.name).toBe("tool_0");
-    expect(descriptor.callerTool).toBe(tools[0]!);
-  });
-
-  it("carries no roles and no executable template", () => {
-    // Empty roles because caller tools are never retrieved through the
-    // RBAC-filtered VectorStore -- and empty is the fail-closed value everywhere
-    // else, so a future path that DID filter these would hide them rather than
-    // expose them (docs/adr/0035 §2).
-    const descriptor = toCallerToolDescriptor(tools[0]!);
-    expect(descriptor.allowedRoles).toEqual([]);
-    expect(descriptor.jobTemplate).toBeUndefined();
-    expect(descriptor.localExec).toBeUndefined();
-    expect(descriptor.agentRunTemplate).toBeUndefined();
   });
 });

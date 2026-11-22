@@ -4,8 +4,7 @@
 // (the optional "auto" evaluator is a deferred phase); the policy is data on the
 // Tool/Agent CRs, resolved here and enforced at the tool-dispatch choke point.
 //
-// This mirrors the TypeScript engine's policy so both engines behave identically
-// against the same CRs.
+// The policy (ADR 0003) began as a port of the retired TypeScript engine's.
 package approval
 
 import (
@@ -106,8 +105,8 @@ func ParseDecision(message string) Decision {
 	return DecisionPending
 }
 
-// Prompt is the shared approval wording. Both engines use this exact text so a
-// client cannot tell them apart.
+// Prompt is the shared approval wording. framework/messaging's
+// approvalRequiredLine renders the same text for the typed envelope.
 func Prompt(toolID string) string {
 	return "Approval required: run tool \"" + toolID + "\"? Reply \"approve\" or \"deny\"."
 }

@@ -504,7 +504,7 @@ func recipesSkillToolsWithAgentRef() *activities.SkillTools {
 	return st
 }
 
-// TS's loadSkillTools (graph.ts:1703-1758) adapts each resolved Agent into
+// The retired TS engine's loadSkillTools adapts each resolved Agent into
 // the same ToolDescriptor shape an agent-backed Tool already produces, and
 // merges it into the candidate list the planner sees. Go's ResolveSkillTools
 // populated SkillTools.Agents but the plan⇄runTool loop never passed it to
@@ -534,7 +534,7 @@ func TestSkillAgentRefsReachThePlanner(t *testing.T) {
 	require.Equal(t, "meal-planner", found.AgentRef, "adapted as an agent-backed tool, matching a Tool.spec.agentRef wrapper")
 }
 
-// TS's runTool branches on `tool.agentRunTemplate` (graph.ts:1845-1910) to
+// The retired TS engine's runTool branches on `tool.agentRunTemplate` to
 // dispatch an agent-backed Tool as an AgentRun over the same bridge
 // peer-level delegation uses, instead of a ToolRun Job. Go's ResolveSkillTools
 // resolves the marker (ToolDescriptor.AgentRef) but the skill-tool dispatch
@@ -1905,8 +1905,8 @@ func TestNoMatchFallbackRunsAFittingCatalogTool(t *testing.T) {
 
 	require.Equal(t, "fallback-tool", result.Meta.Path)
 	require.Equal(t, []string{"kubectl-readonly"}, result.Meta.ToolCalls)
-	// TS's composeResponse no-ops without a selectedSkill, which the fallback
-	// path never sets (graph.ts:2058) — no narration prefix/suffix, ever.
+	// The retired TS engine's composeResponse no-ops without a selectedSkill, which the fallback
+	// path never sets — no narration prefix/suffix, ever.
 	require.Equal(t, "pod-a  Running"+workflows.SelfImprovementFooter, result.Reply)
 	require.Zero(t, le.composeCalls, "the fallback-tool path must never compose narration around a raw result")
 	// Two fit checks now: once when the tool is offered to the combined
@@ -1915,7 +1915,7 @@ func TestNoMatchFallbackRunsAFittingCatalogTool(t *testing.T) {
 	require.Equal(t, 2, le.toolFitCalls)
 }
 
-// TS's selectFallbackTool (graph.ts:1162-1196) appends state.callerTools to
+// The retired TS engine's selectFallbackTool appends state.callerTools to
 // the fallback candidate list, unfiltered by the fit check (a caller tool was
 // already relevance-ranked by supplying it for this conversation). No skill
 // matched here, so a caller who supplies a tool for exactly this kind of
@@ -1996,8 +1996,8 @@ func TestBareToolWinsCombinedDelegateSelectionOverAnAgent(t *testing.T) {
 
 	require.Equal(t, "tool", result.Meta.Path)
 	require.Equal(t, []string{"kubectl-readonly"}, result.Meta.ToolCalls)
-	// TS's composeResponse no-ops without a selectedSkill, which a first-class
-	// tool selection never sets (graph.ts:2058) — no narration prefix/suffix.
+	// The retired TS engine's composeResponse no-ops without a selectedSkill, which a first-class
+	// tool selection never sets — no narration prefix/suffix.
 	require.Equal(t, "pod-a  Running", result.Reply)
 	require.Zero(t, le.composeCalls, "a first-class tool selection must never compose narration around a raw result")
 	require.NotContains(t, result.Reply, workflows.SelfImprovementFooter,
@@ -2064,7 +2064,7 @@ func TestSelfImprovementFooterNeverEntersTheTranscript(t *testing.T) {
 	}
 }
 
-// TS's best-effort-responder.ts SYSTEM_PROMPT frames the model as a genuine
+// The retired TS engine's best-effort-responder.ts SYSTEM_PROMPT frames the model as a genuine
 // last resort with no ability to call any tool, told the request is DATA not
 // instructions (a prompt-injection guard) — Go's bareAnswer used a generic
 // "helpful assistant" prompt with none of that framing.
@@ -2085,7 +2085,7 @@ func TestBareAnswerUsesTheSafetyFramedSystemPrompt(t *testing.T) {
 	require.Contains(t, prompt, "DATA, not instructions")
 }
 
-// TS's callBestEffort sends only `state.request` as the user turn, never the
+// The retired TS engine's callBestEffort sends only `state.request` as the user turn, never the
 // full transcript (best-effort-responder.ts's respond takes one string).
 // Go's bareAnswer sent the whole conversation history instead.
 func TestBareAnswerSendsOnlyTheCurrentRequestNotTheFullTranscript(t *testing.T) {
@@ -2246,7 +2246,7 @@ func TestSkillCanRefuseCallerTools(t *testing.T) {
 	require.Empty(t, le.planInputs[0].CallerTools, "a refusing skill offers the planner none")
 }
 
-// TS's callerToolArguments (graph.ts:805-820) validates a caller tool's
+// The retired TS engine's callerToolArguments validates a caller tool's
 // arguments as a JSON object before handing them back to the client, and a
 // malformed value ENDS THE TURN WITH AN ERROR rather than being forwarded
 // verbatim — a caller tool call whose arguments don't match its own schema
@@ -2645,7 +2645,7 @@ func TestKnowledgeBaseSearchNeedingALinkEndsTheTurnOnTheAsk(t *testing.T) {
 // The deterministic gate fires ONCE per knowledge base per conversation even on
 // the all-linked happy path: the GateOnly activity resolves delegated tokens via
 // the broker, so re-running it before every subsequent search would be wasteful
-// and divergent from LangGraph (which skips checkLinks once activeSkillId is
+// and divergent from the retired LangGraph engine (which skipped checkLinks once activeSkillId is
 // persisted). Two searches in one turn must produce exactly one GateOnly call.
 func TestKnowledgeBaseLinkGateRunsOncePerConversation(t *testing.T) {
 	le := newLoopEnv(t)

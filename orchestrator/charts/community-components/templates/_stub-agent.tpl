@@ -49,7 +49,7 @@ spec:
   {{- /*
     Mirrors the agent this stands in for. The authorization pre-flight derives
     which credentials to resolve, and which secretEnv names to inject, purely
-    from this list (PROVIDER_ENV_VAR in agent-orchestrator/src/agent/graph.ts),
+    from this list (ProviderEnvVar in engines/temporal/internal/authz/authz.go),
     so declaring the same providers means the identity gate behaves identically
     -- including refusing to launch when a credential is missing, which is what
     the identity-keying spec's negative controls assert. A stub that declared

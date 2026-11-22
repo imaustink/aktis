@@ -1,7 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { requireMinikubeContext } from "../support/guard.js";
 import { cleanupAgentRunsSince, kubectl } from "../support/k8s.js";
-import { deployedEngine } from "../support/engine.js";
 import {
   agentRunDetailsSince,
   ciBearerToken,
@@ -44,7 +43,7 @@ requireMinikubeContext();
 /** Matches no example trigger (github-* key on issues/pull_request). */
 const PING = { zen: "Keep it logically awesome.", hook_id: 1 };
 
-describe(`webhook + tick verification (engine: ${deployedEngine()})`, () => {
+describe("webhook + tick verification", () => {
   let startedAt: Date;
   let github: string;
   let slack: string;

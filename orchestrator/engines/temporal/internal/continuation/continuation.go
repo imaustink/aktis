@@ -48,8 +48,6 @@ func Prepend(token, text string) string {
 //     tool, reuse THAT key: the active instance is recovered from state, so a
 //     refine turn continues the same target with no model input.
 //   - Otherwise fall back to the bare tool id (first call, or ambiguous).
-//
-// PARITY: resolveContinuationKey in orchestrator/apps/agent-orchestrator/src/continuation.ts.
 func ResolveKey(toolID, instanceKey string, existing map[string]string) string {
 	if instanceKey != "" {
 		return toolID + "::" + instanceKey

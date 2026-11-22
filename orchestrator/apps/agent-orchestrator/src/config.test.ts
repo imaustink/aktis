@@ -13,22 +13,22 @@ async function loadConfig(env: Record<string, string | undefined>) {
   return (await import("./config.js")).config;
 }
 
-describe("knowledgeBaseNamespace", () => {
+describe("engine selection (docs/adr/0053)", () => {
   afterEach(() => {
-    delete process.env.KNOWLEDGE_BASE_NAMESPACE;
-    delete process.env.AGENT_NAMESPACE;
+    delete process.env.AGENT_ENGINE;
+    delete process.env.AGENT_TEMPORAL_ENGINE_URL;
   });
 
-  it("uses KNOWLEDGE_BASE_NAMESPACE when set, independent of AGENT_NAMESPACE", async () => {
-    const config = await loadConfig({ AGENT_NAMESPACE: "agent-controller", KNOWLEDGE_BASE_NAMESPACE: "knowledge-bases" });
-    // The whole point: KB CRs can live in a namespace separate from where
-    // tools/agents and Jobs do.
-    expect(config.knowledgeBaseNamespace).toBe("knowledge-bases");
-    expect(config.namespace).toBe("agent-controller");
+  // index.ts refuses to start on anything but "temporal" or unset, so the
+  // value must reach it as set -- including a stale "langgraph".
+  it("keeps AGENT_ENGINE as set so startup can refuse a removed engine", async () => {
+    expect((await loadConfig({ AGENT_ENGINE: "langgraph" })).requestedEngine).toBe("langgraph");
+    expect((await loadConfig({ AGENT_ENGINE: "temporal" })).requestedEngine).toBe("temporal");
   });
 
-  it("falls back to AGENT_NAMESPACE so single-namespace deployments are unchanged", async () => {
-    const config = await loadConfig({ AGENT_NAMESPACE: "agent-controller", KNOWLEDGE_BASE_NAMESPACE: undefined });
-    expect(config.knowledgeBaseNamespace).toBe("agent-controller");
+  it("treats an empty AGENT_ENGINE or engine URL as unset", async () => {
+    const config = await loadConfig({ AGENT_ENGINE: "", AGENT_TEMPORAL_ENGINE_URL: "" });
+    expect(config.requestedEngine).toBeUndefined();
+    expect(config.temporalEngineUrl).toBeUndefined();
   });
 });

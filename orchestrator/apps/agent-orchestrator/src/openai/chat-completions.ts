@@ -49,7 +49,7 @@ export interface AgentRequest {
   request: string;
   /**
    * Tool calls the CALLER already executed for the exchange in flight, paired
-   * with their results (docs/adr/0035). Seeds `AgentState.actionHistory`; empty
+   * with their results (docs/adr/0035). Seeds `TurnInput.actionHistory`; empty
    * for every ordinary turn.
    */
   priorToolCalls: PriorCallerToolCall[];
@@ -61,10 +61,10 @@ const HISTORY_MAX_MESSAGES = 8;
 const HISTORY_MAX_CHARS = 24_000;
 
 /**
- * Appended to a `noMatchFallback` reply (graph.ts) so the user knows a turn
- * was handled ad-hoc and can ask for a permanent skill. Exported (rather than
- * kept private to graph.ts) so {@link buildAgentRequest} can strip it back
- * out of a folded assistant message below.
+ * The footer the removed in-process engine (docs/adr/0053) appended to an
+ * ad-hoc "no skill matched" reply. Nothing produces it any more, but chats
+ * that predate the switch still carry it in their history, so it is still
+ * stripped from folded assistant messages below.
  */
 export const SELF_IMPROVEMENT_FOOTER =
   "\n\n---\nNo existing skill or agent matched this request, so it was handled ad-hoc. Ask me to run the self-improvement skill if you'd like a permanent skill added for this next time.";
@@ -86,10 +86,9 @@ function stripSelfImprovementFooter(content: string): string {
 }
 
 /**
- * Builds the actual request text sent to the agent graph. The graph itself
- * is stateless per-turn (docs/adr/0008) — it only ever sees a single
- * `request` string — but standard OpenAI-style chat clients (Open WebUI et
- * al.) always send the FULL conversation, not just the new turn.
+ * Builds the actual request text sent to the engine, which only ever sees a
+ * single `request` string per turn — but standard OpenAI-style chat clients
+ * (Open WebUI et al.) always send the FULL conversation, not just the new turn.
  *
  * A bounded window of the prior conversation (both `user` and `assistant`
  * turns) is folded in ahead of the new user message, wrapped in a
@@ -205,7 +204,7 @@ function collectPriorToolCalls(messages: ChatMessage[], userIdx: number): PriorC
  * embedded chat history happens to match e.g. the software-engineering agent
  * would silently launch a real, privileged AgentRun (cloning/creating repos,
  * opening pull requests) for what should be a cheap, side-effect-free text
- * completion. `server.ts` checks this before invoking the agent graph and
+ * completion. `server.ts` checks this before invoking the engine and
  * routes a match to `TaskCompleter` instead.
  */
 export function isInternalUiTaskRequest(userContent: string): boolean {
@@ -216,69 +215,6 @@ export function isInternalUiTaskRequest(userContent: string): boolean {
 export function renderResult(result: unknown): string {
   if (typeof result === "string") return result;
   return `\`\`\`json\n${JSON.stringify(result, null, 2)}\n\`\`\``;
-}
-
-export interface NodeStatusContext {
-  /** True when checkActiveSkill confirmed the session skill for this turn. */
-  skillContinuation?: boolean;
-}
-
-/**
- * Human-readable status line for a LangGraph "updates"-mode stream chunk,
- * keyed by node name. Reflects agent-graph node transitions (skill check ->
- * retrieve/select skill -> load skill tools -> plan action -> run tool ->
- * compose response), NOT the launched tool's own internal stages (e.g.
- * recipe-scraper's extract/transcribe) — those aren't currently plumbed out
- * of the Job callback protocol (known gap).
- */
-const NODE_STATUS: Record<string, (update: Record<string, unknown>, ctx?: NodeStatusContext) => string | undefined> = {
-  checkActiveSkill: (update) => {
-    // Only narrate when the session's active skill was confirmed for this
-    // turn (docs/adr/0012) — a fall-through to full retrieval is silent
-    // (retrieveSkills/selectDelegate produce their own lines).
-    const skill = update.selectedSkill as { name?: string } | undefined;
-    return skill?.name ? `Continuing with skill: ${skill.name}.` : undefined;
-  },
-  checkActiveAgentRun: (update) => {
-    // Same continuity narration for a running agent (question already
-    // asked, this turn's message is its answer) — a fall-through is silent.
-    const agent = update.selectedAgent as { name?: string } | undefined;
-    return agent?.name ? `Continuing with agent: ${agent.name}.` : undefined;
-  },
-  retrieveSkills: (update) => {
-    const candidates = Array.isArray(update.skillCandidates) ? update.skillCandidates : [];
-    return `Found ${candidates.length} candidate skill(s).`;
-  },
-  retrieveAgents: (update) => {
-    const candidates = Array.isArray(update.agentCandidates) ? update.agentCandidates : [];
-    return `Found ${candidates.length} candidate agent(s).`;
-  },
-  selectDelegate: (update) => {
-    const skill = update.selectedSkill as { name?: string } | undefined;
-    if (skill?.name) return `Selected skill: ${skill.name}.`;
-    const agent = update.selectedAgent as { name?: string } | undefined;
-    if (agent?.name) return `Delegating to agent: ${agent.name}.`;
-    return undefined;
-  },
-  loadSkillTools: (update, ctx) => {
-    // Suppress on continuation turns: the skill (and its tools) didn't change,
-    // so reporting the same tool count again is noise (docs/adr/0012).
-    if (ctx?.skillContinuation) return undefined;
-    const tools = Array.isArray(update.skillTools) ? update.skillTools : [];
-    return `Loaded ${tools.length} tool(s) for this skill.`;
-  },
-  planAction: (update) => {
-    const tool = update.selectedTool as { name?: string } | undefined;
-    return tool?.name ? `Calling tool: ${tool.name}.` : undefined;
-  },
-};
-
-export function nodeStatusText(
-  nodeName: string,
-  update: Record<string, unknown>,
-  ctx?: NodeStatusContext,
-): string | undefined {
-  return NODE_STATUS[nodeName]?.(update, ctx);
 }
 
 export function chatCompletionId(): string {
@@ -409,8 +345,8 @@ export function writeSseDone(res: ServerResponse): void {
 }
 
 /**
- * Maps an agent-graph failure (`AgentState.error`, a free-text string set by
- * the graph nodes in src/agent/graph.ts) to an HTTP status + OpenAI error
+ * Maps a turn failure (`TurnOutcome.error`, a free-text string from the
+ * engine or the engine adapter) to an HTTP status + OpenAI error
  * code for the non-streaming response. Streaming responses can't do this
  * (the 200 + SSE headers are already flushed by the time the graph settles),
  * so they instead render the error as the final assistant message.

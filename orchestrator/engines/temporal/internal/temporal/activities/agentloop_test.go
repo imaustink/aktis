@@ -96,7 +96,7 @@ func TestCheckSkillFitDefaultsFalseOnGarbage(t *testing.T) {
 	require.False(t, fits, "ambiguity must fall back to full retrieval")
 }
 
-// TS's skill-fit-checker.ts sends only the skill's name+description — Go's
+// The retired TS engine's skill-fit-checker.ts sends only the skill's name+description — Go's
 // CheckSkillFit additionally fed a 500-char markdown excerpt, which can shift
 // a borderline yes/no judgment the fit checker isn't meant to see (the
 // markdown is authored procedure, not a description of scope).
@@ -116,7 +116,7 @@ func TestCheckSkillFitSendsOnlyDescriptionNotMarkdown(t *testing.T) {
 	require.Contains(t, fake.lastUser, "recipe workflows")
 }
 
-// TS's tool-fit-checker.ts sends only the tool's name+description — Go's
+// The retired TS engine's tool-fit-checker.ts sends only the tool's name+description — Go's
 // CheckToolFit additionally fed Input/Output, which TS deliberately omits.
 func TestCheckToolFitSendsOnlyDescriptionNotInputOutput(t *testing.T) {
 	fake := &fakeLLM{payload: `{"fits":true}`}
@@ -241,7 +241,7 @@ func TestCheckToolFitPromptFramesTheRequestAsData(t *testing.T) {
 	require.Contains(t, fake.lastUser, "id: kubectl-readonly")
 }
 
-// TS's delegate-selector.ts SYSTEM_PROMPT explicitly instructs preferring a
+// The retired TS engine's delegate-selector.ts SYSTEM_PROMPT explicitly instructs preferring a
 // skill for a single well-defined action vs. an agent for open-ended
 // multi-step work — Go's SelectDelegate defined what each candidate kind IS
 // generically but gave no preference rule, so an ambiguous request (matching

@@ -32,7 +32,7 @@ export const TURN_EVENT_KINDS = [
   "turn-completed",
   // A free-text status line with no richer structure yet. The Temporal engine
   // routes every narration call site through it; the canonical contract
-  // (framework/protocol, ADR 0047) includes it so both engines agree.
+  // (framework/protocol, ADR 0047) includes it.
   "narration",
 ] as const;
 
@@ -73,8 +73,8 @@ export interface TurnEvent {
 }
 
 /**
- * The shared approval prompt wording (ADR 0003) — used VERBATIM by both engines
- * and kept here so the typed envelope renders the exact same line a client sees
+ * The shared approval prompt wording (ADR 0003) — used VERBATIM by the engine
+ * (orchestrator/engines/temporal/internal/approval) and kept here so the typed envelope renders the exact same line a client sees
  * as the turn's approval request.
  */
 export function approvalRequiredLine(toolId: string): string {

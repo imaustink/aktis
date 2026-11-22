@@ -3,14 +3,13 @@ import { CALLER_IDENTITY_HEADER, mintCallerIdentityAssertion } from "../rbac/cal
 import { TRACEPARENT_HEADER } from "../traceparent.js";
 import { startSpan } from "../telemetry.js";
 import { DISPATCH_ASSERTION_HEADER, mintDispatchAssertion } from "../rbac/dispatch-assertion.js";
-import type { AgentGraphInput, AgentGraphLike } from "../server.js";
-import type { AgentState } from "../agent/graph.js";
 import type { IdentityResolver } from "../rbac/types.js";
+import type { IdentityRefusal, TurnEngine, TurnInput, TurnOutcome } from "./types.js";
 import { CALLER_TOOL_ID_PREFIX } from "../caller-tools/types.js";
 
 /**
- * Runs a turn on the Temporal engine (`orchestrator/engines/temporal`) instead of the
- * in-process LangGraph graph — the `AGENT_ENGINE=temporal` half of the switch.
+ * Runs every turn on the Temporal engine (`orchestrator/engines/temporal`), the
+ * only engine since docs/adr/0053 removed the in-process LangGraph loop.
  *
  * ## Why this is an HTTP client and not a Temporal client
  *
@@ -28,27 +27,12 @@ import { CALLER_TOOL_ID_PREFIX } from "../caller-tools/types.js";
  *    explicitly about that pod's blast radius; leaving it unchanged is worth an
  *    extra network hop.
  *
- * ## What this engine does NOT return
+ * ## Conversation state lives in the engine
  *
- * The graph's `AgentState` carries the session fields `persistSession` writes:
- * `selectedSkill`, `agentRunId`, `pendingIdentityLink`, `extractedContinuation`
- * and the rest. This engine returns none of them, deliberately — the workflow
- * holds that state itself (docs/adr/0001), which is the entire point of the
- * change. `persistSession` treats every one as optional and merges rather than
- * replaces, so an all-undefined outcome is a no-op rather than a clobber.
- *
- * Concretely that means a conversation running on this engine keeps its skill
- * continuity, continuation tokens and pending links inside the workflow, and
- * the Redis session record simply stays empty for it. Switching a live
- * conversation between engines mid-flight would lose that state — which is why
- * the flag is process-wide rather than per-request.
+ * The workflow holds a conversation's skill continuity, continuation tokens,
+ * pending links and approvals itself (docs/adr/0001), so a turn's outcome is
+ * only its answer: a result, an error, or tool calls for the caller to run.
  */
-/** The engine's 403 body for a sender who cannot be acted as (docs/adr/0049 §6). */
-export interface IdentityRefusal {
-  status: "failed";
-  error: { code: string; message: string; [key: string]: unknown };
-}
-
 export interface TemporalEngineOptions {
   /** Base URL of the engine's gateway Service, e.g. `http://temporal-engine-gateway:8080`. */
   baseUrl: string;
@@ -62,8 +46,7 @@ export interface TemporalEngineOptions {
   senderAssertionSecret?: string;
   /**
    * Resolves Open WebUI's per-request signed user JWT into a real per-user
-   * identity (the SAME resolver the LangGraph engine's `resolveIdentity` node
-   * uses for `state.forwardedUserToken`) -- needed because the gateway
+   * identity -- needed because the gateway
    * otherwise only ever sees ONE shared service identity for every internal
    * hop, which would collapse every Open WebUI user onto that one subject.
    * Deliberately NOT a general authToken-based resolver: every OTHER caller of
@@ -168,7 +151,7 @@ interface InvokeRecord {
   outcome?: unknown;
 }
 
-export class TemporalEngine implements AgentGraphLike {
+export class TemporalEngine implements TurnEngine {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
 
@@ -177,21 +160,17 @@ export class TemporalEngine implements AgentGraphLike {
     this.fetchImpl = options.fetchImpl ?? fetch;
   }
 
-  async invoke(input: AgentGraphInput): Promise<AgentState> {
+  async invoke(input: TurnInput): Promise<TurnOutcome> {
     const caller = await this.resolveForwardedCaller(input);
     if (caller === UNRESOLVED) {
-      // Same refusal as graph.ts's resolveIdentity node. Sending the turn on
-      // without the header would run it as the gateway's shared bearer
-      // subject, i.e. with whatever credentials that subject holds.
-      return { ...input, error: "unauthorized: could not resolve caller identity" } as AgentState;
+      // Sending the turn on without the header would run it as the gateway's
+      // shared bearer subject, i.e. with whatever credentials that subject holds.
+      return { error: "unauthorized: could not resolve caller identity" };
     }
     if (input.triggerName && !this.options.senderAssertionSecret) {
       // The engine takes a trigger's dispatch only signed (see `start`), so
       // without the secret this turn could only run as something else.
-      return {
-        ...input,
-        error: "temporal engine: an event-triggered turn needs AGENT_SENDER_ASSERTION_SECRET to sign its dispatch",
-      } as AgentState;
+      return { error: "temporal engine: an event-triggered turn needs AGENT_SENDER_ASSERTION_SECRET to sign its dispatch" };
     }
 
     const id = await this.start(input, caller);
@@ -202,36 +181,31 @@ export class TemporalEngine implements AgentGraphLike {
     }
 
     if (record.status === "failed") {
-      return { ...input, error: record.error ?? "the turn failed" } as AgentState;
+      return { error: record.error ?? "the turn failed" };
     }
     if (record.toolCalls?.length) {
       // The second non-error terminal shape (docs/adr/0035): the caller's own
       // client has to run these.
       return {
-        ...input,
         pendingToolCalls: record.toolCalls.map((call) => ({
           id: call.id,
           name: call.name,
           arguments: call.arguments,
         })),
-      } as AgentState;
+      };
     }
     // `outcome` (docs/adr/0052 §2) is the forced agentRef run's structured
     // result as the engine recorded it; passed through raw because server.ts
-    // validates it (shape + size) for both engines in one place.
+    // validates it (shape + size).
     return {
-      ...input,
       result: record.result,
-      ...(record.outcome !== undefined ? { agentOutcome: record.outcome } : {}),
-    } as AgentState;
+      ...(record.outcome !== undefined ? { runOutcome: record.outcome } : {}),
+    };
   }
 
   /**
    * Resumes a turn that parked on a still-outstanding account link, WITHOUT
-   * the caller sending a follow-up message -- LangGraph's own engine already
-   * does this for a live chat caller (authorization-service.ts: the SAME
-   * turn holds open and "resumes automatically once the user links, no
-   * follow-up message needed"). This engine's /invoke is accept-then-poll
+   * the caller sending a follow-up message. The engine's /invoke is accept-then-poll
    * rather than one long-held request, and Authorize's own wait is
    * deliberately short -- "the workflow's durable timer stays in charge of
    * the overall wait rather than a held HTTP request" (authz.go) -- so the
@@ -243,17 +217,15 @@ export class TemporalEngine implements AgentGraphLike {
    *
    * Gated on TWO things, both required:
    *  - `progressListener` set: the established "this caller has somewhere to
-   *    wait" signal (see buildGraphInput's own doc on why setting it for a
-   *    fire-and-forget caller caused a real incident) -- a webhook/triage
+   *    wait" signal (see `TurnInput.progressListener`) -- a webhook/triage
    *    relay must NOT get this, or one relayed turn would block for up to
    *    AUTO_RESUME_MAX_MS instead of returning immediately as ADR 0006
    *    documents.
    *  - `sessionId` set: resuming means re-submitting to the SAME
    *    conversation workflow, which only a stable session id can name.
    *
-   * The initial link-required prompt is surfaced ONCE via the same
-   * "identity-link" progress stage LangGraph's own device-flow prompt uses
-   * (server.ts's streaming handler renders it as real chat content, not a
+   * The initial link-required prompt is surfaced ONCE via the
+   * "identity-link" progress stage (server.ts's streaming handler renders it as real chat content, not a
    * status label) -- otherwise auto-resuming would silently swallow the
    * one thing the human actually needs to see and act on.
    *
@@ -263,10 +235,10 @@ export class TemporalEngine implements AgentGraphLike {
    * each resume made the fifth minute's resume arrive as the gateway's shared
    * bearer subject, which then launched the user's request on that subject's
    * credentials. The JWT authenticated the request when it arrived; the
-   * resumes continue that same request, as LangGraph's held-open wait does.
+   * resumes continue that same request.
    */
   private async autoResumeLink(
-    input: AgentGraphInput,
+    input: TurnInput,
     first: InvokeRecord,
     caller: ForwardedCaller | undefined,
   ): Promise<InvokeRecord> {
@@ -300,51 +272,6 @@ export class TemporalEngine implements AgentGraphLike {
   }
 
   /**
-   * Yields one terminal update, so a streaming caller still gets its answer.
-   *
-   * No per-node narration: those lines describe LangGraph node transitions,
-   * which do not exist here. The engine narrates its own turns over its own
-   * progress query, and plumbing that through this hop would mean a second
-   * streaming protocol for a status line. A streaming client on this engine
-   * therefore sees the reply rather than the running commentary — a real
-   * difference, recorded rather than papered over.
-   *
-   * Deliberately NOT `await this.invoke(input)` before returning: an earlier
-   * version awaited invoke() here, so this method's own returned Promise
-   * didn't settle until the whole (up to `timeoutMs`, default 30 min) turn
-   * had already finished. server.ts's streaming handler does
-   * `const source = await this.graph.stream(...)` before starting its
-   * `withHeartbeat(source, HEARTBEAT_MS)` loop -- so that wrapper, whose only
-   * job is emitting an SSE keep-alive comment whenever the source stalls for
-   * longer than HEARTBEAT_MS, never got a chance to run: it can't race
-   * against a source it doesn't have yet. A long-running turn's SSE
-   * connection then had no guaranteed byte cadence at all (progress
-   * narration is opportunistic, not periodic), so an idle-connection timeout
-   * upstream of this process (ingress, load balancer, browser) would cancel
-   * it (RST_STREAM) even though the turn itself kept running and completed
-   * fine server-side -- the underlying AgentRun Job is unaffected either way
-   * (docs/adr/0033), only the chat client watching it lost its stream.
-   *
-   * An async generator's body does not start running until its first
-   * `.next()` call (JS semantics), so returning the iterable synchronously
-   * and moving the `await this.invoke(input)` inside it defers that whole
-   * wait until `withHeartbeat` actually asks for the next item -- which is
-   * exactly when its race against HEARTBEAT_MS needs to start.
-   */
-  stream(
-    input: AgentGraphInput,
-    _options: { streamMode: "updates" },
-  ): Promise<AsyncIterable<Record<string, Partial<AgentState>>>> {
-    const engine = this;
-    return Promise.resolve({
-      async *[Symbol.asyncIterator]() {
-        const state = await engine.invoke(input);
-        yield { temporalEngine: state };
-      },
-    });
-  }
-
-  /**
    * Resolves the forwarded-user JWT into the identity this turn runs as.
    *
    * `undefined` means the turn carries no per-user identity to forward (no
@@ -353,7 +280,7 @@ export class TemporalEngine implements AgentGraphLike {
    * not be verified or cannot be signed across the hop: that turn must fail,
    * because the fallback is the shared bearer subject.
    */
-  private async resolveForwardedCaller(input: AgentGraphInput): Promise<ForwardedCaller | undefined | typeof UNRESOLVED> {
+  private async resolveForwardedCaller(input: TurnInput): Promise<ForwardedCaller | undefined | typeof UNRESOLVED> {
     const resolver = this.options.forwardedUserIdentityResolver;
     if (!input.forwardedUserToken || !resolver) return undefined;
 
@@ -369,7 +296,7 @@ export class TemporalEngine implements AgentGraphLike {
     return { subject: identity.subject, roles: identity.roles };
   }
 
-  private async start(input: AgentGraphInput, caller: ForwardedCaller | undefined): Promise<string> {
+  private async start(input: TurnInput, caller: ForwardedCaller | undefined): Promise<string> {
     // docs/adr/0050 §4: a client span per engine call, a child of the turn's
     // trace (or the root of a new one); the engine's server span nests under it.
     const hop = startSpan("engine POST /invoke", input.traceparent, {
@@ -404,7 +331,7 @@ export class TemporalEngine implements AgentGraphLike {
    * the 403 body, or undefined for no objection, including whenever the check
    * cannot be made (the turn's own pre-flight still refuses the same way).
    */
-  async checkIdentity(input: AgentGraphInput): Promise<IdentityRefusal | undefined> {
+  async checkIdentity(input: TurnInput): Promise<IdentityRefusal | undefined> {
     if (input.triggerName && !this.options.senderAssertionSecret) return undefined;
     const hop = startSpan("engine POST /invoke/check", input.traceparent, {
       kind: "client",
@@ -428,7 +355,7 @@ export class TemporalEngine implements AgentGraphLike {
   }
 
   private invokeRequest(
-    input: AgentGraphInput,
+    input: TurnInput,
     caller: ForwardedCaller | undefined,
     traceparent: string,
   ): { headers: Record<string, string>; body: string } {
@@ -456,11 +383,9 @@ export class TemporalEngine implements AgentGraphLike {
     // forwarded-user-JWT), signed across the hop -- without this, every
     // caller of /invoke resolves to the SAME gateway-default/bearer subject
     // regardless of which human triggered the turn, which is exactly the
-    // collapsed-identity bug ADR 0030 fixed for webhooks. Mirrors graph.ts's
-    // resolveIdentity node: prefer the forwarded-user JWT over the shared
-    // static authToken when both are available.
+    // collapsed-identity bug ADR 0030 fixed for webhooks.
     // Scoped to the forwarded-user-JWT path ONLY, deliberately -- not a
-    // general "resolve identity somehow" fallback. `input.authToken` alone is
+    // general "resolve identity somehow" fallback. A bearer token alone is
     // ONE value every caller of this process's own /invoke shares (Open WebUI's
     // shared bearer token, integration-gateway's static service token for a
     // relayed webhook turn, etc.), so resolving it says nothing about who is
@@ -530,14 +455,9 @@ export class TemporalEngine implements AgentGraphLike {
         // for a GitHub-acting agent instead of reading one out of the prompt.
         ...(input.targetRepository ? { targetRepository: input.targetRepository } : {}),
         // Already resolved, validated and top-K-ranked by this process's own
-        // handleChat pipeline (ADR 0035) before invoke() is ever called --
-        // the engine's /invoke takes the resolved Descriptor shape (each
-        // ToolDescriptor's nested `callerTool`), not a raw OpenAI tools array,
-        // and re-ranks nothing. Omitting this silently drops every caller
-        // tool for any turn routed through this engine.
-        ...(input.callerTools?.length
-          ? { callerTools: input.callerTools.map((t) => t.callerTool).filter(Boolean) }
-          : {}),
+        // handleChat pipeline (ADR 0035); the engine re-ranks nothing.
+        // Omitting this silently drops every caller tool.
+        ...(input.callerTools?.length ? { callerTools: input.callerTools } : {}),
         ...(input.callerToolChoiceRequired ? { callerToolRequired: true } : {}),
         // Prior client-executed calls (ADR 0035 resume), the same
         // strip-the-namespace transform as everywhere else a caller-tool id
@@ -558,7 +478,7 @@ export class TemporalEngine implements AgentGraphLike {
     };
   }
 
-  private async poll(id: string, input: AgentGraphInput): Promise<InvokeRecord> {
+  private async poll(id: string, input: TurnInput): Promise<InvokeRecord> {
     const deadline = Date.now() + (this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     // Lines already relayed to progressListener -- the engine's /invoke/:id
     // resends the WHOLE narration buffer each poll (same source the
@@ -606,8 +526,7 @@ export class TemporalEngine implements AgentGraphLike {
       // remoteControlUrlListener, never progressListener, so this can't ride
       // on the progress relay below. Without it a Temporal-engine trigger run
       // never recorded the URL on the invocation, and integration-gateway
-      // never posted the "Watch live or take over" link to the issue/PR --
-      // LangGraph's delegateToAgent fires the same listener (graph.ts).
+      // never posted the "Watch live or take over" link to the issue/PR.
       // Checked before the terminal return: the engine also sets it on the
       // finished record, so a short turn polled only once still reports it.
       if (record.remoteControlUrl && record.remoteControlUrl !== announcedRemoteControlUrl) {
