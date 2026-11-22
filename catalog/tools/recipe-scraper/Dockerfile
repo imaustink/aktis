@@ -42,21 +42,46 @@ RUN npm run build --workspace=@aktis/messaging \
 # Keep this version in lockstep with the "playwright" dependency in package.json.
 FROM mcr.microsoft.com/playwright:v1.61.1-jammy AS runtime
 
-# yt-dlp (pinned) + ffmpeg for audio extraction/transcription.
-# yt-dlp must stay current: YouTube et al. change constantly, so an old build
-# breaks (e.g. "Sign in to confirm you're not a bot"). Defaults to the latest
-# release; set YT_DLP_VERSION to a tag (e.g. 2025.06.30) to pin for reproducibility.
+# yt-dlp + ffmpeg for audio extraction/transcription.
+# yt-dlp must stay current: YouTube/TikTok et al. change constantly, so an old
+# build breaks (e.g. "Sign in to confirm you're not a bot", TikTok's
+# "Unexpected response from webpage request"). Defaults to the latest release;
+# set YT_DLP_VERSION to a tag (e.g. 2026.10.26) to pin for reproducibility.
+#
+# We install the self-contained PyInstaller build, NOT the zipapp `yt-dlp`:
+#   - the zipapp runs on the system Python, and this jammy base only has 3.10,
+#     which current yt-dlp refuses to start on (3.11+ required);
+#   - the standalone build bundles curl_cffi, which TikTok's extractor needs
+#     for browser impersonation -- without it TikTok serves a challenge page.
+# It's the *onedir* (.zip) variant on purpose: the onefile binary unpacks its
+# shared libraries into /tmp at startup, which fails on the hardened runtime's
+# noexec /tmp ("failed to map segment from shared object").
 ARG YT_DLP_VERSION=latest
+ARG TARGETARCH
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ffmpeg python3 ca-certificates curl \
+  && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl unzip \
+  && case "$TARGETARCH" in \
+       amd64) YT_DLP_ASSET="yt-dlp_linux" ;; \
+       arm64) YT_DLP_ASSET="yt-dlp_linux_aarch64" ;; \
+       *) echo "unsupported TARGETARCH '$TARGETARCH'" >&2; exit 1 ;; \
+     esac \
   && if [ "$YT_DLP_VERSION" = "latest" ]; then \
-       YT_DLP_URL="https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"; \
+       YT_DLP_URL="https://github.com/yt-dlp/yt-dlp/releases/latest/download/${YT_DLP_ASSET}.zip"; \
      else \
-       YT_DLP_URL="https://github.com/yt-dlp/yt-dlp/releases/download/${YT_DLP_VERSION}/yt-dlp"; \
+       YT_DLP_URL="https://github.com/yt-dlp/yt-dlp/releases/download/${YT_DLP_VERSION}/${YT_DLP_ASSET}.zip"; \
      fi \
-  && curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 "$YT_DLP_URL" -o /usr/local/bin/yt-dlp \
-  && chmod a+rx /usr/local/bin/yt-dlp \
-  && apt-get purge -y curl \
+  && curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 "$YT_DLP_URL" -o /tmp/yt-dlp.zip \
+  && mkdir -p /opt/yt-dlp \
+  && unzip -q /tmp/yt-dlp.zip -d /opt/yt-dlp \
+  && rm /tmp/yt-dlp.zip \
+  && chmod -R a+rX /opt/yt-dlp \
+  && chmod a+rx "/opt/yt-dlp/${YT_DLP_ASSET}" \
+  && ln -s "/opt/yt-dlp/${YT_DLP_ASSET}" /usr/local/bin/yt-dlp \
+  # Fail the build (not a user's job) if the binary can't run or lost impersonation.
+  && yt-dlp --version \
+  # (targets are listed even without curl_cffi, suffixed "(unavailable)").
+  && yt-dlp --list-impersonate-targets | grep -i chrome | grep -qv unavailable \
+  && apt-get purge -y curl unzip \
   && apt-get autoremove -y \
   && rm -rf /var/lib/apt/lists/*
 
