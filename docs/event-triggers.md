@@ -1,6 +1,7 @@
 # Event triggers (`EventSource` + `EventTrigger`)
 
-The implementation contract for [ADR 0048](adr/0048-generic-event-triggers.md).
+The implementation contract for [ADR 0048](adr/0048-generic-event-triggers.md)
+and its run-completion extension, [ADR 0052](adr/0052-run-events-and-software-factory.md).
 Every component that produces, matches or acts on an event follows this
 document; where code and this document disagree, one of them is a bug.
 
@@ -8,6 +9,7 @@ document; where code and this document disagree, one of them is a bug.
                 ┌──────────────────────── integration-gateway ────────────────────────┐
  HTTP webhook ─►│ POST /webhooks/:source  verify ─► parse ─► sender ─► envelope ──┐    │
  CronJob tick ─►│ POST /events/:source/tick  bearer ─► envelope (body = payload) ─┤    │
+ run finished ─►│ onComplete.emitTo ─► run envelope (§9), sender re-verified ─────┤    │
                 │                                                                  ▼    │
                 │                       POST /invoke { event: <envelope> } ──► orchestrator
                 │                                                                  │    │
@@ -24,7 +26,7 @@ integration-gateway and the Temporal gateway watch).
 
 ### `EventSource`
 
-How events arrive and how far they are trusted. Exactly one of `webhook` / `cron`.
+How events arrive and how far they are trusted. Exactly one of `webhook` / `cron` / `run`.
 
 ```yaml
 apiVersion: core.aktis.ai/v1alpha1
@@ -54,11 +56,17 @@ spec:
     timeZone: America/Chicago       # optional
     suspend: false                  # optional
     payload: { repo: imaustink/aktis }   # optional, any JSON; becomes envelope.body
+---
+kind: EventSource
+metadata: { name: runs }
+spec:
+  run: {}                           # run-completion events (§9); no route, no Secret, no sender
 ```
 
 Rules:
 
-- `sender` is only valid with `webhook`. A sender whose provider cannot verify the
+- `sender` is only valid with `webhook` (admission rejects it on `cron` and
+  `run`). A sender whose provider cannot verify the
   login (resolver returns nothing) drops the event. **An unverified login is never
   forwarded** — a source without `sender` runs with no per-user principal, as the
   gateway's own service identity.
@@ -69,6 +77,8 @@ Rules:
 - `bearer` compares `header` (default `authorization`, value `Bearer <secret>`;
   a non-`authorization` header carries the raw secret) in constant time.
 - Verification happens on the raw bytes **before** parsing; failure is `401`.
+- A `run` source receives nothing from outside: integration-gateway synthesizes
+  its events (§9). It is always `Ready` (`RunEvents`) and owns no CronJob.
 - Status: `conditions[type=Ready]`; cron sources also `status.cronJobName`.
 
 ### `EventTrigger`
@@ -91,7 +101,7 @@ spec:
     number: body.pull_request.number
     label: body.label.name
   sessionKey: "github:{{repo}}#{{number}}"   # optional template (see §4)
-  target:                           # exactly one of orchestrator/skillRef/agentRef/toolRef
+  target:                           # exactly one of orchestrator/skillRef/agentRef/toolRef/none
     agentRef: claude-code-swe-agent
     readOnly: true                  # deterministic write-gate for every run in the turn
     promptTemplate: |               # required unless toolRef; {{param}} substitution
@@ -104,9 +114,13 @@ spec:
       sessionPage: true             # append a session-page link to ack (needs GATEWAY_PUBLIC_URL)
       result: true                  # post the turn's result as a comment
       removeLabel: "{{label}}"      # removed when the run ends, success or failure
+      addLabels: ["ai-reviewing"]   # templates; added at acceptance (max 10; "" entries dropped)
+      assignees: ["{{assignee}}"]   # templates; assigned at acceptance (max 10; "" entries dropped)
     http:
       url: http://ci-bridge.tools.svc/results   # LITERAL only — never templated (SSRF)
       secretRef: { name: ci-bridge, key: secret }  # optional: x-event-signature: sha256=<hmac(body)>
+  onComplete:                       # optional (§9)
+    emitTo: runs                    # a run-kind EventSource in the same namespace
 ```
 
 Rules:
@@ -136,6 +150,23 @@ Rules:
   `allowedIdentities` (the trigger is not `Ready` otherwise), it is invalid with
   `toolRef`, and it is honoured only by the Temporal engine. A turn that parks
   on an account link resumes under the same override. It is not a session mode.
+- `none: {}` runs nothing: no AgentRun, skill, tool, LLM call or identity /
+  credential check (so never an identity `403`). The event is matched and
+  accepted (`202` + invocation id) and polling returns
+  `{status:"succeeded", result:""}` at once; only the `reply` side effects run.
+  Admission rejects `none` together with `promptTemplate`, `readOnly` or
+  `identity` (nothing runs to receive them). It is how a handoff such as
+  "assign the PR to a human" is expressed.
+- `reply.github.addLabels` / `assignees` are rendered like `removeLabel`
+  (`{{param}}`), and an entry that renders to `""` is dropped; when nothing is
+  left the field is omitted from the rendered reply. Labels the bot adds this
+  way never re-enter routing (its own webhooks are dropped as bot-authored), so
+  they are safe as status markers; a human applying the same label still fires
+  label triggers.
+- `onComplete.emitTo` must name an existing `run` EventSource in the same
+  namespace, else the trigger is `Ready=False` (`EmitToNotFound` /
+  `EmitToNotRunSource`). core-controller re-checks it when that source appears
+  or changes.
 - A trigger whose CEL fails to compile is `Ready=False` and never matches.
 
 ## 2. The envelope
@@ -143,16 +174,16 @@ Rules:
 Every source produces exactly this JSON object. It is both the `event` field of
 `/invoke` and the CEL activation.
 
-| Field | Type | Webhook | Cron |
-| --- | --- | --- | --- |
-| `source` | string | EventSource name | EventSource name |
-| `kind` | string | `"webhook"` | `"cron"` |
-| `id` | string | `deliveryIdHeader` value, else uuid | `<source>-<unix seconds>-<8 random hex>` |
-| `time` | string | RFC 3339 receipt time (UTC) | RFC 3339 tick time (UTC) |
-| `headers` | map<string,string> | request headers, **lower-cased**, with the verify header, `authorization` and `cookie` removed; repeated headers joined with `", "` | `{}` |
-| `body` | any JSON | `application/json` → parsed; `application/x-www-form-urlencoded` → object of string fields; anything else → `{"text": "<raw>"}` | `spec.cron.payload`, else `{}` |
-| `sender` | map | `{login, isBot}` when `spec.sender` resolved, else `{}` | `{}` |
-| `repository` | string | `repositoryFrom` result, else `""` | `""` |
+| Field | Type | Webhook | Cron | Run (§9) |
+| --- | --- | --- | --- | --- |
+| `source` | string | EventSource name | EventSource name | the `emitTo` source name |
+| `kind` | string | `"webhook"` | `"cron"` | `"run"` |
+| `id` | string | `deliveryIdHeader` value, else uuid | `<source>-<unix seconds>-<8 random hex>` | uuid |
+| `time` | string | RFC 3339 receipt time (UTC) | RFC 3339 tick time (UTC) | RFC 3339 completion time (UTC) |
+| `headers` | map<string,string> | request headers, **lower-cased**, with the verify header, `authorization` and `cookie` removed; repeated headers joined with `", "` | `{}` | `{}` |
+| `body` | any JSON | `application/json` → parsed; `application/x-www-form-urlencoded` → object of string fields; anything else → `{"text": "<raw>"}` | `spec.cron.payload`, else `{}` | the run envelope (§9) |
+| `sender` | map | `{login, isBot}` when `spec.sender` resolved, else `{}` | `{}` | `{login, isBot: false}`: the chain's originating human |
+| `repository` | string | `repositoryFrom` result, else `""` | `""` | the chain's origin repository |
 
 ## 3. CEL
 
@@ -219,10 +250,19 @@ engine modes) and on the Temporal gateway (for direct callers). Request:
 | --- | --- |
 | No trigger matched (including no EventTriggers at all) | `200 {"status":"ignored"}` — no turn, no RAG fallback |
 | Matched, params/template error | `422 {"status":"failed","error":"..."}` |
-| Matched | `202 {"id","status":"pending","trigger":{"name","sessionId","reply"}}` |
+| Matched | `202 {"id","status":"pending","trigger":{"name","sessionId","reply","params","onComplete"?}}` |
 
 `trigger.reply` is the trigger's `reply` with every template already rendered
-(`issueNumber` as a number) or `null`. Polling `GET /invoke/:id` is unchanged.
+(`issueNumber` as a number) or `null`. `trigger.params` is the §4 string form of
+every rendered param (`{name: string}`); `trigger.onComplete` (`{emitTo}`) is
+present only when the trigger sets it. The gateway needs both to build the run
+event (§9).
+
+Polling `GET /invoke/:id` is unchanged except for `outcome`: on a succeeded turn
+whose forced `agentRef` run's final reply carried a structured outcome, the poll
+response includes it as `outcome` (a JSON object whose compact serialization is
+at most 8192 bytes; anything else is dropped and logged). Otherwise it is
+omitted. `result` stays the continuation token.
 
 An event is always matched against the registry. Dispatch is never taken from
 the body: `forcedSkillId`, `forcedAgentId`, `forcedToolId`, `toolInput`,
@@ -296,6 +336,8 @@ opencode-swe-agent) act on one by name:
   Remote Control URL mid-run, it is edited into that ack comment (a separate
   comment only if there is no ack to edit, the edit fails, or a "link your
   account" prompt has been posted below the ack since);
+  `github.addLabels` / `github.assignees` at acceptance, alongside the ack,
+  with the same retry policy as `removeLabel`;
   `github.result` / `http` after;
   `github.removeLabel` after, on every outcome, through the durable pending-action
   store so a crash mid-run still clears it.
@@ -323,3 +365,81 @@ issuer keys, via `system:service-account-issuer-discovery`) and reads the
 payload from the CR, not from the tick. Verifying locally, unlike
 TokenReview, does not notice a ServiceAccount deleted after the token was
 minted; the tick token's 10-minute life bounds that.
+
+## 9. Run events and the software factory
+
+[ADR 0052](adr/0052-run-events-and-software-factory.md). A trigger with
+`onComplete.emitTo: <run source>` publishes each of its runs' completions as an
+event, so another trigger can chain off it. The gateway builds the event at the
+end of the run's lifecycle (after the poll, result comment and label removal)
+and feeds it through the **same** `/invoke` matching path as a webhook. Run
+events are only published for trigger-dispatched runs, never for chat or
+session-page turns, and triggers without `onComplete` behave as before.
+
+The envelope is §2's, with `kind: "run"` and this body:
+
+```
+body: {
+  trigger: "github-issue-triage",            # the trigger whose run finished
+  status:  "succeeded" | "failed" | "timed_out",
+  params:  { repository: "o/r", number: "12", ... },  # that run's params, §4 string form
+  outcome: { ... },                          # the run's structured outcome, {} when none
+  chain: {
+    id:     "<id of the envelope that started the chain>",
+    depth:  1,                               # 1 for the first run event in a chain
+    counts: { "github-issue-triage": 1 },    # runs of each trigger completed in this chain, this one included
+    origin: { login, accountId?, repository },
+  },
+}
+```
+
+`chain.depth` and every `chain.counts` value are JSON integers (CEL `int`, §3).
+The SWE agents (claude-code-swe-agent, opencode-swe-agent) report the outcome
+from the runner, not the model:
+`{pullRequest?: {number, url}, madeNewCommits, verdict?}`. `pullRequest` is set
+when the turn ended with an open PR. `verdict` is set only on `readOnly` runs:
+the runner tells the model to run `aktis-verdict changes-requested` or
+`aktis-verdict ready` once after posting its review, validates what it recorded,
+and reports `"none"` for a missing or invalid one.
+
+**Identity.** A run event never has a bot sender: it carries the sender of the
+webhook that started the chain. Before relaying each hop the gateway re-runs that
+login through the source's identity resolver and `senderClaims`, so a human whose
+access was revoked mid-chain stops the chain, and every hop acts as, and is
+audited to, a verified person (ADR 0049 identity modes apply unchanged). The
+bot-drop guard (§1) is untouched.
+
+**Loop bounds.** Two, both deterministic:
+
+- Per trigger, in CEL: a trigger caps itself on `body.chain.counts`, e.g.
+  `!("factory-review" in body.chain.counts) || body.chain.counts["factory-review"] < 3`.
+- Global, in the gateway: `RUN_EVENT_MAX_DEPTH` (default 12). A run event past
+  it is dropped and logged, and the gateway comments on the issue/PR it would
+  have replied to. No trigger config can exceed it.
+
+**Durability (v1).** The continuation lives in the gateway process, like the
+poll it follows. A gateway restart mid-run loses the next hop; the PR stays
+where it was (its status label shows where) and a human re-applies the label.
+
+### The factory recipe
+
+Shipped as `examples/event-triggers/` (`eventsource-runs.yaml`,
+`eventtrigger-factory-*.yaml`) and enabled for homelab in
+`orchestrator/charts/aktis/values-production.yaml`. All are repo-agnostic.
+
+| Trigger | Matches | Target | Reply |
+| --- | --- | --- | --- |
+| `github-issue-triage` | `ai-triage` applied to an issue (webhook) | SWE agent | ack, result, `removeLabel`; `onComplete.emitTo: runs` |
+| `factory-review` | `source == "runs" && kind == "run" && body.trigger in ["github-issue-triage", "factory-fix"] && body.status == "succeeded" && has(body.outcome.pullRequest) && (!("factory-review" in body.chain.counts) \|\| body.chain.counts["factory-review"] < 3)` | SWE agent, `readOnly` | on the PR: ack + session page, result, `addLabels: [ai-review]`, `removeLabel: ai-review`; `emitTo: runs` |
+| `factory-fix` | `body.trigger == "factory-review" && has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" && body.chain.counts["factory-review"] < 3` | SWE agent (PR-triage prompt) | on the PR: ack, result, `addLabels: [ai-triage]`, `removeLabel: ai-triage`; `emitTo: runs` |
+| `factory-handoff` | `body.trigger == "factory-review" && !(has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" && body.chain.counts["factory-review"] < 3)` | `none` | param `assignee: sender.login`; on the PR: ack with the reason, `assignees: ["{{assignee}}"]` |
+
+So: triage opens a PR → review → a `changes-requested` verdict sends it to a fix
+run, whose completion re-enters review; after at most 3 reviews, or on `ready`,
+no verdict, or a failed review, the PR is assigned to the human who applied the
+original `ai-triage`. `factory-review` takes the PR number from
+`body.outcome.pullRequest.number` (its match guarantees one) and the fix and
+handoff triggers from the review's own `body.params.number`. All three use the
+PR as `sessionKey`, so fix runs and re-reviews share one session per PR. The
+fix loop runs on the PR, not the issue: the review comments live there, and
+issue triage would open a second PR.

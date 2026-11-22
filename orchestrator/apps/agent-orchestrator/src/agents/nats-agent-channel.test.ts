@@ -491,6 +491,20 @@ describe("NatsAgentChannel.awaitReply timing", () => {
     expect((await pending).message).toBe("done");
   });
 
+  // docs/adr/0052 §2
+  it("surfaces the reply's outcome alongside its result, and omits it when absent", async () => {
+    const { channel, nc } = makeChannel();
+    const withOutcome = channel.awaitReply(RUN, { idleTimeoutMs: IDLE_MS });
+    await flush();
+    publishUp(nc, RUN, { type: "reply", message: "done", final: true, result: "tok", outcome: { madeNewCommits: true } });
+    expect(await withOutcome).toMatchObject({ result: "tok", outcome: { madeNewCommits: true } });
+
+    const without = channel.awaitReply("run-2", { idleTimeoutMs: IDLE_MS });
+    await flush();
+    publishUp(nc, "run-2", { type: "reply", message: "done", final: true });
+    expect(await without).not.toHaveProperty("outcome");
+  });
+
   it("collects narration and streams it to onProgress", async () => {
     const { channel, nc } = makeChannel();
     const seen: Array<[string | undefined, string]> = [];

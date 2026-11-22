@@ -465,6 +465,7 @@ async function main(): Promise<void> {
     ...(claudeLoginFlows ? { claudeLoginFlows } : {}),
     ...(connections ? { connections } : {}),
     resumeWaitMs: config.resumeWaitMs,
+    runEventMaxDepth: config.runEventMaxDepth,
     claudeCredentialRefreshEnabled: config.claudeCredentialRefreshEnabled,
     claudeCredentialRefreshMarginMs: config.claudeCredentialRefreshMarginMs,
     claudeCredentialSweepIntervalMs: config.claudeCredentialSweepIntervalMs,

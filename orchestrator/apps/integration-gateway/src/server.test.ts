@@ -51,6 +51,7 @@ const TICK_IDENTITIES: Record<string, string> = {
   [OTHER_TOKEN]: "system:serviceaccount:agents:eventsource-other",
   "aaa.wrongns.sig": "system:serviceaccount:elsewhere:eventsource-nightly",
   "aaa.github.sig": "system:serviceaccount:agents:eventsource-github",
+  "aaa.runs.sig": "system:serviceaccount:agents:eventsource-runs",
 };
 
 const SOURCES: EventSourceResource[] = [
@@ -101,6 +102,8 @@ const SOURCES: EventSourceResource[] = [
     spec: { webhook: { verify: { scheme: "bearer", header: "x-ci-token", secretRef: { name: "ci", key: "token" } } } },
   },
   { metadata: { name: "nightly" }, spec: { cron: { schedule: "0 7 * * *", payload: { repo: "acme/widgets", n: 3 } } } },
+  // docs/adr/0052 §1: receives the gateway's own run-completion events.
+  { metadata: { name: "runs" }, spec: { run: {} } },
 ];
 
 const DEFAULT_TRIGGER: AcceptedTrigger = {
@@ -130,6 +133,8 @@ interface Harness {
   postIssueComment: ReturnType<typeof vi.fn>;
   updateIssueComment: ReturnType<typeof vi.fn>;
   removeIssueLabel: ReturnType<typeof vi.fn>;
+  addIssueLabels: ReturnType<typeof vi.fn>;
+  addIssueAssignees: ReturnType<typeof vi.fn>;
   replyFetch: ReturnType<typeof vi.fn>;
   secretsGet: ReturnType<typeof vi.fn>;
   resolve: ReturnType<typeof vi.spyOn>;
@@ -170,6 +175,12 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
   const removeIssueLabel = vi.fn(async () => {
     order.push("removeLabel");
   });
+  const addIssueLabels = vi.fn(async (_o: string, _r: string, _n: number, labels: string[]) => {
+    order.push(`addLabels:${labels.join(",")}`);
+  });
+  const addIssueAssignees = vi.fn(async (_o: string, _r: string, _n: number, logins: string[]) => {
+    order.push(`assign:${logins.join(",")}`);
+  });
   const replyFetch = vi.fn(async () => {
     order.push("http");
     return new Response(null, { status: 204 });
@@ -191,7 +202,7 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
     tickNamespace: "agents",
     identityResolver,
     orchestratorClient: { submitEvent, poll, invoke, checkLive: vi.fn().mockResolvedValue({ live: false }) } as unknown as OrchestratorClient,
-    githubReplyClient: { postIssueComment, updateIssueComment, removeIssueLabel } as unknown as GithubReplyClient,
+    githubReplyClient: { postIssueComment, updateIssueComment, removeIssueLabel, addIssueLabels, addIssueAssignees } as unknown as GithubReplyClient,
     replyFetch: replyFetch as unknown as typeof fetch,
     log: (line) => logs.push(line),
     onBackgroundError,
@@ -215,6 +226,8 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
     postIssueComment,
     updateIssueComment,
     removeIssueLabel,
+    addIssueLabels,
+    addIssueAssignees,
     replyFetch,
     secretsGet,
     resolve,
@@ -1081,6 +1094,256 @@ describe("webhook trace context (docs/adr/0050 §4)", () => {
         "http.response.status_code": 403,
       });
     });
+  });
+});
+
+describe("run-completion events (docs/adr/0052 §1)", () => {
+  const TRIAGE: AcceptedTrigger = {
+    name: "github-issue-triage",
+    sessionId: "github:acme/widgets#7",
+    reply: { github: { repository: "acme/widgets", issueNumber: 7, removeLabel: "ai-triage" } },
+    params: { repository: "acme/widgets", number: "7" },
+    onComplete: { emitTo: "runs" },
+  };
+  const REVIEW: AcceptedTrigger = {
+    name: "factory-review",
+    sessionId: "github:acme/widgets#12",
+    reply: { github: { repository: "acme/widgets", issueNumber: 12, removeLabel: "ai-review" } },
+    params: { repository: "acme/widgets", number: "12" },
+    onComplete: { emitTo: "runs" },
+  };
+  const PR = { pullRequest: { number: 12, url: "https://github.com/acme/widgets/pull/12" }, madeNewCommits: true };
+
+  /** Accepts the webhook with `first`, then answers each following submit with the next entry (`ignored` once they run out). */
+  function chain(h: Harness, first: AcceptedTrigger, ...rest: AcceptedTrigger[]): void {
+    const queue = [first, ...rest];
+    let n = 0;
+    h.submitEvent.mockImplementation(async (): Promise<EventSubmitResult> => {
+      h.order.push(`submit:${n}`);
+      const trigger = queue[n];
+      n++;
+      return trigger ? { kind: "accepted", id: `inv-${n}`, trigger } : { kind: "ignored" };
+    });
+  }
+
+  const runEnvelopes = (h: Harness): Envelope[] => h.submitEvent.mock.calls.map((c) => c[0] as Envelope).filter((e) => e.kind === "run");
+
+  it("publishes the finished run to the run source with trigger, status, params, outcome and a new chain -- after the label comes off", async () => {
+    const h = await start();
+    chain(h, TRIAGE);
+    h.poll.mockResolvedValueOnce({ status: "succeeded", result: "token", outcome: PR });
+    await postGithub(h);
+    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(2));
+
+    const event = submittedEnvelope(h, 1);
+    expect(event).toEqual({
+      source: "runs",
+      kind: "run",
+      id: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      time: expect.any(String),
+      headers: {},
+      sender: { login: "alice", isBot: false },
+      repository: "acme/widgets",
+      body: {
+        trigger: "github-issue-triage",
+        status: "succeeded",
+        params: { repository: "acme/widgets", number: "7" },
+        outcome: PR,
+        chain: { id: "delivery-123", depth: 1, counts: { "github-issue-triage": 1 }, origin: { login: "alice", repository: "acme/widgets" } },
+      },
+    });
+    // Relayed with the re-verified sender, exactly as a webhook's.
+    expect(h.submitEvent.mock.calls[1]?.[1]).toEqual({ login: "alice" });
+    expect(h.resolve).toHaveBeenLastCalledWith("alice", false, { owner: "acme", repo: "widgets" });
+    expect(h.order.indexOf("removeLabel")).toBeLessThan(h.order.indexOf("submit:1"));
+  });
+
+  it("carries the origin's account id and vouches for its subject on every hop", async () => {
+    const findSubjectsByAccount = vi.fn(async () => ["openwebui:alice"]);
+    const h = await start({ senderSubjects: { findSubjectsByAccount } });
+    chain(h, TRIAGE);
+    const body = JSON.stringify({ ...GITHUB_PAYLOAD, sender: { login: "alice", type: "User", id: 583231 } });
+    await fetch(`http://localhost:${h.port}/webhooks/github-ids`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-github-delivery": "delivery-ids",
+        "x-hub-signature-256": `sha256=${hmacHex("gh-secret", body)}`,
+      },
+      body,
+    });
+    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(2));
+    expect((submittedEnvelope(h, 1).body as { chain: unknown }).chain).toEqual({
+      id: "delivery-ids",
+      depth: 1,
+      counts: { "github-issue-triage": 1 },
+      origin: { login: "alice", accountId: "583231", repository: "acme/widgets" },
+    });
+    expect(h.submitEvent.mock.calls[1]?.[1]).toEqual({ login: "alice", accountId: "583231", subject: "openwebui:alice", subjectStatus: "linked" });
+  });
+
+  it("publishes a failed run too, with outcome {}", async () => {
+    const h = await start();
+    chain(h, TRIAGE);
+    h.poll.mockResolvedValueOnce({ status: "failed", error: "agent crashed" });
+    await postGithub(h);
+    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(2));
+    expect(submittedEnvelope(h, 1).body).toMatchObject({ status: "failed", outcome: {} });
+  });
+
+  it("publishes nothing for a trigger without onComplete.emitTo", async () => {
+    const h = await start();
+    const { onComplete: _omit, ...plain } = TRIAGE;
+    chain(h, plain);
+    await postGithub(h);
+    await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
+    await settle();
+    expect(h.submitEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["a missing source", "nope", /no such usable EventSource/],
+    ["a webhook source", "github", /source is kind webhook, not run/],
+    ["a cron source", "nightly", /source is kind cron, not run/],
+  ])("skips (and logs) emitTo naming %s", async (_, emitTo, why) => {
+    const h = await start();
+    chain(h, { ...TRIAGE, onComplete: { emitTo } });
+    await postGithub(h);
+    await vi.waitFor(() => expect(h.logs.join("\n")).toMatch(why));
+    await settle();
+    expect(h.submitEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it("can't emit for a chain with no verified human (a cron tick)", async () => {
+    const h = await start();
+    chain(h, TRIAGE);
+    await fetch(`http://localhost:${h.port}/events/nightly/tick`, { method: "POST", headers: { authorization: `Bearer ${NIGHTLY_TOKEN}` } });
+    await vi.waitFor(() => expect(h.logs.join("\n")).toMatch(/skipped \(the chain has no verified human sender to act as\)/));
+    await settle();
+    expect(h.submitEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it("publishes nothing while the turn is parked on an identity link that never completes", async () => {
+    const waitForCompletion = vi.fn().mockResolvedValue(undefined);
+    const h = await start({
+      claudeAuthStore: { get: vi.fn(), set: vi.fn(), delete: vi.fn(), waitForCompletion } as unknown as ClaudeTokenStore,
+    });
+    chain(h, TRIAGE);
+    h.poll.mockResolvedValueOnce({ status: "succeeded", identityLinkPending: true, identityLink: { provider: "claude", subject: "s" }, result: "link" });
+    await postGithub(h);
+    await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
+    await settle();
+    expect(h.submitEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops the hop when the origin no longer verifies, and says so on the issue", async () => {
+    const h = await start();
+    chain(h, TRIAGE);
+    // The webhook's own lookup passes; the per-hop re-verification does not
+    // (say alice's access was revoked mid-run).
+    h.resolve.mockResolvedValueOnce({ subject: "alice", roles: ["reporter"] }).mockResolvedValueOnce(undefined);
+    await postGithub(h);
+    await vi.waitFor(() => expect(h.logs.join("\n")).toMatch(/dropped, chain origin alice no longer verifies/));
+    await settle();
+    expect(h.resolve).toHaveBeenCalledTimes(2);
+    expect(h.submitEvent).toHaveBeenCalledTimes(1);
+    expect(h.postIssueComment).toHaveBeenCalledWith("acme", "widgets", 7, expect.stringContaining("alice could not be re-verified"));
+  });
+
+  it("a run started by a run event publishes the next hop: depth and that trigger's count go up, origin is kept", async () => {
+    const h = await start();
+    chain(h, TRIAGE, REVIEW, REVIEW);
+    h.poll
+      .mockResolvedValueOnce({ status: "succeeded", result: "t1", outcome: PR })
+      .mockResolvedValueOnce({ status: "succeeded", result: "t2", outcome: { verdict: "changes-requested" } })
+      .mockResolvedValueOnce({ status: "succeeded", result: "t3", outcome: { verdict: "ready" } });
+    await postGithub(h);
+    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(4));
+
+    const [, second, third] = runEnvelopes(h);
+    expect(second?.body).toEqual({
+      trigger: "factory-review",
+      status: "succeeded",
+      params: { repository: "acme/widgets", number: "12" },
+      outcome: { verdict: "changes-requested" },
+      chain: {
+        id: "delivery-123",
+        depth: 2,
+        counts: { "github-issue-triage": 1, "factory-review": 1 },
+        origin: { login: "alice", repository: "acme/widgets" },
+      },
+    });
+    expect((third?.body as { chain: unknown }).chain).toEqual({
+      id: "delivery-123",
+      depth: 3,
+      counts: { "github-issue-triage": 1, "factory-review": 2 },
+      origin: { login: "alice", repository: "acme/widgets" },
+    });
+    // Every hop is re-verified and relayed as alice.
+    expect(h.submitEvent.mock.calls.slice(1).map((c) => c[1])).toEqual([{ login: "alice" }, { login: "alice" }, { login: "alice" }]);
+    expect(runEnvelopes(h).map((e) => e.sender)).toEqual(Array(3).fill({ login: "alice", isBot: false }));
+  });
+
+  it("drops a hop past RUN_EVENT_MAX_DEPTH and comments on the run's issue/PR", async () => {
+    const h = await start({ runEventMaxDepth: 1 });
+    chain(h, TRIAGE, REVIEW);
+    await postGithub(h);
+    await vi.waitFor(() => expect(h.logs.join("\n")).toMatch(/dropped, chain delivery-123 would reach depth 2 \(max 1\)/));
+    await settle();
+    // Depth 1 went out; depth 2 did not.
+    expect(runEnvelopes(h)).toHaveLength(1);
+    expect(h.postIssueComment).toHaveBeenCalledWith("acme", "widgets", 12, "Stopped the automated chain here: it exceeded 1 steps.");
+  });
+
+  it("allows a chain right up to the cap", async () => {
+    const h = await start({ runEventMaxDepth: 2 });
+    chain(h, TRIAGE, REVIEW);
+    await postGithub(h);
+    await vi.waitFor(() => expect(runEnvelopes(h)).toHaveLength(2));
+  });
+
+  it("a run source is not reachable over HTTP: no webhook route, no tick route", async () => {
+    const h = await start();
+    expect((await fetch(`http://localhost:${h.port}/webhooks/runs`, { method: "POST", body: "{}" })).status).toBe(404);
+    expect((await fetch(`http://localhost:${h.port}/events/runs/tick`, { method: "POST", headers: { authorization: "Bearer aaa.runs.sig" } })).status).toBe(404);
+    await settle();
+    expect(h.submitEvent).not.toHaveBeenCalled();
+  });
+});
+
+describe("reply.github addLabels / assignees (docs/adr/0052 §3)", () => {
+  const HANDOFF: AcceptedTrigger = {
+    name: "factory-handoff",
+    sessionId: "github:acme/widgets#12",
+    reply: { github: { repository: "acme/widgets", issueNumber: 12, ack: "Ready for review.", addLabels: ["ai-reviewed", ""], assignees: ["alice"] } },
+  };
+
+  it("applies them at acceptance, with the ack and before polling (empty entries dropped)", async () => {
+    const h = await start();
+    h.submitEvent.mockResolvedValueOnce({ kind: "accepted", id: "inv-1", trigger: HANDOFF });
+    await postGithub(h);
+    await vi.waitFor(() => expect(h.poll).toHaveBeenCalled());
+    expect(h.addIssueLabels).toHaveBeenCalledWith("acme", "widgets", 12, ["ai-reviewed"]);
+    expect(h.addIssueAssignees).toHaveBeenCalledWith("acme", "widgets", 12, ["alice"]);
+    expect(h.order.slice(0, 4)).toEqual(["comment:Ready for review.", "addLabels:ai-reviewed", "assign:alice", "poll"]);
+  });
+
+  it("is best effort: a failed label add is reported and the run still proceeds", async () => {
+    const h = await start();
+    h.submitEvent.mockResolvedValueOnce({ kind: "accepted", id: "inv-1", trigger: HANDOFF });
+    h.addIssueLabels.mockRejectedValueOnce(new Error("422 after retries"));
+    await postGithub(h);
+    await vi.waitFor(() => expect(h.poll).toHaveBeenCalled());
+    expect(h.onBackgroundError).toHaveBeenCalledWith(expect.objectContaining({ message: "422 after retries" }));
+    expect(h.addIssueAssignees).toHaveBeenCalled();
+  });
+
+  it("calls neither when the reply declares none", async () => {
+    const h = await start();
+    await postGithub(h);
+    await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
+    expect(h.addIssueLabels).not.toHaveBeenCalled();
+    expect(h.addIssueAssignees).not.toHaveBeenCalled();
   });
 });
 

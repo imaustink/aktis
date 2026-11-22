@@ -36,6 +36,7 @@ import { clip } from "./security/redact.js";
 import { installMountedSkills, listInstalledSkills, splitSkillInvocation } from "./skills.js";
 import { parseAwsProfiles, writeAwsConfig } from "./awsConfig.js";
 import { closingLine, ensureClosingReference, parseClosesIssue } from "./closingRef.js";
+import { clearVerdict, collectOutcome, installVerdictCommand, VERDICT_FILE_ENV } from "./outcome.js";
 
 const toolConfig = loadToolConfig();
 const awsProfiles = parseAwsProfiles(toolConfig.awsProfiles);
@@ -194,6 +195,13 @@ async function handler(session: AgentSession): Promise<AgentReply> {
     // The CLI's own spans join the turn's trace (docs/adr/0050 §3c).
     ...claudeCodeTelemetryEnv(session.telemetry),
   };
+  // `aktis-verdict` (docs/adr/0052 §2): how a review records its decision in a
+  // runner-owned file. On PATH for every run -- the gh shim below shares the
+  // same bin directory -- but only a read-only run's prompt mentions it and
+  // only a read-only run's outcome reports it.
+  const verdict = await installVerdictCommand({ homeDir: toolConfig.homeDir });
+  childEnv.PATH = `${verdict.binDir}:${childEnv.PATH ?? ""}`;
+  childEnv[VERDICT_FILE_ENV] = verdict.verdictFile;
   if (delegating) {
     const shim = await installGhShim({ homeDir: toolConfig.homeDir });
     if (shim) {
@@ -273,7 +281,7 @@ async function handler(session: AgentSession): Promise<AgentReply> {
   }
 
   await session.progress("Running Claude Code…", { stage: "agent" });
-  const prompt = buildPrompt(instruction, marker, skill, awsProfiles.profiles, toolConfig.kubeInCluster);
+  const prompt = buildPrompt(instruction, marker, skill, awsProfiles.profiles, toolConfig.kubeInCluster, readOnly);
   const runOpts = {
     cwd: toolConfig.workdir,
     env: childEnv,
@@ -294,6 +302,10 @@ async function handler(session: AgentSession): Promise<AgentReply> {
     seeded: toolConfig.loginCredentialsJson,
   });
   writebackWatcher.start();
+
+  // Cleared right before the turn, so whatever is in the file afterwards was
+  // written during THIS turn, never left over from an earlier one.
+  await clearVerdict(verdict.verdictFile);
 
   const outcome = toolConfig.remoteControlEnabled
     ? await runClaudeTurnRemoteControlled(prompt, {
@@ -361,7 +373,12 @@ async function handler(session: AgentSession): Promise<AgentReply> {
     if (!readOnly) {
       throw new Error(`The coding agent produced no pushable repository or branch. Details: ${clip(summary, 1200)}`);
     }
-    return { message: `The agent produced no pushable repository or pull request. Details: ${clip(summary, 1200)}` };
+    // A review that didn't leave a clone behind may still have posted its
+    // review and recorded a verdict, so the outcome travels with this reply.
+    return {
+      message: `The agent produced no pushable repository or pull request. Details: ${clip(summary, 1200)}`,
+      outcome: await collectOutcome({ discovered: null, madeNewCommits: false, readOnly, verdictFile: verdict.verdictFile }),
+    };
   }
 
   let headSha: string | null = null;
@@ -492,7 +509,12 @@ async function handler(session: AgentSession): Promise<AgentReply> {
     markerHadPr: Boolean(marker?.pr),
   });
 
-  return { message: `${clip(summary, 1500)}${prLine}${closingNote}`, result: encodeSweContinuation(nextMarker) };
+  return {
+    message: `${clip(summary, 1500)}${prLine}${closingNote}`,
+    result: encodeSweContinuation(nextMarker),
+    // Runner-observed facts for chained triggers (docs/adr/0052 §2).
+    outcome: await collectOutcome({ discovered, madeNewCommits, readOnly, verdictFile: verdict.verdictFile }),
+  };
 }
 
 void runAgent(handler);

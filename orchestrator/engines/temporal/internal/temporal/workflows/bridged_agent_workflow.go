@@ -216,7 +216,16 @@ func BridgedAgentWorkflow(ctx workflow.Context, in AgentWorkflowInput) error {
 			}
 			handledSeq[msg.Seq] = true
 			if msg.Final {
-				up(AgentUp{Final: true, Message: msg.Message, Result: msg.ResultText()})
+				// Validated here, the first workflow to hold it, so a malformed
+				// or oversized outcome never reaches the parent's history, the
+				// turn result or a run-completion event. Dropping it costs only
+				// the outcome: the reply itself is still the answer.
+				outcome, err := agentrun.ValidOutcome(msg.Outcome)
+				if err != nil {
+					logger.Warn("dropping the agent's reply outcome", "runId", runID, "error", err)
+					outcome = nil
+				}
+				up(AgentUp{Final: true, Message: msg.Message, Result: msg.ResultText(), Outcome: outcome})
 				return nil
 			}
 			// A non-final reply is a question. HITL has no dedicated message

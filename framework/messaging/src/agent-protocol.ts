@@ -85,6 +85,10 @@ export const AgentUpMessageSchema = z.discriminatedUnion("type", [
     final: z.boolean(),
     // Optional structured result for non-chat consumers (AgentRun status, etc.).
     result: z.unknown().optional(),
+    // Runner-produced facts about the finished turn (docs/adr/0052 §2): a
+    // JSON object, carried to the invocation record and the run-completion
+    // event. Not the model's prose, and not `result` (a continuation token).
+    outcome: z.record(z.string(), z.unknown()).optional(),
   }),
   // Terminal failure.
   AgentMessageBaseSchema.extend({
@@ -196,7 +200,7 @@ export type AgentUpMessage<TResult = unknown> =
   | (AgentMessageBase & { type: "ready" })
   | (AgentMessageBase & { type: "progress"; stage?: string; message: string; pct?: number })
   | (AgentMessageBase & { type: "warning"; message: string })
-  | (AgentMessageBase & { type: "reply"; message: string; final: boolean; result?: TResult })
+  | (AgentMessageBase & { type: "reply"; message: string; final: boolean; result?: TResult; outcome?: Record<string, unknown> })
   | (AgentMessageBase & { type: "failed"; code: string; message: string })
   // `event?` (not required) matches Zod's own inference for a `z.unknown()`
   // field (which admits `undefined`) -- keeping the hand-written type and

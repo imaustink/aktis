@@ -9,6 +9,7 @@ import {
   isReadOnly,
   READ_ONLY_DENY_BASH_PATTERNS,
 } from "./opencode.js";
+import { VERDICT_PROMPT_SECTION } from "./outcome.js";
 
 describe("buildOpencodeConfig", () => {
   it("pins the model and bakes in bash deny rules alongside a blanket allow", () => {
@@ -106,6 +107,20 @@ describe("buildPrompt", () => {
     const prompt = buildPrompt("add a health check", null);
     expect(prompt).not.toContain("CONTINUING work");
     expect(prompt).toContain("gh repo create");
+  });
+
+  // docs/adr/0052 §2: a review records its decision with aktis-verdict.
+  it("ends a read-only prompt with the verdict instruction", () => {
+    const prompt = buildPrompt("review PR #7", null, true);
+    expect(prompt.endsWith(`\n\n${VERDICT_PROMPT_SECTION}`)).toBe(true);
+    expect(prompt).toContain("aktis-verdict changes-requested");
+    expect(prompt).toContain("aktis-verdict ready");
+  });
+
+  it("leaves a write run's prompt unchanged", () => {
+    const prompt = buildPrompt("fix the bug", null, false);
+    expect(prompt).not.toContain("aktis-verdict");
+    expect(prompt).toBe(buildPrompt("fix the bug", null));
   });
 
   // docs/adr/0050 §3c: opencode's AI SDK spans carry prompt and response text

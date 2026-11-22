@@ -29,7 +29,8 @@ spec:
       openAPIV3Schema:
         description: |-
           EventTrigger maps events matching a CEL predicate to an orchestrator turn,
-          Skill, Agent or Tool with CEL-derived params (docs/adr/0048).
+          Skill, Agent or Tool with CEL-derived params (docs/adr/0048), or to reply
+          side effects alone (target.none, docs/adr/0052).
         properties:
           apiVersion:
             description: |-
@@ -59,6 +60,23 @@ spec:
                       from sourceRef.
                     type: string
                 type: object
+              onComplete:
+                description: |-
+                  onComplete publishes the run's completion as an event. Absent, the
+                  trigger behaves as it always has: nothing is emitted.
+                properties:
+                  emitTo:
+                    description: |-
+                      emitTo names a run-kind EventSource (spec.run) in the same namespace.
+                      When a run this trigger started finishes, integration-gateway relays a
+                      kind "run" event on it carrying the run's status, params, outcome and
+                      chain counters, so other triggers can chain off it. The trigger is not
+                      Ready until the source exists and is a run source.
+                    minLength: 1
+                    type: string
+                required:
+                - emitTo
+                type: object
               params:
                 additionalProperties:
                   type: string
@@ -81,6 +99,25 @@ spec:
                       ack:
                         description: ack is a comment posted before the run starts.
                         type: string
+                      addLabels:
+                        description: |-
+                          addLabels are added when the run is accepted, alongside the ack. Each
+                          entry is a {{param}} template; one that renders empty is dropped. Labels
+                          the bot adds never re-enter routing (bot-authored events are dropped),
+                          so they are safe as status markers (docs/adr/0052 §3).
+                        items:
+                          type: string
+                        maxItems: 10
+                        type: array
+                      assignees:
+                        description: |-
+                          assignees are logins assigned to the issue or pull request when the run
+                          is accepted. Each entry is a {{param}} template; one that renders empty
+                          is dropped. GitHub caps an issue at 10 assignees.
+                        items:
+                          type: string
+                        maxItems: 10
+                        type: array
                       issueNumber:
                         description: issueNumber is the issue or pull request number.
                         minLength: 1
@@ -164,6 +201,12 @@ spec:
                     - delegated
                     - hybrid
                     type: string
+                  none:
+                    description: |-
+                      none runs nothing: the trigger is accepted and completes at once with an
+                      empty result, executing only its reply side effects. No AgentRun, no
+                      tool, no identity check.
+                    type: object
                   orchestrator:
                     description: orchestrator runs a conversational turn on the rendered
                       prompt.
@@ -186,12 +229,20 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-validations:
-                - message: exactly one of orchestrator, skillRef, agentRef or toolRef
-                    must be set
-                  rule: (has(self.orchestrator)?1:0)+(has(self.skillRef)?1:0)+(has(self.agentRef)?1:0)+(has(self.toolRef)?1:0)==1
-                - message: promptTemplate is required unless toolRef is set
-                  rule: has(self.toolRef) || (has(self.promptTemplate) && size(self.promptTemplate)
-                    > 0)
+                - message: exactly one of orchestrator, skillRef, agentRef, toolRef
+                    or none must be set
+                  rule: (has(self.orchestrator)?1:0)+(has(self.skillRef)?1:0)+(has(self.agentRef)?1:0)+(has(self.toolRef)?1:0)+(has(self.none)?1:0)==1
+                - message: promptTemplate is required unless toolRef or none is set
+                  rule: has(self.toolRef) || has(self.none) || (has(self.promptTemplate)
+                    && size(self.promptTemplate) > 0)
+                - message: 'promptTemplate cannot be set with none: nothing runs to
+                    receive it'
+                  rule: '!has(self.none) || !has(self.promptTemplate) || size(self.promptTemplate)
+                    == 0'
+                - message: 'readOnly cannot be set with none: nothing runs to restrict'
+                  rule: '!has(self.none) || !has(self.readOnly) || !self.readOnly'
+                - message: 'identity cannot be set with none: nothing runs to authorize'
+                  rule: '!has(self.none) || !has(self.identity)'
                 - message: identity applies to agent runs; it cannot be set with toolRef
                   rule: '!has(self.identity) || !has(self.toolRef)'
             required:

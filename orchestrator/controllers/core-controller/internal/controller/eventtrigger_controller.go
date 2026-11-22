@@ -55,8 +55,9 @@ type EventTriggerReconciler struct {
 // +kubebuilder:rbac:groups=core.aktis.ai,resources=tools,verbs=get;list;watch
 
 // Reconcile sets an EventTrigger's Ready condition: its CEL compiles, its
-// sourceRef (if any) names an existing EventSource, and its single target ref
-// names an existing Skill/Agent/Tool in the same namespace.
+// sourceRef (if any) names an existing EventSource, its onComplete.emitTo (if
+// any) names an existing run EventSource, and its single target ref names an
+// existing Skill/Agent/Tool in the same namespace.
 //
 // Ready is what the engines match on (docs/event-triggers.md §4), so a trigger
 // that would fail at dispatch never matches: a CEL error is fail-closed here
@@ -150,6 +151,23 @@ func (r *EventTriggerReconciler) check(ctx context.Context, trigger *corev1alpha
 		}
 	}
 
+	// emitTo must name a run source: the gateway publishes completions only
+	// to one, so any other name would silently publish nowhere and the chain
+	// would stall after this trigger's first run.
+	if oc := trigger.Spec.OnComplete; oc != nil {
+		var source corev1alpha1.EventSource
+		ok, err := exists(&source, oc.EmitTo)
+		if err != nil {
+			return "", "", err
+		}
+		if !ok {
+			return "EmitToNotFound", fmt.Sprintf("onComplete.emitTo EventSource %q does not exist", oc.EmitTo), nil
+		}
+		if source.Spec.Run == nil {
+			return "EmitToNotRunSource", fmt.Sprintf("onComplete.emitTo EventSource %q is not a run source (spec.run)", oc.EmitTo), nil
+		}
+	}
+
 	target := trigger.Spec.Target
 	var (
 		obj  client.Object
@@ -157,7 +175,9 @@ func (r *EventTriggerReconciler) check(ctx context.Context, trigger *corev1alpha
 		name string
 	)
 	switch {
-	case target.Orchestrator != nil:
+	case target.Orchestrator != nil, target.None != nil:
+		// Nothing to resolve: an orchestrator turn picks its agent later, and
+		// a none target runs nothing.
 		return "", "", nil
 	case target.SkillRef != "":
 		obj, kind, name = &corev1alpha1.Skill{}, "Skill", target.SkillRef
@@ -167,7 +187,7 @@ func (r *EventTriggerReconciler) check(ctx context.Context, trigger *corev1alpha
 		obj, kind, name = &corev1alpha1.Tool{}, "Tool", target.ToolRef
 	default:
 		// Admission's oneOf rule makes this unreachable.
-		return "TargetNotFound", "target sets none of orchestrator, skillRef, agentRef or toolRef", nil
+		return "TargetNotFound", "target sets none of orchestrator, skillRef, agentRef, toolRef or none", nil
 	}
 	ok, err := exists(obj, name)
 	if err != nil {
@@ -194,25 +214,40 @@ func (r *EventTriggerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// appearance or deletion re-checks every trigger naming them — otherwise a
 	// trigger applied before its target would stay NotReady (and unmatched)
 	// until something else touched it.
-	byRef := func(refOf func(*corev1alpha1.EventTrigger) string) handler.EventHandler {
+	byRef := func(refsOf func(*corev1alpha1.EventTrigger) []string) handler.EventHandler {
 		return handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
-			return r.triggersReferencing(ctx, obj, refOf)
+			return r.triggersReferencing(ctx, obj, refsOf)
 		})
+	}
+	one := func(ref func(*corev1alpha1.EventTrigger) string) func(*corev1alpha1.EventTrigger) []string {
+		return func(t *corev1alpha1.EventTrigger) []string { return []string{ref(t)} }
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1alpha1.EventTrigger{}).
-		Watches(&corev1alpha1.EventSource{}, byRef(func(t *corev1alpha1.EventTrigger) string { return t.Spec.SourceRef })).
-		Watches(&corev1alpha1.Skill{}, byRef(func(t *corev1alpha1.EventTrigger) string { return t.Spec.Target.SkillRef })).
-		Watches(&corev1alpha1.Agent{}, byRef(func(t *corev1alpha1.EventTrigger) string { return t.Spec.Target.AgentRef })).
-		Watches(&corev1alpha1.Tool{}, byRef(func(t *corev1alpha1.EventTrigger) string { return t.Spec.Target.ToolRef })).
+		// An EventSource is referenced two ways. Updates matter too, not just
+		// creation: a source switched to or from spec.run flips emitTo's check.
+		Watches(&corev1alpha1.EventSource{}, byRef(eventSourceRefs)).
+		Watches(&corev1alpha1.Skill{}, byRef(one(func(t *corev1alpha1.EventTrigger) string { return t.Spec.Target.SkillRef }))).
+		Watches(&corev1alpha1.Agent{}, byRef(one(func(t *corev1alpha1.EventTrigger) string { return t.Spec.Target.AgentRef }))).
+		Watches(&corev1alpha1.Tool{}, byRef(one(func(t *corev1alpha1.EventTrigger) string { return t.Spec.Target.ToolRef }))).
 		Named("eventtrigger").
 		Complete(r)
+}
+
+// eventSourceRefs are the EventSources a trigger names: its sourceRef and its
+// onComplete.emitTo.
+func eventSourceRefs(t *corev1alpha1.EventTrigger) []string {
+	refs := []string{t.Spec.SourceRef}
+	if t.Spec.OnComplete != nil {
+		refs = append(refs, t.Spec.OnComplete.EmitTo)
+	}
+	return refs
 }
 
 func (r *EventTriggerReconciler) triggersReferencing(
 	ctx context.Context,
 	obj client.Object,
-	refOf func(*corev1alpha1.EventTrigger) string,
+	refsOf func(*corev1alpha1.EventTrigger) []string,
 ) []reconcile.Request {
 	var triggers corev1alpha1.EventTriggerList
 	if err := r.List(ctx, &triggers, client.InNamespace(obj.GetNamespace())); err != nil {
@@ -221,7 +256,7 @@ func (r *EventTriggerReconciler) triggersReferencing(
 	var requests []reconcile.Request
 	for i := range triggers.Items {
 		t := &triggers.Items[i]
-		if refOf(t) != obj.GetName() {
+		if !slices.Contains(refsOf(t), obj.GetName()) {
 			continue
 		}
 		requests = append(requests, reconcile.Request{

@@ -219,6 +219,34 @@ export interface GatewayServerOptions {
   labelReconcilerIntervalMs?: number;
   /** How old an owed removal must be before the sweep acts on it; forwarded to {@link LabelReconciler}. */
   labelReconcilerGraceMs?: number;
+  /**
+   * The global run-event chain depth cap (docs/adr/0052 §1,
+   * `RUN_EVENT_MAX_DEPTH`). Absent -> {@link DEFAULT_RUN_EVENT_MAX_DEPTH}.
+   */
+  runEventMaxDepth?: number;
+}
+
+export const DEFAULT_RUN_EVENT_MAX_DEPTH = 12;
+
+/**
+ * The chain a run belongs to (docs/adr/0052 §1), carried in every run event's
+ * `body.chain`. A webhook/cron delivery starts one at depth 0; each run event
+ * is one deeper.
+ */
+interface RunChain {
+  /** The id of the envelope that started the chain. */
+  id: string;
+  depth: number;
+  /** Completed runs per trigger name in this chain. */
+  counts: Record<string, number>;
+  /** The verified human who started it. Absent for a sourceless sender (cron, a webhook without `sender`), which cannot emit. */
+  origin?: { login: string; accountId?: string; repository: string };
+}
+
+/** How a run ended, for its completion event. */
+interface FinishedRun {
+  status: OrchestratorInvokeResult["status"];
+  outcome?: Record<string, unknown>;
 }
 
 /** The validated `reply.github` of an accepted trigger, with its repository split. */
@@ -230,6 +258,42 @@ interface GithubReplyTarget {
   sessionPage?: boolean;
   result?: boolean;
   removeLabel?: string;
+  /** Applied at acceptance (docs/adr/0052 §3); only non-empty strings survive validation. */
+  addLabels?: string[];
+  assignees?: string[];
+}
+
+/** The non-empty strings of a rendered list; anything else would only earn a 422 from GitHub. */
+function nonEmptyStrings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string" && v.trim() !== "") : [];
+}
+
+const isCount = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+
+/**
+ * Reads back a run event's `body.chain`. The gateway wrote it, and a run
+ * source has no HTTP route, but the engine round-trips it, so it is checked
+ * rather than trusted: an unreadable chain stops emission (fail closed) rather
+ * than restarting at depth 0, which would defeat the depth cap.
+ */
+function parseChain(raw: unknown): RunChain | undefined {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
+  const c = raw as Record<string, unknown>;
+  if (typeof c.id !== "string" || !c.id || !isCount(c.depth)) return undefined;
+  if (typeof c.counts !== "object" || c.counts === null || Array.isArray(c.counts)) return undefined;
+  const counts: Record<string, number> = {};
+  for (const [name, n] of Object.entries(c.counts)) {
+    if (!isCount(n)) return undefined;
+    counts[name] = n;
+  }
+  let origin: RunChain["origin"];
+  if (c.origin !== undefined) {
+    const o = c.origin as Record<string, unknown> | null;
+    if (typeof o !== "object" || o === null || typeof o.login !== "string" || !o.login || typeof o.repository !== "string") return undefined;
+    if (o.accountId !== undefined && typeof o.accountId !== "string") return undefined;
+    origin = { login: o.login, ...(o.accountId ? { accountId: o.accountId } : {}), repository: o.repository };
+  }
+  return { id: c.id, depth: c.depth, counts, ...(origin ? { origin } : {}) };
 }
 
 /** `owner/name`, each a GitHub-legal segment -- what lands in a REST path. */
@@ -832,6 +896,8 @@ export class GatewayServer {
       this.log(`trigger ${trigger.name}: reply.github ignored (repository ${JSON.stringify(gh.repository)} / issueNumber ${JSON.stringify(issueNumber)} unusable)`);
       return undefined;
     }
+    const addLabels = nonEmptyStrings(gh.addLabels);
+    const assignees = nonEmptyStrings(gh.assignees);
     return {
       owner: repoMatch[1] as string,
       repo: repoMatch[2] as string,
@@ -840,6 +906,8 @@ export class GatewayServer {
       ...(gh.sessionPage ? { sessionPage: true } : {}),
       ...(gh.result ? { result: true } : {}),
       ...(gh.removeLabel ? { removeLabel: gh.removeLabel } : {}),
+      ...(addLabels.length ? { addLabels } : {}),
+      ...(assignees.length ? { assignees } : {}),
     };
   }
 
@@ -872,6 +940,8 @@ export class GatewayServer {
       }
     };
     let httpSent = false;
+    // Set once the run has a final outcome to publish (docs/adr/0052 §1).
+    let finished: FinishedRun | undefined;
     // The posted ack, so the Remote Control link can be edited into it
     // rather than posted as a second comment (see remoteControlHooks).
     let ackComment: { id: number; body: string } | undefined;
@@ -904,6 +974,11 @@ export class GatewayServer {
             if (id !== undefined) ackComment = { id, body: ack };
           });
         }
+        // docs/adr/0052 §3: status labels and assignees go on at acceptance,
+        // with the ack. Bot-authored, so they never re-enter routing.
+        const { addLabels, assignees } = gh;
+        if (addLabels) await best(() => this.options.githubReplyClient.addIssueLabels(gh.owner, gh.repo, gh.issueNumber, addLabels));
+        if (assignees) await best(() => this.options.githubReplyClient.addIssueAssignees(gh.owner, gh.repo, gh.issueNumber, assignees));
       }
 
       const turnLabel = `${envelope.source} event ${envelope.id} → ${trigger.name || "trigger"}`;
@@ -954,6 +1029,13 @@ export class GatewayServer {
         outcome = resumed;
       }
 
+      // A turn that is still a "link your account" prompt (a provider whose
+      // store this gateway can't wait on, or a resume that parked again) did
+      // no work, so it has no completion to publish -- its `succeeded` is
+      // the prompt's, not the run's.
+      if (!outcome.identityLinkPending) {
+        finished = { status: outcome.status, ...(outcome.outcome ? { outcome: outcome.outcome } : {}) };
+      }
       await this.completeTurn(sessionId, tracked, outcome);
       if (gh?.result) {
         const text = outcome.status === "succeeded" ? (outcome.result ?? "") : `Something went wrong processing this: ${outcome.error ?? "unknown error"}`;
@@ -989,6 +1071,156 @@ export class GatewayServer {
         }
       }
     }
+
+    // docs/adr/0052 §1: publish the completion LAST -- after the result
+    // comment, the http reply and the label removal -- so the next hop's
+    // acceptance actions (say, re-adding a label this run just removed) land
+    // after this run's cleanup rather than being undone by it. Only a run
+    // with a final outcome publishes: not one whose identity link never
+    // completed (it returns above, inside the try), and not one that threw
+    // before polling produced an outcome (`finished` unset) -- "the
+    // gateway crashed mid-run" is not a run status a trigger should route on.
+    if (finished && trigger.onComplete?.emitTo) {
+      try {
+        await this.emitRunEvent(envelope, sender, trigger, finished, gh, traceparent);
+      } catch (error) {
+        this.report(error);
+      }
+    }
+  }
+
+  /**
+   * The chain an accepted envelope belongs to. A run event carries it in its
+   * body (the gateway built it, below); anything else starts a new one, whose
+   * origin is the delivery's VERIFIED sender -- `sender` is only ever set for
+   * a login the source's provider resolved.
+   */
+  private chainOf(envelope: Envelope, sender: SenderClaims | undefined): RunChain | undefined {
+    if (envelope.kind === "run") return parseChain((envelope.body as Record<string, JsonValue> | null)?.chain);
+    return {
+      id: envelope.id,
+      depth: 0,
+      counts: {},
+      ...(sender?.login
+        ? { origin: { login: sender.login, ...(sender.accountId ? { accountId: sender.accountId } : {}), repository: envelope.repository } }
+        : {}),
+    };
+  }
+
+  /**
+   * Publishes one run's completion to its trigger's `onComplete.emitTo` run
+   * source (docs/adr/0052 §1) through the same `relayEvent` -> `/invoke`
+   * path a webhook takes. Three deterministic gates, each of which stops the
+   * chain here (logged; the first two also commented where the run replied):
+   *
+   *  - the global depth cap (`runEventMaxDepth`), which no trigger can raise;
+   *  - the origin must re-verify NOW: a human whose access was revoked
+   *    mid-chain stops it, and every hop still acts as a verified person;
+   *  - the target must be a run source, and the chain must have a human
+   *    origin at all (a run event never carries a bot or a made-up sender).
+   */
+  private async emitRunEvent(
+    envelope: Envelope,
+    sender: SenderClaims | undefined,
+    trigger: AcceptedTrigger,
+    finished: FinishedRun,
+    gh: GithubReplyTarget | undefined,
+    traceparent: string | undefined,
+  ): Promise<void> {
+    const emitTo = trigger.onComplete!.emitTo;
+    const tag = `run event ${trigger.name || "trigger"} -> ${emitTo}`;
+    const target = this.eventSources.get(emitTo);
+    if (!target || target.kind !== "run") {
+      this.log(`${tag}: skipped (${target ? `source is kind ${target.kind}, not run` : "no such usable EventSource"})`);
+      return;
+    }
+    const chain = this.chainOf(envelope, sender);
+    if (!chain) {
+      this.log(`${tag}: skipped (the run's chain metadata is unreadable)`);
+      return;
+    }
+    const origin = chain.origin;
+    if (!origin) {
+      this.log(`${tag}: skipped (the chain has no verified human sender to act as)`);
+      return;
+    }
+    const comment = async (text: string): Promise<void> => {
+      if (!gh) return;
+      try {
+        await this.options.githubReplyClient.postIssueComment(gh.owner, gh.repo, gh.issueNumber, text);
+      } catch (error) {
+        this.report(error);
+      }
+    };
+
+    const next: RunChain = {
+      id: chain.id,
+      depth: chain.depth + 1,
+      counts: { ...chain.counts, [trigger.name]: (chain.counts[trigger.name] ?? 0) + 1 },
+      origin,
+    };
+    const maxDepth = this.options.runEventMaxDepth ?? DEFAULT_RUN_EVENT_MAX_DEPTH;
+    if (next.depth > maxDepth) {
+      this.log(`${tag}: dropped, chain ${chain.id} would reach depth ${next.depth} (max ${maxDepth})`);
+      await comment(`Stopped the automated chain here: it exceeded ${maxDepth} steps.`);
+      return;
+    }
+
+    // Per-hop re-verification, exactly as resolveSender verifies a webhook's
+    // login (a run event's sender is never a bot).
+    const repoMatch = REPOSITORY.exec(origin.repository);
+    const repoContext: RepoContext | undefined = repoMatch ? { owner: repoMatch[1] as string, repo: repoMatch[2] as string } : undefined;
+    let identity: unknown;
+    try {
+      identity = await this.options.identityResolver.resolve(origin.login, false, repoContext);
+    } catch (error) {
+      this.report(error);
+      identity = undefined;
+    }
+    if (!identity) {
+      this.log(`${tag}: dropped, chain origin ${origin.login} no longer verifies`);
+      await comment(`Stopped the automated chain here: ${origin.login} could not be re-verified for the next step.`);
+      return;
+    }
+    const claims = await this.senderClaims(emitTo, { login: origin.login, ...(origin.accountId ? { accountId: origin.accountId } : {}) });
+
+    const event: Envelope = {
+      source: emitTo,
+      kind: "run",
+      id: randomUUID(),
+      time: this.now().toISOString(),
+      headers: {},
+      sender: { login: origin.login, isBot: false },
+      repository: origin.repository,
+      body: {
+        trigger: trigger.name,
+        status: finished.status,
+        params: trigger.params ?? {},
+        outcome: (finished.outcome ?? {}) as JsonValue,
+        chain: next as unknown as JsonValue,
+      },
+    };
+    // Its own span, in the finished run's trace, so a chain reads as one trace.
+    const span = startSpan("run event", traceparent, {
+      kind: "client",
+      attributes: {
+        "aktis.event_source": emitTo,
+        "aktis.event_id": event.id,
+        "aktis.completed_trigger": trigger.name,
+        "aktis.chain_depth": next.depth,
+      },
+    });
+    let relayed: WebhookOutcome;
+    try {
+      relayed = await this.relayEvent(event, claims, span);
+    } catch (error) {
+      span.fail("internal_error");
+      throw error;
+    } finally {
+      span.end();
+    }
+    // The next hop's run is its own lifecycle; this one is done.
+    relayed.after?.().catch(this.report);
   }
 
   /**
