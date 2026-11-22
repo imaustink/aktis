@@ -21,6 +21,8 @@
 #   1. AKTIS_CLUSTER in the environment
 #   2. AKTIS_CLUSTER in <repo>/cluster.local.env (gitignored)
 #   3. ferry on an Apple-silicon Mac that has it installed, otherwise minikube
+# except `custom`, which only counts when cluster.local.env itself selects it
+# (the same rule e2e/support/guard.ts applies).
 #
 # CI never reaches this file: no workflow starts a local cluster through these
 # scripts (validate-crds.yml and core-controller's own e2e each create their
@@ -47,12 +49,19 @@ cluster_load() {
   # objects; a stray exported variable must not be able to aim that at a
   # cluster nobody chose. e2e/support/guard.ts reads the same file for the
   # same reason.
-  unset AKTIS_CLUSTER_CONTEXT AKTIS_CLUSTER_REGISTRY AKTIS_CLUSTER_LOAD_CMD
+  unset AKTIS_CLUSTER AKTIS_CLUSTER_CONTEXT AKTIS_CLUSTER_REGISTRY AKTIS_CLUSTER_LOAD_CMD
+  local from_file=""
   if [[ -f "$CLUSTER_LOCAL_ENV" ]]; then
     # shellcheck disable=SC1090
     source "$CLUSTER_LOCAL_ENV"
+    from_file="${AKTIS_CLUSTER:-}"
   fi
-  AKTIS_CLUSTER="${from_env:-${AKTIS_CLUSTER:-$(cluster_default_provider)}}"
+  AKTIS_CLUSTER="${from_env:-${from_file:-$(cluster_default_provider)}}"
+  # Same rule as guard.ts's customClusterContext: a custom context is only
+  # trusted when cluster.local.env itself selects AKTIS_CLUSTER=custom.
+  if [[ "$AKTIS_CLUSTER" == custom && "$from_file" != custom ]]; then
+    cluster_die "AKTIS_CLUSTER=custom must be set in cluster.local.env, not only in the environment (docs/local-cluster.md)."
+  fi
   local provider_file="$CLUSTER_LIB_DIR/providers/$AKTIS_CLUSTER.sh"
   [[ -f "$provider_file" ]] || cluster_die "unknown cluster provider '$AKTIS_CLUSTER' (have: $(cluster_providers | tr '\n' ' '))"
   # shellcheck disable=SC1090

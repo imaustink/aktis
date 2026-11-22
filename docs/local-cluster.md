@@ -106,7 +106,9 @@ With neither, images are only `docker build`t, which is right when the nodes
 share your Docker image store (Docker Desktop's built-in Kubernetes).
 
 `AKTIS_CLUSTER_CONTEXT` is read from that file only, never from the
-environment. The e2e suite creates and deletes objects in whatever context it
+environment, and `AKTIS_CLUSTER=custom` must be in the file too: setting it only
+in the environment is refused, so a stale context left in the file cannot be
+picked up by accident. The e2e suite creates and deletes objects in whatever context it
 is allowed to run against, so the allowed list is hardcoded
 (`e2e/support/guard.ts`) and this file is the single, deliberate way to add one
 more. Do not point it at a cluster you care about.
