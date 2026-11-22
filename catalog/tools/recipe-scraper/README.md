@@ -307,13 +307,20 @@ base).
   Dockerfile base image (`mcr.microsoft.com/playwright:vX.Y.Z-jammy`) **must**
   match it exactly, or Chromium won't be found at runtime.
 - `yt-dlp` installs the **latest** release by default (YouTube changes often);
-  pin via the `YT_DLP_VERSION` build arg for reproducibility.
+  pin via the `YT_DLP_VERSION` build arg for reproducibility. It's the
+  self-contained PyInstaller **onedir** build (`yt-dlp_linux[_aarch64].zip`),
+  not the zipapp: the jammy base's Python 3.10 is too old for current yt-dlp,
+  the bundled `curl_cffi` provides the browser impersonation TikTok requires,
+  and onedir (unlike onefile) doesn't need to unpack into the `noexec` `/tmp`.
+- The image is only as fresh as its last build: `latest` is resolved at build
+  time, so a tool that stops working on a site may just need a rebuild.
 
 ## Troubleshooting
 
 | Symptom | Cause & fix |
 | ------- | ----------- |
 | `yt-dlp … Please sign in` / bot gate | Stale yt-dlp and/or the default player client. Rebuild to pull latest yt-dlp; alternate `player_client`s are already configured. For truly gated videos, mount cookies via `RECIPE_YTDLP_COOKIES`. |
+| `[TikTok] … Unexpected response from webpage request` | Stale yt-dlp and/or no impersonation support (`curl_cffi`). The image ships the standalone build, which bundles it; rebuild to pull a current yt-dlp. `yt-dlp --list-impersonate-targets` must show Chrome **without** "(unavailable)". |
 | `Invalid response body … Premature close` from the OpenAI SDK | An `openai` SDK version that predates the container's Node runtime (Node 24). Fixed by using `openai@^6`. If you downgrade the SDK, keep it compatible with the base image's Node. |
 | `Executable doesn't exist at …headless_shell` | `playwright` npm version drifted from the Dockerfile base image. Pin them to the same version. |
 | Blocked URL / exit 3 | The SSRF guard rejected the URL (non-http(s) scheme or a non-public IP). Expected for internal/metadata targets. |
