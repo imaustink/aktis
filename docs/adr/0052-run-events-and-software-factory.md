@@ -169,9 +169,11 @@ no AgentRun, no skill, no tool. In both engines it returns accepted and
 completes immediately, with an empty result. It is how a handoff such as
 "assign the PR to the human" is expressed.
 
-Labels the bot adds this way don't re-enter routing (they're bot-authored and
-dropped), so they're safe to use as status markers. A human applying the same
-label by hand still fires the existing label triggers.
+Labels the bot adds this way are dropped as bot-authored only when the
+gateway's GitHub credential is an App; with a PAT the `labeled` webhook's
+sender is a `User` and routes like a human's. So status markers must be labels
+no trigger matches: the factory uses `ai-reviewing` and `ai-fixing`, not the
+`ai-review` / `ai-triage` labels that start the existing PR triggers.
 
 ### 4. The factory as config
 
@@ -182,9 +184,9 @@ repository the App is installed on.
 | Trigger | Matches (run events on `runs`) | Target | Reply |
 | --- | --- | --- | --- |
 | `github-issue-triage` (existing) | issue labeled `ai-triage` (webhook) | SWE agent | + `onComplete.emitTo: runs` |
-| `factory-review` | `trigger in ["github-issue-triage", "factory-fix"]`, succeeded, has `outcome.pullRequest`, `counts["factory-review"] < 3` | SWE agent, `readOnly` | PR: `addLabels: [ai-review]`, `removeLabel: ai-review`; `emitTo: runs` |
-| `factory-fix` | `trigger == "factory-review"`, `outcome.verdict == "changes-requested"`, `counts["factory-review"] < 3` | SWE agent (PR-triage prompt) | PR: `addLabels: [ai-triage]`, `removeLabel: ai-triage`; `emitTo: runs` |
-| `factory-handoff` | `trigger == "factory-review"` and not routed to fix (verdict ≠ `changes-requested`, or the cap is reached) | `none` | param `assignee: sender.login`; PR: `assignees: ["{{assignee}}"]`, ack summarising the verdict |
+| `factory-review` | `trigger in ["github-issue-triage", "factory-fix"]`, succeeded, has `outcome.pullRequest`, `counts["factory-review"] < 3` | SWE agent, `readOnly` | PR: `addLabels: [ai-reviewing]`, `removeLabel: ai-reviewing`; `emitTo: runs` |
+| `factory-fix` | `trigger == "factory-review"`, `outcome.verdict == "changes-requested"`, `counts["factory-review"] < 3` | SWE agent (PR-triage prompt) | PR: `addLabels: [ai-fixing]`, `removeLabel: ai-fixing`; `emitTo: runs` |
+| `factory-handoff` | `trigger == "factory-review"` and not routed to fix (verdict ≠ `changes-requested`, or the cap is reached); or `trigger == "factory-fix"` and not routed to review (the fix failed, or reported no `outcome.pullRequest`) | `none` | param `assignee: sender.login`; PR: `assignees: ["{{assignee}}"]`, ack summarising the verdict |
 
 Notes:
 - The fix loop runs on the **PR**, not the issue: the review comments live on

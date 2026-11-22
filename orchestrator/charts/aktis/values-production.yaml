@@ -774,9 +774,11 @@ searxng:
 #   completion to the `runs` run source; factory-review (readOnly) reviews the
 #   PR it opened, factory-fix addresses a "changes-requested" verdict and loops
 #   back to review (at most 3 reviews per chain), and factory-handoff (target
-#   none) assigns the PR to the human who applied ai-triage otherwise. The
-#   chain is routed by run events, never by the bot's own label webhooks; the
-#   ai-review / ai-triage labels it adds are status displays only.
+#   none) assigns the PR to the human who applied ai-triage otherwise --
+#   including when a fix run fails or reports no PR. The chain is routed by run
+#   events, not label webhooks. The ai-reviewing / ai-fixing status labels it
+#   adds match no trigger, so they never start a run even when the gateway's
+#   GitHub credential is a PAT (whose label webhooks are not bot-dropped).
 extraManifests:
   # eventsource-github
   - |
@@ -1195,8 +1197,8 @@ extraManifests:
           ack: "🤖 Starting an automated review of this pull request."
           sessionPage: true
           result: true
-          addLabels: ["ai-review"]
-          removeLabel: "ai-review"
+          addLabels: ["ai-reviewing"]
+          removeLabel: "ai-reviewing"
       onComplete:
         emitTo: runs
   # eventtrigger-factory-fix
@@ -1275,8 +1277,8 @@ extraManifests:
           ack: "🤖 Addressing the automated review's feedback now."
           sessionPage: true
           result: true
-          addLabels: ["ai-triage"]
-          removeLabel: "ai-triage"
+          addLabels: ["ai-fixing"]
+          removeLabel: "ai-fixing"
       onComplete:
         emitTo: runs
   # eventtrigger-factory-handoff
@@ -1289,15 +1291,22 @@ extraManifests:
       sourceRef: runs
       match:
         cel: >-
-          source == "runs" && kind == "run" &&
-          body.trigger == "factory-review" &&
-          !(has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" &&
-            body.chain.counts["factory-review"] < 3)
+          source == "runs" && kind == "run" && (
+            (body.trigger == "factory-review" &&
+             !(has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" &&
+               body.chain.counts["factory-review"] < 3)) ||
+            (body.trigger == "factory-fix" &&
+             !(body.status == "succeeded" && has(body.outcome.pullRequest) &&
+               (!("factory-review" in body.chain.counts) || body.chain.counts["factory-review"] < 3))))
       params:
         repository: body.params.repository
         number: body.params.number
         assignee: sender.login
         reason: >-
+          body.trigger == "factory-fix" ? (
+            body.status != "succeeded" ? "the automated fix run did not succeed" :
+            !has(body.outcome.pullRequest) ? "the automated fix run did not report the pull request" :
+            "it reached the limit of 3 automated review rounds") :
           body.status != "succeeded" ? "the review run did not succeed" :
           (has(body.outcome.verdict) && body.outcome.verdict == "ready") ? "the reviewer judged it ready to merge" :
           (has(body.outcome.verdict) && body.outcome.verdict == "changes-requested") ? "it reached the limit of 3 automated review rounds with changes still requested" :
@@ -1308,5 +1317,5 @@ extraManifests:
         github:
           repository: "{{`{{repository}}`}}"
           issueNumber: "{{`{{number}}`}}"
-          ack: "🤖 The automated review is done: {{`{{reason}}`}}. Handing this pull request to @{{`{{assignee}}`}} for a final review."
+          ack: "🤖 Automated work on this pull request is done: {{`{{reason}}`}}. Handing this pull request to @{{`{{assignee}}`}} for a final review."
           assignees: ["{{`{{assignee}}`}}"]

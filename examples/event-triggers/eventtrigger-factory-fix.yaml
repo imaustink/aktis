@@ -6,7 +6,11 @@
 #
 # Exactly the complement of factory-handoff among factory-review events: only
 # an explicit changes-requested verdict under the 3-review cap loops. No
-# verdict, "ready", a failed review or the cap all hand off to a human.
+# verdict, "ready", a failed review or the cap all hand off to a human. A fix
+# run that fails or reports no PR is handed off too (factory-handoff), so the
+# chain never ends silently. The `ai-fixing` status label matches no trigger
+# (unlike `ai-triage`, which starts github-pr-triage), so it cannot start a
+# concurrent write run even when the gateway authenticates with a PAT.
 apiVersion: core.aktis.ai/v1alpha1
 kind: EventTrigger
 metadata:
@@ -81,7 +85,7 @@ spec:
       ack: "🤖 Addressing the automated review's feedback now."
       sessionPage: true
       result: true
-      addLabels: ["ai-triage"]
-      removeLabel: "ai-triage"
+      addLabels: ["ai-fixing"]
+      removeLabel: "ai-fixing"
   onComplete:
     emitTo: runs

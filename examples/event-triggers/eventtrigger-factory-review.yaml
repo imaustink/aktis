@@ -1,8 +1,11 @@
 # Software factory, step 2 (docs/adr/0052 §4): when issue triage or a fix run
 # succeeds with an open PR, review that PR read-only. Routed by the run event,
 # not a GitHub label: the bot's own label/PR webhooks are dropped (self-trigger
-# guard), so the chain never crosses GitHub. The `ai-review` label is only a
-# status display, added at acceptance and removed when the review ends.
+# guard), so the chain never crosses GitHub. The `ai-reviewing` label is only a
+# status display, added at acceptance and removed when the review ends. It is
+# deliberately not `ai-review`: no trigger matches it, so it cannot start a
+# second review even when the gateway authenticates with a PAT (whose label
+# webhooks come from a User and are not bot-dropped).
 #
 # Loop bound: at most 3 reviews per chain (`body.chain.counts`), on top of the
 # gateway's global RUN_EVENT_MAX_DEPTH. A readOnly run's runner appends the
@@ -109,7 +112,7 @@ spec:
       ack: "🤖 Starting an automated review of this pull request."
       sessionPage: true
       result: true
-      addLabels: ["ai-review"]
-      removeLabel: "ai-review"
+      addLabels: ["ai-reviewing"]
+      removeLabel: "ai-reviewing"
   onComplete:
     emitTo: runs

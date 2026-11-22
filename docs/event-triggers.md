@@ -159,10 +159,11 @@ Rules:
   "assign the PR to a human" is expressed.
 - `reply.github.addLabels` / `assignees` are rendered like `removeLabel`
   (`{{param}}`), and an entry that renders to `""` is dropped; when nothing is
-  left the field is omitted from the rendered reply. Labels the bot adds this
-  way never re-enter routing (its own webhooks are dropped as bot-authored), so
-  they are safe as status markers; a human applying the same label still fires
-  label triggers.
+  left the field is omitted from the rendered reply. Only when the gateway's
+  GitHub credential is an App are the resulting `labeled` webhooks dropped as
+  bot-authored; with a PAT their sender is a `User` and they route like a
+  human's. Use status labels that no trigger matches (the factory uses
+  `ai-reviewing` / `ai-fixing`), never a label that starts a run.
 - `onComplete.emitTo` must name an existing `run` EventSource in the same
   namespace, else the trigger is `Ready=False` (`EmitToNotFound` /
   `EmitToNotRunSource`). core-controller re-checks it when that source appears
@@ -430,16 +431,21 @@ Shipped as `examples/event-triggers/` (`eventsource-runs.yaml`,
 | Trigger | Matches | Target | Reply |
 | --- | --- | --- | --- |
 | `github-issue-triage` | `ai-triage` applied to an issue (webhook) | SWE agent | ack, result, `removeLabel`; `onComplete.emitTo: runs` |
-| `factory-review` | `source == "runs" && kind == "run" && body.trigger in ["github-issue-triage", "factory-fix"] && body.status == "succeeded" && has(body.outcome.pullRequest) && (!("factory-review" in body.chain.counts) \|\| body.chain.counts["factory-review"] < 3)` | SWE agent, `readOnly` | on the PR: ack + session page, result, `addLabels: [ai-review]`, `removeLabel: ai-review`; `emitTo: runs` |
-| `factory-fix` | `body.trigger == "factory-review" && has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" && body.chain.counts["factory-review"] < 3` | SWE agent (PR-triage prompt) | on the PR: ack, result, `addLabels: [ai-triage]`, `removeLabel: ai-triage`; `emitTo: runs` |
-| `factory-handoff` | `body.trigger == "factory-review" && !(has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" && body.chain.counts["factory-review"] < 3)` | `none` | param `assignee: sender.login`; on the PR: ack with the reason, `assignees: ["{{assignee}}"]` |
+| `factory-review` | `source == "runs" && kind == "run" && body.trigger in ["github-issue-triage", "factory-fix"] && body.status == "succeeded" && has(body.outcome.pullRequest) && (!("factory-review" in body.chain.counts) \|\| body.chain.counts["factory-review"] < 3)` | SWE agent, `readOnly` | on the PR: ack + session page, result, `addLabels: [ai-reviewing]`, `removeLabel: ai-reviewing`; `emitTo: runs` |
+| `factory-fix` | `body.trigger == "factory-review" && has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" && body.chain.counts["factory-review"] < 3` | SWE agent (PR-triage prompt) | on the PR: ack, result, `addLabels: [ai-fixing]`, `removeLabel: ai-fixing`; `emitTo: runs` |
+| `factory-handoff` | `(body.trigger == "factory-review" && !(has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" && body.chain.counts["factory-review"] < 3)) \|\| (body.trigger == "factory-fix" && !(body.status == "succeeded" && has(body.outcome.pullRequest) && (!("factory-review" in body.chain.counts) \|\| body.chain.counts["factory-review"] < 3)))` | `none` | param `assignee: sender.login`; on the PR: ack with the reason, `assignees: ["{{assignee}}"]` |
 
 So: triage opens a PR → review → a `changes-requested` verdict sends it to a fix
 run, whose completion re-enters review; after at most 3 reviews, or on `ready`,
 no verdict, or a failed review, the PR is assigned to the human who applied the
-original `ai-triage`. `factory-review` takes the PR number from
+original `ai-triage`. A fix run that fails or reports no PR is handed off the
+same way: `factory-handoff` is the exact complement of `factory-fix` among
+review events and of `factory-review` among fix events, so no step ends the
+chain silently. The status labels (`ai-reviewing`, `ai-fixing`) match no
+trigger, so they cannot start a duplicate run whatever the gateway's GitHub
+credential is. `factory-review` takes the PR number from
 `body.outcome.pullRequest.number` (its match guarantees one) and the fix and
-handoff triggers from the review's own `body.params.number`. All three use the
+handoff triggers from the completed run's own `body.params.number`. All three use the
 PR as `sessionKey`, so fix runs and re-reviews share one session per PR. The
 fix loop runs on the PR, not the issue: the review comments live there, and
 issue triage would open a second PR.

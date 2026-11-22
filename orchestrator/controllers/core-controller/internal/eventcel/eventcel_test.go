@@ -40,6 +40,8 @@ func TestCompile(t *testing.T) {
 		{"factory-review match", `source == "runs" && kind == "run" && body.trigger in ["github-issue-triage", "factory-fix"] && body.status == "succeeded" && has(body.outcome.pullRequest) && (!("factory-review" in body.chain.counts) || body.chain.counts["factory-review"] < 3)`, cel.BoolType, false},
 		{"factory-fix verdict", `body.outcome.verdict == "changes-requested"`, cel.BoolType, false},
 		{"factory-handoff not routed to fix", `!(has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" && body.chain.counts["factory-review"] < 3)`, cel.BoolType, false},
+		{"factory-handoff match (review or fix completions)", `source == "runs" && kind == "run" && ((body.trigger == "factory-review" && !(has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" && body.chain.counts["factory-review"] < 3)) || (body.trigger == "factory-fix" && !(body.status == "succeeded" && has(body.outcome.pullRequest) && (!("factory-review" in body.chain.counts) || body.chain.counts["factory-review"] < 3))))`, cel.BoolType, false},
+		{"factory-handoff reason param", `body.trigger == "factory-fix" ? (body.status != "succeeded" ? "the automated fix run did not succeed" : !has(body.outcome.pullRequest) ? "the automated fix run did not report the pull request" : "it reached the limit of 3 automated review rounds") : body.status != "succeeded" ? "the review run did not succeed" : "the reviewer did not record a verdict"`, nil, false},
 		{"run param: pull request number", `body.outcome.pullRequest.number`, nil, false},
 		{"run param: chain origin login", `sender.login`, nil, false},
 		{"syntax error", `body.action ==`, nil, true},

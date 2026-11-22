@@ -647,6 +647,76 @@
         "isBot": false
       },
       "repository": "acme/widgets"
+    },
+    "run_fix_failed": {
+      "source": "runs",
+      "kind": "run",
+      "id": "r-8",
+      "time": "2026-11-21T12:00:00Z",
+      "headers": {},
+      "body": {
+        "trigger": "factory-fix",
+        "status": "failed",
+        "params": {
+          "repository": "acme/widgets",
+          "number": "7"
+        },
+        "outcome": {},
+        "chain": {
+          "id": "d-1",
+          "depth": 4,
+          "counts": {
+            "github-issue-triage": 1,
+            "factory-review": 2,
+            "factory-fix": 2
+          },
+          "origin": {
+            "login": "octocat",
+            "repository": "acme/widgets"
+          }
+        }
+      },
+      "sender": {
+        "login": "octocat",
+        "isBot": false
+      },
+      "repository": "acme/widgets"
+    },
+    "run_fix_no_pr": {
+      "source": "runs",
+      "kind": "run",
+      "id": "r-9",
+      "time": "2026-11-21T12:00:00Z",
+      "headers": {},
+      "body": {
+        "trigger": "factory-fix",
+        "status": "succeeded",
+        "params": {
+          "repository": "acme/widgets",
+          "number": "7"
+        },
+        "outcome": {
+          "madeNewCommits": false
+        },
+        "chain": {
+          "id": "d-1",
+          "depth": 4,
+          "counts": {
+            "github-issue-triage": 1,
+            "factory-review": 2,
+            "factory-fix": 2
+          },
+          "origin": {
+            "login": "octocat",
+            "repository": "acme/widgets"
+          }
+        }
+      },
+      "sender": {
+        "login": "octocat",
+        "isBot": false
+      },
+      "repository": "acme/widgets"
     }
   },
   "cases": [
@@ -2625,6 +2695,518 @@
       ],
       "expect": {
         "trigger": null
+      }
+    },
+    {
+      "name": "adr0052: shipped factory routes a failed fix run to handoff",
+      "envelope": "run_fix_failed",
+      "triggers": [
+        {
+          "name": "factory-review",
+          "sourceRef": "runs",
+          "match": {
+            "cel": "source == \"runs\" && kind == \"run\" && body.trigger in [\"github-issue-triage\", \"factory-fix\"] && body.status == \"succeeded\" && has(body.outcome.pullRequest) && (!(\"factory-review\" in body.chain.counts) || body.chain.counts[\"factory-review\"] < 3)"
+          },
+          "params": {
+            "repository": "body.params.repository",
+            "number": "body.outcome.pullRequest.number"
+          },
+          "sessionKey": "github:{{repository}}#{{number}}",
+          "target": {
+            "agentRef": "swe-agent",
+            "readOnly": true,
+            "promptTemplate": "Review {{repository}}#{{number}}"
+          },
+          "onComplete": {
+            "emitTo": "runs"
+          }
+        },
+        {
+          "name": "factory-fix",
+          "sourceRef": "runs",
+          "match": {
+            "cel": "source == \"runs\" && kind == \"run\" && body.trigger == \"factory-review\" && has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && body.chain.counts[\"factory-review\"] < 3"
+          },
+          "params": {
+            "repository": "body.params.repository",
+            "number": "body.params.number"
+          },
+          "sessionKey": "github:{{repository}}#{{number}}",
+          "target": {
+            "agentRef": "swe-agent",
+            "promptTemplate": "Fix {{repository}}#{{number}}"
+          },
+          "onComplete": {
+            "emitTo": "runs"
+          }
+        },
+        {
+          "name": "factory-handoff",
+          "sourceRef": "runs",
+          "match": {
+            "cel": "source == \"runs\" && kind == \"run\" && ( (body.trigger == \"factory-review\" && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && body.chain.counts[\"factory-review\"] < 3)) || (body.trigger == \"factory-fix\" && !(body.status == \"succeeded\" && has(body.outcome.pullRequest) && (!(\"factory-review\" in body.chain.counts) || body.chain.counts[\"factory-review\"] < 3))))"
+          },
+          "params": {
+            "repository": "body.params.repository",
+            "number": "body.params.number",
+            "assignee": "sender.login",
+            "reason": "body.trigger == \"factory-fix\" ? ( body.status != \"succeeded\" ? \"the automated fix run did not succeed\" : !has(body.outcome.pullRequest) ? \"the automated fix run did not report the pull request\" : \"it reached the limit of 3 automated review rounds\") : body.status != \"succeeded\" ? \"the review run did not succeed\" : (has(body.outcome.verdict) && body.outcome.verdict == \"ready\") ? \"the reviewer judged it ready to merge\" : (has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\") ? \"it reached the limit of 3 automated review rounds with changes still requested\" : \"the reviewer did not record a verdict\""
+          },
+          "target": {
+            "none": {}
+          },
+          "reply": {
+            "github": {
+              "repository": "{{repository}}",
+              "issueNumber": "{{number}}",
+              "ack": "Done: {{reason}}. @{{assignee}}",
+              "assignees": [
+                "{{assignee}}"
+              ]
+            }
+          }
+        }
+      ],
+      "expect": {
+        "trigger": "factory-handoff",
+        "params": {
+          "repository": {
+            "value": "acme/widgets",
+            "type": "string"
+          },
+          "number": {
+            "value": "7",
+            "type": "string"
+          },
+          "assignee": {
+            "value": "octocat",
+            "type": "string"
+          },
+          "reason": {
+            "value": "the automated fix run did not succeed",
+            "type": "string"
+          }
+        },
+        "stringParams": {
+          "repository": "acme/widgets",
+          "number": "7",
+          "assignee": "octocat",
+          "reason": "the automated fix run did not succeed"
+        },
+        "sessionId": "event:runs:r-8",
+        "prompt": "",
+        "reply": {
+          "github": {
+            "repository": "acme/widgets",
+            "issueNumber": 7,
+            "ack": "Done: the automated fix run did not succeed. @octocat",
+            "assignees": [
+              "octocat"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "adr0052: shipped factory routes a fix run with no pullRequest to handoff",
+      "envelope": "run_fix_no_pr",
+      "triggers": [
+        {
+          "name": "factory-review",
+          "sourceRef": "runs",
+          "match": {
+            "cel": "source == \"runs\" && kind == \"run\" && body.trigger in [\"github-issue-triage\", \"factory-fix\"] && body.status == \"succeeded\" && has(body.outcome.pullRequest) && (!(\"factory-review\" in body.chain.counts) || body.chain.counts[\"factory-review\"] < 3)"
+          },
+          "params": {
+            "repository": "body.params.repository",
+            "number": "body.outcome.pullRequest.number"
+          },
+          "sessionKey": "github:{{repository}}#{{number}}",
+          "target": {
+            "agentRef": "swe-agent",
+            "readOnly": true,
+            "promptTemplate": "Review {{repository}}#{{number}}"
+          },
+          "onComplete": {
+            "emitTo": "runs"
+          }
+        },
+        {
+          "name": "factory-fix",
+          "sourceRef": "runs",
+          "match": {
+            "cel": "source == \"runs\" && kind == \"run\" && body.trigger == \"factory-review\" && has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && body.chain.counts[\"factory-review\"] < 3"
+          },
+          "params": {
+            "repository": "body.params.repository",
+            "number": "body.params.number"
+          },
+          "sessionKey": "github:{{repository}}#{{number}}",
+          "target": {
+            "agentRef": "swe-agent",
+            "promptTemplate": "Fix {{repository}}#{{number}}"
+          },
+          "onComplete": {
+            "emitTo": "runs"
+          }
+        },
+        {
+          "name": "factory-handoff",
+          "sourceRef": "runs",
+          "match": {
+            "cel": "source == \"runs\" && kind == \"run\" && ( (body.trigger == \"factory-review\" && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && body.chain.counts[\"factory-review\"] < 3)) || (body.trigger == \"factory-fix\" && !(body.status == \"succeeded\" && has(body.outcome.pullRequest) && (!(\"factory-review\" in body.chain.counts) || body.chain.counts[\"factory-review\"] < 3))))"
+          },
+          "params": {
+            "repository": "body.params.repository",
+            "number": "body.params.number",
+            "assignee": "sender.login",
+            "reason": "body.trigger == \"factory-fix\" ? ( body.status != \"succeeded\" ? \"the automated fix run did not succeed\" : !has(body.outcome.pullRequest) ? \"the automated fix run did not report the pull request\" : \"it reached the limit of 3 automated review rounds\") : body.status != \"succeeded\" ? \"the review run did not succeed\" : (has(body.outcome.verdict) && body.outcome.verdict == \"ready\") ? \"the reviewer judged it ready to merge\" : (has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\") ? \"it reached the limit of 3 automated review rounds with changes still requested\" : \"the reviewer did not record a verdict\""
+          },
+          "target": {
+            "none": {}
+          },
+          "reply": {
+            "github": {
+              "repository": "{{repository}}",
+              "issueNumber": "{{number}}",
+              "ack": "Done: {{reason}}. @{{assignee}}",
+              "assignees": [
+                "{{assignee}}"
+              ]
+            }
+          }
+        }
+      ],
+      "expect": {
+        "trigger": "factory-handoff",
+        "params": {
+          "repository": {
+            "value": "acme/widgets",
+            "type": "string"
+          },
+          "number": {
+            "value": "7",
+            "type": "string"
+          },
+          "assignee": {
+            "value": "octocat",
+            "type": "string"
+          },
+          "reason": {
+            "value": "the automated fix run did not report the pull request",
+            "type": "string"
+          }
+        },
+        "stringParams": {
+          "repository": "acme/widgets",
+          "number": "7",
+          "assignee": "octocat",
+          "reason": "the automated fix run did not report the pull request"
+        },
+        "sessionId": "event:runs:r-9",
+        "prompt": "",
+        "reply": {
+          "github": {
+            "repository": "acme/widgets",
+            "issueNumber": 7,
+            "ack": "Done: the automated fix run did not report the pull request. @octocat",
+            "assignees": [
+              "octocat"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "adr0052: shipped factory routes a fix run past the review cap to handoff",
+      "envelope": "run_fix_at_cap",
+      "triggers": [
+        {
+          "name": "factory-review",
+          "sourceRef": "runs",
+          "match": {
+            "cel": "source == \"runs\" && kind == \"run\" && body.trigger in [\"github-issue-triage\", \"factory-fix\"] && body.status == \"succeeded\" && has(body.outcome.pullRequest) && (!(\"factory-review\" in body.chain.counts) || body.chain.counts[\"factory-review\"] < 3)"
+          },
+          "params": {
+            "repository": "body.params.repository",
+            "number": "body.outcome.pullRequest.number"
+          },
+          "sessionKey": "github:{{repository}}#{{number}}",
+          "target": {
+            "agentRef": "swe-agent",
+            "readOnly": true,
+            "promptTemplate": "Review {{repository}}#{{number}}"
+          },
+          "onComplete": {
+            "emitTo": "runs"
+          }
+        },
+        {
+          "name": "factory-fix",
+          "sourceRef": "runs",
+          "match": {
+            "cel": "source == \"runs\" && kind == \"run\" && body.trigger == \"factory-review\" && has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && body.chain.counts[\"factory-review\"] < 3"
+          },
+          "params": {
+            "repository": "body.params.repository",
+            "number": "body.params.number"
+          },
+          "sessionKey": "github:{{repository}}#{{number}}",
+          "target": {
+            "agentRef": "swe-agent",
+            "promptTemplate": "Fix {{repository}}#{{number}}"
+          },
+          "onComplete": {
+            "emitTo": "runs"
+          }
+        },
+        {
+          "name": "factory-handoff",
+          "sourceRef": "runs",
+          "match": {
+            "cel": "source == \"runs\" && kind == \"run\" && ( (body.trigger == \"factory-review\" && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && body.chain.counts[\"factory-review\"] < 3)) || (body.trigger == \"factory-fix\" && !(body.status == \"succeeded\" && has(body.outcome.pullRequest) && (!(\"factory-review\" in body.chain.counts) || body.chain.counts[\"factory-review\"] < 3))))"
+          },
+          "params": {
+            "repository": "body.params.repository",
+            "number": "body.params.number",
+            "assignee": "sender.login",
+            "reason": "body.trigger == \"factory-fix\" ? ( body.status != \"succeeded\" ? \"the automated fix run did not succeed\" : !has(body.outcome.pullRequest) ? \"the automated fix run did not report the pull request\" : \"it reached the limit of 3 automated review rounds\") : body.status != \"succeeded\" ? \"the review run did not succeed\" : (has(body.outcome.verdict) && body.outcome.verdict == \"ready\") ? \"the reviewer judged it ready to merge\" : (has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\") ? \"it reached the limit of 3 automated review rounds with changes still requested\" : \"the reviewer did not record a verdict\""
+          },
+          "target": {
+            "none": {}
+          },
+          "reply": {
+            "github": {
+              "repository": "{{repository}}",
+              "issueNumber": "{{number}}",
+              "ack": "Done: {{reason}}. @{{assignee}}",
+              "assignees": [
+                "{{assignee}}"
+              ]
+            }
+          }
+        }
+      ],
+      "expect": {
+        "trigger": "factory-handoff",
+        "params": {
+          "repository": {
+            "value": "acme/widgets",
+            "type": "string"
+          },
+          "number": {
+            "value": "7",
+            "type": "string"
+          },
+          "assignee": {
+            "value": "octocat",
+            "type": "string"
+          },
+          "reason": {
+            "value": "it reached the limit of 3 automated review rounds",
+            "type": "string"
+          }
+        },
+        "stringParams": {
+          "repository": "acme/widgets",
+          "number": "7",
+          "assignee": "octocat",
+          "reason": "it reached the limit of 3 automated review rounds"
+        },
+        "sessionId": "event:runs:r-4",
+        "prompt": "",
+        "reply": {
+          "github": {
+            "repository": "acme/widgets",
+            "issueNumber": 7,
+            "ack": "Done: it reached the limit of 3 automated review rounds. @octocat",
+            "assignees": [
+              "octocat"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "adr0052: shipped factory routes a successful fix run back to review",
+      "envelope": "run_fix_under_cap",
+      "triggers": [
+        {
+          "name": "factory-review",
+          "sourceRef": "runs",
+          "match": {
+            "cel": "source == \"runs\" && kind == \"run\" && body.trigger in [\"github-issue-triage\", \"factory-fix\"] && body.status == \"succeeded\" && has(body.outcome.pullRequest) && (!(\"factory-review\" in body.chain.counts) || body.chain.counts[\"factory-review\"] < 3)"
+          },
+          "params": {
+            "repository": "body.params.repository",
+            "number": "body.outcome.pullRequest.number"
+          },
+          "sessionKey": "github:{{repository}}#{{number}}",
+          "target": {
+            "agentRef": "swe-agent",
+            "readOnly": true,
+            "promptTemplate": "Review {{repository}}#{{number}}"
+          },
+          "onComplete": {
+            "emitTo": "runs"
+          }
+        },
+        {
+          "name": "factory-fix",
+          "sourceRef": "runs",
+          "match": {
+            "cel": "source == \"runs\" && kind == \"run\" && body.trigger == \"factory-review\" && has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && body.chain.counts[\"factory-review\"] < 3"
+          },
+          "params": {
+            "repository": "body.params.repository",
+            "number": "body.params.number"
+          },
+          "sessionKey": "github:{{repository}}#{{number}}",
+          "target": {
+            "agentRef": "swe-agent",
+            "promptTemplate": "Fix {{repository}}#{{number}}"
+          },
+          "onComplete": {
+            "emitTo": "runs"
+          }
+        },
+        {
+          "name": "factory-handoff",
+          "sourceRef": "runs",
+          "match": {
+            "cel": "source == \"runs\" && kind == \"run\" && ( (body.trigger == \"factory-review\" && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && body.chain.counts[\"factory-review\"] < 3)) || (body.trigger == \"factory-fix\" && !(body.status == \"succeeded\" && has(body.outcome.pullRequest) && (!(\"factory-review\" in body.chain.counts) || body.chain.counts[\"factory-review\"] < 3))))"
+          },
+          "params": {
+            "repository": "body.params.repository",
+            "number": "body.params.number",
+            "assignee": "sender.login",
+            "reason": "body.trigger == \"factory-fix\" ? ( body.status != \"succeeded\" ? \"the automated fix run did not succeed\" : !has(body.outcome.pullRequest) ? \"the automated fix run did not report the pull request\" : \"it reached the limit of 3 automated review rounds\") : body.status != \"succeeded\" ? \"the review run did not succeed\" : (has(body.outcome.verdict) && body.outcome.verdict == \"ready\") ? \"the reviewer judged it ready to merge\" : (has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\") ? \"it reached the limit of 3 automated review rounds with changes still requested\" : \"the reviewer did not record a verdict\""
+          },
+          "target": {
+            "none": {}
+          },
+          "reply": {
+            "github": {
+              "repository": "{{repository}}",
+              "issueNumber": "{{number}}",
+              "ack": "Done: {{reason}}. @{{assignee}}",
+              "assignees": [
+                "{{assignee}}"
+              ]
+            }
+          }
+        }
+      ],
+      "expect": {
+        "trigger": "factory-review",
+        "params": {
+          "repository": {
+            "value": "acme/widgets",
+            "type": "string"
+          },
+          "number": {
+            "value": 12,
+            "type": "int"
+          }
+        },
+        "stringParams": {
+          "repository": "acme/widgets",
+          "number": "12"
+        },
+        "sessionId": "github:acme/widgets#12",
+        "prompt": "Review acme/widgets#12",
+        "reply": null
+      }
+    },
+    {
+      "name": "adr0052: shipped factory routes a changes-requested review to fix",
+      "envelope": "run_review_changes",
+      "triggers": [
+        {
+          "name": "factory-review",
+          "sourceRef": "runs",
+          "match": {
+            "cel": "source == \"runs\" && kind == \"run\" && body.trigger in [\"github-issue-triage\", \"factory-fix\"] && body.status == \"succeeded\" && has(body.outcome.pullRequest) && (!(\"factory-review\" in body.chain.counts) || body.chain.counts[\"factory-review\"] < 3)"
+          },
+          "params": {
+            "repository": "body.params.repository",
+            "number": "body.outcome.pullRequest.number"
+          },
+          "sessionKey": "github:{{repository}}#{{number}}",
+          "target": {
+            "agentRef": "swe-agent",
+            "readOnly": true,
+            "promptTemplate": "Review {{repository}}#{{number}}"
+          },
+          "onComplete": {
+            "emitTo": "runs"
+          }
+        },
+        {
+          "name": "factory-fix",
+          "sourceRef": "runs",
+          "match": {
+            "cel": "source == \"runs\" && kind == \"run\" && body.trigger == \"factory-review\" && has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && body.chain.counts[\"factory-review\"] < 3"
+          },
+          "params": {
+            "repository": "body.params.repository",
+            "number": "body.params.number"
+          },
+          "sessionKey": "github:{{repository}}#{{number}}",
+          "target": {
+            "agentRef": "swe-agent",
+            "promptTemplate": "Fix {{repository}}#{{number}}"
+          },
+          "onComplete": {
+            "emitTo": "runs"
+          }
+        },
+        {
+          "name": "factory-handoff",
+          "sourceRef": "runs",
+          "match": {
+            "cel": "source == \"runs\" && kind == \"run\" && ( (body.trigger == \"factory-review\" && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && body.chain.counts[\"factory-review\"] < 3)) || (body.trigger == \"factory-fix\" && !(body.status == \"succeeded\" && has(body.outcome.pullRequest) && (!(\"factory-review\" in body.chain.counts) || body.chain.counts[\"factory-review\"] < 3))))"
+          },
+          "params": {
+            "repository": "body.params.repository",
+            "number": "body.params.number",
+            "assignee": "sender.login",
+            "reason": "body.trigger == \"factory-fix\" ? ( body.status != \"succeeded\" ? \"the automated fix run did not succeed\" : !has(body.outcome.pullRequest) ? \"the automated fix run did not report the pull request\" : \"it reached the limit of 3 automated review rounds\") : body.status != \"succeeded\" ? \"the review run did not succeed\" : (has(body.outcome.verdict) && body.outcome.verdict == \"ready\") ? \"the reviewer judged it ready to merge\" : (has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\") ? \"it reached the limit of 3 automated review rounds with changes still requested\" : \"the reviewer did not record a verdict\""
+          },
+          "target": {
+            "none": {}
+          },
+          "reply": {
+            "github": {
+              "repository": "{{repository}}",
+              "issueNumber": "{{number}}",
+              "ack": "Done: {{reason}}. @{{assignee}}",
+              "assignees": [
+                "{{assignee}}"
+              ]
+            }
+          }
+        }
+      ],
+      "expect": {
+        "trigger": "factory-fix",
+        "params": {
+          "repository": {
+            "value": "acme/widgets",
+            "type": "string"
+          },
+          "number": {
+            "value": "12",
+            "type": "string"
+          }
+        },
+        "stringParams": {
+          "repository": "acme/widgets",
+          "number": "12"
+        },
+        "sessionId": "github:acme/widgets#12",
+        "prompt": "Fix acme/widgets#12",
+        "reply": null
       }
     }
   ]
