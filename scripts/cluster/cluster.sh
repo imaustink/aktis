@@ -31,7 +31,11 @@ case "$cmd" in
     # current, and this is the entry point people will run by hand.
     cluster_require_context
     extra=()
-    while IFS= read -r line; do [[ -n "$line" ]] && extra+=("$line"); done < <(provider_skaffold_args)
+    # Captured in an assignment, not read from a process substitution, so a
+    # provider failure (e.g. ferry's registry not running) stops the script
+    # instead of letting skaffold run without --default-repo.
+    skaffold_args="$(provider_skaffold_args)"
+    while IFS= read -r line; do [[ -n "$line" ]] && extra+=("$line"); done <<< "$skaffold_args"
     sub="${1:-}"
     [[ $# -gt 0 ]] && shift
     cd "$CLUSTER_REPO_ROOT"

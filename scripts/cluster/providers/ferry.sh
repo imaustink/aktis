@@ -106,14 +106,22 @@ ferry_registry_port() {
   echo "$port"
 }
 
-ferry_registry() { echo "localhost:$(ferry_registry_port)"; }
+# Each lookup is assigned before it is printed: a failing $(...) inside an
+# echo's arguments is swallowed, and the caller would get "localhost:" back.
+ferry_registry() {
+  local port
+  port="$(ferry_registry_port)" || exit 1
+  echo "localhost:$port"
+}
 
 provider_skaffold_args() {
   # Skaffold needs somewhere to read a built image's digest back from. With no
   # Docker daemon that has to be a registry, and ferry already runs one:
   # naming it as the default repo makes skaffold tag `localhost:<port>/<name>`
   # and look the digest up there after provider_build has built `<name>`.
-  echo "--default-repo=$(ferry_registry)"
+  local registry
+  registry="$(ferry_registry)" || exit 1
+  echo "--default-repo=$registry"
 }
 
 # ferry's builder is buildkit in a pod VM. As of ferry v0.15.0 buildkit's state
