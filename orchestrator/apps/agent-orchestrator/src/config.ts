@@ -129,11 +129,9 @@ export interface AppConfig {
    * `staticIdentities`; `"oidc"` verifies them as JWTs against `oidcIssuer`'s
    * JWKS, falling back to `staticIdentities` when that is also set.
    *
-   * NOT ENFORCED by the facade today (docs/adr/0053, "Follow-ups"): only the
-   * removed in-process engine authenticated the caller's bearer token, and the
-   * Temporal engine authenticates this process's own token instead. Parsed and
-   * kept, together with the resolvers in rbac/, so wiring fail-closed bearer
-   * authentication into the facade needs no deployment changes.
+   * Authenticates whoever starts a turn (rbac/caller-authenticator.ts); a
+   * chat turn with a verified forwarded-user JWT needs no bearer. Decides
+   * whether the turn runs at all, not who it runs as.
    */
   identityResolverKind: "static" | "oidc";
   staticIdentities: string | undefined;
@@ -141,6 +139,12 @@ export interface AppConfig {
   oidcJwksUri: string | undefined;
   oidcAudience: string | undefined;
   oidcRolesClaim: string;
+  /**
+   * Raw `AGENT_CALLER_AUTH`: `enforce` (the default when unset) or `warn`.
+   * Validated at startup (rbac/caller-auth-config.ts), so a typo stops the pod
+   * instead of quietly turning enforcement off.
+   */
+  callerAuthMode: string | undefined;
 }
 
 function num(raw: string | undefined, fallback: number): number {
@@ -192,4 +196,5 @@ export const config: AppConfig = {
   oidcJwksUri: process.env.AGENT_OIDC_JWKS_URI,
   oidcAudience: process.env.AGENT_OIDC_AUDIENCE,
   oidcRolesClaim: process.env.AGENT_OIDC_ROLES_CLAIM ?? "roles",
+  callerAuthMode: process.env.AGENT_CALLER_AUTH || undefined,
 };

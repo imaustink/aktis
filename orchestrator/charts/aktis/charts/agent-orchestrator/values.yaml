@@ -87,10 +87,17 @@ config:
   # the next message). The turn itself keeps running in the engine.
   agentRunTimeoutSeconds: ""
   shutdownDrainMs: ""
-  # NOT ENFORCED YET (docs/adr/0053): the facade does not authenticate the
-  # caller's bearer token; only the removed in-process engine did. The
-  # identityResolver/staticIdentities/oidc* settings below stay wired for the
-  # follow-up that moves that check into the facade.
+  # Turn authentication. Every POST /invoke and /v1/chat/completions must
+  # present a bearer token the resolver below accepts, or (chat only) a
+  # verified Open WebUI user JWT (openWebUiUserJwtSecret*). Anything else gets
+  # a 401 before the turn runs. This decides whether a turn runs, not who it
+  # runs as.
+  #
+  # "enforce" (default) or "warn". warn logs "would reject" and lets the turn
+  # run: set it only while confirming every caller's token is in the map
+  # (integration-gateway's GATEWAY_ORCHESTRATOR_TOKEN or OIDC client, Open
+  # WebUI's openaiApiKey), then remove it.
+  callerAuth: enforce
   #
   # Which IdentityResolver to build: "static" (default) or "oidc". See
   # src/rbac/static-identity-resolver.ts and src/rbac/oidc-identity-resolver.ts.
@@ -236,8 +243,9 @@ service:
     port: 8081
 
 ingress:
-  # Exposes the invoke Service (consumer-facing /invoke, /v1/*). Note the
-  # facade does not authenticate bearer tokens yet (docs/adr/0053).
+  # Exposes the invoke Service (consumer-facing /invoke, /v1/*). Every turn
+  # is authenticated (config.callerAuth), but static-map tokens are long-lived
+  # shared secrets: prefer identityResolver=oidc for anything this exposes.
   enabled: false
   className: ""
   annotations: {}
