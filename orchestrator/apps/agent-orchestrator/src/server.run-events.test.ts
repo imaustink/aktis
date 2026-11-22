@@ -6,7 +6,7 @@ import { SENDER_ASSERTION_HEADER, mintSenderAssertion } from "./rbac/sender-asse
 import { InMemoryInvocationStore } from "./invocation/types.js";
 import { MAX_OUTCOME_BYTES, checkOutcome } from "./invocation/outcome.js";
 import { InvokeServer, type InvocationRecord } from "./server.js";
-import type { TurnEngine, TurnOutcome } from "./engine/types.js";
+import type { TurnEngine, TurnInput, TurnOutcome } from "./engine/types.js";
 import type { Envelope, EventTriggerResource } from "@aktis/event-triggers";
 import { CrdEventTriggerRegistry } from "./routing/crd-event-trigger-registry.js";
 
@@ -262,5 +262,73 @@ describe("checkOutcome", () => {
     const cyclic: Record<string, unknown> = {};
     cyclic.self = cyclic;
     expect(checkOutcome(cyclic).ok).toBe(false);
+  });
+});
+
+describe("GET /invoke/:id adopts a turn whose process died", () => {
+  const outcome = { verdict: "changes-requested" };
+
+  /** An engine that reports its id and then never settles -- the process "dies" mid-turn. */
+  function hangingEngine(adopt?: TurnEngine["adopt"]): TurnEngine {
+    return {
+      invoke: vi.fn(async (input: TurnInput) => {
+        await input.reportEngineInvocation?.("engine-1");
+        return new Promise<TurnOutcome>(() => {});
+      }),
+      checkIdentity: vi.fn().mockResolvedValue(undefined),
+      ...(adopt ? { adopt } : {}),
+    };
+  }
+
+  async function serverOn(engine: TurnEngine, store: InMemoryInvocationStore): Promise<number> {
+    return start(
+      new InvokeServer(
+        engine, undefined, undefined, await triggerRegistry([reviewTrigger]),
+        undefined, undefined, 5, "authcode", store,
+      ),
+    );
+  }
+
+  async function acceptOn(port: number, store: InMemoryInvocationStore): Promise<string> {
+    const res = await postEvent(port, runEnvelope());
+    expect(res.status).toBe(202);
+    const { id } = (await res.json()) as { id: string };
+    for (let i = 0; i < 100 && !(await store.get(id))?.engineInvocationId; i++) await new Promise((r) => setTimeout(r, 5));
+    expect((await store.get(id))?.engineInvocationId).toBe("engine-1");
+    return id;
+  }
+
+  it("a new process finishes the turn from the engine id, outcome and all", async () => {
+    const store = new InMemoryInvocationStore();
+    const dead = await serverOn(hangingEngine(), store);
+    const id = await acceptOn(dead, store);
+
+    const adopt = vi.fn().mockResolvedValue({ result: "Reviewed.", runOutcome: outcome } satisfies TurnOutcome);
+    const replacement = await serverOn(hangingEngine(adopt), store);
+    const record = await settled(replacement, id);
+
+    expect(adopt).toHaveBeenCalledTimes(1);
+    expect(adopt.mock.calls[0]?.[0]).toBe("engine-1");
+    expect(record).toEqual({ id, status: "succeeded", result: "Reviewed.", outcome });
+  });
+
+  it("never adopts a turn this process is still running, and hides its bookkeeping", async () => {
+    const store = new InMemoryInvocationStore();
+    const adopt = vi.fn();
+    const port = await serverOn(hangingEngine(adopt), store);
+    const id = await acceptOn(port, store);
+
+    expect(await poll(port, id)).toEqual({ id, status: "pending" });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(adopt).not.toHaveBeenCalled();
+  });
+
+  it("records an adopted turn's engine failure as a failed turn", async () => {
+    const store = new InMemoryInvocationStore();
+    const dead = await serverOn(hangingEngine(), store);
+    const id = await acceptOn(dead, store);
+
+    const replacement = await serverOn(hangingEngine(vi.fn().mockRejectedValue(new Error("engine 404"))), store);
+    expect(await settled(replacement, id)).toMatchObject({ id, status: "failed", error: "engine 404" });
   });
 });

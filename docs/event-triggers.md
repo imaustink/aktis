@@ -416,9 +416,13 @@ bot-drop guard (§1) is untouched.
   it is dropped and logged, and the gateway comments on the issue/PR it would
   have replied to. No trigger config can exceed it.
 
-**Durability (v1).** The continuation lives in the gateway process, like the
-poll it follows. A gateway restart mid-run loses the next hop; the PR stays
-where it was (its status label shows where) and a human re-applies the label.
+**Durability.** A run survives a rollout of the gateway or the orchestrator.
+The gateway records each accepted run in Redis under a renewed lease, and a
+replacement gateway takes over any run whose lease lapsed (within about two
+and a half minutes), finishing it from the poll on without repeating steps
+already done. The orchestrator re-attaches to a turn whose process died by the
+engine id it recorded. Without Redis (`AGENT_REDIS_URL` / the session-page
+Redis), a gateway restart still drops runs in flight.
 
 ### The factory recipe
 

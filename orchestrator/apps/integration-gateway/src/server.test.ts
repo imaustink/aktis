@@ -8,6 +8,7 @@ import { StaticEventTriggerTable } from "./event-triggers.js";
 import type { GithubReplyClient } from "./github-client.js";
 import { GithubIdentityResolver } from "./identity.js";
 import { InMemoryPendingLabelStore } from "./label-reconciler.js";
+import { InMemoryInflightRunStore, type InflightRun } from "./inflight-runs.js";
 import type { AcceptedTrigger, EventSubmitResult, OrchestratorClient, OrchestratorInvokeResult, PollHooks } from "./orchestrator-client.js";
 import { GatewayServer, type GatewayServerOptions } from "./server.js";
 import { InMemorySessionPageStore } from "./session-page-store.js";
@@ -1344,6 +1345,115 @@ describe("reply.github addLabels / assignees (docs/adr/0052 §3)", () => {
     await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
     expect(h.addIssueLabels).not.toHaveBeenCalled();
     expect(h.addIssueAssignees).not.toHaveBeenCalled();
+  });
+});
+
+describe("in-flight run takeover (a gateway restarted mid-run)", () => {
+  const REVIEW: AcceptedTrigger = {
+    name: "factory-review",
+    sessionId: "github:acme/widgets#12",
+    reply: { github: { repository: "acme/widgets", issueNumber: 12, ack: "Starting a review…", result: true, removeLabel: "ai-review" } },
+    params: { repository: "acme/widgets", number: "12" },
+    onComplete: { emitTo: "runs" },
+  };
+  const VERDICT = { verdict: "changes-requested" };
+
+  /** What a gateway that died mid-poll leaves in the store. */
+  function orphan(overrides: Partial<InflightRun> = {}): InflightRun {
+    return {
+      key: "inv-dead",
+      invocationId: "inv-dead",
+      envelope: {
+        source: "github",
+        kind: "webhook",
+        id: "delivery-dead",
+        time: "2026-11-22T03:05:00Z",
+        headers: {},
+        body: {},
+        sender: { login: "alice", isBot: false },
+        repository: "acme/widgets",
+      },
+      sender: { login: "alice" },
+      trigger: REVIEW,
+      ackComment: { id: 77, body: "Starting a review…" },
+      recordedAt: Date.now() - 60_000,
+      ...overrides,
+    };
+  }
+
+  const runEvents = (h: Harness): Envelope[] => h.submitEvent.mock.calls.map((c) => c[0] as Envelope).filter((e) => e.kind === "run");
+
+  /** One recovery pass, as the periodic sweep would run it. */
+  const sweep = (h: Harness): Promise<void> =>
+    (h.server as unknown as { inflightRecovery: { sweepOnce: () => Promise<void> } }).inflightRecovery.sweepOnce();
+
+  it("records an accepted run while it runs and clears it once finished", async () => {
+    const store = new InMemoryInflightRunStore();
+    const save = vi.spyOn(store, "save");
+    const h = await start({ inflightRunStore: store });
+    await postGithub(h);
+    await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
+    expect(save.mock.calls[0]?.[0]).toMatchObject({ key: "inv-1", invocationId: "inv-1", trigger: { name: "github-review" } });
+    await vi.waitFor(async () => expect(await store.list()).toEqual([]));
+  });
+
+  it("finishes a run a dead gateway left: polls it, posts the result, removes the label, emits the run event -- no second ack", async () => {
+    const store = new InMemoryInflightRunStore();
+    const h = await start({ inflightRunStore: store });
+    h.poll.mockResolvedValueOnce({ status: "succeeded", result: "Changes requested.", outcome: VERDICT });
+    h.submitEvent.mockResolvedValue({ kind: "ignored" });
+    await store.save(orphan());
+    await sweep(h);
+
+    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    expect(h.poll.mock.calls[0]?.[0]).toBe("inv-dead");
+    expect(h.postIssueComment.mock.calls.map((c) => c[3])).toEqual(["Changes requested."]);
+    expect(h.removeIssueLabel).toHaveBeenCalledWith("acme", "widgets", 12, "ai-review");
+    expect(runEvents(h)[0]?.body).toMatchObject({
+      trigger: "factory-review",
+      status: "succeeded",
+      outcome: VERDICT,
+      chain: { id: "delivery-dead", depth: 1, counts: { "factory-review": 1 }, origin: { login: "alice", repository: "acme/widgets" } },
+    });
+    await vi.waitFor(async () => expect(await store.list()).toEqual([]));
+  });
+
+  it("leaves alone a run another gateway still holds the lease on", async () => {
+    const store = new InMemoryInflightRunStore();
+    await store.save(orphan());
+    await store.lease("inv-dead", "the-old-pod", 60_000);
+    const h = await start({ inflightRunStore: store });
+    await settle();
+    expect(h.poll).not.toHaveBeenCalled();
+    expect(await store.list()).toHaveLength(1);
+  });
+
+  it("takes it over once that lease lapses", async () => {
+    const store = new InMemoryInflightRunStore();
+    await store.save(orphan());
+    await store.lease("inv-dead", "the-old-pod", 1);
+    await new Promise((r) => setTimeout(r, 5));
+    const h = await start({ inflightRunStore: store });
+    h.submitEvent.mockResolvedValue({ kind: "ignored" });
+    await vi.waitFor(() => expect(h.poll).toHaveBeenCalledWith("inv-dead", expect.anything()));
+  });
+
+  it("never repeats a result comment or run event the dead gateway already sent", async () => {
+    const store = new InMemoryInflightRunStore();
+    await store.save(orphan({ resultPosted: true, emitted: true }));
+    const h = await start({ inflightRunStore: store });
+    await vi.waitFor(() => expect(h.poll).toHaveBeenCalled());
+    await vi.waitFor(async () => expect(await store.list()).toEqual([]));
+    expect(h.postIssueComment).not.toHaveBeenCalled();
+    expect(h.submitEvent).not.toHaveBeenCalled();
+  });
+
+  it("polls the re-submitted turn when the run had moved on past an identity link", async () => {
+    const store = new InMemoryInflightRunStore();
+    await store.save(orphan({ invocationId: "inv-resubmitted" }));
+    const h = await start({ inflightRunStore: store });
+    h.submitEvent.mockResolvedValue({ kind: "ignored" });
+    await vi.waitFor(() => expect(h.poll).toHaveBeenCalledWith("inv-resubmitted", expect.anything()));
   });
 });
 

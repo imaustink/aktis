@@ -728,7 +728,8 @@ searxng:
 # - Each posts "Starting work on this now." (+ the session page link), the
 #   result, and removes its label when the run ends, so re-applying it
 #   re-triggers. The two review triggers are readOnly: no write credentials.
-# - The software factory (docs/adr/0052 §4): github-issue-triage publishes its
+# - The software factory (docs/adr/0052 §4): github-issue-triage (and
+#   github-issue-autotriage, on new issues in aktis/glyph/homelab) publishes its
 #   completion to the `runs` run source; factory-review (readOnly) reviews the
 #   PR it opened, factory-fix addresses a "changes-requested" verdict and loops
 #   back to review (at most 3 reviews per chain), and factory-handoff (target
@@ -819,6 +820,70 @@ extraManifests:
           removeLabel: "{{`{{label}}`}}"
       # Publish the run's completion to `runs`, where factory-review picks up
       # the PR it opened (docs/adr/0052).
+      onComplete:
+        emitTo: runs
+  # eventtrigger-github-issue-autotriage
+  # Same run as github-issue-triage, but fired by a newly OPENED issue on the
+  # listed repos -- no label needed. Guards:
+  # - author_association: aktis and glyph are public, so anyone can open an
+  #   issue; only the owner / collaborators / org members auto-trigger (the
+  #   label path is implicitly gated the same way -- labeling needs triage
+  #   access). Bot-opened issues are already dropped by the github source.
+  # - no ai-triage label at open time: an issue opened WITH the label also
+  #   gets a `labeled` delivery, and github-issue-triage handles that one --
+  #   without this both would fire.
+  # No removeLabel: there is no triggering label to clear.
+  - |
+    apiVersion: core.aktis.ai/v1alpha1
+    kind: EventTrigger
+    metadata:
+      name: github-issue-autotriage
+    spec:
+      sourceRef: github
+      match:
+        cel: >-
+          headers["x-github-event"] == "issues" &&
+          body.action == "opened" &&
+          body.repository.full_name in ["imaustink/aktis", "imaustink/glyph", "imaustink/homelab"] &&
+          body.issue.author_association in ["OWNER", "MEMBER", "COLLABORATOR"] &&
+          !body.issue.labels.exists(l, l.name == "ai-triage")
+      params:
+        repository: body.repository.full_name
+        number: body.issue.number
+        closesIssue: body.issue.number
+        title: body.issue.title
+        description: body.issue.body
+      sessionKey: "github:{{`{{repository}}`}}#{{`{{number}}`}}"
+      target:
+        agentRef: "claude-code-swe-agent"
+        promptTemplate: |
+          GitHub issue {{`{{repository}}`}}#{{`{{number}}`}} was just opened: "{{`{{title}}`}}"
+
+          {{`{{description}}`}}
+
+          Triage and resolve this issue: investigate the {{`{{repository}}`}}
+          repository (the repository this issue was filed in), implement a fix or
+          feature there if the issue calls for one, and open a pull request against
+          {{`{{repository}}`}}. Do not create a new repository and do not
+          substitute any other repository, even if you lack permission to do
+          something the task seems to ask for (e.g. creating a repo) -- if you
+          cannot complete the task in {{`{{repository}}`}} as given, stop
+          and post a comment explaining exactly what's blocking you instead of
+          working around it elsewhere. If the issue is unclear or you need more
+          context before proceeding, post a comment asking a clarifying question
+          instead of guessing.
+
+          Once you open a pull request, an automated review of it starts on its
+          own, and its feedback is addressed automatically before the PR is
+          handed to a maintainer, so do not ask anyone to apply review labels.
+      reply:
+        github:
+          repository: "{{`{{repository}}`}}"
+          issueNumber: "{{`{{number}}`}}"
+          ack: "🤖 Starting work on this now."
+          result: true
+      # Feeds the software factory exactly like github-issue-triage
+      # (factory-review's match lists both trigger names).
       onComplete:
         emitTo: runs
   # eventtrigger-github-issue-review
@@ -1065,7 +1130,7 @@ extraManifests:
       match:
         cel: >-
           source == "runs" && kind == "run" &&
-          body.trigger in ["github-issue-triage", "factory-fix"] &&
+          body.trigger in ["github-issue-triage", "github-issue-autotriage", "factory-fix"] &&
           body.status == "succeeded" &&
           has(body.outcome.pullRequest) &&
           (!("factory-review" in body.chain.counts) || body.chain.counts["factory-review"] < 3)

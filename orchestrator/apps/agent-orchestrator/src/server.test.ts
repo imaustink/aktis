@@ -266,6 +266,7 @@ describe("InvokeServer", () => {
     expect(engine.invoke).toHaveBeenCalledWith({
       request: "scrape https://example.com/recipe",
       remoteControlUrlListener: expect.any(Function),
+      reportEngineInvocation: expect.any(Function),
       traceparent: ANY_TRACEPARENT,
     });
 
@@ -434,6 +435,7 @@ describe("InvokeServer", () => {
     expect(engine.invoke).toHaveBeenCalledWith({
       request: "extract https://example.com",
       remoteControlUrlListener: expect.any(Function),
+      reportEngineInvocation: expect.any(Function),
       traceparent: ANY_TRACEPARENT,
       sessionId: "cli-7",
     });
@@ -1110,6 +1112,7 @@ describe("InvokeServer identity-link flow selection", () => {
     expect(engine.invoke).toHaveBeenCalledWith({
       request: "open a PR",
       remoteControlUrlListener: expect.any(Function),
+      reportEngineInvocation: expect.any(Function),
       identityLinkFlow: "device",
       traceparent: ANY_TRACEPARENT,
     });
@@ -1188,6 +1191,7 @@ describe("InvokeServer identity-link flow selection", () => {
     const expected = {
       request: "open a PR",
       remoteControlUrlListener: expect.any(Function),
+      reportEngineInvocation: expect.any(Function),
       traceparent: ANY_TRACEPARENT,
     };
 
