@@ -207,6 +207,23 @@ Notes:
   `body.params.number` for a run that was already on the PR. Its `sessionKey`
   is the PR, so fix runs and re-reviews share one session per PR.
 
+**Amendment (2026-11-22): every entry point runs to the end.** As first
+shipped, only issue triage started a chain; `ai-triage` or `ai-review` applied
+to a PR ran one step and stopped. Now:
+- `github-pr-triage` and `github-pr-review` also set `onComplete.emitTo: runs`.
+- `factory-review` also follows `github-pr-triage`, taking the PR number from
+  `body.params.number` when the run reported no `outcome.pullRequest`.
+- `factory-fix` and `factory-handoff` treat a `github-pr-review` verdict like a
+  `factory-review` one. So `ai-review` on a PR someone else opened gets its
+  feedback fixed automatically, then re-reviewed, then handed to whoever
+  applied the label.
+- The cap counts fixes (`counts["factory-fix"] < 2`) instead of reviews, since
+  a chain's first review can now come from either trigger. Every entry point
+  puts one review ahead of each fix, so this still means at most 3 reviews.
+- A `factory-fix` run that failed or reported `madeNewCommits: false` (for
+  example, it couldn't push to a fork's branch) isn't re-reviewed.
+  `factory-handoff` assigns the PR instead, so no chain ends without an owner.
+
 ## Consequences
 
 - The chain never crosses GitHub, so it is immune to the bot-drop guard and to

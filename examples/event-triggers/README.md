@@ -33,14 +33,14 @@ installs production's GitHub triggers. `extraManifests` runs each entry through
 |---|---|---|---|
 | `eventtrigger-github-issue-triage.yaml` | github | agent | `ai-triage` on an issue: implement + open a PR; GitHub ack/result comments, label removed after; `onComplete.emitTo: runs` starts the factory |
 | `eventtrigger-github-issue-review.yaml` | github | agent, `readOnly` | `ai-review` on an issue: review only, no write credentials |
-| `eventtrigger-github-pr-triage.yaml` | github | agent | `ai-triage` on a PR: address feedback, push, sync with base |
-| `eventtrigger-github-pr-review.yaml` | github | agent, `readOnly` | `ai-review` on a PR: inline code review |
+| `eventtrigger-github-pr-triage.yaml` | github | agent | `ai-triage` on a PR: address feedback, push, sync with base; `onComplete.emitTo: runs` sends it to factory review |
+| `eventtrigger-github-pr-review.yaml` | github | agent, `readOnly` | `ai-review` on any PR (including one someone else opened): inline code review; `onComplete.emitTo: runs` routes its verdict to factory fix/handoff |
 | `eventtrigger-slack-mention-chat.yaml` | slack | orchestrator | an @-mention becomes a normal chat turn, one session per thread |
 | `eventtrigger-ci-failure-skill.yaml` | ci | skill, `readOnly` | a failed CI run forces a Skill; optional signed `reply.http` |
 | `eventtrigger-generic-hmac-tool.yaml` | generic-hmac | tool | runs one Tool (web-fetch) on a URL from the body |
 | `eventtrigger-nightly-stale-sweep.yaml` | nightly-sweep | agent, `readOnly` | a scheduled report; params come from the cron payload |
-| `eventtrigger-factory-review.yaml` | runs | agent, `readOnly` | factory: review the PR a triage/fix run opened (max 3 reviews per chain); `addLabels: [ai-review]` |
-| `eventtrigger-factory-fix.yaml` | runs | agent | factory: a `changes-requested` verdict sends the PR to a fix run, which loops back to review |
+| `eventtrigger-factory-review.yaml` | runs | agent, `readOnly` | factory: review the PR an issue-triage/PR-triage/fix run ended on (max 3 reviews per chain); `addLabels: [ai-review]` |
+| `eventtrigger-factory-fix.yaml` | runs | agent | factory: a `changes-requested` verdict (from `factory-review` or `github-pr-review`) sends the PR to a fix run, which loops back to review (max 2 fix rounds) |
 | `eventtrigger-factory-handoff.yaml` | runs | `none` | factory: any other review outcome assigns the PR to the human who started the chain |
 
 Each trigger names the agent, skill or tool it runs (`opencode-swe-agent`,
@@ -50,7 +50,7 @@ source or target does not exist reports `Ready=False` (`SourceNotFound` /
 `onComplete.emitTo` that doesn't name a run source) and dispatches nothing --
 `kubectl get eventtriggers` shows it.
 
-The three `factory-*` triggers plus `eventsource-runs.yaml` and the issue-triage
-trigger's `onComplete` make up the label-driven software factory of
+The three `factory-*` triggers plus `eventsource-runs.yaml` and the
+`onComplete` on the issue-triage, PR-triage and PR-review triggers make up the label-driven software factory of
 [ADR 0052](../../docs/adr/0052-run-events-and-software-factory.md); see
 [docs/event-triggers.md §9](../../docs/event-triggers.md#9-run-events-and-the-software-factory).

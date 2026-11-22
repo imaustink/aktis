@@ -4,6 +4,10 @@
 # from github-pr-triage -- same pull_request/labeled event -- by the label in
 # match.cel.
 #
+# Its completion enters the software factory: a "changes-requested" verdict
+# sends the PR to factory-fix (and then back to review), anything else hands it
+# to the human who applied the label.
+#
 # target.readOnly is the deterministic write gate (AgentRun.spec.readOnly ->
 # AGENT_READ_ONLY): the SWE agent denies `git push` / `gh pr create|merge|...`
 # and mints a contents:read token. It does not depend on the prompt.
@@ -104,3 +108,8 @@ spec:
       ack: "🤖 Starting work on this now."
       result: true
       removeLabel: "{{label}}"
+  # Feeds the software factory (docs/adr/0052), whoever opened the PR: the
+  # runner records this readOnly run's verdict, and factory-fix /
+  # factory-handoff route it exactly like a factory-review verdict.
+  onComplete:
+    emitTo: runs

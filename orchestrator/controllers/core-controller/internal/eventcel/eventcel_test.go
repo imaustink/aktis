@@ -37,10 +37,11 @@ func TestCompile(t *testing.T) {
 		// The shipped factory triggers' expressions over a kind "run" envelope
 		// (docs/adr/0052 §4): body is dyn, so map membership, has() on nested
 		// fields and integer comparisons all type-check.
-		{"factory-review match", `source == "runs" && kind == "run" && body.trigger in ["github-issue-triage", "factory-fix"] && body.status == "succeeded" && has(body.outcome.pullRequest) && (!("factory-review" in body.chain.counts) || body.chain.counts["factory-review"] < 3)`, cel.BoolType, false},
-		{"factory-fix verdict", `body.outcome.verdict == "changes-requested"`, cel.BoolType, false},
-		{"factory-handoff not routed to fix", `!(has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" && body.chain.counts["factory-review"] < 3)`, cel.BoolType, false},
+		{"factory-review match", `source == "runs" && kind == "run" && body.trigger in ["github-issue-triage", "github-issue-autotriage", "github-pr-triage", "factory-fix"] && body.status == "succeeded" && (has(body.outcome.pullRequest) || body.trigger in ["github-pr-triage", "factory-fix"]) && (body.trigger != "factory-fix" || (has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits)) && (!("factory-review" in body.chain.counts) || body.chain.counts["factory-review"] < 3)`, cel.BoolType, false},
+		{"factory-fix match", `source == "runs" && kind == "run" && body.trigger in ["factory-review", "github-pr-review"] && has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" && (!("factory-fix" in body.chain.counts) || body.chain.counts["factory-fix"] < 2)`, cel.BoolType, false},
+		{"factory-handoff match", `source == "runs" && kind == "run" && ((body.trigger in ["factory-review", "github-pr-review"] && !(has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" && (!("factory-fix" in body.chain.counts) || body.chain.counts["factory-fix"] < 2))) || (body.trigger == "factory-fix" && (body.status != "succeeded" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))`, cel.BoolType, false},
 		{"run param: pull request number", `body.outcome.pullRequest.number`, nil, false},
+		{"run param: pull request number with fallback", `has(body.outcome.pullRequest) ? body.outcome.pullRequest.number : body.params.number`, nil, false},
 		{"run param: chain origin login", `sender.login`, nil, false},
 		{"syntax error", `body.action ==`, nil, true},
 		{"undeclared variable", `request.body == "x"`, nil, true},

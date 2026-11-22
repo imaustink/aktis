@@ -728,14 +728,21 @@ searxng:
 # - Each posts "Starting work on this now." (+ the session page link), the
 #   result, and removes its label when the run ends, so re-applying it
 #   re-triggers. The two review triggers are readOnly: no write credentials.
-# - The software factory (docs/adr/0052 §4): github-issue-triage (and
-#   github-issue-autotriage, on new issues in aktis/glyph/homelab) publishes its
-#   completion to the `runs` run source; factory-review (readOnly) reviews the
-#   PR it opened, factory-fix addresses a "changes-requested" verdict and loops
-#   back to review (at most 3 reviews per chain), and factory-handoff (target
-#   none) assigns the PR to the human who applied ai-triage otherwise. The
-#   chain is routed by run events, never by the bot's own label webhooks; the
-#   ai-review / ai-triage labels it adds are status displays only.
+# - The software factory (docs/adr/0052 §4). Every human entry point publishes
+#   its completion to the `runs` run source, so the chain runs to the end no
+#   matter how it was started:
+#     * ai-triage on an issue (github-issue-triage) or a new issue in
+#       aktis/glyph/homelab (github-issue-autotriage) -> factory-review of the
+#       PR it opened;
+#     * ai-triage on a PR (github-pr-triage) -> factory-review of that PR;
+#     * ai-review on a PR (github-pr-review), including a PR someone else
+#       opened -> its verdict routes exactly like factory-review's.
+#   factory-fix addresses a "changes-requested" verdict and loops back to
+#   review (at most 2 fix rounds, so 3 reviews, per chain), and
+#   factory-handoff (target none) assigns the PR to the human who applied the
+#   label otherwise. The chain is routed by run events, never by the bot's own
+#   label webhooks; the ai-review / ai-triage labels it adds are status
+#   displays only.
 extraManifests:
   # eventsource-github
   - |
@@ -1010,9 +1017,9 @@ extraManifests:
           re-invoke you automatically when one does. Push your work and post your
           summary now. If a check is still running when you finish, say so in one
           line -- do not let it block or delay pushing and summarizing, and do not
-          say you'll "finalize" or "resume" later. (The triage label is removed once
-          this run ends, so a maintainer can simply re-apply it to have you pick the
-          PR up again.)
+          say you'll "finalize" or "resume" later. (When this run ends, an
+          automated review of the PR starts on its own, and its feedback is
+          addressed automatically before the PR is handed to a maintainer.)
       reply:
         github:
           repository: "{{`{{repository}}`}}"
@@ -1020,6 +1027,9 @@ extraManifests:
           ack: "🤖 Starting work on this now."
           result: true
           removeLabel: "{{`{{label}}`}}"
+      # Feeds the software factory: factory-review reviews this PR next.
+      onComplete:
+        emitTo: runs
   # eventtrigger-github-pr-review
   - |
     apiVersion: core.aktis.ai/v1alpha1
@@ -1119,6 +1129,11 @@ extraManifests:
           ack: "🤖 Starting work on this now."
           result: true
           removeLabel: "{{`{{label}}`}}"
+      # Feeds the software factory, whoever opened the PR: the runner records
+      # this readOnly run's verdict, and factory-fix / factory-handoff route it
+      # exactly like a factory-review verdict.
+      onComplete:
+        emitTo: runs
   # eventtrigger-factory-review
   - |
     apiVersion: core.aktis.ai/v1alpha1
@@ -1130,13 +1145,18 @@ extraManifests:
       match:
         cel: >-
           source == "runs" && kind == "run" &&
-          body.trigger in ["github-issue-triage", "github-issue-autotriage", "factory-fix"] &&
+          body.trigger in ["github-issue-triage", "github-issue-autotriage", "github-pr-triage", "factory-fix"] &&
           body.status == "succeeded" &&
-          has(body.outcome.pullRequest) &&
+          (has(body.outcome.pullRequest) || body.trigger in ["github-pr-triage", "factory-fix"]) &&
+          (body.trigger != "factory-fix" || (has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits)) &&
           (!("factory-review" in body.chain.counts) || body.chain.counts["factory-review"] < 3)
       params:
         repository: body.params.repository
-        number: body.outcome.pullRequest.number
+        # The PR the run ended on; a run that was already on the PR
+        # (github-pr-triage, factory-fix) falls back to its own number. Issue
+        # triage never falls back: match.cel requires its outcome PR.
+        number: >-
+          has(body.outcome.pullRequest) ? body.outcome.pullRequest.number : body.params.number
       # The PR, so fix runs and re-reviews share one session per PR.
       sessionKey: "github:{{`{{repository}}`}}#{{`{{number}}`}}"
       target:
@@ -1233,9 +1253,9 @@ extraManifests:
       match:
         cel: >-
           source == "runs" && kind == "run" &&
-          body.trigger == "factory-review" &&
+          body.trigger in ["factory-review", "github-pr-review"] &&
           has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" &&
-          body.chain.counts["factory-review"] < 3
+          (!("factory-fix" in body.chain.counts) || body.chain.counts["factory-fix"] < 2)
       params:
         repository: body.params.repository
         number: body.params.number
@@ -1313,14 +1333,18 @@ extraManifests:
       match:
         cel: >-
           source == "runs" && kind == "run" &&
-          body.trigger == "factory-review" &&
-          !(has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" &&
-            body.chain.counts["factory-review"] < 3)
+          ((body.trigger in ["factory-review", "github-pr-review"] &&
+            !(has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" &&
+              (!("factory-fix" in body.chain.counts) || body.chain.counts["factory-fix"] < 2))) ||
+           (body.trigger == "factory-fix" &&
+            (body.status != "succeeded" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))
       params:
         repository: body.params.repository
         number: body.params.number
         assignee: sender.login
         reason: >-
+          (body.trigger == "factory-fix" && body.status != "succeeded") ? "the automated fix run did not succeed" :
+          body.trigger == "factory-fix" ? "the automated fix run pushed no changes" :
           body.status != "succeeded" ? "the review run did not succeed" :
           (has(body.outcome.verdict) && body.outcome.verdict == "ready") ? "the reviewer judged it ready to merge" :
           (has(body.outcome.verdict) && body.outcome.verdict == "changes-requested") ? "it reached the limit of 3 automated review rounds with changes still requested" :
@@ -1331,5 +1355,5 @@ extraManifests:
         github:
           repository: "{{`{{repository}}`}}"
           issueNumber: "{{`{{number}}`}}"
-          ack: "🤖 The automated review is done: {{`{{reason}}`}}. Handing this pull request to @{{`{{assignee}}`}} for a final review."
+          ack: "🤖 Automated work on this pull request is done: {{`{{reason}}`}}. Handing this pull request to @{{`{{assignee}}`}} for a final review."
           assignees: ["{{`{{assignee}}`}}"]

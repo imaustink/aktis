@@ -1,12 +1,15 @@
-# Software factory, step 3b (docs/adr/0052 §4): every factory-review completion
-# that factory-fix does not take -- verdict "ready", no valid verdict ("none"),
-# a review run that did not succeed, or the 3-review cap reached -- assigns the
-# PR to the human who started the chain. target.none runs nothing: no agent,
-# no identity check, only the reply side effects.
+# Software factory, step 3b (docs/adr/0052 §4): every review completion
+# (factory-review or github-pr-review) that factory-fix does not take --
+# verdict "ready", no valid verdict ("none"), a review run that did not
+# succeed, or the 2-fix cap reached -- and every factory-fix run that failed or
+# pushed nothing (which factory-review won't pick up) assigns the PR to the human who started the
+# chain, so no chain ends without an owner. target.none runs nothing: no
+# agent, no identity check, only the reply side effects.
 #
 # `assignee` is the run event's sender: the human who applied the original
-# `ai-triage`, re-verified by the gateway on every hop -- never the bot and
-# never a hard-coded login. `reason` spells out why it was handed off.
+# `ai-triage` or `ai-review`, re-verified by the gateway on every hop -- never
+# the bot and never a hard-coded login. `reason` spells out why it was handed
+# off.
 apiVersion: core.aktis.ai/v1alpha1
 kind: EventTrigger
 metadata:
@@ -16,14 +19,18 @@ spec:
   match:
     cel: >-
       source == "runs" && kind == "run" &&
-      body.trigger == "factory-review" &&
-      !(has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" &&
-        body.chain.counts["factory-review"] < 3)
+      ((body.trigger in ["factory-review", "github-pr-review"] &&
+        !(has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" &&
+          (!("factory-fix" in body.chain.counts) || body.chain.counts["factory-fix"] < 2))) ||
+       (body.trigger == "factory-fix" &&
+        (body.status != "succeeded" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))
   params:
     repository: body.params.repository
     number: body.params.number
     assignee: sender.login
     reason: >-
+      (body.trigger == "factory-fix" && body.status != "succeeded") ? "the automated fix run did not succeed" :
+      body.trigger == "factory-fix" ? "the automated fix run pushed no changes" :
       body.status != "succeeded" ? "the review run did not succeed" :
       (has(body.outcome.verdict) && body.outcome.verdict == "ready") ? "the reviewer judged it ready to merge" :
       (has(body.outcome.verdict) && body.outcome.verdict == "changes-requested") ? "it reached the limit of 3 automated review rounds with changes still requested" :
@@ -34,5 +41,5 @@ spec:
     github:
       repository: "{{repository}}"
       issueNumber: "{{number}}"
-      ack: "🤖 The automated review is done: {{reason}}. Handing this pull request to @{{assignee}} for a final review."
+      ack: "🤖 Automated work on this pull request is done: {{reason}}. Handing this pull request to @{{assignee}} for a final review."
       assignees: ["{{assignee}}"]
