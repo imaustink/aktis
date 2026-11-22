@@ -84,16 +84,21 @@ describe("core-controller RBAC as deployed", () => {
 });
 
 describe("event-trigger RBAC outside core-controller, as deployed (ADR 0048)", () => {
-  it("lets integration-gateway watch EventSources and read the Secrets they name -- and not EventTriggers", async () => {
+  it("lets integration-gateway watch EventSources, read the Secrets they name, and only read EventTriggers", async () => {
     const sa = await serviceAccountOf("agent-controller-integration-gateway");
     for (const verb of ["get", "list", "watch"]) {
       expect(await canI(sa, verb, "eventsources.core.aktis.ai"), `gateway ${verb} eventsources`).toBe(true);
+      // Read for one thing only (the Role's own comment): skipping the sender
+      // lookup for a delivery no trigger could match. Matching itself still
+      // happens in the orchestrator.
+      expect(await canI(sa, verb, "eventtriggers.core.aktis.ai"), `gateway ${verb} eventtriggers`).toBe(true);
     }
     expect(await canI(sa, "get", "secrets")).toBe(true);
-    // Matching happens in the orchestrator, never in the gateway (the Role's
-    // own comment). A grant here would be privilege nobody's code asked for.
-    expect(await canI(sa, "list", "eventtriggers.core.aktis.ai")).toBe(false);
-    expect(await canI(sa, "update", "eventsources.core.aktis.ai")).toBe(false);
+    // Read-only on both: the gateway never authors routing.
+    for (const verb of ["create", "update", "patch", "delete"]) {
+      expect(await canI(sa, verb, "eventtriggers.core.aktis.ai"), `gateway ${verb} eventtriggers`).toBe(false);
+      expect(await canI(sa, verb, "eventsources.core.aktis.ai"), `gateway ${verb} eventsources`).toBe(false);
+    }
   });
 
   it("lets agent-orchestrator watch EventTriggers", async () => {
