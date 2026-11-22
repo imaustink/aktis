@@ -23,11 +23,20 @@ const QDRANT_SERVICE = "agent-controller-qdrant";
 const QDRANT_PORT = 6333;
 const LOCAL_PORT = 18063;
 
-/** The orchestrator's collection names, matching values-e2e.yaml / the chart defaults. */
+/**
+ * The collections under observation, matching values-e2e.yaml.
+ *
+ * The catalog (tools, skills, agents) is indexed by the Temporal engine's
+ * catalog-sync, under its `collectionPrefix: te-`. The unprefixed `tools` /
+ * `skills` / `agents` were the removed in-process engine's index (docs/adr/0053)
+ * and nothing writes them any more; a long-lived cluster may still carry them,
+ * stale. `caller_tools` is agent-orchestrator's own caller-tool index (ADR 0035),
+ * which the facade still owns.
+ */
 export const COLLECTIONS = {
-  tools: "tools",
-  skills: "skills",
-  agents: "agents",
+  tools: "te-tools",
+  skills: "te-skills",
+  agents: "te-agents",
   callerTools: "caller_tools",
 } as const;
 
@@ -100,6 +109,8 @@ export async function payloadNames(baseUrl: string, collection: string, limit = 
     body: JSON.stringify({ limit, with_payload: true, with_vector: false }),
   });
   if (!res.ok) throw new Error(`e2e: qdrant scroll ${collection} failed: ${res.status} ${await res.text()}`);
-  const body = (await res.json()) as { result: { points: { payload?: { name?: string } }[] } };
-  return body.result.points.map((p) => p.payload?.name ?? "").filter((n) => n !== "");
+  // `name` on caller_tools points; the engine's catalog points carry the CR
+  // name as `id` instead.
+  const body = (await res.json()) as { result: { points: { payload?: { name?: string; id?: string } }[] } };
+  return body.result.points.map((p) => p.payload?.name ?? p.payload?.id ?? "").filter((n) => n !== "");
 }

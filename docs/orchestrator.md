@@ -254,9 +254,9 @@ How a caller actually reaches the agent (ADR 0006):
   listener (component 4 above), so the two can be exposed with different
   network reachability: the invoke port to whoever is allowed to call the
   agent, the callback port only to Job pods in-cluster.
-- The bearer token is passed straight through to the graph's
-  `resolveIdentity` node (component 3) rather than re-checked at the HTTP
-  layer — one place resolves identity, not two.
+- The bearer token is authenticated at the HTTP layer, before anything about
+  the turn runs (`rbac/caller-authenticator.ts`; until docs/adr/0053 this was
+  the in-process graph's `resolveIdentity` node). A failure is a `401`.
 
 ### 7. OpenAI Chat Completions-compatible facade
 

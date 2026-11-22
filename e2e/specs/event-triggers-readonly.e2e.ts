@@ -168,7 +168,8 @@ describe("EventTrigger target.readOnly reaches the run", () => {
     });
 
     it("a follow-up prompt from the session page launches a read-only run too", async () => {
-      // The ack carries the session-page link (reply.github.sessionPage).
+      // The ack carries the session-page link: reply.github.sessionPage, which
+      // the e2e overlay re-enables on github-issue-review for this case.
       const ack = (await issueActivity(OWNER, REPO, issue)).comments.find((c) => c.text.includes(EXAMPLE_ACK_TEXT));
       const token = /\/sessions\/([A-Za-z0-9_-]+)/.exec(ack?.text ?? "")?.[1];
       expect(token, "the review's ack comment carries no session-page link").toBeTruthy();
@@ -234,7 +235,10 @@ describe("EventTrigger target.readOnly reaches the run", () => {
       });
       expect(flags.AGENT_READ_ONLY ?? "false").not.toBe("true");
       const reply = await stubReplyOn(issue, afterIndex);
-      expect(parseRunFlagsLine(reply.text)).toEqual({ readOnly: false, params: params(issue, "ai-triage") });
+      // github-issue-triage also renders closesIssue (the PR the agent opens
+      // closes this issue, docs/event-triggers.md §6); the review triggers don't.
+      const triageParams = { ...params(issue, "ai-triage"), closesIssue: String(issue) };
+      expect(parseRunFlagsLine(reply.text)).toEqual({ readOnly: false, params: triageParams });
     });
   });
 });

@@ -217,6 +217,7 @@ See [values.yaml](values.yaml) for the full, commented list. Key ones:
 | `secrets.create` | chart-managed Secret from `secrets.openaiApiKey`/`secrets.callbackSecret` (dev only) | `false` |
 | `ingress.enabled` | expose the invoke Service via Ingress | `false` |
 | `networkPolicy.enabled` | apply the invoke/callback NetworkPolicy pair | `false` |
+| `config.callerAuth` | `enforce`: refuse (401) any turn whose caller does not authenticate; `warn`: log `would reject` and run it (rollout aid only) | `enforce` |
 | `config.identityResolver` | `static` (dev/test) or `oidc` (verify caller bearer tokens as JWTs) | `static` |
 | `config.staticIdentities` | DEV/TEST-ONLY bearer-token map, used when `identityResolver=static` | unset |
 | `config.oidcIssuer` / `config.oidcJwksUri` | required when `identityResolver=oidc`: expected JWT issuer and JWKS endpoint | unset |

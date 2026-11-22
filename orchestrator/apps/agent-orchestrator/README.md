@@ -104,15 +104,34 @@ embeddings and housekeeping completions) and `AGENT_TEMPORAL_ENGINE_URL`.
 Startup refuses `AGENT_ENGINE` set to anything other than `temporal`, so a
 deployment still asking for the removed engine fails loudly.
 
+## Caller authentication
+
+Every `POST /invoke` and `POST /v1/chat/completions` is authenticated before
+anything about the turn runs (`src/rbac/caller-authenticator.ts`), with the
+rule the removed in-process engine applied:
+
+- A chat turn carrying Open WebUI's signed `X-OpenWebUI-User-Jwt`, with
+  `AGENT_OPENWEBUI_USER_JWT_SECRET` set, is authenticated by that JWT. A JWT
+  that does not verify is refused even when the bearer is valid.
+- Every other turn needs a bearer token the identity map resolves:
+  `AGENT_IDENTITY_RESOLVER=static` (`AGENT_STATIC_IDENTITIES`) or `oidc`
+  (`AGENT_OIDC_*`, with the static map as a fallback for the tokens in it).
+
+Anything else gets a `401` before trigger matching, caller tools or the engine
+run. `AGENT_CALLER_AUTH=warn` logs `would reject` instead, as a rollout aid
+while confirming every caller's token is in the map. An unrecognised value
+stops the pod.
+
+This decides whether a turn runs, not who it runs as. That is still the
+forwarded user JWT or the signed sender assertion, else the engine token's
+subject: a bearer token is one value every caller of a client shares, so it
+says nothing about which human is asking.
+
+`GET /invoke/:id`, `GET /v1/models` and `GET /sessions/live` start nothing and
+are not gated.
+
 ## Known gaps
 
-- **The caller's bearer token is not authenticated here.** Only the removed
-  in-process engine resolved it; the engine gateway authenticates this
-  process's own `AGENT_TEMPORAL_ENGINE_TOKEN` instead, so a turn with no
-  forwarded user JWT or sender assertion runs as that token's subject. The
-  static/OIDC resolvers in `src/rbac/` and their `AGENT_IDENTITY_RESOLVER` /
-  `AGENT_STATIC_IDENTITIES` / `AGENT_OIDC_*` settings are kept, but not yet
-  enforced (ADR 0053, follow-ups). The invoke Service is cluster-internal.
 - **`/invoke` can only offer caller tools, not resume from their results** — it
   takes one `request` string with nowhere to put a `role: "tool"` message. The
   full round trip is chat-facade-only (ADR 0035).
