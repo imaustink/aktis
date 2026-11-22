@@ -1,12 +1,12 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import { agentRunAgentRef, agentRunsSince, cleanupAgentRunsSince, waitFor } from "../support/k8s.js";
 import { chatTurn } from "../support/chat.js";
 import { deleteCredentials, seedAllClaudeCredentials } from "../support/credential-store.js";
 import { deleteRedisKeys } from "../support/redis.js";
 import { resetFakeGithub } from "../support/fixtures.js";
 
-requireMinikubeContext();
+requireLocalClusterContext();
 
 /**
  * What the Temporal engine gateway resolves a caller to when it presents only

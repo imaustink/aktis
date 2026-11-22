@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import { cleanupAgentRunsSince } from "../support/k8s.js";
 import { seedAllClaudeCredentials } from "../support/credential-store.js";
 import {
@@ -38,7 +38,7 @@ import {
   slackAppMentionPayload,
 } from "../support/webhook.js";
 
-requireMinikubeContext();
+requireLocalClusterContext();
 
 /**
  * The three non-GitHub example sources, each through its own verification

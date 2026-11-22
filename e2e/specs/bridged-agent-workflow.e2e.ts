@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { connect } from "node:net";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import { agentRunsSince, cleanupAgentRunsSince, waitFor } from "../support/k8s.js";
 import { withPortForward } from "../support/k8s.js";
 import { issueLabeledPayload, postGithubWebhook } from "../support/webhook.js";
@@ -20,7 +20,7 @@ import { seedAllClaudeCredentials } from "../support/credential-store.js";
  * connect is the correct readiness signal for a gRPC port.
  */
 async function withTemporalPortForward<T>(localPort: number, body: () => Promise<T>): Promise<T> {
-  requireMinikubeContext();
+  requireLocalClusterContext();
   const child = execFile("kubectl", ["-n", "controller-agent", "port-forward", "svc/temporal-dev-server", `${localPort}:7233`]);
   let exited: string | undefined;
   child.on("exit", (code, signal) => {
@@ -82,7 +82,7 @@ async function withTemporalPortForward<T>(localPort: number, body: () => Promise
 
 const execFileAsync = promisify(execFile);
 
-requireMinikubeContext();
+requireLocalClusterContext();
 
 // 18090/18091/18092 belong to happy-path/resilience/identity-keying respectively.
 const GATEWAY_PORT = 18093;

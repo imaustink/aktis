@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import { kubectl, kubectlJson, kubectlApplyStdin, waitFor, NAMESPACE } from "../support/k8s.js";
 
 /**
@@ -26,7 +26,7 @@ import { kubectl, kubectlJson, kubectlApplyStdin, waitFor, NAMESPACE } from "../
  * credential: the Connection points at the in-cluster fake.
  */
 
-requireMinikubeContext();
+requireLocalClusterContext();
 
 const CONNECTION = "e2e-fake-atlassian";
 const CORPUS = "alpha-docs";

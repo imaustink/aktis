@@ -1,6 +1,6 @@
 # End-to-end tests
 
-System tests that exercise the **real deployed stack on minikube** —
+System tests that exercise the **real deployed stack on a local cluster** —
 integration-gateway, agent-orchestrator, Redis, NATS, the CRD controllers and
 a real AgentRun — over real HTTP and real Kubernetes objects. Nothing in here
 mocks a component this repo owns.
@@ -13,14 +13,21 @@ whether the gateway's `waitAndResume` blocks on the same subject the graph
 stored. Every one of those has shipped broken at least once (PRs #144/#145,
 #152, #153, #156) and every one was invisible to `vitest` in `apps/*`.
 
-## Safety: these only ever run against minikube
+## Safety: these only ever run against a local throwaway cluster
 
 `support/guard.ts` aborts any spec that touches the cluster unless `kubectl
-config current-context` is exactly `minikube`. This is not a convenience check — the
-default context on the maintainer's machine is a **live cluster**, the tests
-create and delete namespaced objects, and a suite that silently ran there
-would be destructive. The guard runs before any fixture, and there is
+config current-context` is one of a hardcoded list: `ferry-aktis`, `minikube`
+or `kind-aktis`, the contexts of the built-in local cluster providers
+([docs/local-cluster.md](../docs/local-cluster.md)). This is not a convenience
+check — the default context on the maintainer's machine is a **live cluster**,
+the tests create and delete namespaced objects, and a suite that silently ran
+there would be destructive. The guard runs before any fixture, and there is
 deliberately no environment variable to override it.
+
+The one way to add a context is the `custom` provider: `AKTIS_CLUSTER=custom`
+plus `AKTIS_CLUSTER_CONTEXT=<name>` in the gitignored `cluster.local.env`. It
+names one exact context, in a file that is never committed and never exists in
+CI. `specs/cluster-guard.e2e.ts` pins what that file can and cannot widen.
 
 ## What's stubbed, and why only this
 
@@ -81,8 +88,7 @@ nothing asserting it is just a claim.
 ## Running
 
 ```bash
-kubectl config use-context minikube
-./e2e/scripts/up.sh                 # bring the stack up (Temporal engine, the chart default)
+./e2e/scripts/up.sh                 # start the local cluster + bring the stack up (Temporal engine, the chart default)
 npm run e2e -w e2e                  # or: npx vitest run --config e2e/vitest.config.ts
 ```
 
@@ -130,6 +136,7 @@ specs/
   caller-tools.e2e.ts     consumer-supplied tools: real Qdrant queries + the tool_calls round trip
   chat-harness.e2e.ts     the harness's own signing/SSE parsing, vs. the real product (no cluster)
   waitfor-guard.e2e.ts    waitFor's own bounded-probe guarantee (no cluster)
+  cluster-guard.e2e.ts    what cluster.local.env can and cannot add to the context guard (no cluster)
   rbac-parity.e2e.ts      markers -> role.yaml -> Helm chart RBAC agree (no cluster)
   rbac-installed.e2e.ts   the INSTALLED ClusterRole, and that the controller starts
   resilience.e2e.ts       what survives NATS/orchestrator moving mid-turn
@@ -265,7 +272,7 @@ to regenerate. It also asserts the chart grants nothing *beyond* the markers —
 this ClusterRole is the only thing in the system holding `batch/jobs`
 create+delete (ADR 0010).
 
-`rbac-installed.e2e.ts` is the last link, and the only part needing minikube: a
+`rbac-installed.e2e.ts` is the last link, and the only part needing a cluster: a
 correct chart does not make a correct cluster, since a release predating the fix
 keeps serving the old ClusterRole until someone upgrades it.
 

@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import { kubectl, kubectlApplyStdin, waitFor } from "../support/k8s.js";
 import { withQdrant, listCollections, pointCount } from "../support/qdrant.js";
 import { chatSubject, chatTurn } from "../support/chat.js";
@@ -25,7 +25,7 @@ import { seedAtlassianLink, deleteCredentials } from "../support/credential-stor
  * stand-in, and `fake-confluence-fidelity.e2e.ts` is what keeps that honest.
  */
 
-requireMinikubeContext();
+requireLocalClusterContext();
 
 const CONNECTION = "e2e-fake-atlassian";
 const CORPUS = "alpha-docs";

@@ -1,5 +1,7 @@
-# Values file for the local minikube demo of the `aktis` system
-# chart release (namespace `controller-agent`). Merges the two former
+# Values file for the local demo of the `aktis` system chart release
+# (namespace `controller-agent`), on ANY local cluster -- ferry, minikube,
+# kind or your own (docs/local-cluster.md). The filename predates that choice
+# and is kept because charts, docs and scripts reference it. Merges the two former
 # per-chart demo files (charts/agent-orchestrator/values-minikube-demo.yaml
 # and charts/core-controller/values-minikube-demo.yaml) under their subchart
 # keys, now that both are subcharts of one release.

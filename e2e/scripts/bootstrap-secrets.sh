@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # bootstrap-secrets.sh — create the throwaway secrets the e2e stack needs on
-# minikube, and report (without creating) the one that needs a real human key.
+# the local cluster, and report (without creating) the one that needs a real
+# human key.
 #
 # Usage:  ./e2e/scripts/bootstrap-secrets.sh
 #
-# Every value generated here is disposable and scoped to the local minikube
-# profile. Re-running regenerates them, which is fine: the stack reads them at
+# Every value generated here is disposable and scoped to the local cluster
+# (docs/local-cluster.md). Re-running regenerates them, which is fine: the stack reads them at
 # pod start, so a `helm upgrade`/rollout picks up new values.
 #
 # The deliberate exception is OPENAI_API_KEY. The orchestrator's planner makes
@@ -17,17 +18,15 @@
 set -euo pipefail
 
 NS="controller-agent"
-CTX="minikube"
 
 # Same guard as the test suite (e2e/support/guard.ts), for the same reason:
 # this script CREATES cluster objects, and the default context on this machine
 # is a live cluster.
-CURRENT="$(kubectl config current-context 2>/dev/null || true)"
-if [[ "$CURRENT" != "$CTX" ]]; then
-  echo "✗ kubectl context is '$CURRENT', not '$CTX'. Refusing to create secrets." >&2
-  echo "  Switch with:  kubectl config use-context $CTX" >&2
-  exit 1
-fi
+# shellcheck source=../../scripts/cluster/lib.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/scripts/cluster/lib.sh"
+cluster_load
+cluster_require_context
+CTX="$(provider_context)"
 
 kubectl get namespace "$NS" >/dev/null 2>&1 || kubectl create namespace "$NS"
 
@@ -191,8 +190,5 @@ fi
 
 echo ""
 echo "Done. Next:"
-echo "  skaffold run"
-echo "  helm upgrade --install agent-controller orchestrator/charts/aktis \\"
-echo "    -f orchestrator/charts/aktis/values-minikube-demo.yaml \\"
-echo "    -f orchestrator/charts/aktis/values-e2e.yaml"
+echo "  ./e2e/scripts/up.sh      # builds, deploys, and re-runs this script"
 echo "  npm run e2e -w e2e"

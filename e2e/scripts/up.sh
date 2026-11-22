@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# up.sh — bring the whole e2e stack up on minikube, from nothing to ready.
+# up.sh — bring the whole e2e stack up on the local cluster, from nothing to
+# ready. Which cluster that is -- ferry, minikube, kind, your own -- is
+# docs/local-cluster.md; this script starts it if it is not running.
 #
 # Usage:  ./e2e/scripts/up.sh
 #
@@ -27,16 +29,17 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 NS="controller-agent"
-CTX="minikube"
 
 step() { echo ""; echo "▶ $*"; }
 
-CURRENT="$(kubectl config current-context 2>/dev/null || true)"
-if [[ "$CURRENT" != "$CTX" ]]; then
-  echo "✗ kubectl context is '$CURRENT', not '$CTX'. Refusing to deploy." >&2
-  echo "  Switch with:  kubectl config use-context $CTX" >&2
-  exit 1
-fi
+# shellcheck source=../../scripts/cluster/lib.sh
+source "$REPO_ROOT/scripts/cluster/lib.sh"
+cluster_load
+
+step "Starting the local cluster (provider: $AKTIS_CLUSTER)..."
+cluster_up
+# Everything below creates and deletes objects in whatever kubectl points at.
+cluster_require_context
 
 step "Fetching nested subchart dependencies (Helm won't recurse into these)..."
 # The top-level chart's deps are handled by skaffold (skipBuildDependencies:
@@ -92,16 +95,17 @@ sed "s/REPLACED_AT_APPLY/$SINK_SUM/" "$SINK" | kubectl apply -n "$NS" -f - >/dev
 kubectl -n "$NS" rollout status deploy/fake-sink --timeout=120s >/dev/null
 echo "  ✓ fake-sink"
 
-step "Building the web-fetch Tool image into minikube..."
+step "Building the web-fetch Tool image into the cluster..."
 # The generic-hmac -> web-fetch EventTrigger runs this Tool as a ToolRun Job,
 # and the Tool CR (values-minikube-demo.yaml enables it) pins `web-fetch:latest`
-# -- but the e2e skaffold profile does not build it, so on a fresh minikube the
+# -- but the e2e skaffold profile does not build it, so on a fresh cluster the
 # run sits in ErrImageNeverPull/ImagePullBackOff and the spec times out naming
-# neither. Built straight into minikube's runtime; run Jobs pull IfNotPresent.
+# neither. Built through the same provider hook skaffold's artifacts use; run
+# Jobs pull IfNotPresent.
 if [[ "${E2E_SKIP_WEB_FETCH_BUILD:-}" == "1" ]]; then
   echo "  - skipped (E2E_SKIP_WEB_FETCH_BUILD=1)"
 else
-  (cd "$REPO_ROOT" && minikube -p "$CTX" image build -t web-fetch:latest -f catalog/tools/web-fetch/Dockerfile . >/dev/null)
+  (cd "$REPO_ROOT" && ./scripts/cluster/build-image.sh -t web-fetch:latest -f catalog/tools/web-fetch/Dockerfile . >/dev/null)
   echo "  ✓ web-fetch:latest"
 fi
 
@@ -132,7 +136,7 @@ step "Building images and deploying (skaffold profile: e2e)..."
 # shipped an eight-day-old core-controller here, presenting as a rendered Job
 # missing its per-run secretEnv (see orchestrator/controllers/core-controller/.dockerignore).
 #
-# Check with:  skaffold diagnose -p e2e | grep -A3 'Docker artifact: <name>'
+# Check with:  skaffold diagnose -p e2e | grep -A3 'artifact: <name>'
 # A dependency count far below the artifact's real source-file count is the tell.
 #
 # --tolerate-failures-until-deadline: skaffold stamps a fresh run-id label on
@@ -140,7 +144,7 @@ step "Building images and deploying (skaffold profile: e2e)..."
 # orchestrator, which can exit once while they come back. Without the flag the
 # status check fails the whole run on that first exit, although the stack
 # converges seconds later.
-(cd "$REPO_ROOT" && skaffold run -p e2e --tolerate-failures-until-deadline)
+"$REPO_ROOT/scripts/cluster/cluster.sh" skaffold run -p e2e --tolerate-failures-until-deadline
 
 step "Applying the example EventSources/EventTriggers..."
 # examples/event-triggers is not in any chart (ADR 0048); the suite runs the

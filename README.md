@@ -286,12 +286,21 @@ paths (as `values-production.yaml` does).
 The list comes from [.github/release-images.json](.github/release-images.json);
 adding an entry there publishes a new image.
 
-### Minikube quick-start
+### Local quick-start
 
 [scripts/dev-up.sh](scripts/dev-up.sh) automates the full local deploy (start
-minikube, build images, install/upgrade both Helm releases, apply CRs). The
-only step it can't do for you is creating secrets — do this once per fresh
-cluster, in your own terminal (never paste real secrets into chat or files):
+a local cluster, build images, install/upgrade both Helm releases, apply CRs).
+The cluster is [ferry](https://github.com/imaustink/ferry) on an Apple-silicon
+Mac that has it installed and minikube elsewhere; kind or a cluster of your own
+slot in with one setting — see [docs/local-cluster.md](docs/local-cluster.md).
+
+The only step the script can't do for you is creating secrets — do this once
+per fresh cluster, in your own terminal (never paste real secrets into chat or
+files). Start the cluster first so there is something to create them in:
+
+```bash
+./scripts/cluster/cluster.sh up
+```
 
 ```bash
 # Generate a random callback HMAC secret
@@ -325,9 +334,10 @@ Then run:
 ./scripts/dev-up.sh
 ```
 
-These secrets survive normal minikube `stop`/`start` cycles. If the minikube
-container is ever deleted (e.g. after `minikube delete`), all secrets are lost
-and must be re-created before running the script again.
+These secrets survive stopping and starting the cluster
+(`./scripts/cluster/cluster.sh down` / `up`). If the cluster itself is deleted
+(`down --purge`, `minikube delete`), all secrets are lost and must be
+re-created before running the script again.
 
 ## Adding a new tool
 

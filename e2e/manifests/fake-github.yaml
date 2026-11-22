@@ -1,6 +1,6 @@
 # In-cluster stand-in for GitHub's REST API.
 #
-# Deployed only into the minikube e2e environment and pointed at via the
+# Deployed only into the local e2e environment and pointed at via the
 # existing `integrationGateway.githubApiUrl` / agent `githubApiUrl` values --
 # no production code path knows this exists.
 #

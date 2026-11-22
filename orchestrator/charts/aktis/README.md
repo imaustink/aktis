@@ -22,7 +22,7 @@ own release on top of this one.
 orchestrator/charts/aktis/
 ├── Chart.yaml                  # 4 dependencies (2 local file://, 2 remote: open-webui, nats)
 ├── values.yaml                 # per-subchart passthrough + enable toggles
-├── values-minikube-demo.yaml   # the local minikube demo overrides (not packaged)
+├── values-minikube-demo.yaml   # the local demo overrides, any local cluster (not packaged)
 ├── templates/NOTES.txt         # aggregate post-install guidance
 └── charts/
     ├── agent-orchestrator/     # local subchart (with its own qdrant dependency)
@@ -89,8 +89,11 @@ helm install agent-controller oci://ghcr.io/imaustink/charts/aktis \
   --version 0.1.0 -n controller-agent --create-namespace -f my-values.yaml
 ```
 
-For the local minikube workflow (build images into minikube, apply CRDs, then
-this install/upgrade), use [scripts/dev-up.sh](../../../scripts/dev-up.sh).
+For the local workflow (start a local cluster, build images into it, apply
+CRDs, then this install/upgrade), use
+[scripts/dev-up.sh](../../../scripts/dev-up.sh); which cluster that is —
+ferry, minikube, kind or your own — is
+[docs/local-cluster.md](../../../docs/local-cluster.md).
 
 Always upgrade with the same values file so previously-set overrides aren't
 dropped (see the header comment in `values-minikube-demo.yaml`):

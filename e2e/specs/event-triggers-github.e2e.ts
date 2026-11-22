@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import { cleanupAgentRunsSince, waitFor } from "../support/k8s.js";
 import { resetFakeGithub } from "../support/fixtures.js";
 import { seedAllClaudeCredentials } from "../support/credential-store.js";
@@ -16,7 +16,7 @@ import {
 } from "../support/events.js";
 import { issueLabeledPayload, postGithubDelivery } from "../support/webhook.js";
 
-requireMinikubeContext();
+requireLocalClusterContext();
 
 /**
  * The `github-issue-triage` EventTrigger, end to end (docs/event-triggers.md,

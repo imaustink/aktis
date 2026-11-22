@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import { cleanupAgentRunsSince } from "../support/k8s.js";
 import {
   applyEventTrigger,
@@ -13,7 +13,7 @@ import {
 } from "../support/events.js";
 import { fakeSinkRequests, replyPath, replyUrl, resetFakeSink } from "../support/fake-sink.js";
 
-requireMinikubeContext();
+requireLocalClusterContext();
 
 /**
  * The programmatic entry point with an event: `POST /invoke {event}` straight

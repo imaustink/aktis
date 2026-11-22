@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import { kubectl, kubectlApplyStdin, waitFor } from "../support/k8s.js";
 import { withQdrant, pointCount } from "../support/qdrant.js";
 
@@ -25,7 +25,7 @@ import { withQdrant, pointCount } from "../support/qdrant.js";
  *   mix two clients' material behind a single role stamp.
  */
 
-requireMinikubeContext();
+requireLocalClusterContext();
 
 const SLACK_CORPUS = "eng-chat";
 const DRIVE_CORPUS = "delivery-drive";

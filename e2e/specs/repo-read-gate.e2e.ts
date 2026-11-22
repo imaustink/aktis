@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import {
   agentRunAgentRef,
   agentRunSecretEnvNames,
@@ -14,7 +14,7 @@ import { deleteRedisKeys } from "../support/redis.js";
 import { fakeGithubRequests, resetFakeGithub, webhookSecret } from "../support/fixtures.js";
 import { issueLabeledPayload, postGithubWebhook } from "../support/webhook.js";
 
-requireMinikubeContext();
+requireLocalClusterContext();
 
 /**
  * The repository read gate (the Temporal engine's authz.gateRepository).

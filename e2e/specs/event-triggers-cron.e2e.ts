@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import { cleanupAgentRunsSince, kubectl, kubectlJson, waitFor } from "../support/k8s.js";
 import { seedAllClaudeCredentials } from "../support/credential-store.js";
 import {
@@ -13,7 +13,7 @@ import {
   waitForReady,
 } from "../support/events.js";
 
-requireMinikubeContext();
+requireLocalClusterContext();
 
 /**
  * Cron EventSources (docs/event-triggers.md §8): core-controller materializes

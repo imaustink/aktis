@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import { kubectl, kubectlJson, NAMESPACE, waitFor } from "../support/k8s.js";
 import { grantsFromMarkers, missingFrom, type Grant } from "../support/rbac.js";
 
@@ -13,7 +13,7 @@ import { grantsFromMarkers, missingFrom, type Grant } from "../support/rbac.js";
  * resulting crashloop is indistinguishable from the source-level bug at the
  * point where it hurts.
  */
-requireMinikubeContext();
+requireLocalClusterContext();
 
 const markers = grantsFromMarkers();
 

@@ -1,6 +1,6 @@
 # In-cluster stand-in for Atlassian's Confluence API.
 #
-# Deployed only into the minikube e2e environment and reached via the
+# Deployed only into the local e2e environment and reached via the
 # connection-broker's `gatewayOrigin` override — a driver option whose own
 # comment says "exists for tests; production never sets it". No production code
 # path knows this exists.

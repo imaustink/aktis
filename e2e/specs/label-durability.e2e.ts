@@ -1,12 +1,12 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import { agentRunsSince, cleanupAgentRunsSince, waitFor, withPortForward } from "../support/k8s.js";
 import { issueLabeledPayload, postGithubWebhook } from "../support/webhook.js";
 import { fakeGithubRequests, resetFakeGithub, webhookSecret } from "../support/fixtures.js";
 import { seedAllClaudeCredentials } from "../support/credential-store.js";
 import { paceStubAgent, resetStubPacing, rollGateway } from "../support/resilience.js";
 
-requireMinikubeContext();
+requireLocalClusterContext();
 
 const GATEWAY_PORT = 18093;
 const SENDER = "e2e-user";

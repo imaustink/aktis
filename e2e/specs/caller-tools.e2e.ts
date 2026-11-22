@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import { fetchThrough, kubectl, kubectlApplyStdin, waitFor, type PortForward } from "../support/k8s.js";
 import { chatToolTurn, type ChatMessage, type ChatToolDefinition } from "../support/chat.js";
 import { invokeStatus, invokeTurn } from "../support/invoke.js";
@@ -10,7 +10,7 @@ import { makeCallerTool } from "../../orchestrator/apps/agent-orchestrator/src/c
 
 // Module scope, before any fixture: a suite pointed at the wrong cluster must
 // fail on import, not after it has started creating objects.
-requireMinikubeContext();
+requireLocalClusterContext();
 
 /**
  * Consumer-supplied tools (docs/adr/0035), end to end.

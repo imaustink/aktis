@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import {
   kubectl,
   kubectlJson,
@@ -33,7 +33,7 @@ import {
  * namespaced and deleted in afterAll.
  */
 
-requireMinikubeContext();
+requireLocalClusterContext();
 
 const SERVER = "e2e-fake-mcp";
 const BROKER_SERVICE = "agent-controller-mcp-broker";

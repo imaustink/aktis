@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import { kubectl, kubectlJson } from "../support/k8s.js";
 import {
   FIXTURE_LABEL,
@@ -17,7 +17,7 @@ import {
 } from "../support/events.js";
 import { postHmacWebhook } from "../support/webhook.js";
 
-requireMinikubeContext();
+requireLocalClusterContext();
 
 /**
  * `Ready` on EventSources and EventTriggers, and the promise it carries: a
