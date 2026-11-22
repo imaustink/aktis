@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Envelope, EventTriggerResource } from "@aktis/event-triggers";
 import type { WatchCrdFn } from "../k8s/crd-watcher.js";
-import type { CustomObjectsApiLike } from "../registry/crd-tool-registry.js";
+import type { CustomObjectsApiLike } from "./crd-event-trigger-registry.js";
 import { CrdEventTriggerRegistry, parseEnvelope } from "./crd-event-trigger-registry.js";
 
 const GROUP = "core.aktis.ai";

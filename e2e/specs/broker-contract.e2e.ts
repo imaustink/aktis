@@ -10,31 +10,27 @@ import { createBrokerServer, DELEGATED_TOKEN_HEADER } from "../../orchestrator/a
 import { StaticCorpusRegistry } from "../../orchestrator/apps/connection-broker/src/registry.js";
 import { SlackDriver } from "../../orchestrator/apps/connection-broker/src/drivers/slack.js";
 import { HttpResourceSource } from "../../orchestrator/apps/connection-broker/src/sync/http-source.js";
-import { BrokerProber } from "../../orchestrator/apps/agent-orchestrator/src/knowledge-base/retrieve.js";
-import { CorpusReader } from "../../orchestrator/apps/agent-orchestrator/src/knowledge-base/reader.js";
-import { CorpusLookup } from "../../orchestrator/apps/agent-orchestrator/src/knowledge-base/lookup.js";
 
 /**
- * Every client of the connection-broker, driven against the REAL broker server.
+ * The connection-broker's routes, driven for real, against the clients that call them.
  *
- * The broker's routes and the four clients that call them live in three
- * packages and two languages, and nothing but agreement makes them work. That
- * agreement has now broken twice, both times silently, both times in a release
- * that looked complete:
+ * The broker (TypeScript) and its clients — the sync worker's
+ * `HttpResourceSource` and the Temporal engine's Go `internal/corpus` package,
+ * the only retrieval client since docs/adr/0053 removed the in-process engine
+ * — agree on nothing but a convention. That agreement has broken twice, both
+ * times silently, both times in a release that looked complete:
  *
  *   - `HttpResourceSource` asked for `/connections/:name/resources` after
  *     ADR 0043 moved data to `/corpora/`. Every sync request 404'd, so the
  *     write path could not list or fetch anything at all.
- *   - `BrokerProber` asked for `/connections/:name/probe` for the same reason.
- *     Worse, both engines read 404 as a DENIAL, so every probe was counted as
- *     "this caller may not see it" and retrieval answered "No passages
- *     matched" — indistinguishable from an empty corpus. Knowledge-base search
- *     returned nothing, in both engines, always.
+ *   - The retrieval prober asked for `/connections/:name/probe` for the same
+ *     reason, and read the 404 as a DENIAL, so retrieval answered "No passages
+ *     matched" — indistinguishable from an empty corpus.
  *
  * Both survived a full unit suite, because the unit tests asserted the URL each
- * client BUILT. Both sides of those checks came from one assumption, so a
- * rename could move the server and leave the client behind with nothing going
- * red. Only running the two together can catch it, and that is all this does.
+ * client BUILT. So the TypeScript client is driven against the real server
+ * here, the routes the Go client calls are exercised with plain requests
+ * shaped like its own, and the Go source is checked for the same paths.
  *
  * Like `rbac-parity`, this needs NO cluster and NO credentials — the drivers
  * are fakes and the question is purely whether the two halves of this repo
@@ -111,14 +107,6 @@ afterAll(() => server?.close());
 /** The caller's own token. Its value is irrelevant; that one is SENT is not. */
 const DELEGATED = "user-token";
 
-const credentials = {
-  delegatedToken: async () => ({ token: DELEGATED, principals: [] }),
-  // The reader/lookup paths exercised here only call delegatedToken; this
-  // satisfies the multi-member search method on the same resolver interface.
-  delegatedTokens: async (_subject: string, providers: string[]) =>
-    new Map(providers.map((provider) => [provider, { token: DELEGATED, principals: [] }])),
-};
-
 describe("the sync worker's client", () => {
   it("lists through the route the broker serves", async () => {
     const source = new HttpResourceSource({ baseUrl, token: SYNC_TOKEN });
@@ -139,86 +127,56 @@ describe("the sync worker's client", () => {
   });
 });
 
-describe("the retrieval prober", () => {
-  it("probes through the route the broker serves, carrying the caller's token", async () => {
-    const prober = new BrokerProber({
-      baseUrl,
-      token: ORCHESTRATOR_TOKEN,
-      delegatedToken: DELEGATED,
+/**
+ * The routes the Go engine calls, requested the way `internal/corpus` requests
+ * them: the orchestrator's bearer plus the caller's own token.
+ */
+describe("the broker serves the routes the Go engine calls", () => {
+  const goHeaders = {
+    authorization: `Bearer ${ORCHESTRATOR_TOKEN}`,
+    "content-type": "application/json",
+    [DELEGATED_TOKEN_HEADER]: DELEGATED,
+  };
+
+  it("probes, spending the caller's token rather than the corpus's", async () => {
+    const res = await fetch(`${baseUrl}/corpora/${CORPUS}/probe`, {
+      method: "POST",
+      headers: goHeaders,
+      body: JSON.stringify({ sourceId: "1" }),
     });
 
-    const result = await prober.probe({ connectionId: CORPUS, sourceId: "1" });
-
-    expect(result.allowed).toBe(true);
-    // The credential the probe spends is the CALLER's, never the corpus's.
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { allowed: boolean }).allowed).toBe(true);
     const [, credsArg] = driver.probe.mock.calls.at(-1)!;
     expect(credsArg).toEqual({ delegated: DELEGATED });
   });
 
-  it("does not report a missing corpus as a denial", async () => {
-    // The distinction that made the routing bug invisible: a 404 counted as
-    // "you may not see this", so a dead route drained every result silently.
-    const prober = new BrokerProber({
-      baseUrl,
-      token: ORCHESTRATOR_TOKEN,
-      delegatedToken: DELEGATED,
+  it("answers a missing corpus with 404, never the 403 that means a denial", async () => {
+    // The distinction that made the routing bug invisible: the Go prober
+    // treats only 403 as "you may not see this" (checked below), so a dead
+    // route must surface as something else.
+    const res = await fetch(`${baseUrl}/corpora/no-such-corpus/probe`, {
+      method: "POST",
+      headers: goHeaders,
+      body: JSON.stringify({ sourceId: "1" }),
     });
 
-    await expect(
-      prober.probe({ connectionId: "no-such-corpus", sourceId: "1" }),
-    ).rejects.toThrow(/broker returned 404/);
-
-    // And specifically NOT the denial type, which drops candidates quietly.
-    await prober
-      .probe({ connectionId: "no-such-corpus", sourceId: "1" })
-      .catch((err: Error) => {
-        expect(err.constructor.name).toBe("TransientProbeError");
-      });
+    expect(res.status).toBe(404);
   });
-});
 
-describe("the knowledge-base read and lookup clients", () => {
-  const tool = (operation: string) =>
-    ({
-      id: `kb:globex/${operation}`,
-      name: operation,
-      description: "…",
-      allowedRoles: ["reader"],
-      knowledgeBaseExec: {
-        knowledgeBaseId: "globex",
-        displayName: "GLOBEX",
-        operation,
-        members: [
-          {
-            id: CORPUS,
-            label: "GLOBEX Confluence",
-            collection: "c1",
-            allowedRoles: ["reader"],
-            identityProviders: ["atlassian"],
-          },
-        ],
-        disclosePartialVisibility: true,
-      },
-    }) as never;
+  it("reads a document as the caller", async () => {
+    const res = await fetch(`${baseUrl}/corpora/${CORPUS}/documents/1`, { headers: goHeaders });
 
-  const caller = { subject: "openwebui:1", roles: ["reader"] };
-
-  it("reads a document through the route the broker serves", async () => {
-    const reader = new CorpusReader({ brokerUrl: baseUrl, brokerToken: ORCHESTRATOR_TOKEN, credentials });
-
-    const read = await reader.read(tool("read"), `${CORPUS}/1`, caller);
-
-    expect(read.result).toContain("live body");
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("live body");
     expect(driver.readAsUser).toHaveBeenCalled();
   });
 
-  it("looks up through the route the broker serves", async () => {
-    const lookup = new CorpusLookup({ brokerUrl: baseUrl, brokerToken: ORCHESTRATOR_TOKEN, credentials });
+  it("searches live as the caller", async () => {
+    const res = await fetch(`${baseUrl}/corpora/${CORPUS}/search?q=deploy`, { headers: goHeaders });
 
-    const found = await lookup.lookup(tool("lookup"), "deploy", caller);
-
-    // The reference shape the read tool takes, so the pair composes.
-    expect(found.result).toContain(`reference: ${CORPUS}/1`);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("Runbook");
     expect(driver.searchAsUser).toHaveBeenCalled();
   });
 });
@@ -262,8 +220,8 @@ describe("the ingestion credential never reaches a user-facing read", () => {
  * The Go engine cannot be driven from here, so its paths are read instead.
  *
  * Crude on purpose. The alternative to checking the string is not checking it,
- * and this exact string is what broke: `internal/corpus/broker.go` is the Go
- * twin of `BrokerProber` and has to agree with a server written in TypeScript,
+ * and this exact string is what broke: `internal/corpus/broker.go` is the
+ * retrieval prober and has to agree with a server written in TypeScript,
  * with nothing between them but a convention nobody is reminded of.
  */
 describe("the Go engine addresses the same routes", () => {

@@ -222,8 +222,6 @@ const maxRefusalDetail = 200
 // a linked token missing `search:confluence` (Atlassian's 401 "scope does not
 // match") — three different fixes. The driver already puts the source's own
 // explanation in the error the broker returns; this stops throwing it away.
-//
-// PARITY: refusalNote in orchestrator/apps/agent-orchestrator/src/knowledge-base/lookup.ts.
 func refusalNote(status int, body []byte) string {
 	var parsed struct {
 		Error string `json:"error"`

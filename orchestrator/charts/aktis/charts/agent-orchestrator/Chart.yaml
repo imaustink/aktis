@@ -1,8 +1,8 @@
 apiVersion: v2
 name: agent-orchestrator
 description: >-
-  Helm chart for the controller-agent parent orchestrator: RAG-based skill/tool
-  selection and Kubernetes Job launcher (see orchestrator/apps/agent-orchestrator).
+  Helm chart for agent-orchestrator: the OpenAI-compatible and /invoke facade
+  in front of the Temporal agent engine (see orchestrator/apps/agent-orchestrator).
 type: application
 version: 0.2.3
 appVersion: "0.1.0"
@@ -13,7 +13,6 @@ keywords:
   - agent
   - orchestrator
   - llm
-  - langgraph
 maintainers:
   - name: controller-agent
 dependencies:
@@ -27,11 +26,6 @@ dependencies:
     version: "1.18.2"
     repository: https://qdrant.github.io/qdrant-helm
     condition: qdrant.enabled
-  # NATS is provided by the umbrella chart's own `nats` dependency (shared
-  # across the whole release, used for tool-result delivery), not bundled
-  # here -- `nats.enabled` in this subchart's values only toggles URL
-  # derivation (see templates/_helpers.tpl `agent-orchestrator.natsUrl`),
-  # which resolves to the umbrella release's shared NATS Service by name.
   # Redis for the conversation session store (docs/adr/0016) is provided by
   # a simple custom Deployment + Service template in templates/redis.yaml
   # (NOT a Bitnami subchart, to avoid Bitnami image-registry availability

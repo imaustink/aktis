@@ -17,7 +17,7 @@ own** delegated GitHub token, not a shared bot credential (ADR 0022/0027).
 Unlike a tool with a static `GITHUB_TOKEN` baked into its Secret, this tool
 is designed to run with **`Tool.spec.identityProviders: [github]`** set (see
 `orchestrator/charts/community-components/templates/tool-github.yaml`). When a Skill
-routes a call to this tool, `agent-orchestrator`'s `runTool` (`graph.ts`)
+routes a call to this tool, the Temporal engine's tool dispatch
 checks the calling user's own linked GitHub identity via
 `orchestrator/apps/integration-gateway`'s identity-link API (the same OAuth Device Flow
 broker `opencode-swe-agent` uses, ADR 0022) and injects the resulting token
@@ -27,8 +27,7 @@ one credential across every caller. A caller who hasn't linked their GitHub
 account yet gets a clear error asking them to link it via a direct
 conversation with an identity-linking-capable agent first (v1 scope cut:
 this tool's call path cannot itself start a fresh device-flow link -- only
-the peer-level agent-delegation path can, see `graph.ts`'s `runTool`
-comment).
+the peer-level agent-delegation path can).
 
 A `GITHUB_TOKEN`/`GH_TOKEN` env var is all `gh` needs to authenticate --
 `src/github.ts` sets both directly on the child process so `gh` never has

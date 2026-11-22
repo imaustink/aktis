@@ -14,7 +14,7 @@ const OWNER = "e2e-org";
 const REPO = "e2e-repo";
 const TRIGGER_LABEL = "ai-triage";
 
-/** The idle window this environment runs with (`agentIdleTimeoutSeconds`, values-e2e.yaml). */
+/** The idle window this environment runs with (`temporal-engine.worker.idleTimeoutSeconds`, values-e2e.yaml). */
 const IDLE_WINDOW_MS = 30_000;
 
 let issueCounter = 0;

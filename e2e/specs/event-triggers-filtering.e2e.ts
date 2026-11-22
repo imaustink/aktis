@@ -4,7 +4,6 @@ import { cleanupAgentRunsSince, waitFor } from "../support/k8s.js";
 import { resetFakeGithub } from "../support/fixtures.js";
 import { seedAllClaudeCredentials } from "../support/credential-store.js";
 import { resetStubPacing } from "../support/resilience.js";
-import { deployedEngine } from "../support/engine.js";
 import {
   EXAMPLE_ACK_TEXT,
   agentRunDetailsSince,
@@ -55,7 +54,7 @@ let counter = 0;
 const BASE = 81_000 + (Date.now() % 15_000);
 const next = () => BASE + counter++ * 97;
 
-describe(`github deliveries that must not dispatch (engine: ${deployedEngine()})`, () => {
+describe("github deliveries that must not dispatch", () => {
   let secret: string;
   let suiteStartedAt: Date;
   /** issue/PR number -> what was sent, for the failure message. */

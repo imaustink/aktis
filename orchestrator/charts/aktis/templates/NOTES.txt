@@ -15,10 +15,8 @@ Consumer-facing invoke API (ADR 0006):
   kubectl -n {{ .Release.Namespace }} port-forward svc/agent-orchestrator-invoke 8081:8081
   curl -s -X POST http://localhost:8081/invoke \
     -H 'authorization: Bearer <token>' -H 'content-type: application/json' \
-    -d '{"request": "scrape https://example.com/some-recipe"}'
+    -d '{"request": "..."}'
 
-Job callback receiver (in-cluster only, never exposed via Ingress):
-  agent-orchestrator-callback.{{ .Release.Namespace }}.svc.cluster.local:8080
 {{- end }}
 
 {{- if .Values.openwebui.enabled }}

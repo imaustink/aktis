@@ -181,7 +181,7 @@ func BridgedAgentWorkflow(ctx workflow.Context, in AgentWorkflowInput) error {
 				return fail("not_ready", fmt.Sprintf("agent %s never became ready within %s (AgentRun: %v)",
 					in.Agent.ID, bridgedReadyTimeout, status))
 			}
-			// Milliseconds, matching upstream's nats-agent-channel.ts wording
+			// Milliseconds, matching the retired TS engine's wording
 			// exactly ("went silent for <N>ms") — the comment a human reads is
 			// the only place this is observable (the gateway renders whatever
 			// the workflow returns), so the wording is load-bearing, not

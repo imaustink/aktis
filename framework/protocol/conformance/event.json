@@ -100,7 +100,7 @@
       "valid": false,
       "json": { "job_id": "j1", "seq": 0, "ts": "t", "type": "succeeded" },
       "divergences": {
-        "zod": "`result: z.unknown()` admits a missing key. The canonical rule (result required) is what the Temporal engine has always enforced in production; tightening zod is deferred to replacing it with protovalidate-es (ADR 0047), so a tool that relies on the LangGraph engine's leniency is not broken by a contract-only change."
+        "zod": "`result: z.unknown()` admits a missing key. The canonical rule (result required) is what the Temporal engine has always enforced in production; tightening zod is deferred to replacing it with protovalidate-es (ADR 0047)."
       }
     },
     { "name": "failed without code", "valid": false, "json": { "job_id": "j1", "seq": 0, "ts": "t", "type": "failed", "message": "m" } },

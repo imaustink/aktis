@@ -365,12 +365,6 @@ export interface AgentRunDetail {
   readOnly: boolean;
   params: Record<string, string>;
   jobName?: string;
-  /**
-   * `aktis.ai/session-id`. Written by the LangGraph launcher only
-   * (the Temporal launcher sets no annotations), so assert on it only when
-   * `deployedEngine() === "langgraph"`.
-   */
-  sessionAnnotation?: string;
 }
 
 /** Same widening as k8s.ts's agentRunsSince (second-granularity timestamps + host/node skew). */
@@ -397,14 +391,13 @@ export async function agentRunDetailsSince(since: Date): Promise<AgentRunDetail[
       readOnly: i.spec?.readOnly === true,
       params: i.spec?.params ?? {},
       jobName: i.status?.jobName,
-      sessionAnnotation: i.metadata.annotations?.["aktis.ai/session-id"],
     }));
 }
 
 /**
  * The AgentRun an event for `number` launched, found by its PARAMS rather than
- * by recency: `spec.params` is contract (§6) on both engines, while the session
- * annotation is only written by the LangGraph launcher. Matching on the issue
+ * by recency: `spec.params` is contract (§6), while the run carries no session
+ * annotation. Matching on the issue
  * number keeps a straggler from an earlier test from being mistaken for this one.
  */
 export async function waitForAgentRunWithParam(

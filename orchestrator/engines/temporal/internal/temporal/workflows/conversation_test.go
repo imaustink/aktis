@@ -76,8 +76,8 @@ func TestConversationWorkflow_TurnThenIdleCompletion(t *testing.T) {
 	require.Equal(t, 1, result.Turn)
 
 	// bareAnswer (upstream's callBestEffort) sends only the CURRENT request,
-	// never the accumulated transcript — matching best-effort-responder.ts's
-	// respond(), which takes one string, not a message history.
+	// never the accumulated transcript, as the retired TS engine's best-effort
+	// responder did.
 	require.NotEmpty(t, seen.SystemPrompt)
 	require.Len(t, seen.Messages, 1)
 	require.Equal(t, "hi there", seen.Messages[0].Content)

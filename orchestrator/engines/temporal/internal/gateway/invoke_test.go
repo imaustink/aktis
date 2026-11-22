@@ -122,7 +122,7 @@ func TestShapeInvokeTurnRejectsANonEnvelopeEvent(t *testing.T) {
 	require.ErrorIs(t, err, errNotAnEnvelope)
 }
 
-// No trigger table is the same clean no-op as no match (§5) — LangGraph's
+// No trigger table is the same clean no-op as no match (§5) — the retired LangGraph engine's
 // answer too — not an outage the gateway would retry.
 func TestShapeInvokeTurnIgnoresAnEnvelopeWithoutATriggerTable(t *testing.T) {
 	shaped, err := shapeInvokeTurn(invokeRequest{Event: prEnvelope("ai-review")}, "", "", "", nil, testCaller, time.Now())
@@ -438,7 +438,7 @@ func TestHandleInvokeEventOutcomes(t *testing.T) {
 	require.Equal(t, "failed", outcome.Status)
 	require.Contains(t, outcome.Error, "needs-issue")
 
-	// No trigger table: ignored, exactly like LangGraph (§5).
+	// No trigger table: ignored, a clean no-op (§5).
 	rec = post(NewServer(nil, "tq", nil), envelope("ai-review"))
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.JSONEq(t, `{"status":"ignored"}`, rec.Body.String())
@@ -549,7 +549,7 @@ func TestMalformedToolArrayIsRejected(t *testing.T) {
 	require.Contains(t, rec.Body.String(), "duplicate")
 }
 
-// TS's chat-completions.ts openAiError shapes every 400 as
+// agent-orchestrator's chat-completions.ts openAiError shapes every 400 as
 // {error:{message, type:"invalid_request_error", code:"invalid_request"}} so
 // real OpenAI clients (ADR 0035 §3) can parse it; Go must match, not send
 // {message, type:"durable_agents_error"} with no code.

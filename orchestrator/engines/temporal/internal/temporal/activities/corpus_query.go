@@ -85,8 +85,6 @@ type plannerQuery struct {
 //
 // Bounded the way the other live faces are: our role policy per member, then
 // the source's own answer to the caller's token, inside the corpus's scope.
-//
-// PARITY: CorpusQuery in orchestrator/apps/agent-orchestrator/src/knowledge-base/query.ts.
 func (a *KnowledgeBaseActivities) QueryCorpus(
 	ctx context.Context,
 	in QueryCorpusInput,

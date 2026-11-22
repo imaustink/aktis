@@ -97,7 +97,7 @@ const (
 	// bareAnswer node / noMatchFallback's bare branch): no skill, agent, or
 	// tool matched, so the model answers from its own knowledge with NO
 	// ability to take any external action. Framed explicitly as a safety
-	// guard (verbatim from best-effort-responder.ts's SYSTEM_PROMPT) so it
+	// guard so it
 	// cannot claim to have done something it didn't, and the request is
 	// labelled DATA rather than instructions as a prompt-injection guard.
 	bareAnswerSystemPrompt = "No specialized skill, agent, or tool exists for this request — you are the last resort, answering from your own " +

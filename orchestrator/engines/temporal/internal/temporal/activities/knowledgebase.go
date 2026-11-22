@@ -275,8 +275,7 @@ func (a *KnowledgeBaseActivities) SearchKnowledgeBase(
 // naming them.
 //
 // Done here in the activity (not the workflow) because starting a flow is a
-// network call and workflows must stay deterministic. PARITY: the TS graph's
-// knowledgeBaseLinkPrompt (agent/graph.ts).
+// network call and workflows must stay deterministic.
 func (a *KnowledgeBaseActivities) needsLink(ctx context.Context, caller Caller, displayName string, providers []string) SearchKnowledgeBaseOutput {
 	out := needsLinkAsk(displayName, providers)
 	out.Result = a.startLinks(ctx, caller, providers, out.Result)
@@ -326,7 +325,7 @@ func (a *KnowledgeBaseActivities) linkClauses(ctx context.Context, caller Caller
 	// One link to the Connections page for every missing provider, rather
 	// than a clause per provider, each a raw OAuth URL (Aktis ADR
 	// 0046). Nothing is started here: the page starts each flow for the same
-	// subject retrieval reads. PARITY: startKnowledgeBaseLinkClauses in graph.ts.
+	// subject retrieval reads.
 	if authz.UsesConnectionsPage(a.ConnectionsURL, caller.Subject, identitylink.FlowAuthCode) {
 		if page, ok := authz.ConnectionsPageStart(a.ConnectionsURL, providers); ok {
 			names := make([]string, len(providers))

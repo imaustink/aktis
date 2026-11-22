@@ -15,7 +15,7 @@ import (
 // citation. Blending keeps semantic recall while pulling term-exact passages up.
 // Deliberately NOT an external reranker model: the weights are fixed and the
 // sort is stable, so the same question returns the same order, with no new
-// dependency, secret, or per-query network cost. PARITY: rerank.ts.
+// dependency, secret, or per-query network cost.
 const (
 	rerankWeightVector  = 0.7
 	rerankWeightKeyword = 0.3

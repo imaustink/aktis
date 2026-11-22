@@ -160,7 +160,7 @@ addition specific to it:
   conversation — a sufficiently effective prompt injection could in
   principle cause the assistant to echo back a different, attacker-chosen
   slug. [ADR 0017](adr/0017-continuation-tokens-via-session-store.md) closed
-  that off: `graph.ts`'s `runTool` now strips the marker from the tool's
+  that off: the engine's tool dispatch now strips the marker from the tool's
   result before it ever reaches the transcript, storing the slug
   server-side (`SessionRecord.toolContinuations`, keyed by tool id) and
   re-injecting it directly into the tool's next-turn input — the value never
@@ -205,8 +205,8 @@ mechanism at all. This means:
 - A caller who has not yet linked their GitHub account gets an explicit
   error directing them to link it via a direct conversation with an
   identity-linking-capable agent (e.g. `opencode-swe-agent`) first -- the
-  same v1 scope cut as the agent-backed-tool identity gate in `graph.ts`'s
-  `runTool`: this call path cannot itself start a fresh device-flow link.
+  same v1 scope cut as the agent-backed-tool identity gate in the engine's
+  tool dispatch: this call path cannot itself start a fresh device-flow link.
 - A deployment that does not want per-user delegation can instead configure
   `githubTool.identityLink.enabled: false` (the chart default) with a shared
   credential in a Secret, same as any other tool's `secretEnv` -- the blast

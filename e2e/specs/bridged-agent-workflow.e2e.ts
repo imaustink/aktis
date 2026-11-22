@@ -8,7 +8,6 @@ import { withPortForward } from "../support/k8s.js";
 import { issueLabeledPayload, postGithubWebhook } from "../support/webhook.js";
 import { fakeGithubRequests, resetFakeGithub, webhookSecret } from "../support/fixtures.js";
 import { seedAllClaudeCredentials } from "../support/credential-store.js";
-import { isTemporal } from "../support/engine.js";
 
 /**
  * `support/k8s.ts`'s own `withPortForward` gates readiness on a plain HTTP
@@ -107,9 +106,8 @@ const STUB_REPLY_MARKER = "stub-agent-reply";
  */
 const CANONICAL = `github:${SENDER}`;
 
-// Temporal-only by construction: it asks the Temporal server which workflow
-// ran. Under E2E_ENGINE=langgraph there is no workflow to find.
-describe.skipIf(!isTemporal())("Temporal engine: a bridged pod agent actually runs as BridgedAgentWorkflow", () => {
+// Asks the Temporal server which workflow ran.
+describe("Temporal engine: a bridged pod agent actually runs as BridgedAgentWorkflow", () => {
   let secret: string;
   let suiteStartedAt: Date;
 

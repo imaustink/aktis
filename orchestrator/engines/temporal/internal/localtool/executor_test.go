@@ -27,8 +27,7 @@ func (f fakeSecretReader) Read(_ context.Context, secretName, key string) (strin
 }
 
 // fakeSidecar is an HTTP server listening on a unix socket, recording the
-// last request body and replying with a canned status/body — the Go
-// counterpart of local-tool-executor.test.ts's startSidecar.
+// last request body and replying with a canned status/body.
 type fakeSidecar struct {
 	socketDir   string
 	lastRequest *localtool.RunRequest

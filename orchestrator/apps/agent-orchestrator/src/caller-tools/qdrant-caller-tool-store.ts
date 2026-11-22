@@ -28,8 +28,7 @@ interface CallerToolPayload {
 }
 
 /**
- * {@link CallerToolStore} backed by Qdrant (docs/adr/0035 §2), mirroring
- * ../vector-store/qdrant-store.ts. The point id is a UUID derived from the
+ * {@link CallerToolStore} backed by Qdrant (docs/adr/0035 §2). The point id is a UUID derived from the
  * definition's CONTENT HASH rather than from a caller/session id, which is what
  * turns the collection into an embedding cache: an identical definition is
  * embedded once, ever, across all callers and all turns. Since a client resends

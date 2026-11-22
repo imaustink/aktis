@@ -3,11 +3,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-// The REAL broker, driven by the REAL engine client — the two halves of MCP
-// support that live in different packages and must agree with nothing between
-// them but a URL, a header and two JSON shapes.
+// The REAL broker, driven with requests shaped exactly like the Go engine's
+// (the only client since docs/adr/0053) — the two halves of MCP support agree
+// with nothing between them but a URL, a header and two JSON shapes.
 import { createMcpBrokerServer, DELEGATED_TOKEN_HEADER } from "../../orchestrator/apps/mcp-broker/src/server.js";
 import { StaticMCPServerRegistry } from "../../orchestrator/apps/mcp-broker/src/mcpserver-registry.js";
 import { Discovery } from "../../orchestrator/apps/mcp-broker/src/discovery.js";
@@ -20,6 +20,7 @@ import {
   type ToolCallResult,
 } from "../../orchestrator/apps/mcp-broker/src/mcp-client.js";
 import {
+  catalogIdFor,
   GROUP,
   SERVER_LABEL,
   VERSION,
@@ -27,27 +28,26 @@ import {
   type MCPToolCustomResource,
 } from "../../orchestrator/apps/mcp-broker/src/mcp-server-resource.js";
 
-import { MCPBrokerClient } from "../../orchestrator/apps/agent-orchestrator/src/mcp/mcp-broker-client.js";
-import { toMCPToolDescriptor } from "../../orchestrator/apps/agent-orchestrator/src/registry/crd-mcp-tool-registry.js";
-import type { ToolDescriptor } from "../../orchestrator/apps/agent-orchestrator/src/tool-descriptor.js";
-
 /**
- * MCP tool support across its three components and two languages, driven against
- * the REAL broker (ADR 0045). The engine client, the broker server and the Go
- * dispatch activity are three implementations of one contract — a URL, an
- * `x-delegated-token` header, a `{arguments}` request and a `{result,isError}`
- * reply — and nothing but agreement makes a tool call reach a server and come
- * back. This is the same guard `broker-contract.e2e.ts` keeps over the
- * connection-broker, for the same reason: every past break in this repo was a
- * cross-component rename that a unit suite, mocking the other half, waved
- * through. It needs no cluster: the MCP server is a fake and the question is
- * purely whether the halves of this repo agree.
+ * MCP tool support across its components and two languages, driven against the
+ * REAL broker (ADR 0045). The broker server (TypeScript), its discovery writer,
+ * and the Go engine's dispatch activity and catalog reader implement one
+ * contract — a URL, an `x-delegated-token` header, a `{arguments}` request, a
+ * `{result,isError}` reply, and the MCPTool CR's spec fields — and nothing but
+ * agreement makes a tool call reach a server and come back. This is the same
+ * guard `broker-contract.e2e.ts` keeps over the connection-broker, for the same
+ * reason: every past break in this repo was a cross-component rename that a unit
+ * suite, mocking the other half, waved through. It needs no cluster: the MCP
+ * server is a fake and the question is purely whether the halves of this repo
+ * agree.
  *
- * Four boundaries, each exercised with the real code on both sides:
- *   1. The engine client ↔ the broker server (route, auth, fail-closed, errors).
- *   2. Discovery's WRITE of a derived MCPTool ↔ the engine registry's READ of it.
+ * Four boundaries:
+ *   1. The broker serves the route the Go engine calls (route, auth, which
+ *      credential is spent, errors), driven with Go-shaped requests.
+ *   2. Discovery's WRITE of a derived MCPTool carries the fields the Go
+ *      catalog reader decodes.
  *   3. The existence rule (§6) through the real writer.
- *   4. The Go engine addresses the same route and reply the TS client does.
+ *   4. The Go engine's source addresses that same route and reply.
  */
 
 const NAMESPACE = "e2e";
@@ -55,6 +55,9 @@ const ORCHESTRATOR_TOKEN = "broker-secret";
 const SERVICE_TOKEN = "discovery-service-cred";
 const DELEGATED = "alice-delegated-token";
 const SERVER = "github-mcp";
+// Derived, not hardcoded: the broker hashes a lossy remote name into its id.
+const SEARCH_ID = catalogIdFor(SERVER, { remoteToolName: "search_issues", allowedRoles: [] });
+const SECRET_ID = catalogIdFor(SERVER, { remoteToolName: "secret_op", allowedRoles: [] });
 
 /** The remote tools the fake MCP server advertises; mutable for the §6 pass. */
 interface FakeState {
@@ -133,30 +136,9 @@ function serverCR(opts: {
   };
 }
 
-/** The engine-side descriptor for a materialized MCP tool. */
-function mcpToolDescriptor(remoteToolName: string, identityProviders?: string[]): ToolDescriptor {
-  return {
-    id: `mcp-${SERVER}-${remoteToolName}`,
-    name: `mcp-${SERVER}-${remoteToolName}`,
-    description: "…",
-    allowedRoles: ["engineering"],
-    identityProviders,
-    mcpExec: { serverRef: SERVER, remoteToolName },
-  } as ToolDescriptor;
-}
-
-/** A credential resolver that hands back a fixed token, or none when unlinked. */
-function resolver(token: string | undefined) {
-  return {
-    delegatedToken: async () => ({ token: token ?? "", principals: [] as string[] }),
-    delegatedTokens: async (_subject: string, providers: string[]) =>
-      new Map(providers.map((p) => [p, { token: token ?? "", principals: [] as string[] }])),
-  };
-}
-
 const caller = { subject: "openwebui:alice" };
 
-describe("the engine client and the broker server agree", () => {
+describe("the broker serves the route the Go engine calls", () => {
   let server: Server;
   let brokerUrl: string;
   let state: FakeState;
@@ -166,7 +148,7 @@ describe("the engine client and the broker server agree", () => {
     { remoteToolName: "explode", allowedRoles: ["engineering"] },
   ];
 
-  function startBroker(identityProviders: string[] | undefined): void {
+  async function startBroker(identityProviders: string[] | undefined): Promise<void> {
     server = createMcpBrokerServer({
       auth: { orchestratorToken: ORCHESTRATOR_TOKEN },
       registry: new StaticMCPServerRegistry([
@@ -174,6 +156,28 @@ describe("the engine client and the broker server agree", () => {
       ]),
       client: fakeMcpClient(state),
     });
+    await new Promise<void>((resolve) => server.listen(0, () => resolve()));
+    brokerUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  }
+
+  /** One tools/call exactly as mcptool.go's callThroughBroker sends it. */
+  function call(
+    tool: string,
+    args: Record<string, unknown>,
+    opts: { delegated?: string; brokerToken?: string; server?: string } = {},
+  ): Promise<Response> {
+    return fetch(
+      `${brokerUrl}/servers/${encodeURIComponent(opts.server ?? SERVER)}/tools/${encodeURIComponent(tool)}/call`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${opts.brokerToken ?? ORCHESTRATOR_TOKEN}`,
+          ...(opts.delegated ? { [DELEGATED_TOKEN_HEADER]: opts.delegated } : {}),
+        },
+        body: JSON.stringify({ arguments: args }),
+      },
+    );
   }
 
   beforeEach(() => {
@@ -187,30 +191,15 @@ describe("the engine client and the broker server agree", () => {
     };
   });
 
-  afterAll(() => server?.close());
+  afterEach(() => server?.close());
 
-  async function listen(): Promise<void> {
-    await new Promise<void>((resolve) => server.listen(0, () => resolve()));
-    brokerUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  }
+  it("proxies a call, spending the caller's delegated token upstream", async () => {
+    await startBroker(["github"]);
 
-  it("proxies a call through the route the broker serves, carrying the caller's token", async () => {
-    startBroker(["github"]);
-    await listen();
-    const client = new MCPBrokerClient({
-      brokerUrl,
-      brokerToken: ORCHESTRATOR_TOKEN,
-      credentials: resolver(DELEGATED),
-    });
+    const res = await call("search_issues", { query: "is:open" }, { delegated: DELEGATED });
 
-    const out = await client.call(
-      mcpToolDescriptor("search_issues", ["github"]),
-      `{"query":"is:open"}`,
-      caller,
-    );
-
-    expect(out.needsLink).toBeFalsy();
-    expect(out.result).toBe(`echo:${JSON.stringify({ query: "is:open" })}`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ result: `echo:${JSON.stringify({ query: "is:open" })}`, isError: false });
     // The broker spent the CALLER's delegated token upstream — never the
     // discovery/service credential (ADR 0045 §5).
     expect(state.calls).toHaveLength(1);
@@ -221,98 +210,51 @@ describe("the engine client and the broker server agree", () => {
     });
   });
 
-  it("fails closed when the caller has not linked, never calling the server", async () => {
-    startBroker(["github"]);
-    await listen();
-    const client = new MCPBrokerClient({
-      brokerUrl,
-      brokerToken: ORCHESTRATOR_TOKEN,
-      credentials: resolver(undefined), // unlinked
-    });
+  it("spends the service credential for a no-identity server called with no delegated header", async () => {
+    await startBroker(undefined); // server declares no identityProviders
 
-    const out = await client.call(mcpToolDescriptor("search_issues", ["github"]), `{}`, caller);
+    const res = await call("search_issues", {});
 
-    expect(out.needsLink).toBe(true);
-    expect(out.result).toMatch(/link the account/i);
-    expect(state.calls, "the broker is never reached with a fallback credential").toHaveLength(0);
+    expect(res.status).toBe(200);
+    expect(state.calls[0]!.token, "a no-identity server runs on the service credential").toBe(SERVICE_TOKEN);
   });
 
-  it("spends the service credential, and sends no delegated header, for a no-identity server", async () => {
-    startBroker(undefined); // server declares no identityProviders
-    await listen();
-    const client = new MCPBrokerClient({
-      brokerUrl,
-      brokerToken: ORCHESTRATOR_TOKEN,
-      credentials: resolver(DELEGATED),
-    });
+  it("returns a tool-level error as isError, not a failed request", async () => {
+    await startBroker(["github"]);
 
-    const out = await client.call(mcpToolDescriptor("search_issues"), `{}`, caller);
+    const res = await call("explode", {}, { delegated: DELEGATED });
 
-    expect(out.result).toContain("echo:");
-    expect(state.calls[0]!.token, "a no-identity server runs on the service credential").toBe(
-      SERVICE_TOKEN,
-    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { result: string; isError: boolean };
+    expect(body.isError).toBe(true);
+    expect(body.result).toContain("the repo does not exist");
   });
 
-  it("returns a tool-level error as prose, not a thrown turn", async () => {
-    startBroker(["github"]);
-    await listen();
-    const client = new MCPBrokerClient({
-      brokerUrl,
-      brokerToken: ORCHESTRATOR_TOKEN,
-      credentials: resolver(DELEGATED),
-    });
-
-    const out = await client.call(mcpToolDescriptor("explode", ["github"]), `{}`, caller);
-
-    // isError travels back as the flattened text the model can act on.
-    expect(out.result).toContain("the repo does not exist");
-    expect(out.needsLink).toBeFalsy();
-  });
-
-  it("refuses an unexposed tool with a 404 the client surfaces as prose", async () => {
-    startBroker(["github"]);
-    await listen();
-    const client = new MCPBrokerClient({
-      brokerUrl,
-      brokerToken: ORCHESTRATOR_TOKEN,
-      credentials: resolver(DELEGATED),
-    });
+  it("refuses an unexposed tool with a 404, never reaching the server", async () => {
+    await startBroker(["github"]);
 
     // Advertised by the server but NOT in the exposure map → the broker refuses.
-    const out = await client.call(mcpToolDescriptor("delete_repo", ["github"]), `{}`, caller);
+    const res = await call("delete_repo", {}, { delegated: DELEGATED });
 
-    expect(out.result).toContain("refused that call (404)");
+    expect(res.status).toBe(404);
     expect(state.calls, "an unexposed tool never reaches the server").toHaveLength(0);
   });
 
   it("refuses an unknown server with a 404", async () => {
-    startBroker(["github"]);
-    await listen();
-    const client = new MCPBrokerClient({
-      brokerUrl,
-      brokerToken: ORCHESTRATOR_TOKEN,
-      credentials: resolver(DELEGATED),
-    });
+    await startBroker(["github"]);
 
-    const tool = mcpToolDescriptor("search_issues", ["github"]);
-    (tool.mcpExec as { serverRef: string }).serverRef = "no-such-server";
+    const res = await call("search_issues", {}, { delegated: DELEGATED, server: "no-such-server" });
 
-    const out = await client.call(tool, `{}`, caller);
-    expect(out.result).toContain("refused that call (404)");
+    expect(res.status).toBe(404);
   });
 
-  it("rejects a bad broker token with a 401 the client surfaces as prose", async () => {
-    startBroker(["github"]);
-    await listen();
-    const client = new MCPBrokerClient({
-      brokerUrl,
-      brokerToken: "wrong-token",
-      credentials: resolver(DELEGATED),
-    });
+  it("rejects a bad broker token with a 401", async () => {
+    await startBroker(["github"]);
 
-    const out = await client.call(mcpToolDescriptor("search_issues", ["github"]), `{}`, caller);
-    expect(out.result).toContain("refused that call (401)");
+    const res = await call("search_issues", {}, { delegated: DELEGATED, brokerToken: "wrong-token" });
+
+    expect(res.status).toBe(401);
+    expect(state.calls).toHaveLength(0);
   });
 });
 
@@ -362,11 +304,11 @@ describe("discovery's write and the engine's read agree", () => {
     // search_issues and secret_op are materialized; ghost_tool (not advertised)
     // and list_repos (expose:false) are not.
     expect([...k8s.tools.keys()].sort()).toEqual([
-      `mcp-${SERVER}-search_issues`.replace(/_/g, "-"),
-      `mcp-${SERVER}-secret_op`.replace(/_/g, "-"),
+      SEARCH_ID,
+      SECRET_ID,
     ]);
 
-    const search = k8s.tools.get(`mcp-${SERVER}-search-issues`)!;
+    const search = k8s.tools.get(SEARCH_ID)!;
     // description/inputSchema from the LIVE tool; roles/tier from the EXPOSURE;
     // identityProviders from the SERVER.
     expect(search.spec).toMatchObject({
@@ -383,7 +325,7 @@ describe("discovery's write and the engine's read agree", () => {
     expect(search.metadata.labels?.[SERVER_LABEL]).toBe(SERVER);
 
     // A hidden exposure carries hidden through.
-    expect(k8s.tools.get(`mcp-${SERVER}-secret-op`)!.spec.hidden).toBe(true);
+    expect(k8s.tools.get(SECRET_ID)!.spec.hidden).toBe(true);
 
     // The status is a REPORT of everything advertised, each marked exposed per
     // the map — a grant of nothing.
@@ -397,18 +339,17 @@ describe("discovery's write and the engine's read agree", () => {
     expect(exposedByName.get("list_repos")).toBe(false); // advertised, withdrawn
     expect(exposedByName.has("secret_op")).toBe(true);
 
-    // The engine READS exactly what the broker WROTE: the derived CR turns into a
-    // dispatchable descriptor with the right coordinates and identity gate.
-    const descriptor = toMCPToolDescriptor(search as unknown as Parameters<typeof toMCPToolDescriptor>[0]);
-    expect(descriptor).toBeDefined();
-    expect(descriptor!.mcpExec).toEqual({
-      serverRef: SERVER,
-      remoteToolName: "search_issues",
-      inputSchema: JSON.stringify({ type: "object" }),
-    });
-    expect(descriptor!.allowedRoles).toEqual(["engineering", "support"]);
-    expect(descriptor!.identityProviders).toEqual(["github"]);
-    expect(toMCPToolDescriptor(k8s.tools.get(`mcp-${SERVER}-secret-op`)! as never)!.hidden).toBe(true);
+    // The engine READS exactly what the broker WROTE: every spec field the
+    // broker sets is one the Go catalog reader decodes (decode.go's
+    // mcpToolSpec). Read as source, like the dispatch checks below.
+    const decodeGo = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "..", "..", "orchestrator/engines/temporal/internal/catalog/decode.go"),
+      "utf8",
+    );
+    const mcpToolSpecGo = decodeGo.slice(decodeGo.indexOf("type mcpToolSpec struct"));
+    for (const field of Object.keys(search.spec)) {
+      expect(mcpToolSpecGo, `Go reader decodes spec.${field}`).toMatch(new RegExp(`json:"${field}[",]`));
+    }
   });
 
   it("deletes a materialized tool the server stops advertising (the existence rule §6)", async () => {
@@ -418,15 +359,15 @@ describe("discovery's write and the engine's read agree", () => {
     const disco = discovery(k8s, fakeMcpClient(state));
 
     await disco.runServer({ name: SERVER, cr: server, serviceToken: SERVICE_TOKEN });
-    expect(k8s.tools.has(`mcp-${SERVER}-search-issues`)).toBe(true);
+    expect(k8s.tools.has(SEARCH_ID)).toBe(true);
 
     // The server drops search_issues from its live list; the next pass removes
     // the derived tool rather than leaving a tombstone that fails when invoked.
     state.tools = state.tools.filter((t) => t.name !== "search_issues");
     await disco.runServer({ name: SERVER, cr: server, serviceToken: SERVICE_TOKEN });
 
-    expect(k8s.tools.has(`mcp-${SERVER}-search-issues`)).toBe(false);
-    expect(k8s.tools.has(`mcp-${SERVER}-secret-op`), "the still-live tool stays").toBe(true);
+    expect(k8s.tools.has(SEARCH_ID)).toBe(false);
+    expect(k8s.tools.has(SECRET_ID), "the still-live tool stays").toBe(true);
   });
 
   it("marks a server Degraded and retains its tools when it is unreachable", async () => {
@@ -453,7 +394,7 @@ describe("discovery's write and the engine's read agree", () => {
  * The Go engine cannot be driven from here, so its dispatch path is read.
  *
  * Crude on purpose, exactly as `broker-contract.e2e.ts` reads the Go corpus
- * broker: `mcptool.go` is the Go twin of `MCPBrokerClient` and has to address a
+ * broker: `mcptool.go` is the broker's client and has to address a
  * TypeScript server, with nothing between them but this convention. The string
  * IS the contract; the alternative to checking it is not checking it.
  */
@@ -480,7 +421,8 @@ describe("the Go engine addresses the same broker route and reply", () => {
   });
 
   it("fails closed on a missing delegated token rather than falling back", () => {
-    // A NeedsLink path keyed on IdentityProviders, like the TS client's.
+    // A NeedsLink path keyed on IdentityProviders: an unlinked caller gets a
+    // link prompt, never a call on some other credential.
     expect(mcptoolGo).toContain("IdentityProviders");
     expect(mcptoolGo).toMatch(/NeedsLink/);
   });

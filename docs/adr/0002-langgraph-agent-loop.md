@@ -1,6 +1,6 @@
 # 0002: Agent reasoning loop built on LangGraph.js
 
-**Status:** accepted
+**Status:** superseded by [0053](0053-remove-langgraph-engine.md) — the LangGraph loop was removed; every turn runs on the Temporal engine ([0036](0036-temporal-execution-engine.md)).
 
 ## Context
 

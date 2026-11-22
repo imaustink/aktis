@@ -1,5 +1,4 @@
-// Package localtool is the Go port of agent-orchestrator's
-// src/local/local-tool-executor.ts (ADR 0014): the client side of a
+// Package localtool is the client side (ADR 0014) of a
 // LocalTool's dispatch to a per-language executor sidecar running in the same
 // pod. The engine never fetches, sandboxes, or runs a LocalTool's code
 // itself — that is entirely the sidecar's job — it only resolves secretEnv

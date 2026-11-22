@@ -1,8 +1,7 @@
-# The Temporal agent engine (orchestrator/engines/temporal), off by default.
+# The Temporal agent engine (orchestrator/engines/temporal).
 #
-# agent-orchestrator runs its in-process LangGraph loop unless
-# AGENT_ENGINE=temporal selects this instead (docs/adr/0036). Enabling this
-# subchart alone changes nothing: the orchestrator has to be told to use it.
+# Required: agent-orchestrator forwards every turn to this engine's gateway
+# (docs/adr/0036, 0053). There is no other agent loop.
 
 # A Temporal cluster is assumed to exist — this takes its address rather than
 # bundling a server, so enabling the engine adds no stateful component.
@@ -18,7 +17,7 @@ llm:
   model: gpt-4o-2024-08-06
   embedModel: text-embedding-3-small
   # Secret holding OPENAI_API_KEY. Defaults to the orchestrator's own secret so
-  # one key serves both engines rather than being duplicated per engine.
+  # one key serves the release rather than being duplicated per component.
   secretName: agent-controller-agent-orchestrator
 
 # Qdrant backs the catalog RAG index. Leave host empty to disable retrieval
@@ -55,7 +54,7 @@ callback:
 # declarative loop and checkpoint-resume step tools.
 #
 # Point this at the same NATS the orchestrator uses — the agents publish to
-# subjects keyed by AgentRun id, so both engines speak to the same place.
+# subjects keyed by AgentRun id.
 nats:
   url: ""
 

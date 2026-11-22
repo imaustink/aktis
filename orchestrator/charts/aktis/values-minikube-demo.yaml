@@ -26,8 +26,6 @@ agent-orchestrator:
     tag: latest
   qdrant:
     enabled: true
-  nats:
-    enabled: true
   # Redis-backed conversation-session store (docs/adr/0016), tested here
   # against the chart's bundled Redis Deployment (templates/redis.yaml).
   redis:
@@ -41,29 +39,20 @@ agent-orchestrator:
   # a reader-only token returns 0 candidate skills.
   config:
     staticIdentities: '{"openwebui-dev-token":{"subject":"open-webui","roles":["reader","writer"]}}'
-  # LocalTool executor sidecars (ADR 0014): node/python/go/shell executors run
-  # in the orchestrator pod and run LocalTool CRs in a bubblewrap sandbox.
-  # Images built into minikube by dev-up.sh / manual `docker build` of
-  # orchestrator/sidecars/localtool-executor (one per runtime). Requires unprivileged user
-  # namespaces on the node for the per-tool network sandbox.
-  localTool:
-    enabled: true
 
 core-controller:
   enabled: true
   image:
     tag: latest
-  # Must match the in-cluster NATS Service the orchestrator itself connects
-  # to (agent-orchestrator.natsUrl helper derives
-  # "<release>-nats.<namespace>.svc.cluster.local"). Without this, AgentRun
+  # Must match the umbrella's in-cluster NATS Service
+  # ("<release>-nats.<namespace>.svc.cluster.local"). Without this, AgentRun
   # Jobs fall back to the chart default "nats://nats:4222", which doesn't
   # resolve, and every delegated agent crashes on startup.
   nats:
     agentUrl: "nats://agent-controller-nats.controller-agent.svc.cluster.local:4222"
 
-# Top-level NATS server (nats subchart). The agent-orchestrator.nats.enabled
-# above controls URL derivation in the orchestrator; this enables the actual
-# server pod. Both must be true for NATS-based result delivery.
+# Top-level NATS server (nats subchart), used by the temporal-engine and
+# delegated agent pods.
 nats:
   enabled: true
 

@@ -4,7 +4,6 @@ import { cleanupAgentRunsSince, waitFor } from "../support/k8s.js";
 import { resetFakeGithub } from "../support/fixtures.js";
 import { seedAllClaudeCredentials } from "../support/credential-store.js";
 import { paceStubAgent, resetStubPacing } from "../support/resilience.js";
-import { deployedEngine } from "../support/engine.js";
 import {
   EXAMPLE_ACK_TEXT,
   STUB_REPLY_MARKER,
@@ -46,7 +45,7 @@ const OWNER = "e2e-org";
 const REPO = "e2e-repo";
 const LABEL = "ai-triage";
 
-/** values-e2e.yaml's idle window (agentIdleTimeoutSeconds / worker.idleTimeoutSeconds). */
+/** values-e2e.yaml's idle window (temporal-engine.worker.idleTimeoutSeconds). */
 const IDLE_WINDOW_MS = 30_000;
 
 let counter = 0;
@@ -80,7 +79,7 @@ async function labelIssue(secret: string, issue: number): Promise<void> {
   expect(status).toBe(202);
 }
 
-describe(`EventTrigger github-issue-triage (engine: ${deployedEngine()})`, () => {
+describe("EventTrigger github-issue-triage", () => {
   let secret: string;
   let suiteStartedAt: Date;
 
@@ -114,14 +113,9 @@ describe(`EventTrigger github-issue-triage (engine: ${deployedEngine()})`, () =>
     // promptTemplate was rendered with the params (single pass, §4).
     expect(run.goal).toContain(`GitHub issue ${OWNER}/${REPO}#${issue} was labeled "${LABEL}"`);
     expect(run.goal).not.toContain("{{");
-    // The session the turn ran on: the trigger's sessionKey
-    // "github:{{repository}}#{{number}}". Engine-specific only in WHERE it is
-    // observable -- the LangGraph launcher stamps it on the run; the Temporal
-    // launcher stamps nothing, so there it is pinned by
-    // event-triggers-invoke.e2e.ts's trigger.sessionId instead.
-    if (deployedEngine() === "langgraph") {
-      expect(run.sessionAnnotation).toBe(`github:${OWNER}/${REPO}#${issue}`);
-    }
+    // The session the turn ran on (the trigger's sessionKey
+    // "github:{{repository}}#{{number}}") is not stamped on the run; it is
+    // pinned by event-triggers-invoke.e2e.ts's trigger.sessionId instead.
 
     // §6 in the container's env, read while the Job still exists (TTL).
     const flags = await waitFor("the run's Job", async () => runJobFlags(run.jobName ?? run.name).catch(() => undefined), {

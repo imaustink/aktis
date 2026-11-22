@@ -90,36 +90,6 @@ Tests are **serial** (`fileParallelism: false`, `maxConcurrency: 1`): they
 share one cluster, and several assert on global state (Redis keys, AgentRun
 lists) that concurrent runs would race on.
 
-### Per engine
-
-agent-orchestrator drives turns with one of two engines (docs/adr/0036):
-`temporal` (the chart default -- `AGENT_ENGINE=temporal`, the Go worker) or
-`langgraph` (`AGENT_ENGINE` unset, the in-process loop). `E2E_ENGINE` selects
-one for BOTH the deploy and the run:
-
-```bash
-E2E_ENGINE=langgraph ./e2e/scripts/up.sh       # clears agentEngine on the release after skaffold
-E2E_ENGINE=langgraph npm run e2e -w e2e
-
-E2E_ENGINE=temporal ./e2e/scripts/up.sh        # or plain ./e2e/scripts/up.sh
-E2E_ENGINE=temporal npm run e2e -w e2e
-```
-
-`support/engine.ts` reads the engine off the deployed orchestrator and, when
-`E2E_ENGINE` is set and disagrees, **fails** rather than reporting parity it
-never measured. Without `E2E_ENGINE` the suite runs against whatever is deployed
-and names it in each event-trigger `describe`.
-
-The specs are engine-agnostic wherever the contract says behaviour is
-identical (all of `event-triggers-*`: matching happens in agent-orchestrator in
-both modes, and the Temporal engine is handed the resolved turn). Engine-only
-behaviour is gated with `describe.skipIf(!isTemporal())`:
-`bridged-agent-workflow` (asks the Temporal server), `repo-read-gate` (a Temporal
-authz feature LangGraph does not have) and knowledge-base-retrieval's "the Go
-engine served them". The one engine-specific expectation inside an event spec
-is where a session id is OBSERVABLE (the LangGraph launcher annotates the
-AgentRun with it; the Temporal launcher does not), noted where it is asserted.
-
 Other knobs: `E2E_NO_EGRESS=1` skips the one spec that needs the public
 internet; `E2E_SKIP_WEB_FETCH_BUILD=1` skips building the web-fetch image in
 `up.sh`; `E2E_KEEP_AGENT_RUNS=1` keeps AgentRuns after a green run.
@@ -138,7 +108,6 @@ support/
                     EventSource/EventTrigger CRs + Ready waits, /invoke with an envelope,
                     AgentRun/ToolRun readOnly+params readers, fake-github issue activity
   fake-sink.ts      reads fake-sink's recording; verifies x-event-signature
-  engine.ts         which engine is deployed; enforces E2E_ENGINE
   chat.ts           drives the CHAT entry point (per-user JWT + streaming /v1/chat/completions)
   invoke.ts         drives the PROGRAMMATIC entry point (accept-then-poll /invoke)
   openwebui-jwt.ts  chat.ts's cluster-free half: JWT minting, SSE assembly
@@ -211,8 +180,8 @@ by a per-test, higher-priority twin and its own selection through `/invoke`.
   secret; "no run" in a window followed by a control that DOES run in that
   window; "NotReady never matches" followed by the same trigger, fixed,
   matching. An absence alone passes for any broken reason.
-- *Find runs by params, not by recency.* `AgentRun.spec.params` is contract on
-  both engines (§6), so `waitForAgentRunWithParam(since, "number", n)` cannot
+- *Find runs by params, not by recency.* `AgentRun.spec.params` is contract
+  (§6), so `waitForAgentRunWithParam(since, "number", n)` cannot
   pick up a straggler from an earlier test.
 - *Wait for the orchestrator to SEE a per-test trigger, not just for Ready.*
   `waitForTriggersLoaded` applies a probe trigger whose params always fail, and
@@ -346,7 +315,7 @@ Two consequences worth knowing before editing it:
   test. `afterAll` resets them — leaving pacing on the CR makes every later
   spec slow, and a leftover silent phase makes them fail outright.
 - **It needs a short idle window.** `values-e2e.yaml` sets
-  `agentIdleTimeoutSeconds: 20` (production defaults to 10 minutes) so a test
+  `temporal-engine.worker.idleTimeoutSeconds: 30` (production defaults to 10 minutes) so a test
   can wait out a genuinely silent agent. The window bounds *silence*, not
   duration, so this does not cap how long a run may take — one of the specs
   asserts exactly that by pacing a narrating turn to five times the window and

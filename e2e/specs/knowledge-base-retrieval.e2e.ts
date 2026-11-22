@@ -4,7 +4,6 @@ import { kubectl, kubectlApplyStdin, waitFor } from "../support/k8s.js";
 import { withQdrant, listCollections, pointCount } from "../support/qdrant.js";
 import { chatSubject, chatTurn } from "../support/chat.js";
 import { seedAtlassianLink, deleteCredentials } from "../support/credential-store.js";
-import { isTemporal } from "../support/engine.js";
 
 /**
  * A knowledge base, from a synced corpus to what a caller is allowed to read.
@@ -204,11 +203,7 @@ describe("the sync CronJob", () => {
   }, 600_000);
 });
 
-// Retrieval runs only on the Temporal engine: the LangGraph dispatcher has no
-// knowledge-base dispatch kind (it answers "has neither a jobTemplate,
-// localExec, nor agentRunTemplate spec" for kb:<name>/search -- a parity gap,
-// not something these specs can exercise there).
-describe.skipIf(!isTemporal())("retrieval, as the asking user", () => {
+describe("retrieval, as the asking user", () => {
   it("answers from the corpus and cites it", async () => {
     const { text } = await chatTurn(
       FULL_USER,
@@ -294,7 +289,7 @@ describe.skipIf(!isTemporal())("retrieval, as the asking user", () => {
   }, 300_000);
 });
 
-describe.skipIf(!isTemporal())("a caller with no linked account", () => {
+describe("a caller with no linked account", () => {
   const STRANGER = "kb-unlinked";
 
   it("is asked to link rather than served on the ingestion credential", async () => {
@@ -314,19 +309,14 @@ describe.skipIf(!isTemporal())("a caller with no linked account", () => {
 /**
  * WHICH engine served those turns.
  *
- * The chart defaults agentEngine=temporal, so every assertion above already
- * runs through the Go worker — but nothing said so, and a spec that proves a
- * behaviour on an engine nobody can name is proving it about a system it
- * cannot identify. If that default ever flips, these tests would silently
- * start covering the LangGraph path instead and still pass, leaving the Go
- * knowledge-base path with no end-to-end coverage at all.
+ * Every turn runs through the Go worker, but a spec that proves a behaviour
+ * without naming what served it is proving it about a system it cannot
+ * identify — this pins that the Go knowledge-base path is what ran.
  *
  * Asserted from the worker's own execution log rather than from config: what
  * matters is that the Go activity RAN, not that a value was set.
  */
-// Engine identity, meaningful only when Temporal is the engine under test;
-// under E2E_ENGINE=langgraph the turns above ran in-process instead.
-describe.skipIf(!isTemporal())("the Go engine is what served them", () => {
+describe("the Go engine is what served them", () => {
   it("ran SearchKnowledgeBase as a Temporal activity for this spec's turns", async () => {
     const log = await kubectl([
       "logs",

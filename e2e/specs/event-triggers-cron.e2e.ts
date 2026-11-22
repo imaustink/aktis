@@ -2,7 +2,6 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { requireMinikubeContext } from "../support/guard.js";
 import { cleanupAgentRunsSince, kubectl, kubectlJson, waitFor } from "../support/k8s.js";
 import { seedAllClaudeCredentials } from "../support/credential-store.js";
-import { deployedEngine } from "../support/engine.js";
 import {
   TICK_TOKEN_AUDIENCE,
   applyEventSource,
@@ -74,7 +73,7 @@ async function cronJobGone(name: string): Promise<boolean> {
   return (await kubectl(["get", "cronjob", name, "--ignore-not-found", "-o", "name"])).trim() === "";
 }
 
-describe(`cron EventSources (engine: ${deployedEngine()})`, () => {
+describe("cron EventSources", () => {
   let startedAt: Date;
   const manualJobs: string[] = [];
 

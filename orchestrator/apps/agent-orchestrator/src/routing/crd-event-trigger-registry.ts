@@ -8,7 +8,16 @@ import {
   type SelectResult,
 } from "@aktis/event-triggers";
 import { makeCrdWatcher, type WatchCrdFn } from "../k8s/crd-watcher.js";
-import type { CustomObjectsApiLike } from "../registry/crd-tool-registry.js";
+
+/** Minimal slice of the k8s CustomObjectsApi this registry needs — kept small and mockable for tests. */
+export interface CustomObjectsApiLike {
+  listNamespacedCustomObject(request: {
+    group: string;
+    version: string;
+    namespace: string;
+    plural: string;
+  }): Promise<{ items?: unknown[] }>;
+}
 
 /** Plural resource name used by the `EventTrigger` CRD (matches `config/crd/bases` in orchestrator/controllers/core-controller). */
 export const EVENT_TRIGGER_PLURAL = "eventtriggers";

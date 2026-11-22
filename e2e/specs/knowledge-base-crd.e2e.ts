@@ -282,9 +282,9 @@ describe("reconciling a Corpus", () => {
   });
 
   it("resolves provider and identityProviders onto the Corpus status", async () => {
-    // Both engines watch ONE kind (ADR 0043). They read these off the Corpus
+    // The engine watches ONE kind (ADR 0043). It reads these off the Corpus
     // rather than joining to the Connection, so a controller that fails to
-    // copy them leaves every engine unable to pick a driver or a credential.
+    // copy them leaves it unable to pick a driver or a credential.
     const resolved = await waitFor(
       "corpus status carries the resolved Connection fields",
       async () => {

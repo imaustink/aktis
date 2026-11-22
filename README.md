@@ -138,7 +138,7 @@ Kubernetes. Either half can be adopted without the other.
 │   ├── tools/                  # on-demand tool containers (recipe-scraper, github, web-search, …)
 │   └── tools-local/            # in-pod LocalTool examples (Go, Node, Python, shell)
 ├── orchestrator/               # runs agents at scale; depends only on the framework
-│   ├── apps/                   # agent-orchestrator (LangGraph engine), integration-gateway, connection-broker, mcp-broker
+│   ├── apps/                   # agent-orchestrator (facade), integration-gateway, connection-broker, mcp-broker
 │   ├── engines/temporal/       # the Temporal execution engine (Go)
 │   ├── controllers/core-controller/  # Go controller — CRDs + reconcilers, launches Jobs
 │   ├── packages/event-triggers/      # EventSource/EventTrigger contract: envelope, CEL, matching (ADR 0048)
@@ -182,9 +182,11 @@ secret injection, and lifecycle tracking.
 | --- | ---- |
 | **agent-orchestrator** | [orchestrator/apps/agent-orchestrator/README.md](orchestrator/apps/agent-orchestrator/README.md) |
 
-A long-lived LangGraph.js service that handles the agent loop: resolves caller
-identity, selects a Skill via RAG, plans an action, and creates a `ToolRun` or
-`AgentRun` CR for the controller to execute.
+The long-lived front door: the OpenAI-compatible chat API, `POST /invoke`,
+event-trigger routing and caller identity. It forwards every turn to the
+[Temporal engine](orchestrator/engines/temporal/), which runs the agent loop:
+selects a Skill via RAG, plans an action, and creates a `ToolRun` or
+`AgentRun` CR for the controller to execute (ADR 0036, 0053).
 
 ### Example tools
 

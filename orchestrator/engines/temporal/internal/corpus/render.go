@@ -113,8 +113,6 @@ func Render(in RenderInput) string {
 // KB answer is cited and disclosed regardless of finish/respond (the "finish vs
 // respond" verbatim gap). Built from the SAME probe outcome Render uses, so the
 // two never drift. Returns "" when there is nothing to say.
-//
-// PARITY: citationsBlock in orchestrator/apps/agent-orchestrator/src/knowledge-base/render.ts.
 func CitationsBlock(in RenderInput) string {
 	return SourcesBlock(Sources(in)) + CaveatsBlock(CaveatLines(in))
 }

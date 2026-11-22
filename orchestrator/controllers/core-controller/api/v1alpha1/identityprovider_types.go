@@ -75,13 +75,11 @@ const AgentCredentialSecretLabel = "core.aktis.ai/agent-credential"
 // declared ONCE per provider and shared by every Tool/Agent that references
 // it, rather than repeated (and liable to drift) on each one.
 //
-// Before this CRD existed, this same information was a hardcoded TypeScript
-// map in agent-orchestrator (authorization-service.ts's `IDENTITY_PROVIDERS`)
-// — adding a provider meant an agent-orchestrator source change and a
-// redeploy of that image. Now it is cluster config: agent-orchestrator watches
-// IdentityProvider CRs the same way it already watches Tool/Agent/Skill, and a
-// new OAuth-based provider (flow: oauth) needs no agent-orchestrator code
-// change at all, just a new CR.
+// Before this CRD existed, this same information was hardcoded in the agent
+// engine — adding a provider meant a source change and a redeploy. Now it is
+// cluster config: the engine watches IdentityProvider CRs the same way it
+// watches Tool/Agent/Skill, and a new OAuth-based provider (flow: oauth) needs
+// no code change at all, just a new CR.
 type IdentityProviderSpec struct {
 	// envVar is the name of the environment variable this provider's resolved
 	// token is injected as on a launched AgentRun/ToolRun (AgentLaunchOptions'

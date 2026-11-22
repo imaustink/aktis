@@ -6,6 +6,10 @@ Date: 2026-08-02
 
 Proposed
 
+> **2026-11-21:** [0053](0053-remove-langgraph-engine.md) removed the LangGraph
+> engine and the `AGENT_ENGINE` switch. Temporal is now the only engine. The
+> `langgraph` default and rollback path described below no longer exist.
+
 Amends [0002](0002-langgraph-agent-loop.md) (the LangGraph loop), and retires or
 narrows the coordination machinery in
 [0006](0006-async-http-invoke-interface.md) (in-memory invocation records),

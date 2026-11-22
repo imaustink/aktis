@@ -1,9 +1,8 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, type Mock } from "vitest";
 import { SENDER_ASSERTION_HEADER, mintSenderAssertion } from "./rbac/sender-assertion.js";
 import { InMemoryInvocationStore, type InvocationStore } from "./invocation/types.js";
-import { InvokeServer, type AgentGraphLike, type InvocationRecord } from "./server.js";
-import type { AgentState } from "./agent/graph.js";
-import type { AgentOrchestratorChannel } from "./agents/nats-agent-channel.js";
+import { InvokeServer, type InvocationRecord } from "./server.js";
+import type { IdentityRefusal, TurnInput, TurnOutcome } from "./engine/types.js";
 import { InMemorySessionStore } from "./session/in-memory-session-store.js";
 import type { Envelope, EventTriggerResource } from "@aktis/event-triggers";
 import { CrdEventTriggerRegistry } from "./routing/crd-event-trigger-registry.js";
@@ -86,15 +85,29 @@ function listenOn(server: InvokeServer): Promise<number> {
   });
 }
 
-/** Default no-op stream so tests that only exercise /invoke don't need to stub it explicitly. */
-async function* noStream(): AsyncGenerator<Record<string, Partial<AgentState>>> {
-  // empty
+/** A TurnEngine whose calls can be inspected. */
+interface FakeEngine {
+  invoke: Mock<(input: TurnInput) => Promise<TurnOutcome>>;
+  checkIdentity: Mock<(input: TurnInput) => Promise<IdentityRefusal | undefined>>;
 }
 
-async function* toStream(
-  items: Record<string, Partial<AgentState>>[],
-): AsyncGenerator<Record<string, Partial<AgentState>>> {
-  for (const item of items) yield item;
+/**
+ * A fake engine. `turn` is either the outcome every turn ends with, or an
+ * implementation -- the place a streaming test drives `input.progressListener`
+ * before the turn settles, exactly as the Temporal adapter relays narration.
+ */
+function fakeEngine(turn: TurnOutcome | ((input: TurnInput) => Promise<TurnOutcome>) = { result: "done" }): FakeEngine {
+  return {
+    invoke: vi.fn(typeof turn === "function" ? turn : async () => turn),
+    checkIdentity: vi.fn(async (): Promise<IdentityRefusal | undefined> => undefined),
+  };
+}
+
+/** A turn that settles only when the test says so. */
+function deferredEngine(): { engine: FakeEngine; settle: (outcome: TurnOutcome) => void } {
+  let settle!: (outcome: TurnOutcome) => void;
+  const pending = new Promise<TurnOutcome>((resolve) => (settle = resolve));
+  return { engine: fakeEngine(() => pending), settle: (outcome) => settle(outcome) };
 }
 
 async function readSse(res: Response): Promise<unknown[]> {
@@ -106,6 +119,40 @@ async function readSse(res: Response): Promise<unknown[]> {
     .map((line) => JSON.parse(line.slice("data: ".length)) as unknown);
 }
 
+type SseChunk = {
+  event?: { type?: string; data?: { description?: string; done?: boolean } };
+  choices?: { delta: { content?: string; tool_calls?: unknown[] }; finish_reason: string | null }[];
+};
+
+function contentOf(chunks: SseChunk[]): string {
+  return chunks
+    .filter((c) => c.choices)
+    .map((c) => c.choices![0]?.delta.content ?? "")
+    .join("");
+}
+
+function statusesOf(chunks: SseChunk[]): string[] {
+  return chunks.filter((c) => c.event?.type === "status").map((c) => c.event?.data?.description ?? "");
+}
+
+function chat(port: number, body: Record<string, unknown>, headers: Record<string, string> = {}): Promise<Response> {
+  return fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer tok-1", ...headers },
+    body: JSON.stringify(body),
+  });
+}
+
+function invoke(port: number, body: unknown, headers: Record<string, string> = {}): Promise<Response> {
+  return fetch(`http://127.0.0.1:${port}/invoke`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: "Bearer tok-1", ...headers },
+    body: JSON.stringify(body),
+  });
+}
+
+const tick = (ms = 10): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
 describe("InvokeServer", () => {
   // The record is the request, and it used to live only in the memory of the
   // pod that accepted it. That pod therefore had to survive to answer the
@@ -115,33 +162,24 @@ describe("InvokeServer", () => {
   // all. A shared store means whichever replica is asked can answer.
   it("serves a poll from a store, so a DIFFERENT instance can answer it", async () => {
     const shared = new InMemoryInvocationStore();
-    let resolveGraph!: (state: AgentState) => void;
-    const accepting = new InvokeServer(
-      { invoke: vi.fn().mockReturnValue(new Promise<AgentState>((r) => (resolveGraph = r))), stream: vi.fn().mockResolvedValue(noStream()) },
-      undefined, undefined, undefined, undefined, undefined, undefined, 5, "authcode", shared,
-    );
-    // A second process entirely -- same store, its own graph it never runs.
-    const polling = new InvokeServer(
-      { invoke: vi.fn(), stream: vi.fn() },
-      undefined, undefined, undefined, undefined, undefined, undefined, 5, "authcode", shared,
-    );
+    const { engine, settle } = deferredEngine();
+    const accepting = new InvokeServer(engine, undefined, undefined, undefined, undefined, undefined, 5, "authcode", shared);
+    // A second process entirely -- same store, its own engine it never calls.
+    const polling = new InvokeServer(fakeEngine(), undefined, undefined, undefined, undefined, undefined, 5, "authcode", shared);
     const acceptPort = await listenOn(accepting);
     const pollPort = await listenOn(polling);
 
-    const postRes = await fetch(`http://127.0.0.1:${acceptPort}/invoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ request: "do the thing" }),
-    });
-    const { id } = (await postRes.json()) as { id: string };
+    const { id } = (await (await invoke(acceptPort, { request: "do the thing" })).json()) as { id: string };
 
-    resolveGraph({ request: "x", authToken: "tok-1", skillCandidates: [], result: "done" } as unknown as AgentState);
-    await new Promise((r) => setTimeout(r, 10));
+    settle({ result: "done" });
+    await tick();
 
     // The instance that never saw the POST answers the poll.
     const polled = await fetch(`http://127.0.0.1:${pollPort}/invoke/${id}`);
     expect(polled.status).toBe(200);
     expect((await polled.json()) as { status: string }).toMatchObject({ status: "succeeded" });
+    await accepting.close();
+    await polling.close();
   });
 
   // The terminal record write is the last thing a fire-and-forget turn does,
@@ -172,28 +210,17 @@ describe("InvokeServer", () => {
         throw new Error("redis terminal write failed");
       },
     };
-    let resolveGraph!: (state: AgentState) => void;
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockReturnValue(new Promise<AgentState>((r) => (resolveGraph = r))),
-      stream: vi.fn().mockResolvedValue(noStream()),
-    };
-    const server = new InvokeServer(
-      graph,
-      undefined, undefined, undefined, undefined, undefined, undefined, 5, "authcode", failingTerminalStore,
-    );
+    const { engine, settle } = deferredEngine();
+    const server = new InvokeServer(engine, undefined, undefined, undefined, undefined, undefined, 5, "authcode", failingTerminalStore);
     const port = await listenOn(server);
     try {
-      const postRes = await fetch(`http://127.0.0.1:${port}/invoke`, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-        body: JSON.stringify({ request: "do the thing" }),
-      });
+      const postRes = await invoke(port, { request: "do the thing" });
       expect(postRes.status).toBe(202);
 
-      // Settle the graph so the terminal write fires -- and rejects.
-      resolveGraph({ request: "x", authToken: "tok-1", skillCandidates: [], result: "done" } as unknown as AgentState);
+      // Settle the turn so the terminal write fires -- and rejects.
+      settle({ result: "done" });
       // Let the void-ed chain run and give any unhandled rejection a chance to surface.
-      await new Promise((r) => setTimeout(r, 30));
+      await tick(30);
 
       expect(unhandled).toEqual([]);
       expect(errorSpy).toHaveBeenCalledWith(
@@ -208,50 +235,37 @@ describe("InvokeServer", () => {
   });
 
   // Durable records make an answer RETRIEVABLE from any replica; they do not
-  // make a turn whose graph died with its process complete itself. So a pod on
-  // the way out must refuse new work rather than hand back a 202 for a turn
-  // nobody will ever finish -- the caller retries and reaches the replacement.
+  // keep this process's poll of the engine alive. So a pod on the way out must
+  // refuse new work rather than hand back a 202 for a record nobody will ever
+  // complete -- the caller retries and reaches the replacement.
   it("refuses new turns once draining, instead of accepting one it cannot finish", async () => {
-    const graph: AgentGraphLike = { invoke: vi.fn(), stream: vi.fn().mockResolvedValue(noStream()) };
-    const server = new InvokeServer(graph);
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
     server.beginDraining();
 
-    const res = await fetch(`http://127.0.0.1:${port}/invoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ request: "do the thing" }),
-    });
+    const res = await invoke(port, { request: "do the thing" });
     expect(res.status).toBe(503);
     expect(res.headers.get("retry-after")).toBe("1");
-    // The decisive part: no graph run was started for a turn that could not
-    // have been completed.
-    expect(graph.invoke).not.toHaveBeenCalled();
+    // The decisive part: no turn was started that could not have been completed.
+    expect(engine.invoke).not.toHaveBeenCalled();
+    await server.close();
   });
 
-  it("accepts a request, returns 202 + id, and the result becomes available once the graph resolves", async () => {
-    let resolveGraph!: (state: AgentState) => void;
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockReturnValue(new Promise<AgentState>((resolve) => (resolveGraph = resolve))),
-      stream: vi.fn().mockResolvedValue(noStream()),
-    };
-    const server = new InvokeServer(graph);
+  it("accepts a request, returns 202 + id, and the result becomes available once the turn resolves", async () => {
+    const { engine, settle } = deferredEngine();
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
-    const postRes = await fetch(`http://127.0.0.1:${port}/invoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ request: "scrape https://example.com/recipe" }),
-    });
+    const postRes = await invoke(port, { request: "scrape https://example.com/recipe" });
     expect(postRes.status).toBe(202);
     const { id, status } = (await postRes.json()) as { id: string; status: string };
     expect(status).toBe("pending");
-    expect(graph.invoke).toHaveBeenCalledWith({
+    await tick();
+    expect(engine.invoke).toHaveBeenCalledWith({
       request: "scrape https://example.com/recipe",
-      authToken: "tok-1",
       remoteControlUrlListener: expect.any(Function),
-      reportIdentityLinkPending: expect.any(Function),
       traceparent: ANY_TRACEPARENT,
     });
 
@@ -259,48 +273,41 @@ describe("InvokeServer", () => {
     expect(pendingRes.status).toBe(200);
     expect((await pendingRes.json()) as { status: string }).toMatchObject({ status: "pending" });
 
-    resolveGraph({ request: "x", authToken: "tok-1", skillCandidates: [], result: { title: "Pancakes" } } as AgentState);
-    await new Promise((r) => setTimeout(r, 10));
+    settle({ result: "Pancakes" });
+    await tick();
 
     const doneRes = await fetch(`http://127.0.0.1:${port}/invoke/${id}`);
     expect((await doneRes.json()) as { status: string; result: unknown }).toMatchObject({
       status: "succeeded",
-      result: { title: "Pancakes" },
+      result: "Pancakes",
     });
 
     await server.close();
   });
 
-  it("surfaces remoteControlUrl on GET /invoke/:id once a 'remote-control-url' progress event lands, and carries it through to the terminal response", async () => {
-    let resolveGraph!: (state: AgentState) => void;
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockImplementation((input: { remoteControlUrlListener?: (url: string) => void }) => {
-        // Simulate the delegate node forwarding a remote-control-url event --
-        // this fire-and-forget /invoke path never sets `progressListener`
-        // (see server.ts's doc on why), only `remoteControlUrlListener`.
-        input.remoteControlUrlListener?.("https://claude.ai/code/session_abc123");
-        return new Promise<AgentState>((resolve) => (resolveGraph = resolve));
-      }),
-      stream: vi.fn().mockResolvedValue(noStream()),
-    };
-    const server = new InvokeServer(graph);
+  it("surfaces remoteControlUrl on GET /invoke/:id as soon as the engine reports one, and carries it through to the terminal response", async () => {
+    let settle!: (outcome: TurnOutcome) => void;
+    const engine = fakeEngine((input) => {
+      // This fire-and-forget /invoke path never sets `progressListener` (see
+      // TurnInput's doc on why), only `remoteControlUrlListener`.
+      input.remoteControlUrlListener?.("https://claude.ai/code/session_abc123");
+      return new Promise<TurnOutcome>((resolve) => (settle = resolve));
+    });
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
-    const postRes = await fetch(`http://127.0.0.1:${port}/invoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ request: "triage this" }),
-    });
-    const { id } = (await postRes.json()) as { id: string };
+    const { id } = (await (await invoke(port, { request: "triage this" })).json()) as { id: string };
+    await tick();
 
     const pendingRes = await fetch(`http://127.0.0.1:${port}/invoke/${id}`);
     expect((await pendingRes.json()) as { remoteControlUrl?: string }).toMatchObject({
       status: "pending",
       remoteControlUrl: "https://claude.ai/code/session_abc123",
     });
+    expect(engine.invoke.mock.calls[0]![0].progressListener).toBeUndefined();
 
-    resolveGraph({ request: "x", authToken: "tok-1", skillCandidates: [], result: "opened PR #7" } as AgentState);
-    await new Promise((r) => setTimeout(r, 10));
+    settle({ result: "opened PR #7" });
+    await tick();
 
     const doneRes = await fetch(`http://127.0.0.1:${port}/invoke/${id}`);
     expect((await doneRes.json()) as { status: string; remoteControlUrl?: string }).toMatchObject({
@@ -311,36 +318,23 @@ describe("InvokeServer", () => {
     await server.close();
   });
 
-  it("omits remoteControlUrl entirely when no 'remote-control-url' progress event ever arrives", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({ request: "x", authToken: "tok-1", skillCandidates: [], result: "done" } as AgentState),
-      stream: vi.fn().mockResolvedValue(noStream()),
-    };
-    const server = new InvokeServer(graph);
+  it("omits remoteControlUrl entirely when the engine never reports one", async () => {
+    const server = new InvokeServer(fakeEngine({ result: "done" }));
     const port = await listenOn(server);
 
-    const postRes = await fetch(`http://127.0.0.1:${port}/invoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ request: "open a PR" }),
-    });
-    const { id } = (await postRes.json()) as { id: string };
-    await new Promise((r) => setTimeout(r, 10));
+    const { id } = (await (await invoke(port, { request: "open a PR" })).json()) as { id: string };
+    await tick();
 
-    const doneRes = await fetch(`http://127.0.0.1:${port}/invoke/${id}`);
-    const body = (await doneRes.json()) as Record<string, unknown>;
+    const body = (await (await fetch(`http://127.0.0.1:${port}/invoke/${id}`)).json()) as Record<string, unknown>;
     expect(body.status).toBe("succeeded");
     expect(Object.keys(body)).not.toContain("remoteControlUrl");
 
     await server.close();
   });
 
-  it("marks the invocation failed when the graph settles with a state error", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({ request: "x", authToken: "", skillCandidates: [], error: "no matching skill for this request" } as AgentState),
-      stream: vi.fn().mockResolvedValue(noStream()),
-    };
-    const server = new InvokeServer(graph);
+  it("marks the invocation failed when the turn settles with an error", async () => {
+    const engine = fakeEngine({ error: "no matching skill for this request" });
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
     const postRes = await fetch(`http://127.0.0.1:${port}/invoke`, {
@@ -349,15 +343,8 @@ describe("InvokeServer", () => {
       body: JSON.stringify({ request: "do a thing" }),
     });
     const { id } = (await postRes.json()) as { id: string };
-    expect(graph.invoke).toHaveBeenCalledWith({
-      request: "do a thing",
-      authToken: "",
-      remoteControlUrlListener: expect.any(Function),
-      reportIdentityLinkPending: expect.any(Function),
-      traceparent: ANY_TRACEPARENT,
-    });
 
-    await new Promise((r) => setTimeout(r, 10));
+    await tick();
     const res = await fetch(`http://127.0.0.1:${port}/invoke/${id}`);
     expect((await res.json()) as { status: string; error: string }).toMatchObject({
       status: "failed",
@@ -367,25 +354,37 @@ describe("InvokeServer", () => {
     await server.close();
   });
 
-  it("rejects a missing/invalid body with 400 without invoking the graph", async () => {
-    const graph: AgentGraphLike = { invoke: vi.fn(), stream: vi.fn() };
-    const server = new InvokeServer(graph);
+  it("marks the invocation failed when the engine call itself rejects", async () => {
+    const engine = fakeEngine(async () => {
+      throw new Error("temporal engine /invoke failed: 502");
+    });
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
-    const res = await fetch(`http://127.0.0.1:${port}/invoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({}),
+    const { id } = (await (await invoke(port, { request: "do a thing" })).json()) as { id: string };
+    await tick();
+
+    expect(await (await fetch(`http://127.0.0.1:${port}/invoke/${id}`)).json()).toMatchObject({
+      status: "failed",
+      error: "temporal engine /invoke failed: 502",
     });
+    await server.close();
+  });
+
+  it("rejects a missing/invalid body with 400 without starting a turn", async () => {
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine);
+    const port = await listenOn(server);
+
+    const res = await invoke(port, {});
     expect(res.status).toBe(400);
-    expect(graph.invoke).not.toHaveBeenCalled();
+    expect(engine.invoke).not.toHaveBeenCalled();
 
     await server.close();
   });
 
   it("returns 404 for an unknown invocation id", async () => {
-    const graph: AgentGraphLike = { invoke: vi.fn(), stream: vi.fn() };
-    const server = new InvokeServer(graph);
+    const server = new InvokeServer(fakeEngine());
     const port = await listenOn(server);
 
     const res = await fetch(`http://127.0.0.1:${port}/invoke/does-not-exist`);
@@ -395,37 +394,49 @@ describe("InvokeServer", () => {
   });
 
   /**
-   * `buildGraphInput` awaits `sessionStore.get` before the graph ever runs
+   * `buildTurnInput` awaits `sessionStore.get` before the turn ever starts
    * (see server.ts) -- a Redis blip there rejects that promise before the
-   * `this.graph.invoke(...).catch(...)` chain even exists to catch it. Left
+   * `this.engine.invoke(...).catch(...)` chain even exists to catch it. Left
    * unhandled, that crashes the process, wiping every other in-flight
    * invocation and turning their polls into "poll failed: 404" for the
    * caller. This asserts the record still resolves to "failed" instead.
    */
-  it("marks the invocation failed (not an unhandled rejection) when buildGraphInput itself rejects", async () => {
-    const graph: AgentGraphLike = { invoke: vi.fn(), stream: vi.fn() };
+  it("marks the invocation failed (not an unhandled rejection) when buildTurnInput itself rejects", async () => {
+    const engine = fakeEngine();
     const failingSessionStore = {
       get: vi.fn().mockRejectedValue(new Error("redis: connection reset")),
       set: vi.fn(),
     };
-    const server = new InvokeServer(graph, failingSessionStore as unknown as InMemorySessionStore);
+    const server = new InvokeServer(engine, failingSessionStore);
     const port = await listenOn(server);
 
-    const postRes = await fetch(`http://127.0.0.1:${port}/invoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ request: "do a thing", session_id: "session-1" }),
-    });
-    const { id } = (await postRes.json()) as { id: string };
+    const { id } = (await (await invoke(port, { request: "do a thing", session_id: "session-1" })).json()) as { id: string };
 
-    await new Promise((r) => setTimeout(r, 10));
+    await tick();
     const res = await fetch(`http://127.0.0.1:${port}/invoke/${id}`);
     expect(res.status).toBe(200);
     expect((await res.json()) as { status: string; error: string }).toMatchObject({
       status: "failed",
       error: "redis: connection reset",
     });
-    expect(graph.invoke).not.toHaveBeenCalled();
+    expect(engine.invoke).not.toHaveBeenCalled();
+
+    await server.close();
+  });
+
+  it("carries an optional session_id on POST /invoke into the turn", async () => {
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine, new InMemorySessionStore({ ttlMs: 60_000, maxEntries: 10 }));
+    const port = await listenOn(server);
+
+    await invoke(port, { request: "extract https://example.com", session_id: "cli-7" });
+    await tick();
+    expect(engine.invoke).toHaveBeenCalledWith({
+      request: "extract https://example.com",
+      remoteControlUrlListener: expect.any(Function),
+      traceparent: ANY_TRACEPARENT,
+      sessionId: "cli-7",
+    });
 
     await server.close();
   });
@@ -448,54 +459,39 @@ describe("InvokeServer /invoke with an event envelope (ADR 0048, docs/event-trig
       body: { action: "labeled", label: { name: "ai-review" }, repository: { full_name: "acme/widgets" }, issue: { number: 7 } },
     });
 
-  function graphSpy(): AgentGraphLike {
-    return {
-      invoke: vi.fn().mockResolvedValue({ request: "x", authToken: "", skillCandidates: [], result: "done" } as AgentState),
-      stream: vi.fn().mockResolvedValue(noStream()),
-    };
-  }
-
-  async function post(port: number, body: unknown): Promise<Response> {
-    return fetch(`http://127.0.0.1:${port}/invoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify(body),
-    });
-  }
-
   it("answers 200 ignored and starts NO turn when no trigger matches", async () => {
-    const graph = graphSpy();
+    const engine = fakeEngine();
     const invocations = new InMemoryInvocationStore();
     const setSpy = vi.spyOn(invocations, "set");
     const server = new InvokeServer(
-      graph, undefined, undefined, await triggerRegistry([reviewTrigger]),
-      undefined, undefined, undefined, 5, "authcode", invocations,
+      engine, undefined, undefined, await triggerRegistry([reviewTrigger]),
+      undefined, undefined, 5, "authcode", invocations,
     );
     const port = await listenOn(server);
 
     // An event that matches nothing -- even with a perfectly good `request`,
     // which must NOT be run as a RAG fallback.
-    const res = await post(port, { request: "please do something", event: envelope() });
-    await new Promise((r) => setTimeout(r, 10));
+    const res = await invoke(port, { request: "please do something", event: envelope() });
+    await tick();
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ status: "ignored" });
-    expect(graph.invoke).not.toHaveBeenCalled();
+    expect(engine.invoke).not.toHaveBeenCalled();
     expect(setSpy).not.toHaveBeenCalled();
     await server.close();
   });
 
   it("ignores every event when no trigger table is configured", async () => {
-    const graph = graphSpy();
-    const server = new InvokeServer(graph);
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
-    const res = await post(port, { event: reviewEvent() });
-    await new Promise((r) => setTimeout(r, 10));
+    const res = await invoke(port, { event: reviewEvent() });
+    await tick();
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ status: "ignored" });
-    expect(graph.invoke).not.toHaveBeenCalled();
+    expect(engine.invoke).not.toHaveBeenCalled();
     await server.close();
   });
 
@@ -507,44 +503,44 @@ describe("InvokeServer /invoke with an event envelope (ADR 0048, docs/event-trig
         target: { orchestrator: {}, promptTemplate: "PR {{number}}" },
       },
     };
-    const graph = graphSpy();
-    const server = new InvokeServer(graph, undefined, undefined, await triggerRegistry([broken]));
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine, undefined, undefined, await triggerRegistry([broken]));
     const port = await listenOn(server);
 
-    const res = await post(port, { event: envelope() });
-    await new Promise((r) => setTimeout(r, 10));
+    const res = await invoke(port, { event: envelope() });
+    await tick();
 
     expect(res.status).toBe(422);
     const body = (await res.json()) as { status: string; error: string };
     expect(body.status).toBe("failed");
     expect(body.error).toContain("needs-a-pr");
-    expect(graph.invoke).not.toHaveBeenCalled();
+    expect(engine.invoke).not.toHaveBeenCalled();
     await server.close();
   });
 
   it("answers 400 for a malformed envelope and starts no turn", async () => {
-    const graph = graphSpy();
-    const server = new InvokeServer(graph, undefined, undefined, await triggerRegistry([catchAllTrigger]));
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine, undefined, undefined, await triggerRegistry([catchAllTrigger]));
     const port = await listenOn(server);
 
     const { kind: _kind, ...noKind } = envelope();
-    const res = await post(port, { request: "triage", event: noKind });
-    await new Promise((r) => setTimeout(r, 10));
+    const res = await invoke(port, { request: "triage", event: noKind });
+    await tick();
 
     expect(res.status).toBe(400);
     // Rejected by envelope validation itself, naming the problem.
     expect(((await res.json()) as { error: string }).error).toContain("event.kind");
-    expect(graph.invoke).not.toHaveBeenCalled();
+    expect(engine.invoke).not.toHaveBeenCalled();
     await server.close();
   });
 
   it("starts the resolved turn and answers 202 with the trigger, its session id and rendered reply", async () => {
-    const graph = graphSpy();
-    const server = new InvokeServer(graph, undefined, undefined, await triggerRegistry([reviewTrigger]));
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine, undefined, undefined, await triggerRegistry([reviewTrigger]));
     const port = await listenOn(server);
 
-    const res = await post(port, { request: "ignored when an event matches", event: reviewEvent() });
-    await new Promise((r) => setTimeout(r, 10));
+    const res = await invoke(port, { request: "ignored when an event matches", event: reviewEvent() });
+    await tick();
 
     expect(res.status).toBe(202);
     const body = (await res.json()) as Record<string, unknown>;
@@ -558,8 +554,8 @@ describe("InvokeServer /invoke with an event envelope (ADR 0048, docs/event-trig
         params: { repo: "acme/widgets", number: "7" },
       },
     });
-    expect(graph.invoke).toHaveBeenCalledTimes(1);
-    const input = vi.mocked(graph.invoke).mock.calls[0]![0];
+    expect(engine.invoke).toHaveBeenCalledTimes(1);
+    const input = engine.invoke.mock.calls[0]![0];
     expect(input).toMatchObject({
       request: "Review acme/widgets#7",
       sessionId: "github:acme/widgets#7",
@@ -579,14 +575,14 @@ describe("InvokeServer /invoke with an event envelope (ADR 0048, docs/event-trig
       metadata: { name: "ci-failed" },
       spec: { target: { skillRef: "ci-triage-skill", promptTemplate: "CI failed" } },
     };
-    const graph = graphSpy();
-    const server = new InvokeServer(graph, undefined, undefined, await triggerRegistry([skillTrigger]));
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine, undefined, undefined, await triggerRegistry([skillTrigger]));
     const port = await listenOn(server);
 
-    await post(port, { event: envelope() });
-    await new Promise((r) => setTimeout(r, 10));
+    await invoke(port, { event: envelope() });
+    await tick();
 
-    const input = vi.mocked(graph.invoke).mock.calls[0]![0];
+    const input = engine.invoke.mock.calls[0]![0];
     expect(input).toMatchObject({ request: "CI failed", forcedSkillId: "ci-triage-skill", triggerName: "ci-failed" });
     expect(input.forcedAgentId).toBeUndefined();
     // Not read-only: the trigger didn't ask for it, and nothing defaults it on.
@@ -599,14 +595,14 @@ describe("InvokeServer /invoke with an event envelope (ADR 0048, docs/event-trig
       metadata: { name: "notify" },
       spec: { params: { input: "body.issue.title" }, target: { toolRef: "slack-notify" } },
     };
-    const graph = graphSpy();
-    const server = new InvokeServer(graph, undefined, undefined, await triggerRegistry([toolTrigger]));
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine, undefined, undefined, await triggerRegistry([toolTrigger]));
     const port = await listenOn(server);
 
-    await post(port, { event: envelope() });
-    await new Promise((r) => setTimeout(r, 10));
+    await invoke(port, { event: envelope() });
+    await tick();
 
-    expect(vi.mocked(graph.invoke).mock.calls[0]![0]).toMatchObject({
+    expect(engine.invoke.mock.calls[0]![0]).toMatchObject({
       request: "Run tool slack-notify",
       forcedToolId: "slack-notify",
       toolInput: "Add dark mode",
@@ -615,14 +611,14 @@ describe("InvokeServer /invoke with an event envelope (ADR 0048, docs/event-trig
   });
 
   it("runs an orchestrator target as an ordinary conversational turn on the rendered prompt", async () => {
-    const graph = graphSpy();
-    const server = new InvokeServer(graph, undefined, undefined, await triggerRegistry([catchAllTrigger]));
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine, undefined, undefined, await triggerRegistry([catchAllTrigger]));
     const port = await listenOn(server);
 
-    await post(port, { event: envelope({ repository: "" }), session_id: "caller-session" });
-    await new Promise((r) => setTimeout(r, 10));
+    await invoke(port, { event: envelope({ repository: "" }), session_id: "caller-session" });
+    await tick();
 
-    const input = vi.mocked(graph.invoke).mock.calls[0]![0];
+    const input = engine.invoke.mock.calls[0]![0];
     expect(input).toMatchObject({ request: "triage", sessionId: "caller-session", triggerName: "catch-all" });
     expect(input.forcedSkillId).toBeUndefined();
     expect(input.forcedAgentId).toBeUndefined();
@@ -633,19 +629,38 @@ describe("InvokeServer /invoke with an event envelope (ADR 0048, docs/event-trig
   });
 
   it("leaves a request without an event exactly as it was: conversational, nothing forced", async () => {
-    const graph = graphSpy();
-    const server = new InvokeServer(graph, undefined, undefined, await triggerRegistry([catchAllTrigger]));
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine, undefined, undefined, await triggerRegistry([catchAllTrigger]));
     const port = await listenOn(server);
 
-    const res = await post(port, { request: "what's for dinner?" });
-    await new Promise((r) => setTimeout(r, 10));
+    const res = await invoke(port, { request: "what's for dinner?" });
+    await tick();
 
     expect(res.status).toBe(202);
     expect(await res.json()).not.toHaveProperty("trigger");
-    const input = vi.mocked(graph.invoke).mock.calls[0]![0];
+    const input = engine.invoke.mock.calls[0]![0];
     expect(input.request).toBe("what's for dinner?");
     expect(input.triggerName).toBeUndefined();
     expect(input.readOnly).toBeUndefined();
+    await server.close();
+  });
+
+  // The repository a webhook fired on is the one integration-gateway checked
+  // the sender's permission on, so it has to reach the engine's read gate as
+  // data rather than only as words in the rendered prompt.
+  it("carries a webhook event's repository into the turn as the target repository", async () => {
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine, undefined, undefined, await triggerRegistry([catchAllTrigger]));
+    const port = await listenOn(server);
+
+    await invoke(port, { event: envelope({ repository: "e2e-org/e2e-repo" }) });
+    await tick();
+    expect(engine.invoke).toHaveBeenLastCalledWith(expect.objectContaining({ targetRepository: "e2e-org/e2e-repo" }));
+
+    await invoke(port, { event: envelope({ repository: "" }) });
+    await tick();
+    expect(engine.invoke.mock.lastCall![0]).not.toHaveProperty("targetRepository");
+
     await server.close();
   });
 
@@ -656,38 +671,37 @@ describe("InvokeServer /invoke with an event envelope (ADR 0048, docs/event-trig
 
     it("makes every later turn in a read-only session read-only, and never leaks into another session", async () => {
       const sessions = store();
-      // The graph returns a resolved identity + skill so persistSession REWRITES
-      // the record after each turn -- the rewrite must carry the flag forward.
-      const graph: AgentGraphLike = {
-        invoke: vi.fn().mockResolvedValue({
-          request: "x",
-          authToken: "",
-          skillCandidates: [],
-          result: "done",
-          identity: { subject: "integration-gateway", roles: [] },
-          selectedSkill: { id: "s1" },
-        } as unknown as AgentState),
-        stream: vi.fn().mockResolvedValue(noStream()),
-      };
-      const server = new InvokeServer(graph, sessions, undefined, await triggerRegistry([reviewTrigger]));
+      const engine = fakeEngine();
+      const server = new InvokeServer(engine, sessions, undefined, await triggerRegistry([reviewTrigger]));
       const port = await listenOn(server);
 
-      await post(port, { event: reviewEvent() });
-      await new Promise((r) => setTimeout(r, 10));
+      await invoke(port, { event: reviewEvent() });
+      await tick();
       expect((await sessions.get("github:acme/widgets#7"))?.readOnly).toBe(true);
 
       // A session-page follow-up: no event, just a prompt on the same session.
-      await post(port, { request: "now push a fix", session_id: "github:acme/widgets#7" });
-      await new Promise((r) => setTimeout(r, 10));
-      expect(vi.mocked(graph.invoke).mock.calls[1]![0]).toMatchObject({ readOnly: true });
-      // ...and the record is still read-only after that turn's own rewrite.
+      await invoke(port, { request: "now push a fix", session_id: "github:acme/widgets#7" });
+      await tick();
+      expect(engine.invoke.mock.calls[1]![0]).toMatchObject({ readOnly: true });
       expect((await sessions.get("github:acme/widgets#7"))?.readOnly).toBe(true);
 
       // A different conversation is untouched.
-      await post(port, { request: "now push a fix", session_id: "github:acme/widgets#8" });
-      await new Promise((r) => setTimeout(r, 10));
-      expect(vi.mocked(graph.invoke).mock.calls[2]![0].readOnly).toBeUndefined();
+      await invoke(port, { request: "now push a fix", session_id: "github:acme/widgets#8" });
+      await tick();
+      expect(engine.invoke.mock.calls[2]![0].readOnly).toBeUndefined();
       expect((await sessions.get("github:acme/widgets#8"))?.readOnly).toBeUndefined();
+      await server.close();
+    });
+
+    it("applies the flag to a chat-completions follow-up on the same session too", async () => {
+      const sessions = store();
+      await sessions.set("chat-ro", { readOnly: true });
+      const engine = fakeEngine();
+      const server = new InvokeServer(engine, sessions);
+      const port = await listenOn(server);
+
+      await chat(port, { messages: [{ role: "user", content: "push it" }] }, { "x-openwebui-chat-id": "chat-ro" });
+      expect(engine.invoke.mock.calls[0]![0]).toMatchObject({ readOnly: true, sessionId: "chat-ro" });
       await server.close();
     });
 
@@ -709,90 +723,45 @@ describe("InvokeServer /invoke with an event envelope (ADR 0048, docs/event-trig
         body: { action: "labeled", label: { name: "ai-triage" }, repository: { full_name: "acme/widgets" }, issue: { number: 7 } },
       });
       const sessions = store();
-      const graph: AgentGraphLike = {
-        invoke: vi.fn().mockResolvedValue({
-          request: "x",
-          authToken: "",
-          skillCandidates: [],
-          result: "done",
-          identity: { subject: "integration-gateway", roles: [] },
-          selectedSkill: { id: "s1" },
-        } as unknown as AgentState),
-        stream: vi.fn().mockResolvedValue(noStream()),
-      };
-      const server = new InvokeServer(graph, sessions, undefined, await triggerRegistry([reviewTrigger, triageTrigger]));
+      const engine = fakeEngine();
+      const server = new InvokeServer(engine, sessions, undefined, await triggerRegistry([reviewTrigger, triageTrigger]));
       const port = await listenOn(server);
 
-      await post(port, { event: reviewEvent() });
-      await new Promise((r) => setTimeout(r, 10));
+      await invoke(port, { event: reviewEvent() });
+      await tick();
       expect((await sessions.get("github:acme/widgets#7"))?.readOnly).toBe(true);
 
-      await post(port, { event: triageEvent });
-      await new Promise((r) => setTimeout(r, 10));
-      expect(vi.mocked(graph.invoke).mock.calls[1]![0]).toMatchObject({ triggerName: "github-pr-triage" });
-      expect(vi.mocked(graph.invoke).mock.calls[1]![0].readOnly).toBeUndefined();
+      await invoke(port, { event: triageEvent });
+      await tick();
+      expect(engine.invoke.mock.calls[1]![0]).toMatchObject({ triggerName: "github-pr-triage" });
+      expect(engine.invoke.mock.calls[1]![0].readOnly).toBeUndefined();
       expect((await sessions.get("github:acme/widgets#7"))?.readOnly).toBeUndefined();
 
       // Its follow-ups inherit the writable mode...
-      await post(port, { request: "also fix the typo", session_id: "github:acme/widgets#7" });
-      await new Promise((r) => setTimeout(r, 10));
-      expect(vi.mocked(graph.invoke).mock.calls[2]![0].readOnly).toBeUndefined();
+      await invoke(port, { request: "also fix the typo", session_id: "github:acme/widgets#7" });
+      await tick();
+      expect(engine.invoke.mock.calls[2]![0].readOnly).toBeUndefined();
 
       // ...and a later review makes it read-only again.
-      await post(port, { event: reviewEvent() });
-      await new Promise((r) => setTimeout(r, 10));
-      expect(vi.mocked(graph.invoke).mock.calls[3]![0]).toMatchObject({ readOnly: true });
+      await invoke(port, { event: reviewEvent() });
+      await tick();
+      expect(engine.invoke.mock.calls[3]![0]).toMatchObject({ readOnly: true });
       expect((await sessions.get("github:acme/widgets#7"))?.readOnly).toBe(true);
-      await server.close();
-    });
-
-    it("records an agent run's launch mode on the session and keeps it when a later turn continues the run", async () => {
-      const sessions = store();
-      const parked = (runId: string) =>
-        ({
-          request: "x",
-          authToken: "",
-          skillCandidates: [],
-          result: "a question",
-          identity: { subject: "integration-gateway", roles: [] },
-          selectedAgent: { id: "claude-code-swe-agent" },
-          agentRunId: runId,
-          agentAwaitingReply: true,
-        }) as unknown as AgentState;
-      const graph: AgentGraphLike = {
-        invoke: vi.fn().mockResolvedValueOnce(parked("run-1")).mockResolvedValueOnce(parked("run-1")),
-        stream: vi.fn().mockResolvedValue(noStream()),
-      };
-      const server = new InvokeServer(graph, sessions, undefined, await triggerRegistry([reviewTrigger]));
-      const port = await listenOn(server);
-
-      await post(port, { event: reviewEvent() });
-      await new Promise((r) => setTimeout(r, 10));
-      expect(await sessions.get("github:acme/widgets#7")).toMatchObject({ activeAgentRunId: "run-1", activeAgentRunReadOnly: true });
-
-      // The follow-up continues run-1 and hands the graph its launch mode.
-      await post(port, { request: "answer", session_id: "github:acme/widgets#7" });
-      await new Promise((r) => setTimeout(r, 10));
-      expect(vi.mocked(graph.invoke).mock.calls[1]![0]).toMatchObject({ activeAgentRunId: "run-1", activeAgentRunReadOnly: true });
-      expect((await sessions.get("github:acme/widgets#7"))?.activeAgentRunReadOnly).toBe(true);
       await server.close();
     });
 
     it("records the flag before the turn runs, so a turn that never finishes still leaves the session read-only", async () => {
       const sessions = store();
       let sawFlagAtInvoke: boolean | undefined;
-      const graph: AgentGraphLike = {
-        invoke: vi.fn().mockImplementation(async () => {
-          sawFlagAtInvoke = (await sessions.get("github:acme/widgets#7"))?.readOnly;
-          return new Promise<AgentState>(() => {}); // the pod "dies" mid-turn
-        }),
-        stream: vi.fn().mockResolvedValue(noStream()),
-      };
-      const server = new InvokeServer(graph, sessions, undefined, await triggerRegistry([reviewTrigger]));
+      const engine = fakeEngine(async () => {
+        sawFlagAtInvoke = (await sessions.get("github:acme/widgets#7"))?.readOnly;
+        return new Promise<TurnOutcome>(() => {}); // the pod "dies" mid-turn
+      });
+      const server = new InvokeServer(engine, sessions, undefined, await triggerRegistry([reviewTrigger]));
       const port = await listenOn(server);
 
-      await post(port, { event: reviewEvent() });
-      await new Promise((r) => setTimeout(r, 10));
+      await invoke(port, { event: reviewEvent() });
+      await tick();
 
       expect(sawFlagAtInvoke).toBe(true);
       await server.close();
@@ -800,158 +769,9 @@ describe("InvokeServer /invoke with an event envelope (ADR 0048, docs/event-trig
   });
 });
 
-describe("InvokeServer session-scoped pending identity link (GitHub OAuth Device Flow)", () => {
-  function sessionStore() {
-    return new InMemorySessionStore({ ttlMs: 60_000, maxEntries: 10 });
-  }
-
-  /**
-   * A turn that lost its channel to a still-working run must leave the
-   * awaiting-reply anchor behind. The default for a turn that produced no reply
-   * is to CLEAR the active-run state (the run concluded), which for this case
-   * would throw away the only pointer back to a run that is still holding the
-   * answer.
-   */
-  it("keeps the awaiting-reply anchor when the turn ended with a lost channel", async () => {
-    const identity = { subject: "alice", roles: ["reader"] };
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({
-        request: "x",
-        authToken: "tok-1",
-        skillCandidates: [],
-        identity,
-        selectedAgent: { id: "claude-code-swe" },
-        agentRunId: "run-1",
-        agentAwaitingReply: false,
-        agentResumePending: true,
-        result: "Still working -- I lost my connection to agent run `run-1`.",
-      } as unknown as AgentState),
-      stream: vi.fn(),
-    };
-    const store = sessionStore();
-    const server = new InvokeServer(graph, store);
-    const port = await listenOn(server);
-
-    await fetch(`http://127.0.0.1:${port}/invoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ request: "fix the bug", session_id: "session-1" }),
-    });
-    await new Promise((r) => setTimeout(r, 10));
-
-    expect(await store.get("session-1")).toMatchObject({
-      subject: "alice",
-      activeAgentId: "claude-code-swe",
-      activeAgentRunId: "run-1",
-      activeAgentRunAwaitingReply: true,
-    });
-
-    await server.close();
-  });
-
-  it("clears the anchor once the agent actually replies", async () => {
-    const identity = { subject: "alice", roles: ["reader"] };
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({
-        request: "x",
-        authToken: "tok-1",
-        skillCandidates: [],
-        identity,
-        selectedAgent: { id: "claude-code-swe" },
-        agentRunId: "run-1",
-        agentAwaitingReply: false,
-        result: "opened a PR",
-      } as unknown as AgentState),
-      stream: vi.fn(),
-    };
-    const store = sessionStore();
-    await store.set("session-1", {
-      subject: "alice",
-      activeAgentId: "claude-code-swe",
-      activeAgentRunId: "run-1",
-      activeAgentRunAwaitingReply: true,
-    });
-    const server = new InvokeServer(graph, store);
-    const port = await listenOn(server);
-
-    await fetch(`http://127.0.0.1:${port}/invoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ request: "any update?", session_id: "session-1" }),
-    });
-    await new Promise((r) => setTimeout(r, 10));
-
-    const record = await store.get("session-1");
-    expect(record?.activeAgentRunId).toBeUndefined();
-    expect(record?.activeAgentRunAwaitingReply).toBeUndefined();
-
-    await server.close();
-  });
-
-  it("persists pendingIdentityLink from a turn that paused on device-flow authorization, and offers it to the graph on the next turn", async () => {
-    const identity = { subject: "alice", roles: ["reader"] };
-    const pendingIdentityLink = {
-      agentId: "opencode-swe",
-      provider: "github",
-      deviceCode: "raw-device-code",
-      expiresAt: Date.now() + 900_000,
-    };
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({
-        request: "x",
-        authToken: "tok-1",
-        skillCandidates: [],
-        identity,
-        pendingIdentityLink,
-        identityLinkPending: true,
-        result: "please link your GitHub account",
-      } as AgentState),
-      stream: vi.fn(),
-    };
-    const server = new InvokeServer(graph, sessionStore());
-    const port = await listenOn(server);
-
-    const postRes = await fetch(`http://127.0.0.1:${port}/invoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ request: "open a PR", session_id: "session-1" }),
-    });
-    const { id } = (await postRes.json()) as { id: string };
-    await new Promise((r) => setTimeout(r, 10));
-    const doneRes = await fetch(`http://127.0.0.1:${port}/invoke/${id}`);
-    expect((await doneRes.json()) as { status: string }).toMatchObject({ status: "succeeded" });
-
-    // Second turn: the session should now offer the pending link back to the graph.
-    await fetch(`http://127.0.0.1:${port}/invoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ request: "any message", session_id: "session-1" }),
-    });
-
-    expect(graph.invoke).toHaveBeenNthCalledWith(2, {
-      request: "any message",
-      authToken: "tok-1",
-      remoteControlUrlListener: expect.any(Function),
-      reportIdentityLinkPending: expect.any(Function),
-      traceparent: ANY_TRACEPARENT,
-      sessionId: "session-1",
-      activeSkillId: undefined,
-      activeAgentId: undefined,
-      activeAgentRunId: undefined,
-      sessionSubject: "alice",
-      toolContinuations: undefined,
-      agentContinuations: undefined,
-      pendingIdentityLink,
-    });
-
-    await server.close();
-  });
-});
-
 describe("InvokeServer OpenAI-compatible chat completions (ADR 0007)", () => {
   it("GET /v1/models lists a single model id", async () => {
-    const graph: AgentGraphLike = { invoke: vi.fn(), stream: vi.fn() };
-    const server = new InvokeServer(graph);
+    const server = new InvokeServer(fakeEngine());
     const port = await listenOn(server);
 
     const res = await fetch(`http://127.0.0.1:${port}/v1/models`);
@@ -963,29 +783,14 @@ describe("InvokeServer OpenAI-compatible chat completions (ADR 0007)", () => {
   });
 
   it("POST /v1/chat/completions (non-streaming) returns a chat.completion with the rendered result", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({
-        request: "scrape https://example.com",
-        authToken: "tok-1",
-        skillCandidates: [],
-        result: { title: "Pancakes" },
-      } as AgentState),
-      stream: vi.fn(),
-    };
-    const server = new InvokeServer(graph);
+    const engine = fakeEngine({ result: "# Pancakes" });
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
-    const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({
-        model: "agent-orchestrator",
-        messages: [{ role: "user", content: "scrape https://example.com" }],
-      }),
-    });
+    const res = await chat(port, { model: "agent-orchestrator", messages: [{ role: "user", content: "scrape https://example.com" }] });
 
     expect(res.status).toBe(200);
-    expect(graph.invoke).toHaveBeenCalledWith({ request: "scrape https://example.com", authToken: "tok-1" });
+    expect(engine.invoke).toHaveBeenCalledWith({ request: "scrape https://example.com" });
     const body = (await res.json()) as { object: string; choices: { message: { content: string } }[] };
     expect(body.object).toBe("chat.completion");
     expect(body.choices[0]?.message.content).toContain("Pancakes");
@@ -993,39 +798,18 @@ describe("InvokeServer OpenAI-compatible chat completions (ADR 0007)", () => {
     await server.close();
   });
 
-  it("POST /v1/chat/completions forwards Open WebUI's per-user signed JWT header to the graph (non-streaming)", async () => {
-    // Regression test: authToken alone is Open WebUI's single static bearer
-    // token, shared by every one of its users -- the X-OpenWebUI-User-Jwt
-    // header must reach the graph as forwardedUserToken so resolveIdentity
-    // can resolve each human to their own subject instead.
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({
-        request: "scrape https://example.com",
-        authToken: "tok-1",
-        skillCandidates: [],
-        result: { title: "Pancakes" },
-      } as AgentState),
-      stream: vi.fn(),
-    };
-    const server = new InvokeServer(graph);
+  it("POST /v1/chat/completions forwards Open WebUI's per-user signed JWT header to the engine (non-streaming)", async () => {
+    // The bearer token is Open WebUI's single static token, shared by every one
+    // of its users -- the X-OpenWebUI-User-Jwt header must reach the engine as
+    // forwardedUserToken so each human resolves to their own subject.
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
-    await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: "Bearer tok-1",
-        "x-openwebui-user-jwt": "alices-signed-jwt",
-      },
-      body: JSON.stringify({
-        model: "agent-orchestrator",
-        messages: [{ role: "user", content: "scrape https://example.com" }],
-      }),
-    });
+    await chat(port, { messages: [{ role: "user", content: "scrape https://example.com" }] }, { "x-openwebui-user-jwt": "alices-signed-jwt" });
 
-    expect(graph.invoke).toHaveBeenCalledWith({
+    expect(engine.invoke).toHaveBeenCalledWith({
       request: "scrape https://example.com",
-      authToken: "tok-1",
       forwardedUserToken: "alices-signed-jwt",
     });
 
@@ -1033,91 +817,47 @@ describe("InvokeServer OpenAI-compatible chat completions (ADR 0007)", () => {
   });
 
   it("POST /v1/chat/completions omits forwardedUserToken when Open WebUI sends no such header", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({
-        request: "scrape https://example.com",
-        authToken: "tok-1",
-        skillCandidates: [],
-        result: { title: "Pancakes" },
-      } as AgentState),
-      stream: vi.fn(),
-    };
-    const server = new InvokeServer(graph);
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
-    await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({
-        model: "agent-orchestrator",
-        messages: [{ role: "user", content: "scrape https://example.com" }],
-      }),
-    });
+    await chat(port, { messages: [{ role: "user", content: "scrape https://example.com" }] });
 
-    expect(graph.invoke).toHaveBeenCalledWith({ request: "scrape https://example.com", authToken: "tok-1" });
+    expect(engine.invoke).toHaveBeenCalledWith({ request: "scrape https://example.com" });
 
     await server.close();
   });
 
-  it("POST /v1/chat/completions (streaming) forwards Open WebUI's per-user signed JWT header to the graph", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn(),
-      stream: vi.fn().mockResolvedValue(toStream([{ composeResponse: { result: "done" } }])),
-    };
-    const server = new InvokeServer(graph);
+  it("POST /v1/chat/completions (streaming) forwards Open WebUI's per-user signed JWT header to the engine", async () => {
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
-    await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: "Bearer tok-1",
-        "x-openwebui-user-jwt": "alices-signed-jwt",
-      },
-      body: JSON.stringify({
-        model: "agent-orchestrator",
-        stream: true,
-        messages: [{ role: "user", content: "scrape https://example.com" }],
-      }),
-    });
+    await (
+      await chat(port, { stream: true, messages: [{ role: "user", content: "scrape https://example.com" }] }, { "x-openwebui-user-jwt": "alices-signed-jwt" })
+    ).text();
 
-    expect(graph.stream).toHaveBeenCalledWith(
-      expect.objectContaining({ authToken: "tok-1", forwardedUserToken: "alices-signed-jwt" }),
-      { streamMode: "updates" },
-    );
+    expect(engine.invoke).toHaveBeenCalledWith(expect.objectContaining({ forwardedUserToken: "alices-signed-jwt" }));
 
     await server.close();
   });
 
   it("POST /v1/chat/completions folds prior conversation turns (e.g. a previously extracted recipe) into the request instead of discarding them", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({
-        request: "x",
-        authToken: "tok-1",
-        skillCandidates: [],
-        result: "Published!",
-      } as AgentState),
-      stream: vi.fn(),
-    };
-    const server = new InvokeServer(graph);
+    const engine = fakeEngine({ result: "Published!" });
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
-    await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({
-        messages: [
-          { role: "user", content: "Extract this recipe: https://example.com/recipe" },
-          { role: "assistant", content: "# Pancakes\n\n## Ingredients\n- Flour" },
-          { role: "user", content: "publish it!" },
-        ],
-      }),
+    await chat(port, {
+      messages: [
+        { role: "user", content: "Extract this recipe: https://example.com/recipe" },
+        { role: "assistant", content: "# Pancakes\n\n## Ingredients\n- Flour" },
+        { role: "user", content: "publish it!" },
+      ],
     });
 
-    expect(graph.invoke).toHaveBeenCalledWith({
+    expect(engine.invoke).toHaveBeenCalledWith({
       request:
         '<conversation_history>\n<message role="user">\nExtract this recipe: https://example.com/recipe\n</message>\n<message role="assistant">\n# Pancakes\n\n## Ingredients\n- Flour\n</message>\n</conversation_history>\n\npublish it!',
-      authToken: "tok-1",
     });
 
     await server.close();
@@ -1126,33 +866,20 @@ describe("InvokeServer OpenAI-compatible chat completions (ADR 0007)", () => {
   it("POST /v1/chat/completions keeps a recipe the USER pasted (not assistant-produced) visible on the next turn", async () => {
     // Regression: the fold used to include only the most recent assistant
     // message, so a user-pasted recipe was silently discarded when the next
-    // turn was just "Let's publish it" — the planner then claimed the recipe
-    // was missing from the conversation history.
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({
-        request: "x",
-        authToken: "tok-1",
-        skillCandidates: [],
-        result: "Published!",
-      } as AgentState),
-      stream: vi.fn(),
-    };
-    const server = new InvokeServer(graph);
+    // turn was just "Let's publish it".
+    const engine = fakeEngine({ result: "Published!" });
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
-    await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({
-        messages: [
-          { role: "user", content: "# Kentucky Butter Cake\n\n## Ingredients\n- Butter" },
-          { role: "assistant", content: "What changes would you like to make?" },
-          { role: "user", content: "Let's publish it" },
-        ],
-      }),
+    await chat(port, {
+      messages: [
+        { role: "user", content: "# Kentucky Butter Cake\n\n## Ingredients\n- Butter" },
+        { role: "assistant", content: "What changes would you like to make?" },
+        { role: "user", content: "Let's publish it" },
+      ],
     });
 
-    const request = (graph.invoke as ReturnType<typeof vi.fn>).mock.calls[0]![0].request as string;
+    const request = engine.invoke.mock.calls[0]![0].request;
     expect(request).toContain("# Kentucky Butter Cake");
     expect(request).toContain('<message role="user">');
     expect(request).toContain("What changes would you like to make?");
@@ -1161,17 +888,8 @@ describe("InvokeServer OpenAI-compatible chat completions (ADR 0007)", () => {
     await server.close();
   });
 
-  it("POST /v1/chat/completions (non-streaming) maps a graph error to an OpenAI-shaped HTTP error", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({
-        request: "x",
-        authToken: "",
-        skillCandidates: [],
-        error: "unauthorized: could not resolve caller identity",
-      } as AgentState),
-      stream: vi.fn(),
-    };
-    const server = new InvokeServer(graph);
+  it("POST /v1/chat/completions (non-streaming) maps a turn error to an OpenAI-shaped HTTP error", async () => {
+    const server = new InvokeServer(fakeEngine({ error: "unauthorized: could not resolve caller identity" }));
     const port = await listenOn(server);
 
     const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
@@ -1187,470 +905,117 @@ describe("InvokeServer OpenAI-compatible chat completions (ADR 0007)", () => {
     await server.close();
   });
 
-  it("rejects a request with no user message, without invoking the graph", async () => {
-    const graph: AgentGraphLike = { invoke: vi.fn(), stream: vi.fn() };
-    const server = new InvokeServer(graph);
+  it("rejects a request with no user message, without starting a turn", async () => {
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
-    const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ messages: [{ role: "system", content: "be nice" }] }),
-    });
+    const res = await chat(port, { messages: [{ role: "system", content: "be nice" }] });
 
     expect(res.status).toBe(400);
-    expect(graph.invoke).not.toHaveBeenCalled();
+    expect(engine.invoke).not.toHaveBeenCalled();
 
     await server.close();
   });
 
-  it("POST /v1/chat/completions (streaming) emits per-node status chunks then the final result over SSE", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn(),
-      stream: vi.fn().mockResolvedValue(
-        toStream([
-          { resolveIdentity: { identity: { subject: "alice", roles: ["reader"] } } },
-          {
-            retrieveSkills: {
-              skillCandidates: [
-                { skill: { id: "recipe-publisher-skill" }, score: 0.9 } as AgentState["skillCandidates"][number],
-              ],
-            },
-          },
-          { selectSkill: { selectedSkill: { id: "recipe-publisher-skill", name: "Recipe Extraction & Publishing" } as AgentState["selectedSkill"] } },
-          { loadSkillTools: { skillTools: [{ id: "recipe-scraper", name: "recipe-scraper" }] as AgentState["skillTools"] } },
-          { planAction: { selectedTool: { id: "recipe-scraper", name: "recipe-scraper" } as AgentState["selectedTool"] } },
-          { runTool: { result: { title: "Pancakes" } } },
-          { composeResponse: {} },
-        ]),
-      ),
-    };
-    const server = new InvokeServer(graph);
+  it("POST /v1/chat/completions (streaming) relays progress as status steps, then the final result over SSE", async () => {
+    const engine = fakeEngine(async (input) => {
+      input.progressListener?.("agent", "running Bash");
+      return { result: "Argentina won the 2022 World Cup." };
+    });
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
-    const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({
-        stream: true,
-        messages: [{ role: "user", content: "scrape https://example.com" }],
-      }),
-    });
+    const res = await chat(port, { stream: true, messages: [{ role: "user", content: "who won the world cup?" }] });
 
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/event-stream");
-    expect(graph.stream).toHaveBeenCalledWith(
-      expect.objectContaining({ request: "scrape https://example.com", authToken: "tok-1" }),
-      { streamMode: "updates" },
+    expect(engine.invoke).toHaveBeenCalledWith(
+      expect.objectContaining({ request: "who won the world cup?", progressListener: expect.any(Function) }),
     );
 
-    const chunks = (await readSse(res)) as { event?: { type?: string; data?: { description?: string } }; choices?: { delta: { content?: string }; finish_reason: string | null }[] }[];
-    const statusDescriptions = chunks.filter((c) => c.event?.type === "status").map((c) => c.event?.data?.description ?? "");
-    const allContent = chunks.filter((c) => c.choices).map((c) => c.choices![0]?.delta.content ?? "").join("");
-    expect(statusDescriptions).toContain("Calling tool: recipe-scraper.");
-    expect(allContent).toContain("Pancakes");
+    const chunks = (await readSse(res)) as SseChunk[];
+    expect(statusesOf(chunks)).toContain("agent: running Bash");
+    expect(contentOf(chunks)).toContain("Argentina won the 2022 World Cup.");
+    expect(contentOf(chunks)).not.toContain("agent stream ended unexpectedly");
     expect(chunks.filter((c) => c.choices).at(-1)?.choices![0]?.finish_reason).toBe("stop");
+    // The step left open by the last progress line is closed before the stream ends.
+    expect(chunks.some((c) => c.event?.data?.description === "agent: running Bash" && c.event.data.done === true)).toBe(true);
 
     await server.close();
   });
 
-  it("POST /v1/chat/completions (streaming) surfaces a mid-graph error as the final assistant message", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn(),
-      stream: vi
-        .fn()
-        .mockResolvedValue(toStream([{ resolveIdentity: { error: "unauthorized: could not resolve caller identity" } }])),
-    };
-    const server = new InvokeServer(graph);
+  it("POST /v1/chat/completions (streaming) reports a turn that ended with no result, error or tool calls, rather than rendering `undefined`", async () => {
+    const engine = fakeEngine(async () => ({}));
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
-    const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "do a thing" }] }),
-    });
+    const res = await chat(port, { stream: true, messages: [{ role: "user", content: "hello" }] });
 
-    expect(res.status).toBe(200); // headers already sent by the time the graph settles
-    const chunks = (await readSse(res)) as { choices: { delta: { content?: string } }[] }[];
-    const allContent = chunks.map((c) => c.choices[0]?.delta.content ?? "").join("");
-    expect(allContent).toContain("unauthorized");
+    const chunks = (await readSse(res)) as SseChunk[];
+    expect(contentOf(chunks)).toContain("agent stream ended unexpectedly");
+    expect(contentOf(chunks)).not.toContain("undefined");
 
     await server.close();
   });
 
-  it("POST /v1/chat/completions (streaming) surfaces a planAction 'respond' (no tool call) as the final message instead of hanging until 'agent stream ended unexpectedly'", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn(),
-      stream: vi.fn().mockResolvedValue(
-        toStream([
-          { resolveIdentity: { identity: { subject: "alice", roles: ["reader"] } } },
-          {
-            retrieveSkills: {
-              skillCandidates: [
-                { skill: { id: "recipe-refining-skill" }, score: 0.9 } as AgentState["skillCandidates"][number],
-              ],
-            },
-          },
-          { selectSkill: { selectedSkill: { id: "recipe-refining-skill", name: "Recipe Refining" } as AgentState["selectedSkill"] } },
-          { loadSkillTools: { skillTools: [{ id: "recipe-publisher", name: "recipe-publisher" }] as AgentState["skillTools"] } },
-          // Planner chose to respond directly (e.g. "publish it!" with no recipe Markdown
-          // included) -- no selectedTool, so the graph never reaches runTool.
-          { planAction: { result: "I don't see a recipe to publish -- please paste it back in." } },
-        ]),
-      ),
-    };
-    const server = new InvokeServer(graph);
+  it("POST /v1/chat/completions (streaming) surfaces a turn error as the final assistant message", async () => {
+    const server = new InvokeServer(fakeEngine({ error: "unauthorized: could not resolve caller identity" }));
     const port = await listenOn(server);
 
-    const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "publish it!" }] }),
-    });
+    const res = await chat(port, { stream: true, messages: [{ role: "user", content: "do a thing" }] });
 
-    expect(res.status).toBe(200);
-    const chunks = (await readSse(res)) as { type?: string; choices?: { delta: { content?: string }; finish_reason: string | null }[] }[];
-    const allContent = chunks.filter((c) => c.choices).map((c) => c.choices![0]?.delta.content ?? "").join("");
-    expect(allContent).toContain("please paste it back in");
-    expect(allContent).not.toContain("agent stream ended unexpectedly");
-    expect(chunks.filter((c) => c.choices).at(-1)?.choices![0]?.finish_reason).toBe("stop");
+    expect(res.status).toBe(200); // headers already sent by the time the turn settles
+    expect(contentOf((await readSse(res)) as SseChunk[])).toContain("❌ unauthorized");
 
     await server.close();
   });
 
-  it("POST /v1/chat/completions (streaming) surfaces a selectDelegate best-effort answer (no skill/tool/agent matched) instead of hanging until 'agent stream ended unexpectedly'", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn(),
-      stream: vi.fn().mockResolvedValue(
-        toStream([
-          { resolveIdentity: { identity: { subject: "alice", roles: ["reader"] } } },
-          { retrieveSkills: { skillCandidates: [] } },
-          { retrieveAgents: { agentCandidates: [] } },
-          // noMatchFallback's true last resort: no skill/tool/agent selected at
-          // all, `result` set directly on selectDelegate -- the graph routes
-          // straight to END without ever reaching runTool/composeResponse.
-          { selectDelegate: { result: "Here's a peach cocktail syrup recipe...", wasFallback: true } },
-        ]),
-      ),
-    };
-    const server = new InvokeServer(graph);
-    const port = await listenOn(server);
-
-    const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "help me create a recipe for peach cocktail syrup" }] }),
-    });
-
-    expect(res.status).toBe(200);
-    const chunks = (await readSse(res)) as { choices?: { delta: { content?: string }; finish_reason: string | null }[] }[];
-    const allContent = chunks.filter((c) => c.choices).map((c) => c.choices![0]?.delta.content ?? "").join("");
-    expect(allContent).toContain("peach cocktail syrup recipe");
-    expect(allContent).not.toContain("agent stream ended unexpectedly");
-    expect(chunks.filter((c) => c.choices).at(-1)?.choices![0]?.finish_reason).toBe("stop");
-
-    await server.close();
-  });
-
-  it("POST /v1/chat/completions (streaming) surfaces a terminal result from an engine that is not the LangGraph graph (docs/adr/0036)", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn(),
-      stream: vi.fn().mockResolvedValue(
-        // The Temporal engine yields ONE terminal update under its own key. It
-        // has no LangGraph nodes, so it matches none of the node-name branches
-        // -- before the result-based fallback a succeeded turn ended as
-        // "agent stream ended unexpectedly".
-        toStream([{ temporalEngine: { result: "Argentina won the 2022 World Cup." } }]),
-      ),
-    };
-    const server = new InvokeServer(graph);
-    const port = await listenOn(server);
-
-    const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "who won the world cup?" }] }),
-    });
-
-    expect(res.status).toBe(200);
-    const chunks = (await readSse(res)) as { choices?: { delta: { content?: string }; finish_reason: string | null }[] }[];
-    const allContent = chunks.filter((c) => c.choices).map((c) => c.choices![0]?.delta.content ?? "").join("");
-    expect(allContent).toContain("Argentina won the 2022 World Cup.");
-    expect(allContent).not.toContain("agent stream ended unexpectedly");
-    expect(chunks.filter((c) => c.choices).at(-1)?.choices![0]?.finish_reason).toBe("stop");
-
-    await server.close();
-  });
-
-  it("POST /v1/chat/completions (streaming) still reports a stream that ends with no terminal node AND no result", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn(),
-      stream: vi.fn().mockResolvedValue(toStream([{ retrieveSkills: { skillCandidates: [] } }])),
-    };
-    const server = new InvokeServer(graph);
-    const port = await listenOn(server);
-
-    const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "hi" }] }),
-    });
-
-    const chunks = (await readSse(res)) as { choices?: { delta: { content?: string }; finish_reason: string | null }[] }[];
-    const allContent = chunks.filter((c) => c.choices).map((c) => c.choices![0]?.delta.content ?? "").join("");
-    expect(allContent).toContain("agent stream ended unexpectedly");
-
-    await server.close();
-  });
-
-  it("POST /v1/chat/completions (streaming) surfaces a bareAnswer (capability-need gate, docs/adr/0019) instead of hanging until 'agent stream ended unexpectedly'", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn(),
-      stream: vi.fn().mockResolvedValue(
-        toStream([
-          { resolveIdentity: { identity: { subject: "alice", roles: ["reader"] } } },
-          { checkNeedsCapability: { needsCapability: false } },
-          // The capability-need gate judged no skill/tool/agent is needed --
-          // `result` is set directly on `bareAnswer` and the graph routes
-          // straight to END, skipping retrieveSkills/retrieveAgents entirely.
-          { bareAnswer: { result: "Paris is the capital of France." } },
-        ]),
-      ),
-    };
-    const server = new InvokeServer(graph);
-    const port = await listenOn(server);
-
-    const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "What is the capital of France?" }] }),
-    });
-
-    expect(res.status).toBe(200);
-    const chunks = (await readSse(res)) as { choices?: { delta: { content?: string }; finish_reason: string | null }[] }[];
-    const allContent = chunks.filter((c) => c.choices).map((c) => c.choices![0]?.delta.content ?? "").join("");
-    expect(allContent).toContain("Paris is the capital of France");
-    expect(allContent).not.toContain("agent stream ended unexpectedly");
-    expect(chunks.filter((c) => c.choices).at(-1)?.choices![0]?.finish_reason).toBe("stop");
-
-    await server.close();
-  });
-});
-
-describe("InvokeServer session-scoped active skill (ADR 0012)", () => {
-  const identity = { subject: "open-webui", roles: ["reader"] };
-  const selectedSkill = { id: "recipe-skill", name: "Recipe Skill" } as AgentState["selectedSkill"];
-
-  function sessionStore() {
-    return new InMemorySessionStore({ ttlMs: 60_000, maxEntries: 10 });
-  }
-
-  it("remembers the selected skill per chat id and offers it to the graph on the next turn (non-streaming)", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({
-        request: "x",
-        authToken: "tok-1",
-        skillCandidates: [],
-        identity,
-        selectedSkill,
-        result: "done",
-      } as AgentState),
-      stream: vi.fn(),
-    };
-    const server = new InvokeServer(graph, sessionStore());
-    const port = await listenOn(server);
-
-    const send = () =>
-      fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: "Bearer tok-1",
-          "x-openwebui-chat-id": "chat-42",
-        },
-        body: JSON.stringify({ messages: [{ role: "user", content: "extract https://example.com" }] }),
-      });
-
-    await send();
-    // First turn: no session yet -> plain stateless input.
-    expect(graph.invoke).toHaveBeenNthCalledWith(1, {
-      request: "extract https://example.com",
-      authToken: "tok-1",
-      sessionId: "chat-42",
-    });
-
-    await send();
-    // Second turn: the previous turn's skill + its identity subject are offered.
-    expect(graph.invoke).toHaveBeenNthCalledWith(2, {
-      request: "extract https://example.com",
-      authToken: "tok-1",
-      sessionId: "chat-42",
-      activeSkillId: "recipe-skill",
-      sessionSubject: "open-webui",
-    });
-
-    await server.close();
-  });
-
-  it("does not persist a session for a failed turn", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({
-        request: "x",
-        authToken: "tok-1",
-        skillCandidates: [],
-        error: "no matching skill for this request",
-      } as AgentState),
-      stream: vi.fn(),
-    };
-    const server = new InvokeServer(graph, sessionStore());
-    const port = await listenOn(server);
-
-    const send = () =>
-      fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-openwebui-chat-id": "chat-42" },
-        body: JSON.stringify({ messages: [{ role: "user", content: "do a thing" }] }),
-      });
-
-    await send();
-    await send();
-    expect(graph.invoke).toHaveBeenNthCalledWith(2, { request: "do a thing", authToken: "", sessionId: "chat-42" });
-
-    await server.close();
-  });
-
-  it("stays fully stateless when the chat-id header is absent, even with a session store configured", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({
-        request: "x",
-        authToken: "tok-1",
-        skillCandidates: [],
-        identity,
-        selectedSkill,
-        result: "done",
-      } as AgentState),
-      stream: vi.fn(),
-    };
-    const server = new InvokeServer(graph, sessionStore());
-    const port = await listenOn(server);
-
-    const send = () =>
-      fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-        body: JSON.stringify({ messages: [{ role: "user", content: "extract https://example.com" }] }),
-      });
-
-    await send();
-    await send();
-    expect(graph.invoke).toHaveBeenNthCalledWith(2, {
-      request: "extract https://example.com",
-      authToken: "tok-1",
-    });
-
-    await server.close();
-  });
-
-  it("persists the session from a streaming turn and narrates continuation on the next one", async () => {
-    const streamedTurn = [
-      { resolveIdentity: { identity } },
-      { retrieveSkills: { skillCandidates: [{ skill: { id: "recipe-skill" }, score: 0.9 }] as AgentState["skillCandidates"] } },
-      { selectSkill: { selectedSkill } },
-      { loadSkillTools: { skillTools: [{ id: "recipe-scraper", name: "recipe-scraper" }] as AgentState["skillTools"] } },
-      { planAction: { result: "extracted!" } },
-    ];
-    const continuedTurn = [
-      { resolveIdentity: { identity } },
-      // checkActiveSkill confirmed the session's skill -- retrieval/selection skipped.
-      { checkActiveSkill: { selectedSkill } },
-      { loadSkillTools: { skillTools: [{ id: "recipe-scraper", name: "recipe-scraper" }] as AgentState["skillTools"] } },
-      { planAction: { result: "refined!" } },
-    ];
-    const graph: AgentGraphLike = {
-      invoke: vi.fn(),
-      stream: vi
-        .fn()
-        .mockResolvedValueOnce(toStream(streamedTurn))
-        .mockResolvedValueOnce(toStream(continuedTurn)),
-    };
-    const server = new InvokeServer(graph, sessionStore());
-    const port = await listenOn(server);
-
-    const send = (content: string) =>
-      fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: "Bearer tok-1",
-          "x-openwebui-chat-id": "chat-42",
-        },
-        body: JSON.stringify({ stream: true, messages: [{ role: "user", content }] }),
-      });
-
-    await (await send("extract https://example.com")).text();
-    expect(graph.stream).toHaveBeenNthCalledWith(
-      1,
-      expect.objectContaining({ request: "extract https://example.com", authToken: "tok-1" }),
-      { streamMode: "updates" },
-    );
-
-    const res = await send("make it spicier");
-    expect(graph.stream).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({
-        request: "make it spicier",
-        authToken: "tok-1",
-        activeSkillId: "recipe-skill",
-        sessionSubject: "open-webui",
+  it("POST /v1/chat/completions (streaming) surfaces a rejected engine call as the final assistant message", async () => {
+    const server = new InvokeServer(
+      fakeEngine(async () => {
+        throw new Error("temporal engine /invoke failed: 503");
       }),
-      { streamMode: "updates" },
     );
-    const chunks = (await readSse(res)) as { event?: { type?: string; data?: { description?: string } }; choices?: { delta: { content?: string } }[] }[];
-    const statusDescriptions = chunks.filter((c) => c.event?.type === "status").map((c) => c.event?.data?.description ?? "");
-    const allContent = chunks.filter((c) => c.choices).map((c) => c.choices![0]?.delta.content ?? "").join("");
-    expect(statusDescriptions.some((d) => d.startsWith("Continuing with skill: Recipe Skill"))).toBe(true);
-    expect(statusDescriptions.every((d) => !d.startsWith("Selected skill"))).toBe(true);
+    const port = await listenOn(server);
 
+    const res = await chat(port, { stream: true, messages: [{ role: "user", content: "do a thing" }] });
+
+    expect(contentOf((await readSse(res)) as SseChunk[])).toContain("❌ temporal engine /invoke failed: 503");
+    await server.close();
+  });
+
+  it("streams an identity-link prompt as inline chat content, never a truncated status label", async () => {
+    const prompt = "Link your GitHub account to continue: https://gateway.example.com/identity-link/start?state=abc";
+    const engine = fakeEngine(async (input) => {
+      input.progressListener?.("identity-link", prompt);
+      return { result: "Done." };
+    });
+    const server = new InvokeServer(engine);
+    const port = await listenOn(server);
+
+    const chunks = (await readSse(await chat(port, { stream: true, messages: [{ role: "user", content: "open a PR" }] }))) as SseChunk[];
+
+    expect(contentOf(chunks)).toContain(prompt);
+    expect(statusesOf(chunks).every((d) => !d.includes("identity-link"))).toBe(true);
     await server.close();
   });
 
   it("streams a Remote Control session URL as inline chat content, never a truncated status label", async () => {
     const rcUrl = "https://claude.ai/code/session_abc123";
-    const graph: AgentGraphLike = {
-      invoke: vi.fn(),
-      // The delegate node forwards the agent's `remote-control-url` progress
-      // event through `progressListener` (agent/graph.ts). The chat facade
-      // must render it as real, clickable content -- routing it through a
-      // status label (truncated to 120 chars) would mangle the URL.
-      stream: vi.fn().mockImplementation((input: { progressListener?: (stage: string, message: string | undefined) => void }) => {
-        input.progressListener?.("remote-control-url", rcUrl);
-        return toStream([{ planAction: { identity, result: "Opened PR #42." } }]);
-      }),
-    };
-    const server = new InvokeServer(graph, sessionStore());
+    // The engine adapter relays the agent's `remote-control-url` progress
+    // through `progressListener`. The chat facade must render it as real,
+    // clickable content -- a status label (truncated to 120 chars) would
+    // mangle the URL.
+    const engine = fakeEngine(async (input) => {
+      input.progressListener?.("remote-control-url", rcUrl);
+      return { result: "Opened PR #42." };
+    });
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
-    const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: "Bearer tok-1",
-        "x-openwebui-chat-id": "chat-rc",
-      },
-      body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "fix the bug" }] }),
-    });
-
-    const chunks = (await readSse(res)) as {
-      event?: { type?: string; data?: { description?: string } };
-      choices?: { delta: { content?: string } }[];
-    }[];
-    const allContent = chunks
-      .filter((c) => c.choices)
-      .map((c) => c.choices![0]?.delta.content ?? "")
-      .join("");
-    const statusDescriptions = chunks
-      .filter((c) => c.event?.type === "status")
-      .map((c) => c.event?.data?.description ?? "");
+    const chunks = (await readSse(await chat(port, { stream: true, messages: [{ role: "user", content: "fix the bug" }] }))) as SseChunk[];
+    const allContent = contentOf(chunks);
 
     // The full URL is delivered as content with a "watch live" affordance...
     expect(allContent).toContain(rcUrl);
@@ -1658,163 +1023,94 @@ describe("InvokeServer session-scoped active skill (ADR 0012)", () => {
     // ...the actual turn result still follows...
     expect(allContent).toContain("Opened PR #42.");
     // ...and the URL never leaks into a (truncated) status label.
-    expect(statusDescriptions.every((d) => !d.includes("claude.ai/code"))).toBe(true);
+    expect(statusesOf(chunks).every((d) => !d.includes("claude.ai/code"))).toBe(true);
 
     await server.close();
   });
 
   it("separates consecutive agent-text narration chunks instead of fusing them into a run-on sentence", async () => {
     // Each "agent-text" progress call is one COMPLETE, independent text block
-    // straight from claude-runner.ts's own stream-json parsing -- neither
-    // engine ever joins successive blocks with a separator upstream of here,
-    // so writing them verbatim back-to-back used to fuse
-    // "...GitHub account." and "Found it..." into one run-on
-    // "...GitHub account.Found it...".
-    const graph: AgentGraphLike = {
-      invoke: vi.fn(),
-      stream: vi.fn().mockImplementation((input: { progressListener?: (stage: string, message: string | undefined) => void }) => {
-        input.progressListener?.("agent-text", "I'll start by checking whether the repo exists.");
-        input.progressListener?.("agent-text", "Found it — bitovi/ai-experiments is accessible.");
-        return toStream([{ planAction: { identity, result: "Opened PR #42." } }]);
-      }),
-    };
-    const server = new InvokeServer(graph, sessionStore());
+    // straight from claude-runner.ts's own stream-json parsing -- nothing joins
+    // successive blocks with a separator upstream of here, so writing them
+    // verbatim back-to-back used to fuse "...repo exists." and "Found it..."
+    // into one run-on "...repo exists.Found it...".
+    const engine = fakeEngine(async (input) => {
+      input.progressListener?.("agent-text", "I'll start by checking whether the repo exists.");
+      input.progressListener?.("agent-text", "Found it — bitovi/ai-experiments is accessible.");
+      return { result: "Opened PR #42." };
+    });
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
-    const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: "Bearer tok-1",
-        "x-openwebui-chat-id": "chat-narration",
-      },
-      body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "fix the bug" }] }),
-    });
-
-    const chunks = (await readSse(res)) as { choices?: { delta: { content?: string } }[] }[];
-    const allContent = chunks
-      .filter((c) => c.choices)
-      .map((c) => c.choices![0]?.delta.content ?? "")
-      .join("");
+    const allContent = contentOf((await readSse(await chat(port, { stream: true, messages: [{ role: "user", content: "fix the bug" }] }))) as SseChunk[]);
 
     expect(allContent).not.toContain("repo exists.Found it");
     expect(allContent).toMatch(/repo exists\.\s+Found it/);
+    expect(allContent).not.toContain("accessible.Opened");
 
     await server.close();
   });
 
   it("closes an open status step as soon as real content starts streaming", async () => {
-    // A mechanical tool-status step ("agent: running Bash") sets
-    // `openStatusLabel` with done:false. If the agent's remaining work is
-    // mostly agent-text (no further tool-status callbacks), that step must
-    // not stay open until the very end of the turn -- Open WebUI's
-    // StatusHistory would otherwise show a stale "running Bash" spinner for
-    // the rest of the turn even while real narration is already well past
-    // it. The agent-text/identity-link/remote-control-url branches must
-    // close it out themselves, same as finish()/finishWithToolCalls() do.
-    const graph: AgentGraphLike = {
-      invoke: vi.fn(),
-      stream: vi.fn().mockImplementation((input: { progressListener?: (stage: string, message: string | undefined) => void }) => {
-        input.progressListener?.("agent", "running Bash");
-        input.progressListener?.("agent-text", "Empty directory, so I need to clone the repo fresh.");
-        return toStream([{ planAction: { identity, result: "Opened PR #42." } }]);
-      }),
-    };
-    const server = new InvokeServer(graph, sessionStore());
+    // A mechanical tool-status step ("agent: running Bash") is opened with
+    // done:false. If the agent's remaining work is mostly agent-text (no
+    // further tool-status lines), that step must not stay open until the very
+    // end of the turn -- Open WebUI's StatusHistory would otherwise show a
+    // stale "running Bash" spinner for the rest of the turn.
+    const engine = fakeEngine(async (input) => {
+      input.progressListener?.("agent", "running Bash");
+      input.progressListener?.("agent-text", "Empty directory, so I need to clone the repo fresh.");
+      return { result: "Opened PR #42." };
+    });
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
-    const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: "Bearer tok-1",
-        "x-openwebui-chat-id": "chat-status-close",
-      },
-      body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "fix the bug" }] }),
-    });
-
-    const chunks = (await readSse(res)) as {
-      event?: { type?: string; data?: { description?: string; done?: boolean } };
-      choices?: { delta: { content?: string } }[];
-    }[];
+    const chunks = (await readSse(await chat(port, { stream: true, messages: [{ role: "user", content: "fix the bug" }] }))) as SseChunk[];
     const statuses = chunks.filter((c) => c.event?.type === "status").map((c) => c.event!.data!);
 
-    // The "running Bash" step must be closed (done:true) BEFORE the
-    // agent-text content chunk that follows it -- not left open until
-    // finish() at the very end of the turn.
+    // The "running Bash" step must be closed (done:true) BEFORE the agent-text
+    // content chunk that follows it -- not left open until the end.
     const runningBashIndex = chunks.findIndex((c) => c.event?.data?.description === "agent: running Bash" && c.event.data.done === false);
     const closedIndex = chunks.findIndex((c) => c.event?.data?.description === "agent: running Bash" && c.event.data.done === true);
     const contentIndex = chunks.findIndex((c) => c.choices?.[0]?.delta.content?.includes("Empty directory"));
     expect(runningBashIndex).toBeGreaterThanOrEqual(0);
     expect(closedIndex).toBeGreaterThan(runningBashIndex);
     expect(closedIndex).toBeLessThan(contentIndex);
-    // Exactly one close for that step -- not left dangling for finish() to
-    // close again at the end too.
+    // Exactly one close for that step -- not closed again at the end too.
     expect(statuses.filter((s) => s.description === "agent: running Bash" && s.done === true)).toHaveLength(1);
 
     await server.close();
   });
 
-  it("accepts an optional session_id on POST /invoke for non-chat callers", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({
-        request: "x",
-        authToken: "tok-1",
-        skillCandidates: [],
-        identity,
-        selectedSkill,
-        result: "done",
-      } as AgentState),
-      stream: vi.fn().mockResolvedValue(noStream()),
-    };
-    const server = new InvokeServer(graph, sessionStore());
+  it("carries the chat-id header as the turn's session id", async () => {
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine, new InMemorySessionStore({ ttlMs: 60_000, maxEntries: 10 }));
     const port = await listenOn(server);
 
-    const send = () =>
-      fetch(`http://127.0.0.1:${port}/invoke`, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-        body: JSON.stringify({ request: "extract https://example.com", session_id: "cli-7" }),
-      });
+    await chat(port, { messages: [{ role: "user", content: "extract https://example.com" }] }, { "x-openwebui-chat-id": "chat-42" });
+    await chat(port, { messages: [{ role: "user", content: "extract https://example.com" }] });
 
-    await send();
-    await new Promise((r) => setTimeout(r, 10)); // fire-and-forget graph run persists async
-    await send();
-    expect(graph.invoke).toHaveBeenNthCalledWith(2, {
-      request: "extract https://example.com",
-      authToken: "tok-1",
-      remoteControlUrlListener: expect.any(Function),
-      reportIdentityLinkPending: expect.any(Function),
-      traceparent: ANY_TRACEPARENT,
-      sessionId: "cli-7",
-      activeSkillId: "recipe-skill",
-      sessionSubject: "open-webui",
-    });
+    expect(engine.invoke).toHaveBeenNthCalledWith(1, { request: "extract https://example.com", sessionId: "chat-42" });
+    // No header: nothing session-scoped at all.
+    expect(engine.invoke).toHaveBeenNthCalledWith(2, { request: "extract https://example.com" });
 
     await server.close();
   });
+});
 
-  it("threads an explicit identity_link_flow on POST /invoke into the graph input", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({ request: "x", authToken: "tok-1", skillCandidates: [], result: "done" } as AgentState),
-      stream: vi.fn().mockResolvedValue(noStream()),
-    };
-    const server = new InvokeServer(graph);
+describe("InvokeServer identity-link flow selection", () => {
+  it("threads an explicit identity_link_flow on POST /invoke into the turn", async () => {
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
-    await fetch(`http://127.0.0.1:${port}/invoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ request: "open a PR", identity_link_flow: "device" }),
-    });
-    await new Promise((r) => setTimeout(r, 10));
+    await invoke(port, { request: "open a PR", identity_link_flow: "device" });
+    await tick();
 
-    expect(graph.invoke).toHaveBeenCalledWith({
+    expect(engine.invoke).toHaveBeenCalledWith({
       request: "open a PR",
-      authToken: "tok-1",
       remoteControlUrlListener: expect.any(Function),
       identityLinkFlow: "device",
-      reportIdentityLinkPending: expect.any(Function),
       traceparent: ANY_TRACEPARENT,
     });
 
@@ -1826,407 +1122,137 @@ describe("InvokeServer session-scoped active skill (ADR 0012)", () => {
     // field, so before this was configurable every chat turn was pinned to
     // "authcode" -- unusable on a deployment whose GitHub App Callback URL
     // cannot be made to match, with no way to opt into the device flow.
-    const graph: AgentGraphLike = {
-      invoke: vi.fn(),
-      stream: vi.fn().mockImplementation(() => toStream([{ planAction: { identity, result: "done" } }])),
-    };
-    const server = new InvokeServer(graph, undefined, undefined, undefined, undefined, undefined, undefined, 5, "device");
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine, undefined, undefined, undefined, undefined, undefined, 5, "device");
     const port = await listenOn(server);
 
-    await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ stream: true, messages: [{ role: "user", content: "open a PR" }] }),
-    });
-    await new Promise((r) => setTimeout(r, 10));
+    await (await chat(port, { stream: true, messages: [{ role: "user", content: "open a PR" }] })).text();
 
-    // `stream` is called as (input, { streamMode }), so assert on the input
-    // argument rather than the whole call signature.
-    expect(vi.mocked(graph.stream).mock.calls[0]![0]).toMatchObject({ identityLinkFlow: "device" });
+    expect(engine.invoke.mock.calls[0]![0]).toMatchObject({ identityLinkFlow: "device" });
 
     await server.close();
   });
 
   // An OpenAI-SDK client with no browser can ask for the device flow per
-  // turn, the same field /invoke takes. Before, a chat turn could only ever
-  // get the deployment default, which also made the device flow unreachable
-  // from any chat e2e spec.
-  it("threads an explicit identity_link_flow on a chat-completions turn into the graph input, streaming or not", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({ request: "x", authToken: "tok-1", skillCandidates: [], result: "done" } as AgentState),
-      stream: vi.fn().mockImplementation(() => toStream([{ planAction: { identity, result: "done" } }])),
-    };
-    const server = new InvokeServer(graph);
+  // turn, the same field /invoke takes.
+  it("threads an explicit identity_link_flow on a chat-completions turn into the turn, streaming or not", async () => {
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
     const send = (stream: boolean) =>
-      fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-        body: JSON.stringify({ stream, identity_link_flow: "device", messages: [{ role: "user", content: "open a PR" }] }),
-      }).then((r) => r.text());
+      chat(port, { stream, identity_link_flow: "device", messages: [{ role: "user", content: "open a PR" }] }).then((r) => r.text());
 
     await send(true);
     await send(false);
 
-    expect(vi.mocked(graph.stream).mock.calls[0]![0]).toMatchObject({ identityLinkFlow: "device" });
-    expect(graph.invoke).toHaveBeenCalledWith(expect.objectContaining({ identityLinkFlow: "device" }));
+    expect(engine.invoke.mock.calls[0]![0]).toMatchObject({ identityLinkFlow: "device" });
+    expect(engine.invoke.mock.calls[1]![0]).toMatchObject({ identityLinkFlow: "device" });
 
     await server.close();
   });
 
   it("lets an explicit chat-completions identity_link_flow override the configured default, and ignores an invalid one", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn(),
-      stream: vi.fn().mockImplementation(() => toStream([{ planAction: { identity, result: "done" } }])),
-    };
-    const server = new InvokeServer(graph, undefined, undefined, undefined, undefined, undefined, undefined, 5, "device");
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine, undefined, undefined, undefined, undefined, undefined, 5, "device");
     const port = await listenOn(server);
     const send = (flow: string) =>
-      fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-        body: JSON.stringify({ stream: true, identity_link_flow: flow, messages: [{ role: "user", content: "open a PR" }] }),
-      }).then((r) => r.text());
+      chat(port, { stream: true, identity_link_flow: flow, messages: [{ role: "user", content: "open a PR" }] }).then((r) => r.text());
 
     await send("authcode");
     await send("carrier-pigeon");
 
-    expect(vi.mocked(graph.stream).mock.calls[0]![0]).toMatchObject({ identityLinkFlow: "authcode" });
+    expect(engine.invoke.mock.calls[0]![0]).toMatchObject({ identityLinkFlow: "authcode" });
     // Invalid falls back to the deployment default rather than failing the turn.
-    expect(vi.mocked(graph.stream).mock.calls[1]![0]).toMatchObject({ identityLinkFlow: "device" });
-
-    await server.close();
-  });
-
-  // The repository a webhook fired on is the one integration-gateway checked
-  // the sender's permission on, so it has to reach the engine's read gate as
-  // data rather than only as words in the rendered prompt.
-  it("carries a webhook event's repository into the graph input as the target repository", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({ request: "x", authToken: "tok-1", skillCandidates: [], result: "done" } as AgentState),
-      stream: vi.fn().mockResolvedValue(noStream()),
-    };
-    const server = new InvokeServer(graph, undefined, undefined, await triggerRegistry([catchAllTrigger]));
-    const port = await listenOn(server);
-    const send = (event: unknown) =>
-      fetch(`http://127.0.0.1:${port}/invoke`, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-        body: JSON.stringify({ event }),
-      });
-
-    await send(envelope({ repository: "e2e-org/e2e-repo" }));
-    await new Promise((r) => setTimeout(r, 10));
-    expect(graph.invoke).toHaveBeenLastCalledWith(expect.objectContaining({ targetRepository: "e2e-org/e2e-repo" }));
-
-    await send(envelope({ repository: "" }));
-    await new Promise((r) => setTimeout(r, 10));
-    expect(vi.mocked(graph.invoke).mock.lastCall![0]).not.toHaveProperty("targetRepository");
+    expect(engine.invoke.mock.calls[1]![0]).toMatchObject({ identityLinkFlow: "device" });
 
     await server.close();
   });
 
   it("lets an explicit /invoke identity_link_flow override the configured default", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({ request: "x", authToken: "tok-1", skillCandidates: [], result: "done" } as AgentState),
-      stream: vi.fn().mockResolvedValue(noStream()),
-    };
-    const server = new InvokeServer(graph, undefined, undefined, undefined, undefined, undefined, undefined, 5, "device");
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine, undefined, undefined, undefined, undefined, undefined, 5, "device");
     const port = await listenOn(server);
 
-    await fetch(`http://127.0.0.1:${port}/invoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ request: "open a PR", identity_link_flow: "authcode" }),
-    });
-    await new Promise((r) => setTimeout(r, 10));
+    await invoke(port, { request: "open a PR", identity_link_flow: "authcode" });
+    await tick();
 
-    expect(graph.invoke).toHaveBeenCalledWith(expect.objectContaining({ identityLinkFlow: "authcode" }));
+    expect(engine.invoke).toHaveBeenCalledWith(expect.objectContaining({ identityLinkFlow: "authcode" }));
 
     await server.close();
   });
 
   it("silently ignores a missing or invalid identity_link_flow on POST /invoke, without failing the request", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({ request: "x", authToken: "tok-1", skillCandidates: [], result: "done" } as AgentState),
-      stream: vi.fn().mockResolvedValue(noStream()),
-    };
-    const server = new InvokeServer(graph);
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
+    const expected = {
+      request: "open a PR",
+      remoteControlUrlListener: expect.any(Function),
+      traceparent: ANY_TRACEPARENT,
+    };
 
-    const omittedRes = await fetch(`http://127.0.0.1:${port}/invoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ request: "open a PR" }),
-    });
+    const omittedRes = await invoke(port, { request: "open a PR" });
     expect(omittedRes.status).toBe(202);
-    await new Promise((r) => setTimeout(r, 10));
-    expect(graph.invoke).toHaveBeenLastCalledWith({
-      request: "open a PR",
-      authToken: "tok-1",
-      remoteControlUrlListener: expect.any(Function),
-      reportIdentityLinkPending: expect.any(Function),
-      traceparent: ANY_TRACEPARENT,
-    });
+    await tick();
+    expect(engine.invoke).toHaveBeenLastCalledWith(expected);
 
-    const invalidRes = await fetch(`http://127.0.0.1:${port}/invoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ request: "open a PR", identity_link_flow: "carrier-pigeon" }),
-    });
+    const invalidRes = await invoke(port, { request: "open a PR", identity_link_flow: "carrier-pigeon" });
     expect(invalidRes.status).toBe(202);
-    await new Promise((r) => setTimeout(r, 10));
-    expect(graph.invoke).toHaveBeenLastCalledWith({
-      request: "open a PR",
-      authToken: "tok-1",
-      remoteControlUrlListener: expect.any(Function),
-      reportIdentityLinkPending: expect.any(Function),
-      traceparent: ANY_TRACEPARENT,
-    });
+    await tick();
+    expect(engine.invoke).toHaveBeenLastCalledWith(expected);
 
     await server.close();
   });
 });
 
-describe("InvokeServer live-session tunnel (ADR 0026)", () => {
-  const graph: AgentGraphLike = {
-    invoke: vi.fn().mockResolvedValue({ request: "x", authToken: "", skillCandidates: [] } as unknown as AgentState),
-    stream: vi.fn().mockResolvedValue(noStream()),
-  };
-
-  function fakeChannel(overrides: Partial<AgentOrchestratorChannel> = {}): AgentOrchestratorChannel {
-    return {
-      awaitReply: vi.fn(),
-      sendPrompt: vi.fn(),
-      close: vi.fn(),
-      ...overrides,
-    };
-  }
-
-  it("404s on all three routes when no agentChannel is configured", async () => {
-    const server = new InvokeServer(graph, new InMemorySessionStore({ ttlMs: 60_000, maxEntries: 10 }));
+describe("InvokeServer live-session routes after docs/adr/0053", () => {
+  // The engine owns its agent runs, so this process never has a live tunnel to
+  // offer. `/sessions/live` still answers a CONFIRMED not-live, because
+  // integration-gateway's label reconciler only clears a label on a positive
+  // terminal signal (a 404 reads as "unknown").
+  it("answers /sessions/live with a confirmed not-live", async () => {
+    const server = new InvokeServer(fakeEngine());
     const port = await listenOn(server);
 
-    expect((await fetch(`http://127.0.0.1:${port}/sessions/live?sessionId=s1`)).status).toBe(404);
-    expect((await fetch(`http://127.0.0.1:${port}/agent-runs/run-1/events?sessionId=s1`)).status).toBe(404);
-    expect(
-      (await fetch(`http://127.0.0.1:${port}/agent-runs/run-1/opencode?sessionId=s1`, { method: "POST" })).status,
-    ).toBe(404);
-
-    await server.close();
-  });
-
-  it("reports not live when the session has no lastAgentRunId", async () => {
-    const sessionStore = new InMemorySessionStore({ ttlMs: 60_000, maxEntries: 10 });
-    const forwardOpencodeRequest = vi.fn();
-    const server = new InvokeServer(graph, sessionStore, undefined, undefined, fakeChannel({ forwardOpencodeRequest }));
-    const port = await listenOn(server);
-
-    const res = await fetch(`http://127.0.0.1:${port}/sessions/live?sessionId=unknown-session`, {
-      headers: { authorization: "Bearer tok-1" },
-    });
-    expect(await res.json()).toEqual({ live: false });
-    expect(forwardOpencodeRequest).not.toHaveBeenCalled();
-
-    await server.close();
-  });
-
-  it("reports live via a real-time health probe when the session has a lastAgentRunId that responds", async () => {
-    const sessionStore = new InMemorySessionStore({ ttlMs: 60_000, maxEntries: 10 });
-    await sessionStore.set("acme-session", { subject: "alice", lastAgentRunId: "run-42" });
-    const forwardOpencodeRequest = vi.fn().mockResolvedValue({ status: 200, body: { ok: true } });
-    const server = new InvokeServer(graph, sessionStore, undefined, undefined, fakeChannel({ forwardOpencodeRequest }));
-    const port = await listenOn(server);
-
-    const res = await fetch(`http://127.0.0.1:${port}/sessions/live?sessionId=acme-session`, {
-      headers: { authorization: "Bearer tok-1" },
-    });
-    expect(await res.json()).toEqual({ live: true, agentRunId: "run-42" });
-    expect(forwardOpencodeRequest).toHaveBeenCalledWith("run-42", { method: "GET", path: "/global/health" }, 2_000);
-
-    await server.close();
-  });
-
-  it("reports not live when the probe times out (Pod no longer reachable)", async () => {
-    const sessionStore = new InMemorySessionStore({ ttlMs: 60_000, maxEntries: 10 });
-    await sessionStore.set("acme-session", { subject: "alice", lastAgentRunId: "run-42" });
-    const forwardOpencodeRequest = vi.fn().mockRejectedValue(new Error("timed out"));
-    const server = new InvokeServer(graph, sessionStore, undefined, undefined, fakeChannel({ forwardOpencodeRequest }));
-    const port = await listenOn(server);
-
-    const res = await fetch(`http://127.0.0.1:${port}/sessions/live?sessionId=acme-session`, {
-      headers: { authorization: "Bearer tok-1" },
-    });
-    expect(await res.json()).toEqual({ live: false });
-
-    await server.close();
-  });
-
-  it("401s the live routes without a bearer token", async () => {
-    const sessionStore = new InMemorySessionStore({ ttlMs: 60_000, maxEntries: 10 });
-    const server = new InvokeServer(graph, sessionStore, undefined, undefined, fakeChannel({ forwardOpencodeRequest: vi.fn() }));
-    const port = await listenOn(server);
-
-    expect((await fetch(`http://127.0.0.1:${port}/sessions/live?sessionId=s1`)).status).toBe(401);
-
-    await server.close();
-  });
-
-  it("forwards a proxied opencode request only when the session's own lastAgentRunId matches the runId in the URL", async () => {
-    const sessionStore = new InMemorySessionStore({ ttlMs: 60_000, maxEntries: 10 });
-    await sessionStore.set("acme-session", { subject: "alice", lastAgentRunId: "run-42" });
-    const forwardOpencodeRequest = vi.fn().mockResolvedValue({ status: 200, body: { finalMessage: "hi" } });
-    const server = new InvokeServer(graph, sessionStore, undefined, undefined, fakeChannel({ forwardOpencodeRequest }));
-    const port = await listenOn(server);
-
-    const wrongRunRes = await fetch(`http://127.0.0.1:${port}/agent-runs/some-other-run/opencode?sessionId=acme-session`, {
-      method: "POST",
-      headers: { authorization: "Bearer tok-1", "content-type": "application/json" },
-      body: JSON.stringify({ method: "POST", path: "/session/ses_1/message", body: { parts: [] } }),
-    });
-    expect(wrongRunRes.status).toBe(404);
-    expect(forwardOpencodeRequest).not.toHaveBeenCalled();
-
-    const res = await fetch(`http://127.0.0.1:${port}/agent-runs/run-42/opencode?sessionId=acme-session`, {
-      method: "POST",
-      headers: { authorization: "Bearer tok-1", "content-type": "application/json" },
-      body: JSON.stringify({ method: "POST", path: "/session/ses_1/message", body: { parts: [{ type: "text", text: "hi" }] } }),
-    });
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ status: 200, body: { finalMessage: "hi" } });
-    expect(forwardOpencodeRequest).toHaveBeenCalledWith("run-42", {
-      method: "POST",
-      path: "/session/ses_1/message",
-      body: { parts: [{ type: "text", text: "hi" }] },
-    });
-
-    await server.close();
-  });
-
-  it("streams opencode_event up-messages as SSE and closes on session_ended", async () => {
-    const sessionStore = new InMemorySessionStore({ ttlMs: 60_000, maxEntries: 10 });
-    await sessionStore.set("acme-session", { subject: "alice", lastAgentRunId: "run-42" });
-    let deliver!: (msg: { type: string; [k: string]: unknown }) => void;
-    const subscribeLive = vi.fn((_runId: string, onMessage: (msg: never) => void) => {
-      deliver = onMessage as unknown as typeof deliver;
-      return { unsubscribe: vi.fn() };
-    });
-    const server = new InvokeServer(graph, sessionStore, undefined, undefined, fakeChannel({ subscribeLive: subscribeLive as unknown as AgentOrchestratorChannel["subscribeLive"] }));
-    const port = await listenOn(server);
-
-    const res = await fetch(`http://127.0.0.1:${port}/agent-runs/run-42/events?sessionId=acme-session`, {
+    const res = await fetch(`http://127.0.0.1:${port}/sessions/live?sessionId=${encodeURIComponent("github:acme/widgets#7")}`, {
       headers: { authorization: "Bearer tok-1" },
     });
     expect(res.status).toBe(200);
-    expect(subscribeLive).toHaveBeenCalledWith("run-42", expect.any(Function));
-
-    deliver({ type: "opencode_event", event: { type: "message.part.updated", part: { text: "hi" } } });
-    deliver({ type: "session_ended", reason: "idle timeout" });
-
-    const body = await res.text();
-    expect(body).toContain('data: {"type":"message.part.updated","part":{"text":"hi"}}');
-    expect(body).toContain("event: session_ended");
-
-    await server.close();
-  });
-});
-
-describe("InvokeServer canonical credential subject plumbing", () => {
-  it("threads the envelope's sender.login from POST /invoke into the graph input", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({ request: "x", authToken: "tok-1", skillCandidates: [], result: "done" } as AgentState),
-      stream: vi.fn().mockResolvedValue(noStream()),
-    };
-    const server = new InvokeServer(graph, undefined, undefined, await triggerRegistry([catchAllTrigger]));
-    const port = await listenOn(server);
-
-    await fetch(`http://127.0.0.1:${port}/invoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ event: envelope({ sender: { login: "imaustink", isBot: false } }) }),
-    });
-    await new Promise((r) => setTimeout(r, 10));
-
-    expect(graph.invoke).toHaveBeenCalledWith(expect.objectContaining({ senderLogin: "imaustink" }));
-
+    expect(await res.json()).toEqual({ live: false });
     await server.close();
   });
 
-  it("reports the pending link's OWN subject on GET /invoke/:id, not the raw identity subject", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({
-        request: "x",
-        authToken: "tok-1",
-        skillCandidates: [],
-        identity: { subject: "service-subject", roles: ["reader"] },
-        pendingIdentityLink: {
-          agentId: "claude-code-swe",
-          provider: "claude-remote",
-          flow: "page",
-          expiresAt: Date.now() + 600_000,
-          subject: "github:imaustink",
-        },
-        identityLinkPending: true,
-        result: "please link your Claude account",
-      } as AgentState),
-      stream: vi.fn(),
-    };
-    const server = new InvokeServer(graph);
+  it("401s /sessions/live without a bearer token", async () => {
+    const server = new InvokeServer(fakeEngine());
     const port = await listenOn(server);
 
-    const postRes = await fetch(`http://127.0.0.1:${port}/invoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ request: "triage this issue" }),
-    });
-    const { id } = (await postRes.json()) as { id: string };
-    await new Promise((r) => setTimeout(r, 10));
-
-    const done = (await (await fetch(`http://127.0.0.1:${port}/invoke/${id}`)).json()) as {
-      identityLink?: { provider: string; subject: string };
-    };
-    // integration-gateway's waitAndResume blocks on exactly this subject. If
-    // it were recomputed from identity.subject it would wait on a record the
-    // link never writes -- the PR #144 re-auth loop.
-    expect(done.identityLink).toEqual({ provider: "claude-remote", subject: "github:imaustink" });
-
+    const res = await fetch(`http://127.0.0.1:${port}/sessions/live?sessionId=s1`);
+    expect(res.status).toBe(401);
     await server.close();
   });
 
-  it("falls back to the identity subject for a link parked before the subject field existed", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({
-        request: "x",
-        authToken: "tok-1",
-        skillCandidates: [],
-        identity: { subject: "alice", roles: ["reader"] },
-        pendingIdentityLink: {
-          agentId: "opencode-swe",
-          provider: "github",
-          flow: "authcode",
-          expiresAt: Date.now() + 600_000,
-        },
-        identityLinkPending: true,
-        result: "please link your GitHub account",
-      } as AgentState),
-      stream: vi.fn(),
-    };
-    const server = new InvokeServer(graph);
+  it("400s /sessions/live without a sessionId", async () => {
+    const server = new InvokeServer(fakeEngine());
     const port = await listenOn(server);
 
-    const postRes = await fetch(`http://127.0.0.1:${port}/invoke`, {
+    const res = await fetch(`http://127.0.0.1:${port}/sessions/live`, { headers: { authorization: "Bearer tok-1" } });
+    expect(res.status).toBe(400);
+    await server.close();
+  });
+
+  it("no longer serves the agent-run tunnel routes", async () => {
+    const server = new InvokeServer(fakeEngine());
+    const port = await listenOn(server);
+    const auth = { authorization: "Bearer tok-1" };
+
+    const events = await fetch(`http://127.0.0.1:${port}/agent-runs/run-1/events?sessionId=s1`, { headers: auth });
+    const opencode = await fetch(`http://127.0.0.1:${port}/agent-runs/run-1/opencode?sessionId=s1`, {
       method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ request: "open a PR" }),
+      headers: { ...auth, "content-type": "application/json" },
+      body: JSON.stringify({ method: "GET", path: "/global/health" }),
     });
-    const { id } = (await postRes.json()) as { id: string };
-    await new Promise((r) => setTimeout(r, 10));
-
-    const done = (await (await fetch(`http://127.0.0.1:${port}/invoke/${id}`)).json()) as {
-      identityLink?: { provider: string; subject: string };
-    };
-    expect(done.identityLink).toEqual({ provider: "github", subject: "alice" });
-
+    expect(events.status).toBe(404);
+    expect(opencode.status).toBe(404);
     await server.close();
   });
 });
@@ -2234,73 +1260,65 @@ describe("InvokeServer canonical credential subject plumbing", () => {
 describe("InvokeServer signed sender assertion (docs/adr/0030 §6)", () => {
   const SECRET = "assertion-secret";
 
-  async function serverWithAssertions(graph: AgentGraphLike, secret: string | undefined = SECRET) {
-    // Positional order: graph, sessionStore, taskCompleter,
-    // eventTriggerRegistry, agentChannel, senderAssertionSecret.
-    return new InvokeServer(graph, undefined, undefined, await triggerRegistry([catchAllTrigger]), undefined, secret);
+  async function serverWithAssertions(engine: FakeEngine, secret: string | undefined = SECRET) {
+    // Positional order: engine, sessionStore, taskCompleter,
+    // eventTriggerRegistry, senderAssertionSecret.
+    return new InvokeServer(engine, undefined, undefined, await triggerRegistry([catchAllTrigger]), secret);
   }
 
-  function graphSpy(): AgentGraphLike {
-    return {
-      invoke: vi.fn().mockResolvedValue({ request: "x", authToken: "t", skillCandidates: [], result: "done" } as AgentState),
-      stream: vi.fn().mockResolvedValue(noStream()),
-    };
-  }
-
-  it("accepts a login only from a verified assertion, ignoring the unsigned body field", async () => {
-    const graph = graphSpy();
-    const server = await serverWithAssertions(graph);
+  it("threads the envelope's sender.login from POST /invoke into the turn", async () => {
+    const engine = fakeEngine();
+    const server = await serverWithAssertions(engine, "");
     const port = await listenOn(server);
 
-    await fetch(`http://127.0.0.1:${port}/invoke`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: "Bearer tok-1",
-        [SENDER_ASSERTION_HEADER]: mintSenderAssertion(SECRET, "imaustink"),
-      },
-      // A DIFFERENT login in the body: with a secret configured this must be
-      // ignored outright, not merged or preferred.
-      body: JSON.stringify({ event: envelope({ sender: { login: "victim" } }) }),
-    });
-    await new Promise((r) => setTimeout(r, 10));
+    await invoke(port, { event: envelope({ sender: { login: "imaustink", isBot: false } }) });
+    await tick();
 
-    expect(graph.invoke).toHaveBeenCalledWith(expect.objectContaining({ senderLogin: "imaustink" }));
+    expect(engine.invoke).toHaveBeenCalledWith(expect.objectContaining({ senderLogin: "imaustink" }));
+    await server.close();
+  });
+
+  it("accepts a login only from a verified assertion, ignoring the unsigned body field", async () => {
+    const engine = fakeEngine();
+    const server = await serverWithAssertions(engine);
+    const port = await listenOn(server);
+
+    // A DIFFERENT login in the body: with a secret configured this must be
+    // ignored outright, not merged or preferred.
+    await invoke(
+      port,
+      { event: envelope({ sender: { login: "victim" } }) },
+      { [SENDER_ASSERTION_HEADER]: mintSenderAssertion(SECRET, "imaustink") },
+    );
+    await tick();
+
+    expect(engine.invoke).toHaveBeenCalledWith(expect.objectContaining({ senderLogin: "imaustink" }));
     await server.close();
   });
 
   it("drops an unsigned senderLogin entirely when a secret is configured", async () => {
-    const graph = graphSpy();
-    const server = await serverWithAssertions(graph);
+    const engine = fakeEngine();
+    const server = await serverWithAssertions(engine);
     const port = await listenOn(server);
 
-    await fetch(`http://127.0.0.1:${port}/invoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ event: envelope({ sender: { login: "victim" } }) }),
-    });
-    await new Promise((r) => setTimeout(r, 10));
+    await invoke(port, { event: envelope({ sender: { login: "victim" } }) });
+    await tick();
 
     // No principal rather than the WRONG principal: holding the gateway's
     // token must not be enough to be handed another person's credentials.
-    const arg = (graph.invoke as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as { senderLogin?: string };
-    expect(arg.senderLogin).toBeUndefined();
+    expect(engine.invoke.mock.calls[0]![0].senderLogin).toBeUndefined();
     await server.close();
   });
 
   it("still trusts the body field when no secret is configured (upgrade compatibility)", async () => {
-    const graph = graphSpy();
-    const server = await serverWithAssertions(graph, ""); // "" = no secret configured
+    const engine = fakeEngine();
+    const server = await serverWithAssertions(engine, ""); // "" = no secret configured
     const port = await listenOn(server);
 
-    await fetch(`http://127.0.0.1:${port}/invoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ event: envelope({ sender: { login: "imaustink" } }) }),
-    });
-    await new Promise((r) => setTimeout(r, 10));
+    await invoke(port, { event: envelope({ sender: { login: "imaustink" } }) });
+    await tick();
 
-    expect(graph.invoke).toHaveBeenCalledWith(expect.objectContaining({ senderLogin: "imaustink" }));
+    expect(engine.invoke).toHaveBeenCalledWith(expect.objectContaining({ senderLogin: "imaustink" }));
     await server.close();
   });
 });
@@ -2314,97 +1332,63 @@ describe("InvokeServer consumer-supplied tools (docs/adr/0035)", () => {
     };
   }
 
-  it("resolves the caller's tools onto the graph input", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({ result: "ok" } as AgentState),
-      stream: vi.fn(),
-    };
-    const server = new InvokeServer(graph);
+  it("resolves the caller's tools onto the turn", async () => {
+    const engine = fakeEngine({ result: "ok" });
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
-    await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({
-        messages: [{ role: "user", content: "what's the weather?" }],
-        tools: [toolDef("get_weather", "Look up the weather")],
-      }),
+    await chat(port, {
+      messages: [{ role: "user", content: "what's the weather?" }],
+      tools: [toolDef("get_weather", "Look up the weather")],
     });
 
-    expect(graph.invoke).toHaveBeenCalledWith(
+    expect(engine.invoke).toHaveBeenCalledWith(
       expect.objectContaining({
         callerTools: [
-          expect.objectContaining({
-            id: "caller:get_weather",
-            name: "get_weather",
-            allowedRoles: [],
-            callerTool: expect.objectContaining({ name: "get_weather" }),
-          }),
+          expect.objectContaining({ name: "get_weather", description: "Look up the weather" }),
         ],
       }),
     );
     await server.close();
   });
 
-  it("leaves the graph input untouched when the caller sends no tools", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({ result: "ok" } as AgentState),
-      stream: vi.fn(),
-    };
-    const server = new InvokeServer(graph);
+  it("leaves the turn input untouched when the caller sends no tools", async () => {
+    const engine = fakeEngine({ result: "ok" });
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
-    await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] }),
-    });
+    await chat(port, { messages: [{ role: "user", content: "hi" }] });
 
-    expect(graph.invoke).toHaveBeenCalledWith({ request: "hi", authToken: "tok-1" });
+    expect(engine.invoke).toHaveBeenCalledWith({ request: "hi" });
     await server.close();
   });
 
   it("400s a malformed tools array instead of silently ignoring it", async () => {
     // A client that offers tools and silently never gets a tool call can't tell
     // "not chosen" from "never seen".
-    const graph: AgentGraphLike = { invoke: vi.fn(), stream: vi.fn() };
-    const server = new InvokeServer(graph);
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
-    const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({
-        messages: [{ role: "user", content: "hi" }],
-        tools: [{ type: "function", function: { name: "bad name!" } }],
-      }),
+    const res = await chat(port, {
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{ type: "function", function: { name: "bad name!" } }],
     });
 
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: { message: string } };
     expect(body.error.message).toContain("must match");
-    expect(graph.invoke).not.toHaveBeenCalled();
+    expect(engine.invoke).not.toHaveBeenCalled();
     await server.close();
   });
 
   it("(non-streaming) returns tool_calls with finish_reason tool_calls", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({
-        pendingToolCalls: [{ id: "call_abc", name: "get_weather", arguments: '{"city":"Chicago"}' }],
-      } as AgentState),
-      stream: vi.fn(),
-    };
-    const server = new InvokeServer(graph);
+    const server = new InvokeServer(
+      fakeEngine({ pendingToolCalls: [{ id: "call_abc", name: "get_weather", arguments: '{"city":"Chicago"}' }] }),
+    );
     const port = await listenOn(server);
 
-    const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({
-        messages: [{ role: "user", content: "weather?" }],
-        tools: [toolDef("get_weather")],
-      }),
-    });
+    const res = await chat(port, { messages: [{ role: "user", content: "weather?" }], tools: [toolDef("get_weather")] });
 
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
@@ -2417,32 +1401,14 @@ describe("InvokeServer consumer-supplied tools (docs/adr/0035)", () => {
   });
 
   it("(streaming) emits a tool_calls delta then a tool_calls finish", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn(),
-      stream: vi.fn().mockResolvedValue(
-        toStream([
-          { resolveIdentity: { identity: { subject: "alice", roles: ["reader"] } } },
-          { runTool: { pendingToolCalls: [{ id: "call_abc", name: "get_weather", arguments: '{"city":"Chicago"}' }] } },
-        ]),
-      ),
-    };
-    const server = new InvokeServer(graph);
+    const server = new InvokeServer(
+      fakeEngine({ pendingToolCalls: [{ id: "call_abc", name: "get_weather", arguments: '{"city":"Chicago"}' }] }),
+    );
     const port = await listenOn(server);
 
-    const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({
-        stream: true,
-        messages: [{ role: "user", content: "weather?" }],
-        tools: [toolDef("get_weather")],
-      }),
-    });
+    const res = await chat(port, { stream: true, messages: [{ role: "user", content: "weather?" }], tools: [toolDef("get_weather")] });
 
-    const chunks = (await readSse(res)) as {
-      choices?: { delta: { tool_calls?: { index: number; function: { name: string } }[] }; finish_reason: string | null }[];
-    }[];
-    const withChoices = chunks.filter((c) => c.choices);
+    const withChoices = ((await readSse(res)) as SseChunk[]).filter((c) => c.choices);
     expect(withChoices[0]!.choices![0]!.delta.tool_calls).toEqual([
       { index: 0, id: "call_abc", type: "function", function: { name: "get_weather", arguments: '{"city":"Chicago"}' } },
     ]);
@@ -2453,62 +1419,49 @@ describe("InvokeServer consumer-supplied tools (docs/adr/0035)", () => {
   it("passes a client-executed tool result back as seeded actionHistory", async () => {
     // The full round trip: the client ran our tool call and resent the
     // conversation with the result (docs/adr/0035 §1).
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({ result: "It's 58F and raining." } as AgentState),
-      stream: vi.fn(),
-    };
-    const server = new InvokeServer(graph);
+    const engine = fakeEngine({ result: "It's 58F and raining." });
+    const server = new InvokeServer(engine);
     const port = await listenOn(server);
 
-    await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({
-        messages: [
-          { role: "user", content: "weather in Chicago?" },
-          {
-            role: "assistant",
-            content: null,
-            tool_calls: [{ id: "call_abc", type: "function", function: { name: "get_weather", arguments: '{"city":"Chicago"}' } }],
-          },
-          { role: "tool", tool_call_id: "call_abc", content: "58F and raining" },
-        ],
-        tools: [toolDef("get_weather")],
-      }),
+    await chat(port, {
+      messages: [
+        { role: "user", content: "weather in Chicago?" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{ id: "call_abc", type: "function", function: { name: "get_weather", arguments: '{"city":"Chicago"}' } }],
+        },
+        { role: "tool", tool_call_id: "call_abc", content: "58F and raining" },
+      ],
+      tools: [toolDef("get_weather")],
     });
 
-    expect(graph.invoke).toHaveBeenCalledWith(
+    expect(engine.invoke).toHaveBeenCalledWith(
       expect.objectContaining({
         request: "weather in Chicago?",
-        actionHistory: [
-          { toolId: "caller:get_weather", toolArgs: '{"city":"Chicago"}', result: "58F and raining" },
-        ],
+        actionHistory: [{ toolId: "caller:get_weather", toolArgs: '{"city":"Chicago"}', result: "58F and raining" }],
       }),
     );
     await server.close();
   });
 
-  it("never reaches the graph — or emits a tool call — for an Open WebUI housekeeping request", async () => {
+  it("never reaches the engine — or emits a tool call — for an Open WebUI housekeeping request", async () => {
     // Open WebUI sends title/tag generation to the SAME endpoint with the same
     // body, tool array included. Emitting a tool call here would have the client
     // execute a real function as a side effect of rendering a chat title
     // (docs/adr/0035 §5).
-    const graph: AgentGraphLike = { invoke: vi.fn(), stream: vi.fn() };
-    const server = new InvokeServer(graph, undefined, {
+    const engine = fakeEngine();
+    const server = new InvokeServer(engine, undefined, {
       complete: vi.fn().mockResolvedValue("Chicago Weather"),
-    } as unknown as ConstructorParameters<typeof InvokeServer>[2]);
+    });
     const port = await listenOn(server);
 
-    const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({
-        messages: [{ role: "user", content: "### Task:\nGenerate a concise title" }],
-        tools: [toolDef("get_weather")],
-      }),
+    const res = await chat(port, {
+      messages: [{ role: "user", content: "### Task:\nGenerate a concise title" }],
+      tools: [toolDef("get_weather")],
     });
 
-    expect(graph.invoke).not.toHaveBeenCalled();
+    expect(engine.invoke).not.toHaveBeenCalled();
     const body = (await res.json()) as { choices: { message: { content: string }; finish_reason: string }[] };
     expect(body.choices[0]!.finish_reason).toBe("stop");
     expect(body.choices[0]!.message.content).toBe("Chicago Weather");
@@ -2523,19 +1476,11 @@ describe("InvokeServer consumer-supplied tools (docs/adr/0035)", () => {
       search: vi.fn().mockImplementation((_t: string, tools: unknown[], k: number) => Promise.resolve(tools.slice(0, k))),
       prune: vi.fn(),
     };
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({ result: "ok" } as AgentState),
-      stream: vi.fn(),
-    };
-    const server = new InvokeServer(graph, undefined, undefined, undefined, undefined, undefined, callerToolStore, 2);
+    const engine = fakeEngine({ result: "ok" });
+    const server = new InvokeServer(engine, undefined, undefined, undefined, undefined, callerToolStore, 2);
     const port = await listenOn(server);
 
-    const post = (tools: unknown[]): Promise<Response> =>
-      fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-        body: JSON.stringify({ messages: [{ role: "user", content: "hi" }], tools }),
-      });
+    const post = (tools: unknown[]): Promise<Response> => chat(port, { messages: [{ role: "user", content: "hi" }], tools });
 
     await post([toolDef("a"), toolDef("b")]);
     expect(callerToolStore.index).not.toHaveBeenCalled();
@@ -2543,29 +1488,17 @@ describe("InvokeServer consumer-supplied tools (docs/adr/0035)", () => {
     await post([toolDef("a"), toolDef("b"), toolDef("c")]);
     expect(callerToolStore.index).toHaveBeenCalledTimes(1);
     expect(callerToolStore.search).toHaveBeenCalledWith("hi", expect.arrayContaining([expect.anything()]), 2);
-    // Pruned to top-K before it ever reaches the planner.
-    const lastCall = (graph.invoke as ReturnType<typeof vi.fn>).mock.calls.at(-1)![0] as { callerTools: unknown[] };
-    expect(lastCall.callerTools).toHaveLength(2);
+    // Pruned to top-K before it ever reaches the engine.
+    expect(engine.invoke.mock.lastCall![0].callerTools).toHaveLength(2);
 
     await server.close();
   });
 
   it("surfaces pendingToolCalls on GET /invoke/:id for a programmatic caller", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({
-        pendingToolCalls: [{ id: "call_abc", name: "get_weather", arguments: "{}" }],
-      } as AgentState),
-      stream: vi.fn().mockResolvedValue(noStream()),
-    };
-    const server = new InvokeServer(graph);
+    const server = new InvokeServer(fakeEngine({ pendingToolCalls: [{ id: "call_abc", name: "get_weather", arguments: "{}" }] }));
     const port = await listenOn(server);
 
-    const postRes = await fetch(`http://127.0.0.1:${port}/invoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: "Bearer tok-1" },
-      body: JSON.stringify({ request: "weather?", tools: [toolDef("get_weather")] }),
-    });
-    const { id } = (await postRes.json()) as { id: string };
+    const { id } = (await (await invoke(port, { request: "weather?", tools: [toolDef("get_weather")] })).json()) as { id: string };
     await vi.waitFor(async () => {
       const res = await fetch(`http://127.0.0.1:${port}/invoke/${id}`);
       const body = (await res.json()) as { status: string; pendingToolCalls?: { name: string }[] };
@@ -2588,68 +1521,54 @@ describe("InvokeServer accept-phase identity check (docs/adr/0049 §6)", () => {
   };
   const claims = { login: "alice", accountId: "583231", subjectStatus: "unlinked" as const };
 
-  async function post(graph: AgentGraphLike, trigger = agentTrigger): Promise<{ res: Response; server: InvokeServer }> {
-    const server = new InvokeServer(graph, undefined, undefined, await triggerRegistry([trigger]), undefined, SECRET);
+  async function post(engine: FakeEngine, trigger = agentTrigger): Promise<{ res: Response; server: InvokeServer }> {
+    const server = new InvokeServer(engine, undefined, undefined, await triggerRegistry([trigger]), SECRET);
     const port = await listenOn(server);
-    const res = await fetch(`http://127.0.0.1:${port}/invoke`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: "Bearer tok-1",
-        [SENDER_ASSERTION_HEADER]: mintSenderAssertion(SECRET, claims),
-      },
-      body: JSON.stringify({ event: envelope({ sender: { login: "alice" } }) }),
+    const res = await invoke(port, { event: envelope({ sender: { login: "alice" } }) }, {
+      [SENDER_ASSERTION_HEADER]: mintSenderAssertion(SECRET, claims),
     });
     return { res, server };
   }
 
-  const refusal = {
-    status: "failed" as const,
+  const refusal: IdentityRefusal = {
+    status: "failed",
     error: { code: "identity_link_required", message: "alice: link your GitHub account so swe can act as you: https://gw/x" },
   };
 
   it("answers 403 with the engine's identity error and the trigger's reply, and runs nothing", async () => {
-    const checkIdentity = vi.fn().mockResolvedValue(refusal);
-    const graph: AgentGraphLike = { invoke: vi.fn(), stream: vi.fn(), checkIdentity };
-    const { res, server } = await post(graph);
+    const engine = fakeEngine();
+    engine.checkIdentity.mockResolvedValue(refusal);
+    const { res, server } = await post(engine);
 
     expect(res.status).toBe(403);
     const body = (await res.json()) as { error: Record<string, unknown> };
     expect(body.error.code).toBe("identity_link_required");
     expect(body.error.trigger).toMatchObject({ name: "triage-as-sender", reply: { github: { onIdentityError: true } } });
-    expect(graph.invoke).not.toHaveBeenCalled();
+    expect(engine.invoke).not.toHaveBeenCalled();
 
     // The check saw the turn as the engine would: forced agent, signed
     // override, and the gateway's full sender claims.
-    expect(checkIdentity).toHaveBeenCalledWith(
+    expect(engine.checkIdentity).toHaveBeenCalledWith(
       expect.objectContaining({ forcedAgentId: "swe", identityOverride: "delegated", senderLogin: "alice", senderClaims: claims }),
     );
     await server.close();
   });
 
   it("accepts as before when the engine has no objection, carrying the claims into the run", async () => {
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({ request: "x", authToken: "t", skillCandidates: [], result: "done" } as AgentState),
-      stream: vi.fn().mockResolvedValue(noStream()),
-      checkIdentity: vi.fn().mockResolvedValue(undefined),
-    };
-    const { res, server } = await post(graph);
+    const engine = fakeEngine();
+    const { res, server } = await post(engine);
     expect(res.status).toBe(202);
-    await new Promise((r) => setTimeout(r, 10));
-    expect(graph.invoke).toHaveBeenCalledWith(expect.objectContaining({ senderClaims: claims }));
+    await tick();
+    expect(engine.invoke).toHaveBeenCalledWith(expect.objectContaining({ senderClaims: claims }));
     await server.close();
   });
 
   it("does not check a trigger that names no agent", async () => {
-    const checkIdentity = vi.fn().mockResolvedValue(refusal);
-    const graph: AgentGraphLike = {
-      invoke: vi.fn().mockResolvedValue({ request: "x", authToken: "t", skillCandidates: [], result: "done" } as AgentState),
-      stream: vi.fn().mockResolvedValue(noStream()),
-      checkIdentity,
-    };
-    const { res, server } = await post(graph, catchAllTrigger);
+    const engine = fakeEngine();
+    engine.checkIdentity.mockResolvedValue(refusal);
+    const { res, server } = await post(engine, catchAllTrigger);
     expect(res.status).toBe(202);
-    expect(checkIdentity).not.toHaveBeenCalled();
+    expect(engine.checkIdentity).not.toHaveBeenCalled();
     await server.close();
   });
 });
@@ -2660,19 +1579,16 @@ describe("InvokeServer trace context (docs/adr/0050 §4)", () => {
       ["00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", "4bf92f3577b34da6a3ce929d0e0e4736"],
       ["not-a-traceparent", undefined],
     ] as const) {
-      const graph: AgentGraphLike = {
-        invoke: vi.fn().mockResolvedValue({ request: "x", authToken: "t", skillCandidates: [], result: "done" } as AgentState),
-        stream: vi.fn().mockResolvedValue(noStream()),
-      };
-      const server = new InvokeServer(graph);
+      const engine = fakeEngine();
+      const server = new InvokeServer(engine);
       const port = await listenOn(server);
       await fetch(`http://127.0.0.1:${port}/invoke`, {
         method: "POST",
         headers: { "content-type": "application/json", authorization: "Bearer t", traceparent: header },
         body: JSON.stringify({ request: "hi" }),
       });
-      await new Promise((r) => setTimeout(r, 10));
-      const arg = (graph.invoke as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as { traceparent?: string };
+      await tick();
+      const arg = engine.invoke.mock.calls[0]![0];
       expect(arg.traceparent).toEqual(ANY_TRACEPARENT);
       // Never the inbound span itself: this hop is a span of its own.
       expect(arg.traceparent).not.toBe(header);
@@ -2686,11 +1602,8 @@ describe("InvokeServer trace context (docs/adr/0050 §4)", () => {
     const exporter = new InMemorySpanExporter();
     const stop = setupTelemetry("agent-orchestrator", { spanProcessor: new SimpleSpanProcessor(exporter) });
     try {
-      const graph: AgentGraphLike = {
-        invoke: vi.fn().mockResolvedValue({ request: "x", authToken: "t", skillCandidates: [], result: "done" } as AgentState),
-        stream: vi.fn().mockResolvedValue(noStream()),
-      };
-      const server = new InvokeServer(graph);
+      const engine = fakeEngine();
+      const server = new InvokeServer(engine);
       const port = await listenOn(server);
       const res = await fetch(`http://127.0.0.1:${port}/invoke`, {
         method: "POST",
@@ -2698,11 +1611,10 @@ describe("InvokeServer trace context (docs/adr/0050 §4)", () => {
         body: JSON.stringify({ request: "hi" }),
       });
       const { id } = (await res.json()) as { id: string };
-      await new Promise((r) => setTimeout(r, 10));
+      await tick();
       const span = exporter.getFinishedSpans().find((s) => s.name === "POST /invoke");
       expect(span?.parentSpanContext?.spanId).toBe("00f067aa0ba902b7");
-      const arg = (graph.invoke as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as { traceparent?: string };
-      expect(arg.traceparent).toBe(`00-4bf92f3577b34da6a3ce929d0e0e4736-${span!.spanContext().spanId}-01`);
+      expect(engine.invoke.mock.calls[0]![0].traceparent).toBe(`00-4bf92f3577b34da6a3ce929d0e0e4736-${span!.spanContext().spanId}-01`);
       expect(span?.attributes).toMatchObject({ "http.response.status_code": 202, "aktis.invocation_id": id });
       await server.close();
     } finally {

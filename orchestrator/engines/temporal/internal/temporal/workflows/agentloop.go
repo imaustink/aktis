@@ -24,8 +24,7 @@ import (
 // Raised 4→8 so a knowledge-base turn can actually iterate: search, read what
 // came back, search again with narrower terms, and read a live document — the
 // research loop the KB skill now asks for — without the cap forcing an answer
-// after one lookup. Still a runaway guard, just a looser one. PARITY:
-// MAX_TOOL_STEPS in the TS graph.
+// after one lookup. Still a runaway guard, just a looser one.
 const maxToolSteps = 8
 
 // Change IDs for workflow.GetVersion, one per change that alters the commands a
@@ -313,8 +312,7 @@ func runAgentTurn(ctx workflow.Context, actx workflow.Context, state *Conversati
 		// relevance-gate the catalog with the same CheckToolFit two-stage gate
 		// selectFallbackTool already uses, so a well-fitting Tool is offered to
 		// the combined selector rather than being starved out by a broad Agent
-		// that merely overlaps the request. Mirrors the langgraph engine's
-		// retrieveTools node.
+		// that merely overlaps the request.
 		fittedTools := fitCandidates(ctx, actx, in.Message, retrieveCatalogTools(ctx, actx, in))
 
 		if len(skills) == 0 && len(agents) == 0 && len(fittedTools) == 0 {
@@ -401,8 +399,7 @@ func runAgentTurn(ctx workflow.Context, actx workflow.Context, state *Conversati
 
 	// A skill's own agentRefs (ADR 0021) reach the planner as candidates too,
 	// adapted into the same ToolDescriptor shape an agent-backed Tool
-	// (Tool.spec.agentRef) already produces (upstream's loadSkillTools,
-	// graph.ts:1703-1758) — the planner and the dispatch below don't need to
+	// (Tool.spec.agentRef) already produces — the planner and the dispatch below don't need to
 	// know whether AgentRef came from a Tool wrapper or a Skill's own refs.
 	planCandidates := skillTools.Tools
 	for _, agent := range skillTools.Agents {
@@ -580,8 +577,7 @@ func runAgentTurn(ctx workflow.Context, actx workflow.Context, state *Conversati
 			// Back into the loop like a search, NOT returned as the answer: a
 			// live document is material to answer from. Returning it ended the
 			// turn on a raw dump the moment the planner reached for the live
-			// face, with no synthesis and no further steps. PARITY: the TS graph
-			// appends read results to actionHistory and re-plans.
+			// face, with no synthesis and no further steps.
 			outcome := ToolOutcome{Succeeded: true, Result: read.Result}
 			lastSuccess, lastWasKnowledgeBase = &outcome, true
 			pendingVerbatim = ""
@@ -835,8 +831,7 @@ func runAgentTurn(ctx workflow.Context, actx workflow.Context, state *Conversati
 			// sources/disclosure must survive a LATER non-KB tool in the same turn
 			// (e.g. [KB search -> other tool -> respond]), or the turn emits an
 			// uncited answer and drops the ADR 0040 guarantee. Only knowledge-base
-			// results add to it, matching the TS engine, where the KB nodes are the
-			// sole writers.
+			// results add to it.
 			note(plan.ToolID + " finished")
 		} else {
 			record.Error = outcome.ErrorCode + ": " + outcome.ErrorMessage
@@ -927,8 +922,7 @@ func runAgentTurn(ctx workflow.Context, actx workflow.Context, state *Conversati
 //
 // Dispatch branches on tool.AgentRef (ADR 0021/agentRunTemplate): an
 // agent-backed tool runs as an AgentRun over the same child-workflow bridge
-// peer-level delegation uses, instead of a ToolRun Job (upstream's runTool,
-// graph.ts:1845-1910).
+// peer-level delegation uses, instead of a ToolRun Job.
 func runToolWithContinuation(
 	ctx workflow.Context,
 	actx workflow.Context,
@@ -1134,9 +1128,7 @@ func runAgentBackedTool(
 }
 
 // bareAnswer is the true last resort (upstream's callBestEffort): only the
-// CURRENT request reaches the model, never the accumulated transcript — the
-// same call best-effort-responder.ts's respond() makes with one string, not
-// a message history.
+// CURRENT request reaches the model, never the accumulated transcript.
 func bareAnswer(ctx workflow.Context, actx workflow.Context, request string) (string, error) {
 	var reply string
 	err := workflow.ExecuteActivity(actx, activities.CompleteTurnActivityName, activities.CompleteTurnInput{
@@ -1175,8 +1167,8 @@ func findTool(toolID string, st *activities.SkillTools) *catalog.ToolDescriptor 
 }
 
 // adaptAgentAsTool adapts a resolved Agent into the same ToolDescriptor shape
-// an agent-backed Tool (Tool.spec.agentRef) already produces (upstream ADR
-// 0021, graph.ts:1703-1758's loadSkillTools): the planner and dispatch don't
+// an agent-backed Tool (Tool.spec.agentRef) already produces (ADR 0021): the
+// planner and dispatch don't
 // need to know whether AgentRef came from a Tool wrapper or a Skill's own
 // agentRefs.
 func adaptAgentAsTool(agent catalog.AgentDescriptor) catalog.ToolDescriptor {
@@ -1205,8 +1197,6 @@ func adaptAgentAsTool(agent catalog.AgentDescriptor) catalog.ToolDescriptor {
 //     to an appended Sources list when it cited nothing), and what the
 //     retrievals could not see is appended — so citations/disclosure (ADR 0040)
 //     survive Respond while useful synthesis is preserved.
-//
-// PARITY: respondResult in orchestrator/apps/agent-orchestrator/src/agent/graph.ts.
 func finalizeRespond(response, verbatim string, cited citations) string {
 	if verbatim != "" {
 		return verbatim

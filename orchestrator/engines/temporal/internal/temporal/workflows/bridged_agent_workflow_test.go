@@ -410,7 +410,7 @@ func TestBridgedAgentNeverReadyFailsFast(t *testing.T) {
 	require.True(t, cancelled)
 }
 
-// TS's nats-agent-channel.ts bounds silence from a bridged agent by
+// The retired TS engine's nats-agent-channel.ts bounded silence from a bridged agent by
 // AGENT_IDLE_TIMEOUT_SECONDS (config.ts, overridable per deployment) and
 // reports "went silent for <N>ms" verbatim in that wording. Go hardcoded 30
 // minutes with no way to override it and reported a %s-formatted Duration

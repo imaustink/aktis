@@ -4,7 +4,6 @@ import { cleanupAgentRunsSince, fetchThrough, waitFor } from "../support/k8s.js"
 import { resetFakeGithub } from "../support/fixtures.js";
 import { seedAllClaudeCredentials } from "../support/credential-store.js";
 import { resetStubPacing } from "../support/resilience.js";
-import { deployedEngine } from "../support/engine.js";
 import {
   EXAMPLE_ACK_TEXT,
   STUB_REPLY_MARKER,
@@ -30,7 +29,7 @@ requireMinikubeContext();
  * riding on a string surviving an attacker-influenced body.
  *
  * Each hop is asserted where it is observable:
- *   CR        AgentRun.spec.readOnly          (the orchestrator's output, both engines)
+ *   CR        AgentRun.spec.readOnly          (the engine's output)
  *   Job       AGENT_READ_ONLY=true            (core-controller's rendering)
  *   process   stub reply `readOnly=true ...`  (agent-runtime's session.readOnly)
  *
@@ -99,7 +98,7 @@ async function assertReadOnlyAllTheWayDown(run: AgentRunDetail, expected: Record
   expect(parseRunFlagsLine(replyText)).toEqual({ readOnly: true, params: expected });
 }
 
-describe(`EventTrigger target.readOnly reaches the run (engine: ${deployedEngine()})`, () => {
+describe("EventTrigger target.readOnly reaches the run", () => {
   let secret: string;
   let suiteStartedAt: Date;
 
@@ -194,9 +193,8 @@ describe(`EventTrigger target.readOnly reaches the run (engine: ${deployedEngine
       // Wait for the follow-up TURN to finish (the session page stops showing a
       // "working…" turn), not for a launch: whether this plain chat turn may
       // launch at all is the engine's repository read gate's call, not the
-      // sticky flag's. The Temporal engine refuses it -- a session-page prompt
-      // names no verified repository for a github-declaring agent (ADR 0042) --
-      // while LangGraph has no such gate and launches.
+      // sticky flag's. The engine refuses it -- a session-page prompt names no
+      // verified repository for a github-declaring agent (ADR 0042).
       await waitFor(
         "the follow-up turn to finish on the session page",
         async () => {
@@ -208,15 +206,12 @@ describe(`EventTrigger target.readOnly reaches the run (engine: ${deployedEngine
 
       // A plain conversational turn -- no trigger, so no params to match on;
       // any run launched since the prompt is this turn's (the suite is serial).
-      // The invariant on BOTH engines: nothing it launched may be writable.
+      // The invariant: nothing it launched may be writable. The follow-up may
+      // launch nothing at all, so this loop can be vacuous; the sticky flag
+      // for a follow-up is pinned by the Go engine's
+      // TestReadOnlyIsStickyUntilATriggerSetsItAgain.
       const runs = await agentRunDetailsSince(startedAt);
       for (const run of runs) expect(run.readOnly, `AgentRun ${run.name} (${run.agentRef}) launched by the follow-up`).toBe(true);
-      // Where the follow-up does launch (LangGraph), require that it did, so the
-      // loop above is never vacuous there. Temporal's sticky flag for a
-      // follow-up is pinned by TestReadOnlyIsStickyUntilATriggerSetsItAgain.
-      if ((await deployedEngine()) === "langgraph") {
-        expect(runs.length, "the LangGraph follow-up launched no AgentRun").toBeGreaterThan(0);
-      }
     });
 
     it("a TRIAGE label applied after the review runs writable: a trigger turn sets the session's mode", async () => {

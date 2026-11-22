@@ -19,7 +19,7 @@ const STUB_REPLY_MARKER = "stub-agent-reply";
 const STARTING_WORK_ACK = "Starting work on this now.";
 
 /**
- * The idle window this environment runs with — `agentIdleTimeoutSeconds` in
+ * The idle window this environment runs with — `temporal-engine.worker.idleTimeoutSeconds` in
  * orchestrator/charts/aktis/values-e2e.yaml. Specs below pace turns relative to
  * it, so it lives here as a named constant rather than as scattered magic
  * numbers that would silently stop meaning anything if the value changed.
@@ -268,9 +268,9 @@ describe("resilience: infrastructure moving under an in-flight agent turn", () =
    * What is NOT the explanation: a stale image. `maxReconnectAttempts: -1` was
    * confirmed present in the deployed stub-agent bundle, so the AGENT side has
    * the reconnect hardening too, and it still failed. The orchestrator side of
-   * this is separately proven against a real 23s outage in
-   * orchestrator/apps/agent-orchestrator/src/agents/nats-agent-channel.integration.test.ts
-   * (the client rides it out, resubscribes and receives the reply), so what is
+   * this was separately proven against a real 23s outage by the retired
+   * in-process engine's NATS channel test (removed with it, docs/adr/0053;
+   * the Temporal engine now owns that hop), so what is
    * unverified is specifically an agent POD surviving the loss of its NATS
    * server -- publishes issued while the server is gone, and whether the run
    * process survives to publish its reply at all.

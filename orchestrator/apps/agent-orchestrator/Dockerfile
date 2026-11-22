@@ -50,12 +50,6 @@ COPY --from=build /repo/node_modules ./node_modules
 COPY --from=build /repo/orchestrator/apps/agent-orchestrator/dist ./dist
 COPY --from=build /repo/orchestrator/apps/agent-orchestrator/package.json ./package.json
 
-# NOTE: no per-tool manifest.json COPY lines here anymore (ADR 0009 is
-# superseded by ADR 0010) -- the tool catalog is now discovered at runtime
-# from `Tool` custom resources (see src/registry/crd-tool-registry.ts)
-# rather than baked into this image at build time. Registering a new tool
-# is now "apply a Tool CR", not "add a COPY line + rebuild".
-
 RUN useradd --system --uid 10001 --create-home orchestrator
 USER orchestrator
 

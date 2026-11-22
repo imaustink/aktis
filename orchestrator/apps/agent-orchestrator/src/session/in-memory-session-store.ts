@@ -1,4 +1,3 @@
-import type { SubAgentApprovalPending } from "../agent/graph.js";
 import type { SessionRecord, SessionStore } from "./types.js";
 
 export interface InMemorySessionStoreOptions {
@@ -14,9 +13,8 @@ export interface InMemorySessionStoreOptions {
  * In-memory {@link SessionStore} adapter (docs/adr/0012). Deliberately
  * simple: a Map with sliding-TTL expiry checked lazily on access plus a
  * max-entries cap with least-recently-updated eviction — no timers to leak.
- * Suitable for the chart's default single-replica deployment only; sessions
- * are best-effort routing hints, so losing one (restart, eviction, a second
- * replica) degrades harmlessly to per-turn skill selection.
+ * Suitable for a single-replica deployment only: a second replica, a restart
+ * or an eviction loses the record.
  */
 export class InMemorySessionStore implements SessionStore {
   private readonly sessions = new Map<string, SessionRecord>();
@@ -47,17 +45,5 @@ export class InMemorySessionStore implements SessionStore {
       this.sessions.delete(oldest);
     }
     return Promise.resolve();
-  }
-
-  /** Scans the map for sessions holding a sub-agent-approval pause (index.ts sweeper). */
-  listSubAgentApprovals(): Promise<Array<{ sessionId: string; pending: SubAgentApprovalPending }>> {
-    const out: Array<{ sessionId: string; pending: SubAgentApprovalPending }> = [];
-    for (const [sessionId, record] of this.sessions) {
-      // Skip TTL-expired records: they'd be dropped on next `get` anyway, and a
-      // timed-out session has no live run worth resolving a tool call against.
-      if (this.now() - record.updatedAt > this.opts.ttlMs) continue;
-      if (record.subAgentApprovalPending) out.push({ sessionId, pending: record.subAgentApprovalPending });
-    }
-    return Promise.resolve(out);
   }
 }

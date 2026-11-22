@@ -1,15 +1,14 @@
-import type { ToolDescriptor } from "../tool-descriptor.js";
-import { callerToolId, type CallerToolChoice, type CallerToolDescriptor, type CallerToolStore } from "./types.js";
+import type { CallerToolChoice, CallerToolDescriptor, CallerToolStore } from "./types.js";
 
 /**
- * Decides WHICH of a caller's supplied tools reach the action planner
+ * Decides WHICH of a caller's supplied tools reach the engine
  * (docs/adr/0035 §3) — the just-in-time vectorization step.
  *
  * The ordering here is the whole point. Retrieval is only worth its cost when
  * there is actually something to prune, so a caller sending a handful of tools
  * pays nothing at all: no embedding, no Qdrant round trip, no added latency on
  * the hot path. Only a caller with a large tool array (the case that would
- * otherwise drown a Skill's own 1–5 declared tools in the planner's prompt) gets
+ * otherwise drown the engine's own tools in the planner's prompt) gets
  * indexed and ranked.
  */
 export async function resolveCallerTools(
@@ -55,27 +54,4 @@ export async function resolveCallerTools(
     onWarn?.("caller-tool retrieval failed; truncating to the first tools without ranking", err);
     return tools.slice(0, topK);
   }
-}
-
-/**
- * Adapts a caller tool into the same {@link ToolDescriptor} shape the rest of
- * the graph already dispatches on, with `callerTool` joining
- * `jobTemplate`/`localExec`/`agentRunTemplate` as a fourth mutually-exclusive
- * kind — the only one `runTool` doesn't execute.
- *
- * `allowedRoles` is empty because caller tools are never indexed into, or
- * retrieved from, the RBAC-filtered `VectorStore`: authorization is vacuous for
- * a function the caller both supplied and will run themselves (docs/adr/0035
- * §2). Empty is also the fail-closed value everywhere else in this codebase, so
- * if some future path ever did filter these by role, the accident would be
- * "invisible" rather than "visible to everyone".
- */
-export function toCallerToolDescriptor(tool: CallerToolDescriptor): ToolDescriptor {
-  return {
-    id: callerToolId(tool.name),
-    name: tool.name,
-    description: tool.description,
-    allowedRoles: [],
-    callerTool: tool,
-  };
 }

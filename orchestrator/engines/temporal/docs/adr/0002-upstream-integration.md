@@ -1,5 +1,10 @@
 # ADR 0002 — Upstreaming the Temporal engine into agent-controller
 
+> **Historical (2026-11-21).** The LangGraph engine and the `AGENT_ENGINE`
+> switch this document refers to were removed by
+> [ADR 0053](../../../../../docs/adr/0053-remove-langgraph-engine.md). Kept as a
+> record; it no longer describes a live option.
+
 - Status: accepted
 - Date: 2026-08-02
 - Amends [ADR 0001](0001-agents-as-temporal-workflows.md) §6

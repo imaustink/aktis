@@ -16,7 +16,7 @@ document; where code and this document disagree, one of them is a bug.
                 │  ◄── 200 ignored | 202 { id, trigger: { sessionId, reply } } ◄───┘    │
                 │  reply adapters: ack ─► poll ─► result ─► onComplete                 │
                 └──────────────────────────────────────────────────────────────────────┘
- orchestrator (LangGraph or Temporal): match EventTriggers (CEL) ─► params ─► target
+ orchestrator ─► Temporal engine: match EventTriggers (CEL) ─► params ─► target
 ```
 
 ## 1. CRDs (`core.aktis.ai/v1alpha1`, namespaced)
@@ -129,8 +129,7 @@ Rules:
   selection) on the rendered prompt. `skillRef` / `agentRef` force that Skill /
   Agent (still re-resolved under the caller's roles; a miss is a turn failure, not
   a fallback). `toolRef` runs that Tool once with `params` as its input, skipping the
-  planner; `promptTemplate` is optional for it. Tools take one string input in
-  both engines, so the **tool input** is: the string form of `params.input` when
+  planner; `promptTemplate` is optional for it. Tools take one string input, so the **tool input** is: the string form of `params.input` when
   `params` has exactly one key named `input`; otherwise the params object as
   compact JSON with sorted keys (`{}` when there are no params).
 - `readOnly: true` sets `readOnly` on every `AgentRun` and `ToolRun` the turn

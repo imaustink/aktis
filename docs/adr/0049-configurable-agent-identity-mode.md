@@ -417,6 +417,9 @@ Temporal gateway's verdicts.
 
 ### The LangGraph engine is frozen, and fails closed
 
+> **2026-11-21:** superseded by [0053](0053-remove-langgraph-engine.md), which
+> removed the LangGraph engine. The fail-closed refusals below went with it.
+
 The in-process LangGraph engine (`AGENT_ENGINE=langgraph`) is headed for
 deprecation, so none of this is built on it. It must still never silently
 ignore a mode it doesn't implement:

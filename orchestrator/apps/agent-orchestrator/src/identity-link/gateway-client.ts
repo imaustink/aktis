@@ -6,7 +6,7 @@
  * gateway), styled the same way: bearer-authed, fetch-based, injectable
  * `fetchImpl` for tests.
  *
- * Lets `delegateToAgent`/`checkPendingIdentityLink` (agent/graph.ts) start a
+ * Was written for the removed in-process engine (docs/adr/0053) to start a
  * one-time OAuth Device Flow for a caller who hasn't linked their GitHub
  * identity yet, poll it to completion, and fetch the caller's current
  * (transparently refreshed) token once linked.
@@ -53,7 +53,7 @@ export interface IdentityLinkToken {
 
 export interface IdentityLinkPort {
   start(provider: string, subject: string, flow: "device" | "authcode"): Promise<IdentityLinkStartResult>;
-  /** Only ever called for a `"device"`-flow pending link (see graph.ts's `checkPendingIdentityLink`) -- a provider whose `start` never returns `flow: "device"` need not meaningfully implement this. */
+  /** Only ever called for a `"device"`-flow pending link -- a provider whose `start` never returns `flow: "device"` need not meaningfully implement this. */
   poll(provider: string, subject: string, deviceCode: string): Promise<IdentityLinkPollStatus>;
   /** Returns `undefined` when nothing is linked yet for this (provider, subject) -- a 404, not an error. */
   getToken(provider: string, subject: string): Promise<IdentityLinkToken | undefined>;
