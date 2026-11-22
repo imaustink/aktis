@@ -1,6 +1,7 @@
 package workflows
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -73,6 +74,12 @@ type TurnMeta struct {
 	// reported one (see TurnProgress.RemoteControlUrl / ConversationState.
 	// RemoteControlUrl). Empty for every run that never emits one.
 	RemoteControlUrl string `json:"remoteControlUrl,omitempty"`
+	// Outcome is the forced agent's final-reply outcome object (docs/adr/0052
+	// §2), surfaced as `outcome` on the /invoke poll so integration-gateway
+	// can put it in the run-completion event. Kept only on a turn that
+	// dispatched a forced agentRef (see ConversationWorkflow); a chat turn
+	// that happened to delegate never reports one.
+	Outcome json.RawMessage `json:"outcome,omitempty"`
 }
 
 // runAgentTurn is the ported agent loop: active agent → event trigger target →
@@ -108,7 +115,10 @@ func runAgentTurn(ctx workflow.Context, actx workflow.Context, state *Conversati
 			meta.Path = "agent-continued"
 			meta.AgentID = state.ActiveAgentID
 			gen := state.beginAgentListen(ctx)
-			reply, preempted := handleAgentUp(ctx, state, state.ActiveAgentID, state.ActiveAgentWorkflowID, gen, note)
+			// Carried like any other delegation's; ConversationWorkflow keeps it
+			// only when this turn itself was a forced agentRef dispatch.
+			reply, outcome, preempted := handleAgentUp(ctx, state, state.ActiveAgentID, state.ActiveAgentWorkflowID, gen, note)
+			meta.Outcome = outcome
 			if preempted {
 				// A still-later turn took over listening for this episode's
 				// reply before (or while) this one was waiting — that turn

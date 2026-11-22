@@ -1,6 +1,7 @@
 package workflows
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"go.temporal.io/sdk/workflow"
@@ -133,7 +134,8 @@ func delegateToAgent(ctx workflow.Context, actx workflow.Context, state *Convers
 	state.ActiveAgentReadOnly = in.ReadOnly
 
 	gen := state.beginAgentListen(ctx)
-	reply, preempted := handleAgentUp(ctx, state, agent.ID, childID, gen, note)
+	reply, outcome, preempted := handleAgentUp(ctx, state, agent.ID, childID, gen, note)
+	meta.Outcome = outcome
 	if preempted {
 		// Vanishingly unlikely for the call that JUST started this episode
 		// (nothing else could have raced it in), but handled the same way
@@ -155,7 +157,10 @@ func delegateToAgent(ctx workflow.Context, actx workflow.Context, state *Convers
 // this one was still waiting; the caller must not act on the empty message
 // (no clearActive, no reply content) since the newer call owns finishing
 // this exchange.
-func handleAgentUp(ctx workflow.Context, state *ConversationState, agentID, childID string, myGeneration int, note func(string)) (message string, preempted bool) {
+//
+// outcome is the final reply's runner outcome (docs/adr/0052 §2), set only
+// when the episode concluded with a Final message carrying one.
+func handleAgentUp(ctx workflow.Context, state *ConversationState, agentID, childID string, myGeneration int, note func(string)) (message string, outcome json.RawMessage, preempted bool) {
 	upCh := workflow.GetSignalChannel(ctx, AgentUpSignalPrefix+childID)
 	timerCtx, cancelTimer := workflow.WithCancel(ctx)
 	defer cancelTimer()
@@ -171,7 +176,7 @@ func handleAgentUp(ctx workflow.Context, state *ConversationState, agentID, chil
 		// ahead of the preempt channel delivering) must still be caught here
 		// before this call touches upCh again.
 		if state.AgentListenGeneration != myGeneration {
-			return "", true
+			return "", nil, true
 		}
 
 		var (
@@ -203,7 +208,7 @@ func handleAgentUp(ctx workflow.Context, state *ConversationState, agentID, chil
 		if timedOut {
 			clearActive()
 			_ = workflow.RequestCancelExternalWorkflow(ctx, childID, "").Get(ctx, nil)
-			return fmt.Sprintf("Agent %s didn't respond within %s; I've cancelled it.", agentID, agentEpisodeTimeout), false
+			return fmt.Sprintf("Agent %s didn't respond within %s; I've cancelled it.", agentID, agentEpisodeTimeout), nil, false
 		}
 		if !received {
 			continue
@@ -213,7 +218,7 @@ func handleAgentUp(ctx workflow.Context, state *ConversationState, agentID, chil
 			note(u.Message)
 		case u.Failed:
 			clearActive()
-			return fmt.Sprintf("Agent %s failed (%s): %s", agentID, u.Code, u.Message), false
+			return fmt.Sprintf("Agent %s failed (%s): %s", agentID, u.Code, u.Message), nil, false
 		case u.Final:
 			clearActive()
 			if u.Result != "" {
@@ -222,10 +227,10 @@ func handleAgentUp(ctx workflow.Context, state *ConversationState, agentID, chil
 				}
 				state.AgentContinuations[agentID] = u.Result
 			}
-			return u.Message, false
+			return u.Message, u.Outcome, false
 		default: // a question — the episode stays active across turns
 			note("Agent " + agentID + " needs input")
-			return u.Message, false
+			return u.Message, nil, false
 		}
 	}
 }

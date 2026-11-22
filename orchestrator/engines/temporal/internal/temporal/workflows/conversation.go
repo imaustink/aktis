@@ -491,6 +491,13 @@ func ConversationWorkflow(ctx workflow.Context, state *ConversationState) error 
 			return TurnResult{}, err
 		}
 		meta.Narration = progress.Lines
+		// The outcome is a forced agentRef turn's (docs/adr/0052 §2): it is
+		// what an EventTrigger's onComplete reports, and no other caller
+		// asked for it. A chat turn that delegated keeps its response as it
+		// always was.
+		if in.ForcedAgentID == "" {
+			meta.Outcome = nil
+		}
 		switch {
 		case progress.RemoteControlUrl != "":
 			// This turn's own episode start/continuation reported it.

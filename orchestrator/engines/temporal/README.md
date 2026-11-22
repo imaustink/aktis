@@ -90,13 +90,21 @@ curl -s -XPOST localhost:8080/invoke -H 'Content-Type: application/json' -d '{
             "sender":{"login":"octocat","isBot":false},"repository":"acme/widgets"}
 }'
 # 202 {"id":"conversation-github-acme-widgets-42.<uuid>","status":"pending",
-#      "trigger":{"name":"github-pr-review","sessionId":"github:acme/widgets#42","reply":{...}}}
+#      "trigger":{"name":"github-pr-review","sessionId":"github:acme/widgets#42","reply":{...},
+#                 "params":{"number":"42","repo":"acme/widgets"},"onComplete":{"emitTo":"runs"}}}
 # 200 {"status":"ignored"}                 — no trigger matched: no turn, no RAG fallback
 # 422 {"status":"failed","error":"..."}    — matched, but params/templates failed
 
 curl -s localhost:8080/invoke/<id>
-# {"id":"...","status":"succeeded","result":"..."}
+# {"id":"...","status":"succeeded","result":"...","outcome":{...}}
 ```
+
+`onComplete` appears only when the trigger sets it. `outcome` (docs/adr/0052
+§2) is a forced `agentRef` run's final-reply outcome object, when it sent
+one; anything that is not a JSON object of at most 8192 bytes compact is
+dropped. A `target.none` trigger is accepted (202, same `trigger` object)
+but runs nothing and skips the identity check; its poll reports
+`{"status":"succeeded","result":""}` straight away.
 
 A forced target is re-resolved under the caller's roles and a miss fails the
 turn. A `toolRef` runs its tool once with `toolInput`, skipping the planner.

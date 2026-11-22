@@ -43,7 +43,11 @@ type EventTriggerMatch struct {
 }
 
 type EventTriggerTarget struct {
-	Orchestrator   *struct{} `json:"orchestrator,omitempty"`
+	Orchestrator *struct{} `json:"orchestrator,omitempty"`
+	// None runs nothing: the trigger exists only for its reply side effects
+	// (a label, an assignee) and, via onComplete, to end a chain cleanly
+	// (docs/adr/0052 §3).
+	None           *struct{} `json:"none,omitempty"`
 	SkillRef       string    `json:"skillRef,omitempty"`
 	AgentRef       string    `json:"agentRef,omitempty"`
 	ToolRef        string    `json:"toolRef,omitempty"`
@@ -52,6 +56,33 @@ type EventTriggerTarget struct {
 	// Identity overrides the identity mode of every agent the turn
 	// authorizes (docs/adr/0049); see authz.ResolveMode.
 	Identity string `json:"identity,omitempty"`
+}
+
+// Target kinds, as the TS engine's TriggerTargetKind names them.
+const (
+	TargetOrchestrator = "orchestrator"
+	TargetNone         = "none"
+	TargetSkill        = "skill"
+	TargetAgent        = "agent"
+	TargetTool         = "tool"
+)
+
+// Kind names which of the (mutually exclusive) targets is set. A descriptor
+// that compiled has exactly one; "" means none of them is.
+func (t EventTriggerTarget) Kind() string {
+	switch {
+	case t.None != nil:
+		return TargetNone
+	case t.Orchestrator != nil:
+		return TargetOrchestrator
+	case t.SkillRef != "":
+		return TargetSkill
+	case t.AgentRef != "":
+		return TargetAgent
+	case t.ToolRef != "":
+		return TargetTool
+	}
+	return ""
 }
 
 type EventSecretKeySelector struct {
@@ -66,6 +97,10 @@ type EventGitHubReply struct {
 	SessionPage bool   `json:"sessionPage,omitempty"`
 	Result      bool   `json:"result,omitempty"`
 	RemoveLabel string `json:"removeLabel,omitempty"`
+	// AddLabels / Assignees are applied when the run is accepted (docs/adr/
+	// 0052 §3). Each entry is a template, rendered like RemoveLabel.
+	AddLabels []string `json:"addLabels,omitempty"`
+	Assignees []string `json:"assignees,omitempty"`
 	// OnIdentityError: docs/adr/0049 §6.
 	OnIdentityError bool `json:"onIdentityError,omitempty"`
 }
@@ -84,13 +119,21 @@ type EventTriggerReply struct {
 }
 
 type EventTriggerSpec struct {
-	SourceRef  string             `json:"sourceRef,omitempty"`
-	Priority   int32              `json:"priority,omitempty"`
-	Match      EventTriggerMatch  `json:"match,omitempty"`
-	Params     map[string]string  `json:"params,omitempty"`
-	SessionKey string             `json:"sessionKey,omitempty"`
-	Target     EventTriggerTarget `json:"target"`
-	Reply      *EventTriggerReply `json:"reply,omitempty"`
+	SourceRef  string                  `json:"sourceRef,omitempty"`
+	Priority   int32                   `json:"priority,omitempty"`
+	Match      EventTriggerMatch       `json:"match,omitempty"`
+	Params     map[string]string       `json:"params,omitempty"`
+	SessionKey string                  `json:"sessionKey,omitempty"`
+	Target     EventTriggerTarget      `json:"target"`
+	Reply      *EventTriggerReply      `json:"reply,omitempty"`
+	OnComplete *EventTriggerOnComplete `json:"onComplete,omitempty"`
+}
+
+// EventTriggerOnComplete names the run-kind EventSource that receives this
+// trigger's run-completion events (docs/adr/0052 §1). The engine only reports
+// it in the accepted response; integration-gateway emits the event.
+type EventTriggerOnComplete struct {
+	EmitTo string `json:"emitTo,omitempty"`
 }
 
 // --- the envelope (docs/event-triggers.md §2) ---
@@ -502,8 +545,10 @@ func (d *EventTriggerDescriptor) compile() error {
 	// The controller's admission CEL enforces both of these; re-checked here
 	// because a trigger with two targets would silently dispatch to one.
 	targets := 0
-	if d.Spec.Target.Orchestrator != nil {
-		targets++
+	for _, set := range []bool{d.Spec.Target.Orchestrator != nil, d.Spec.Target.None != nil} {
+		if set {
+			targets++
+		}
 	}
 	for _, ref := range []string{d.Spec.Target.SkillRef, d.Spec.Target.AgentRef, d.Spec.Target.ToolRef} {
 		if ref != "" {
@@ -511,10 +556,16 @@ func (d *EventTriggerDescriptor) compile() error {
 		}
 	}
 	if targets != 1 {
-		return fmt.Errorf("exactly one of orchestrator/skillRef/agentRef/toolRef must be set, got %d", targets)
+		return fmt.Errorf("exactly one of orchestrator/none/skillRef/agentRef/toolRef must be set, got %d", targets)
 	}
-	if d.Spec.Target.ToolRef == "" && strings.TrimSpace(d.Spec.Target.PromptTemplate) == "" {
-		return fmt.Errorf("promptTemplate is required unless toolRef is set")
+	if d.Spec.Target.None != nil {
+		// Nothing runs, so a run mode or a prompt would be config that reads
+		// as meaningful and is silently ignored (docs/adr/0052 §3).
+		if d.Spec.Target.ReadOnly || d.Spec.Target.Identity != "" || d.Spec.Target.PromptTemplate != "" {
+			return fmt.Errorf("readOnly, identity and promptTemplate cannot be set with none")
+		}
+	} else if d.Spec.Target.ToolRef == "" && strings.TrimSpace(d.Spec.Target.PromptTemplate) == "" {
+		return fmt.Errorf("promptTemplate is required unless toolRef or none is set")
 	}
 	// Identity modes apply to agent runs; a tool has none (docs/adr/0049).
 	if d.Spec.Target.ToolRef != "" && d.Spec.Target.Identity != "" {
@@ -607,6 +658,10 @@ type RenderedGitHubReply struct {
 	SessionPage bool   `json:"sessionPage,omitempty"`
 	Result      bool   `json:"result,omitempty"`
 	RemoveLabel string `json:"removeLabel,omitempty"`
+	// AddLabels / Assignees: rendered, with "" entries dropped; omitted when
+	// nothing is left (docs/adr/0052 §3).
+	AddLabels []string `json:"addLabels,omitempty"`
+	Assignees []string `json:"assignees,omitempty"`
 	// OnIdentityError: docs/adr/0049 §6.
 	OnIdentityError bool `json:"onIdentityError,omitempty"`
 }
@@ -807,6 +862,24 @@ func toolInput(params map[string]any) (string, error) {
 	return CompactJSON(params)
 }
 
+// renderList renders each template and drops entries that render to "" — a
+// param that is legitimately empty (an event with no sender login, say) means
+// "nothing to add", never an API call naming an empty label or login. nil
+// when nothing is left, so the field is omitted from the rendered reply.
+func renderList(templates []string, params map[string]any) ([]string, error) {
+	var out []string
+	for i, template := range templates {
+		value, err := RenderEventTemplate(template, params)
+		if err != nil {
+			return nil, fmt.Errorf("[%d]: %w", i, err)
+		}
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out, nil
+}
+
 // decimalDigits is the only spelling an issue number may render to: no sign,
 // no whitespace, no exponent — strconv and Number() each accept some of those
 // and would disagree on which.
@@ -838,6 +911,12 @@ func renderReply(reply *EventTriggerReply, params map[string]any) (*RenderedRepl
 		}
 		if rendered.RemoveLabel, err = RenderEventTemplate(g.RemoveLabel, params); err != nil {
 			return nil, fmt.Errorf("github.removeLabel: %w", err)
+		}
+		if rendered.AddLabels, err = renderList(g.AddLabels, params); err != nil {
+			return nil, fmt.Errorf("github.addLabels: %w", err)
+		}
+		if rendered.Assignees, err = renderList(g.Assignees, params); err != nil {
+			return nil, fmt.Errorf("github.assignees: %w", err)
 		}
 		rendered.OnIdentityError = g.OnIdentityError
 		out.GitHub = rendered

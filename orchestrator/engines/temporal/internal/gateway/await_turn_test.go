@@ -22,8 +22,10 @@ type fakeUpdateHandle struct {
 	reply string
 	// path sets TurnResult.Meta.Path, e.g. "link-required" -- what a poller
 	// reads to tell a parked turn apart from a genuinely finished one.
-	path  string
-	calls int
+	path string
+	// outcome sets TurnResult.Meta.Outcome (docs/adr/0052 §2).
+	outcome string
+	calls   int
 	// onCall runs before each result is returned, so a test can cancel the
 	// context mid-flight the way a disconnecting client would.
 	onCall func(call int)
@@ -42,6 +44,9 @@ func (f *fakeUpdateHandle) Get(_ context.Context, valuePtr interface{}) error {
 	if out, ok := valuePtr.(*workflows.TurnResult); ok {
 		out.Reply = f.reply
 		out.Meta.Path = f.path
+		if f.outcome != "" {
+			out.Meta.Outcome = []byte(f.outcome)
+		}
 	}
 	return nil
 }

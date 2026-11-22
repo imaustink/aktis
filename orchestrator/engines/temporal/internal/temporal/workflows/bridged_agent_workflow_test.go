@@ -2,6 +2,7 @@ package workflows_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,6 +37,70 @@ func (le *loopEnv) deliverUp(msg agentrun.UpMessage, at time.Duration) {
 		_ = le.env.SignalWorkflowByID(launch.WorkflowID, agentrun.UpSignalPrefix+launch.RunID, msg)
 	}
 	le.env.RegisterDelayedCallback(attempt, at)
+}
+
+// runBridgedTurnWithOutcome drives one bridged-agent turn to a final reply
+// carrying outcome, and returns the turn's result. forced picks a
+// trigger-style forced agentRef turn over a chat turn that delegated.
+func runBridgedTurnWithOutcome(t *testing.T, forced bool, outcome string) workflows.TurnResult {
+	t.Helper()
+	le := newLoopEnv(t)
+	agent := bridgedAgent()
+	le.agents = []catalog.AgentDescriptor{agent}
+	le.resolvedAgent = &agent
+	le.delegate = activities.DelegateChoice{Kind: activities.DelegateAgent, ID: agent.ID}
+
+	in := workflows.TurnInput{Message: "Review acme/widgets#42", Caller: activities.Caller{Subject: "svc:gw", Roles: []string{"agent"}}}
+	if forced {
+		in.ForcedAgentID = agent.ID
+		in.TriggerName = "factory-review"
+	}
+	var result workflows.TurnResult
+	le.sendTurnInput(t, "turn-1", in, &result, time.Millisecond)
+	le.deliverUp(agentrun.UpMessage{Seq: 1, Type: agentrun.UpReady}, time.Second)
+	reply := agentrun.UpMessage{Seq: 2, Type: agentrun.UpReply, Final: true, Message: "Reviewed.", Result: []byte(`"tok"`)}
+	if outcome != "" {
+		reply.Outcome = []byte(outcome)
+	}
+	le.deliverUp(reply, 2*time.Second)
+
+	le.env.ExecuteWorkflow(workflows.ConversationWorkflowName, (*workflows.ConversationState)(nil))
+	require.True(t, le.env.IsWorkflowCompleted())
+	require.NoError(t, le.env.GetWorkflowError())
+	require.Equal(t, "Reviewed.", result.Reply, "the reply is unaffected by the outcome, valid or not")
+	return result
+}
+
+// docs/adr/0052 §2: a forced agentRef turn's final-reply outcome reaches the
+// turn result (and from there the /invoke poll), compacted.
+func TestBridgedAgentOutcomeReachesAForcedTurnsResult(t *testing.T) {
+	result := runBridgedTurnWithOutcome(t, true, `{ "pullRequest": {"number": 12, "url": "https://x"}, "madeNewCommits": false, "verdict": "ready" }`)
+	require.Equal(t, "agent-routed", result.Meta.Path)
+	require.Equal(t, `{"pullRequest":{"number":12,"url":"https://x"},"madeNewCommits":false,"verdict":"ready"}`, string(result.Meta.Outcome))
+}
+
+// Only a forced agentRef turn reports an outcome: a chat turn that happened
+// to delegate keeps its response exactly as it was.
+func TestBridgedAgentOutcomeStaysOffAChatTurn(t *testing.T) {
+	result := runBridgedTurnWithOutcome(t, false, `{"madeNewCommits":true}`)
+	require.Equal(t, "agent", result.Meta.Path)
+	require.Empty(t, result.Meta.Outcome)
+}
+
+// A non-object or oversized outcome is dropped before it reaches the parent;
+// the reply still lands.
+func TestBridgedAgentDropsAnInvalidOutcome(t *testing.T) {
+	for name, outcome := range map[string]string{
+		"array":     `[1,2]`,
+		"string":    `"ready"`,
+		"null":      `null`,
+		"oversized": `{"pad":"` + strings.Repeat("x", agentrun.MaxOutcomeBytes) + `"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			result := runBridgedTurnWithOutcome(t, true, outcome)
+			require.Empty(t, result.Meta.Outcome)
+		})
+	}
 }
 
 // An unmodified upstream pod agent, launched as the AgentRun it always was,

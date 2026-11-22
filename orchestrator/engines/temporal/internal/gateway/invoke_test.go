@@ -456,12 +456,16 @@ func TestHandleInvokeEventOutcomes(t *testing.T) {
 // trigger declares no reply, so a consumer can tell "no side effects" from
 // "an older gateway that never sends the field".
 func TestInvokeAcceptedTriggerShape(t *testing.T) {
+	m := &catalog.TriggerMatch{Trigger: catalog.NewEventTriggerDescriptor("t", catalog.EventTriggerSpec{
+		Target: catalog.EventTriggerTarget{Orchestrator: &struct{}{}, PromptTemplate: "x"},
+	}, true)}
 	raw, err := json.Marshal(invokeAccepted{
 		ID: "w.u", Status: invokeStatusPending,
-		Trigger: &invokeTrigger{Name: "t", SessionID: "event:ci:1"},
+		Trigger: newInvokeTrigger(m, "event:ci:1"),
 	})
 	require.NoError(t, err)
-	require.JSONEq(t, `{"id":"w.u","status":"pending","trigger":{"name":"t","sessionId":"event:ci:1","reply":null}}`, string(raw))
+	// params is {} with no params (never null); onComplete is absent unless set.
+	require.JSONEq(t, `{"id":"w.u","status":"pending","trigger":{"name":"t","sessionId":"event:ci:1","reply":null,"params":{}}}`, string(raw))
 
 	raw, err = json.Marshal(invokeAccepted{ID: "w.u", Status: invokeStatusPending})
 	require.NoError(t, err)
@@ -680,4 +684,128 @@ func TestShapeInvokeTurnCarriesTheTriggersIdentityOverride(t *testing.T) {
 	matched, err := shapeInvokeTurn(invokeRequest{Event: prEnvelope("ai-review")}, "", "", "", reg, testCaller, now)
 	require.NoError(t, err)
 	require.Equal(t, "agent", matched.turn.IdentityOverride)
+}
+
+// --- docs/adr/0052 ---
+
+// runEnvelope is a run-completion event as integration-gateway builds it.
+func runEnvelope() *catalog.Envelope {
+	return &catalog.Envelope{
+		Source: "runs", Kind: "run", ID: "r-1", Time: "2026-11-21T12:00:00Z",
+		Headers: map[string]string{},
+		Body: map[string]any{
+			"trigger": "factory-review", "status": "succeeded",
+			"params":  map[string]any{"repository": "acme/widgets", "number": "12"},
+			"outcome": map[string]any{"verdict": "ready", "pullRequest": map[string]any{"number": float64(12), "url": "https://x"}},
+			"chain":   map[string]any{"id": "d-1", "depth": float64(2), "counts": map[string]any{"factory-review": float64(1)}},
+		},
+		Sender:     map[string]any{"login": "imaustink", "isBot": false},
+		Repository: "acme/widgets",
+	}
+}
+
+// factoryDoneTriggers: a target.none trigger that labels and assigns the PR
+// once a review says it is ready, and reports its own completion.
+func factoryDoneTriggers(t *testing.T) *catalog.EventTriggerRegistry {
+	t.Helper()
+	reg := catalog.NewEventTriggerRegistry()
+	d := catalog.NewEventTriggerDescriptor("factory-ready", catalog.EventTriggerSpec{
+		SourceRef: "runs",
+		Match:     catalog.EventTriggerMatch{CEL: `kind == "run" && body.outcome.verdict == "ready"`},
+		Params: map[string]string{
+			"repository": "body.params.repository",
+			"number":     "body.outcome.pullRequest.number",
+			"assignee":   "sender.login",
+		},
+		SessionKey: "github:{{repository}}#{{number}}",
+		Target:     catalog.EventTriggerTarget{None: &struct{}{}},
+		Reply: &catalog.EventTriggerReply{GitHub: &catalog.EventGitHubReply{
+			Repository: "{{repository}}", IssueNumber: "{{number}}", RemoveLabel: "factory-review",
+			AddLabels: []string{"ready-for-human", "{{missing-renders-verbatim}}"}, Assignees: []string{"{{assignee}}"},
+		}},
+		OnComplete: &catalog.EventTriggerOnComplete{EmitTo: "runs"},
+	}, true)
+	require.NoError(t, d.Invalid())
+	reg.Upsert(d)
+	return reg
+}
+
+func postInvoke(s *Server, body any) *httptest.ResponseRecorder {
+	raw, _ := json.Marshal(body)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/invoke", strings.NewReader(string(raw)))
+	req.Header.Set("Content-Type", "application/json")
+	s.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
+// A run-kind envelope is an envelope like any other: accepted and matched.
+func TestShapeInvokeTurnAcceptsARunKindEnvelope(t *testing.T) {
+	reg := catalog.NewEventTriggerRegistry()
+	reg.Upsert(catalog.NewEventTriggerDescriptor("factory-fix", catalog.EventTriggerSpec{
+		SourceRef: "runs",
+		Match:     catalog.EventTriggerMatch{CEL: `kind == "run" && body.status == "succeeded"`},
+		Params:    map[string]string{"number": "body.outcome.pullRequest.number"},
+		Target:    catalog.EventTriggerTarget{AgentRef: "claude-code-swe-agent", PromptTemplate: "Fix #{{number}}"},
+	}, true))
+	shaped, err := shapeInvokeTurn(invokeRequest{Event: runEnvelope()}, "", "", "", reg, testCaller, time.Now())
+	require.NoError(t, err)
+	require.False(t, shaped.ignored)
+	require.Equal(t, "factory-fix", shaped.turn.TriggerName)
+	require.Equal(t, "Fix #12", shaped.turn.Message)
+}
+
+// target.none: 202 with an id and the full trigger object (params,
+// onComplete, rendered addLabels/assignees), with NO identity check and NO
+// workflow -- the client answers every identity check with a refusal and
+// panics on anything else, so either reaching it fails the test. The poll
+// then reports success immediately, again touching no workflow.
+func TestInvokeTargetNoneAcceptsAndRunsNothing(t *testing.T) {
+	temporal := &identityCheckClient{answer: linkRequired}
+	s := NewServer(temporal, "tq", nil, WithEventTriggers(factoryDoneTriggers(t)))
+
+	rec := postInvoke(s, map[string]any{"event": runEnvelope()})
+	require.Equal(t, http.StatusAccepted, rec.Code, rec.Body.String())
+	require.Empty(t, temporal.inputs, "a none target must not run the identity pre-flight")
+
+	var accepted map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &accepted))
+	id, _ := accepted["id"].(string)
+	require.NotEmpty(t, id)
+	require.Equal(t, "pending", accepted["status"])
+	trigger, err := json.Marshal(accepted["trigger"])
+	require.NoError(t, err)
+	require.JSONEq(t, `{
+		"name": "factory-ready",
+		"sessionId": "github:acme/widgets#12",
+		"params": {"repository": "acme/widgets", "number": "12", "assignee": "imaustink"},
+		"onComplete": {"emitTo": "runs"},
+		"reply": {"github": {
+			"repository": "acme/widgets", "issueNumber": 12, "removeLabel": "factory-review",
+			"addLabels": ["ready-for-human", "{{missing-renders-verbatim}}"], "assignees": ["imaustink"]
+		}}
+	}`, string(trigger))
+
+	poll := invokeStatusRequest(t, s, id)
+	require.Equal(t, http.StatusOK, poll.Code)
+	require.JSONEq(t, `{"id":"`+id+`","status":"succeeded","result":""}`, poll.Body.String())
+
+	// The accept-phase check endpoint has nothing to object to either.
+	check := httptest.NewRecorder()
+	raw, _ := json.Marshal(map[string]any{"event": runEnvelope()})
+	req := httptest.NewRequest(http.MethodPost, "/invoke/check", strings.NewReader(string(raw)))
+	req.Header.Set("Content-Type", "application/json")
+	s.Handler().ServeHTTP(check, req)
+	require.Equal(t, http.StatusNoContent, check.Code)
+	require.Empty(t, temporal.inputs)
+}
+
+// The trigger object omits onComplete when the trigger sets none.
+func TestInvokeTriggerOmitsAnUnsetOnComplete(t *testing.T) {
+	shaped, err := shapeInvokeTurn(invokeRequest{Event: prEnvelope("ai-review")}, "", "", "", reviewTriggers(t), testCaller, time.Now())
+	require.NoError(t, err)
+	raw, err := json.Marshal(newInvokeTrigger(shaped.match, shaped.sessionID))
+	require.NoError(t, err)
+	require.NotContains(t, string(raw), "onComplete")
+	require.Contains(t, string(raw), `"params":{"number":"42","repo":"acme/widgets"}`)
 }

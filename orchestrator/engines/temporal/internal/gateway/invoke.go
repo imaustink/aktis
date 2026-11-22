@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
@@ -136,6 +137,29 @@ type invokeTrigger struct {
 	SessionID string `json:"sessionId"`
 	// Reply is null, not absent, when the trigger declares none.
 	Reply *catalog.RenderedReply `json:"reply"`
+	// Params is the §4.4 string form of every rendered param: what
+	// integration-gateway carries into the run-completion event's
+	// body.params (docs/adr/0052 §1), so a chained trigger can read
+	// `body.params.repository` without re-deriving it. Always present on a
+	// match ({} with no params), like the TS engine's selection.stringParams.
+	Params map[string]string `json:"params"`
+	// OnComplete is the trigger's onComplete, only when it sets one: its
+	// presence is what tells integration-gateway to emit a run event at all.
+	OnComplete *catalog.EventTriggerOnComplete `json:"onComplete,omitempty"`
+}
+
+// newInvokeTrigger is the accepted response's (and an identity refusal's)
+// trigger object for a match made here.
+func newInvokeTrigger(m *catalog.TriggerMatch, sessionID string) *invokeTrigger {
+	t := &invokeTrigger{Name: m.Trigger.Name, SessionID: sessionID, Reply: m.Reply, Params: m.StringParams}
+	if t.Params == nil {
+		t.Params = map[string]string{}
+	}
+	if oc := m.Trigger.Spec.OnComplete; oc != nil && oc.EmitTo != "" {
+		copied := *oc
+		t.OnComplete = &copied
+	}
+	return t
 }
 
 // invokeOutcome is a non-turn /invoke answer (§5): "ignored" (200) or
@@ -177,6 +201,11 @@ type invokeRecord struct {
 	// not have to catch it mid-poll before the turn completes. Only ever set
 	// when the delegated agent actually emits one (today: claude-code-swe-agent).
 	RemoteControlUrl string `json:"remoteControlUrl,omitempty"`
+	// Outcome is a forced agentRef turn's runner outcome object (docs/adr/
+	// 0052 §2), already validated (a JSON object, <= 8192 bytes compact) by
+	// the bridged workflow. Distinct from Result, which stays the reply.
+	// integration-gateway copies it into the run-completion event.
+	Outcome json.RawMessage `json:"outcome,omitempty"`
 }
 
 const (
@@ -240,6 +269,10 @@ type shapedInvoke struct {
 	// retrieval fallback (a CI or Stripe webhook that matches nothing must not
 	// be read as free text).
 	ignored bool
+	// none: the event matched a target.none trigger (docs/adr/0052 §3). It is
+	// accepted -- its reply side effects and onComplete are real -- but no
+	// turn runs, so turn is empty and must never reach a workflow.
+	none bool
 	// match is the trigger matched HERE, if any; nil for a resolved turn.
 	match *catalog.TriggerMatch
 }
@@ -384,6 +417,13 @@ func shapeInvokeTurn(
 	}
 
 	target := m.Trigger.Spec.Target
+	if target.Kind() == catalog.TargetNone {
+		// Returned before a turn is built: there is no target whose identity
+		// a pre-flight could check, and nothing that could launch.
+		log.Printf("/invoke event %s/%s matched trigger %s: target none, nothing runs",
+			req.Event.Source, req.Event.ID, m.Trigger.Name)
+		return shapedInvoke{none: true, sessionID: m.SessionID, match: m}, nil
+	}
 	turn.Message = m.Prompt
 	turn.ForcedSkillID = target.SkillRef
 	turn.ForcedAgentID = target.AgentRef
@@ -435,6 +475,22 @@ func (s *Server) handleInvoke(c *gin.Context) {
 		return
 	case shaped.ignored:
 		c.JSON(http.StatusOK, invokeOutcome{Status: invokeStatusIgnored})
+		return
+	case shaped.none:
+		// Accepted with an id like any matched event, so integration-gateway
+		// runs the reply side effects and its usual poll -> run-completion
+		// path unchanged. Answered before the identity check and before any
+		// workflow: nothing runs, so there is no one to act as and nothing to
+		// wait for. The id carries no workflow; the poll answers it directly.
+		sessionID := shaped.sessionID
+		if sessionID == "" {
+			sessionID = uuid.NewString()
+		}
+		c.JSON(http.StatusAccepted, invokeAccepted{
+			ID:      encodeInvocationID(noneInvocationWorkflowID, uuid.NewString()),
+			Status:  invokeStatusPending,
+			Trigger: newInvokeTrigger(shaped.match, sessionID),
+		})
 		return
 	}
 	turn := shaped.turn
@@ -491,7 +547,7 @@ func (s *Server) handleInvoke(c *gin.Context) {
 
 	accepted := invokeAccepted{ID: encodeInvocationID(workflowID, updateID), Status: invokeStatusPending}
 	if m := shaped.match; m != nil {
-		accepted.Trigger = &invokeTrigger{Name: m.Trigger.Name, SessionID: sessionID, Reply: m.Reply}
+		accepted.Trigger = newInvokeTrigger(m, sessionID)
 	}
 	c.JSON(http.StatusAccepted, accepted)
 }
@@ -501,6 +557,13 @@ func (s *Server) handleInvokeStatus(c *gin.Context) {
 	workflowID, updateID, ok := decodeInvocationID(id)
 	if !ok {
 		writeError(c, http.StatusBadRequest, "malformed invocation id")
+		return
+	}
+	if workflowID == noneInvocationWorkflowID {
+		// A target.none acceptance: done the moment it was accepted. Stated
+		// explicitly rather than through invokeRecord, whose Result is
+		// omitempty: the contract is result "" (docs/adr/0052 §3).
+		c.JSON(http.StatusOK, gin.H{"id": id, "status": invokeStatusSucceeded, "result": ""})
 		return
 	}
 
@@ -521,6 +584,7 @@ func (s *Server) handleInvokeStatus(c *gin.Context) {
 			Path:             result.Meta.Path,
 			ToolCalls:        result.PendingToolCalls,
 			RemoteControlUrl: result.Meta.RemoteControlUrl,
+			Outcome:          result.Meta.Outcome,
 		})
 
 	case ctx.Err() != nil && c.Request.Context().Err() == nil, isTransportTimeoutOrCancel(err):
@@ -555,6 +619,13 @@ func (s *Server) handleInvokeStatus(c *gin.Context) {
 		c.JSON(http.StatusOK, invokeRecord{ID: id, Status: invokeStatusFailed, Error: err.Error()})
 	}
 }
+
+// noneInvocationWorkflowID stands in for the workflow half of a target.none
+// acceptance's id. It cannot collide with a real one: every /invoke workflow
+// id is "conversation-<sanitized session>". Stateless, like every other id
+// here, so any replica answers the poll. A forged "none.<x>" id polls as an
+// empty success, which reveals nothing and runs nothing.
+const noneInvocationWorkflowID = "none"
 
 // isUnknownUpdate distinguishes an id naming nothing (the workflow aged out,
 // or the caller made it up) from a turn that ran and failed.
