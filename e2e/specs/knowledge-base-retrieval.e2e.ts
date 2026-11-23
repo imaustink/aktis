@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import { kubectl, kubectlApplyStdin, waitFor } from "../support/k8s.js";
 import { withQdrant, listCollections, pointCount } from "../support/qdrant.js";
 import { chatSubject, chatTurn } from "../support/chat.js";
@@ -25,7 +25,7 @@ import { seedAtlassianLink, deleteCredentials } from "../support/credential-stor
  * stand-in, and `fake-confluence-fidelity.e2e.ts` is what keeps that honest.
  */
 
-requireMinikubeContext();
+requireLocalClusterContext();
 
 const CONNECTION = "e2e-fake-atlassian";
 const CORPUS = "alpha-docs";
@@ -342,10 +342,13 @@ describe("the Go engine is what served them", () => {
     // logs that it has DISABLED them otherwise — a deployment missing that
     // config fails every knowledge-base turn as an unregistered activity,
     // which names neither the broker nor the config.
+    // From the START of the container's log, where startup writes it: a
+    // `--tail` window misses it once the worker has logged more than the
+    // window since (it had logged 4,515 lines by this spec on 2026-11-22).
     const log = await kubectl([
       "logs",
       "deploy/agent-controller-temporal-engine-worker",
-      "--tail=4000",
+      "--limit-bytes=1048576",
     ]);
 
     expect(log).toContain("knowledge-base activities enabled");

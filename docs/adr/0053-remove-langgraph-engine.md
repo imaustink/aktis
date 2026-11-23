@@ -104,7 +104,10 @@ no deployment would see the warning.
 Found while removing the engine. Each is a gap on every Temporal deployment
 today, not one this change opens.
 
-1. **The facade does not authenticate the caller's bearer token.** Only the
+1. **Resolved: the facade authenticates every turn again**
+   (`rbac/caller-authenticator.ts`, `AGENT_CALLER_AUTH`), with the rule the
+   removed engine's `resolveIdentity` applied. The gap as found:
+   **The facade does not authenticate the caller's bearer token.** Only the
    LangGraph graph resolved it (`resolveIdentity`, failing closed). The
    Temporal adapter never forwards it: the engine gateway authenticates
    agent-orchestrator's own `AGENT_TEMPORAL_ENGINE_TOKEN`. So a turn that

@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import {
   agentRunAgentRef,
   agentRunSecretEnvNames,
@@ -23,7 +23,7 @@ import { bounceRedis } from "../support/resilience.js";
 import { issueLabeledPayload, postGithubWebhook } from "../support/webhook.js";
 import { fakeGithubRequests, resetFakeGithub, webhookSecret } from "../support/fixtures.js";
 
-requireMinikubeContext();
+requireLocalClusterContext();
 
 const GATEWAY_PORT = 18092;
 const SENDER = "e2e-user";

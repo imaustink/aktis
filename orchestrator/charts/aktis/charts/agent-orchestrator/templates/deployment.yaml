@@ -129,12 +129,19 @@ spec:
               value: {{ .Values.config.shutdownDrainMs | quote }}
             {{- end }}
             {{/*
-            Bearer-token identity (static map / OIDC). Kept wired, but NOT
-            enforced: the facade does not authenticate the caller's bearer
-            token yet -- only the in-process LangGraph engine did, and it was
-            removed (docs/adr/0053). A follow-up wires these back into the
-            facade.
+            Turn authentication (docs/adr/0053 follow-up 1): every /invoke and
+            chat turn needs a bearer token the static map / OIDC below
+            resolves, or (chat only) a verified Open WebUI user JWT.
+            callerAuth=warn logs instead of refusing; a rollout aid only.
             */}}
+            {{- $callerAuth := .Values.config.callerAuth | default "enforce" }}
+            {{- if not (has $callerAuth (list "enforce" "warn")) }}
+            {{- fail (printf "agent-orchestrator.config.callerAuth=%q is not supported: use enforce (the default) or warn" $callerAuth) }}
+            {{- end }}
+            {{- if eq $callerAuth "warn" }}
+            - name: AGENT_CALLER_AUTH
+              value: "warn"
+            {{- end }}
             {{- if eq .Values.config.identityResolver "oidc" }}
             - name: AGENT_IDENTITY_RESOLVER
               value: "oidc"

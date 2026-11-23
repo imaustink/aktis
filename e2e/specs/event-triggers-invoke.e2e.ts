@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import { cleanupAgentRunsSince } from "../support/k8s.js";
 import {
   applyEventTrigger,
@@ -13,7 +13,7 @@ import {
 } from "../support/events.js";
 import { fakeSinkRequests, replyPath, replyUrl, resetFakeSink } from "../support/fake-sink.js";
 
-requireMinikubeContext();
+requireLocalClusterContext();
 
 /**
  * The programmatic entry point with an event: `POST /invoke {event}` straight
@@ -186,12 +186,14 @@ describe("POST /invoke with an event envelope", () => {
         github: expect.objectContaining({
           repository: "e2e-org/e2e-repo",
           issueNumber: issue,
-          sessionPage: true,
           result: true,
           removeLabel: "ai-triage",
           ack: expect.stringContaining("Starting work on this now."),
         }),
       });
+      // GitHub trigger acks carry no gateway session-page link (1956119b):
+      // the agent's own Remote Control link is where a run is watched.
+      expect(r.body.trigger?.reply?.github).not.toHaveProperty("sessionPage");
       expect(JSON.stringify(r.body.trigger?.reply)).not.toContain("{{");
     });
 

@@ -43,3 +43,7 @@ orchestrator/charts/aktis/charts/core-controller/crds/*.yaml
 # Python bytecode from the helm-values-form tool test run
 __pycache__/
 *.pyc
+
+# Which local cluster this checkout uses, when not the default
+# (docs/local-cluster.md). Per machine, and can name a kube context.
+cluster.local.env

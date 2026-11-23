@@ -1,12 +1,12 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import { agentRunAgentRef, agentRunsSince, cleanupAgentRunsSince, waitFor } from "../support/k8s.js";
 import { chatTurn } from "../support/chat.js";
 import { deleteCredentials, seedAllClaudeCredentials } from "../support/credential-store.js";
 import { deleteRedisKeys } from "../support/redis.js";
 import { resetFakeGithub } from "../support/fixtures.js";
 
-requireMinikubeContext();
+requireLocalClusterContext();
 
 /**
  * What the Temporal engine gateway resolves a caller to when it presents only
@@ -139,13 +139,16 @@ describe("a parked chat turn keeps its caller's identity", () => {
   it("refuses a chat turn whose forwarded JWT has already expired, rather than running it as the shared subject", async () => {
     const startedAt = new Date();
 
-    const turn = await chatTurn(unlinkedUser("expired"), REQUEST, {
-      sessionId: session("expired"),
-      jwtExpiresInSeconds: -60,
-      timeoutMs: 60_000,
-    });
-
-    expect(turn.text).toMatch(/could not resolve caller identity/i);
+    // Refused at the facade's authentication gate (docs/adr/0053 follow-up 1),
+    // before any turn starts: an expired JWT does not verify, and a chat turn
+    // that carries one is never retried on the bearer.
+    await expect(
+      chatTurn(unlinkedUser("expired"), REQUEST, {
+        sessionId: session("expired"),
+        jwtExpiresInSeconds: -60,
+        timeoutMs: 60_000,
+      }),
+    ).rejects.toThrow(/chat completion failed: 401 .*could not authenticate the caller/);
     await expectNoLaunchSince(startedAt);
   });
 });

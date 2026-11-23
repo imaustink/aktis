@@ -23,6 +23,8 @@ const state = vi.hoisted(() => ({
   headBefore: "aaa",
   headAfter: "aaa",
   revParseCalls: 0,
+  /** Whether the stubbed git reports HEAD on a remote-tracking branch (i.e. pushed). */
+  headOnRemote: true,
   discovered: null as null | { repo: string; branch: string; pr: string | null; prUrl: string | null; prCreatedAt: string | null },
 }));
 
@@ -96,6 +98,7 @@ vi.mock("./git.js", async (orig) => ({
   countCommitsSince: async () => 0,
   discoverResult: async () => state.discovered,
   appendCoAuthorTrailer: async () => {},
+  isHeadOnRemote: async () => state.headOnRemote,
   // Only `git rev-parse HEAD` (before, then after the turn) reaches here.
   runCommand: async () => ({ code: 0, stdout: state.revParseCalls++ === 0 ? state.headBefore : state.headAfter, stderr: "" }),
 }));
@@ -119,6 +122,7 @@ describe("index outcome wiring", () => {
     state.published = [];
     state.modelVerdictArgs = null;
     state.revParseCalls = 0;
+    state.headOnRemote = true;
     state.headBefore = state.headAfter = "aaa";
     state.discovered = {
       repo: "acme/widgets",
@@ -169,6 +173,17 @@ describe("index outcome wiring", () => {
     expect(reply.outcome).toEqual({
       pullRequest: { number: 7, url: "https://github.com/acme/widgets/pull/7" },
       madeNewCommits: true,
+    });
+  });
+
+  it("a write run whose commits never reached a remote reports no new commits", async () => {
+    state.readOnly = false;
+    state.headAfter = "bbb";
+    state.headOnRemote = false;
+    const reply = await runMain();
+    expect(reply.outcome).toEqual({
+      pullRequest: { number: 7, url: "https://github.com/acme/widgets/pull/7" },
+      madeNewCommits: false,
     });
   });
 });

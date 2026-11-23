@@ -15,6 +15,7 @@ import type { SessionStore } from "./session/types.js";
 import { RedisInvocationStore } from "./invocation/redis-invocation-store.js";
 import { InMemoryInvocationStore, type InvocationStore } from "./invocation/types.js";
 import { InvokeServer } from "./server.js";
+import { buildCallerAuthenticator } from "./rbac/caller-auth-config.js";
 import { retryWithBackoff } from "./retry.js";
 
 /** Process exit code for startup failures — this is a long-lived service, not a one-shot CLI (ADR 0006). */
@@ -81,6 +82,17 @@ async function main(): Promise<void> {
   const openWebUiResolver = config.openWebUiUserJwtSecret
     ? new OpenWebUiForwardedUserResolver({ secret: config.openWebUiUserJwtSecret, roles: config.openWebUiUserRoles })
     : undefined;
+
+  // Authenticates whoever starts a turn (docs/adr/0053 follow-up 1): a
+  // verified Open WebUI user JWT on a chat turn, otherwise a bearer token the
+  // static/OIDC map resolves. Handed the BARE JWT verifier, not the
+  // principal-recording one below, so a refused turn records nothing.
+  const callerAuth = buildCallerAuthenticator(config, openWebUiResolver);
+  if ("error" in callerAuth) {
+    console.error(callerAuth.error);
+    process.exit(EXIT_STARTUP_FAILURE);
+  }
+  for (const warning of callerAuth.warnings) console.error(`WARNING: ${warning}`);
 
   const identityLinkGateway =
     config.identityLinkGatewayUrl && config.identityLinkGatewayToken
@@ -214,6 +226,7 @@ async function main(): Promise<void> {
     config.callerToolTopK,
     config.defaultIdentityLinkFlow,
     invocationStore,
+    callerAuth.authenticator,
   );
   if (!config.senderAssertionSecret) {
     console.error(

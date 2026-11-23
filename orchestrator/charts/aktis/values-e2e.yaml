@@ -1,4 +1,4 @@
-# values-e2e.yaml — minikube overlay for the e2e suite (see e2e/README.md).
+# values-e2e.yaml — local-cluster overlay for the e2e suite (see e2e/README.md).
 #
 # Layered ON TOP of values-minikube-demo.yaml, not instead of it:
 #   helm upgrade --install agent-controller orchestrator/charts/aktis \
@@ -371,7 +371,7 @@ mcp-broker:
   enabled: true
   image:
     # The subchart defaults to Always (correct for the mutable :latest in prod),
-    # but skaffold builds a local-only SHA tag into minikube's docker, which
+    # but skaffold builds a local-only SHA tag into the local cluster, which
     # Always then tries — and fails — to pull from a registry. Use the local
     # image in e2e. (connection-broker carries the same prod default and needs
     # the same override once its image is rebuilt here.)

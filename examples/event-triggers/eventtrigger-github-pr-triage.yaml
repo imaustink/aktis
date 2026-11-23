@@ -2,7 +2,7 @@
 # feedback on it, push the updates, and sync it with its base branch. Same label
 # as issue triage -- what it means is decided by what got labeled (the
 # x-github-event header). Unlike github-pr-review this one DOES push, so it is
-# not readOnly.
+# not readOnly. Its completion enters the software factory (factory-review).
 apiVersion: core.aktis.ai/v1alpha1
 kind: EventTrigger
 metadata:
@@ -69,9 +69,9 @@ spec:
       re-invoke you automatically when one does. Push your work and post your
       summary now. If a check is still running when you finish, say so in one
       line -- do not let it block or delay pushing and summarizing, and do not
-      say you'll "finalize" or "resume" later. (The triage label is removed once
-      this run ends, so a maintainer can simply re-apply it to have you pick the
-      PR up again.)
+      say you'll "finalize" or "resume" later. (When this run ends, an
+      automated review of the PR starts on its own, and its feedback is
+      addressed automatically before the PR is handed to a maintainer.)
   reply:
     github:
       repository: "{{repository}}"
@@ -79,3 +79,6 @@ spec:
       ack: "🤖 Starting work on this now."
       result: true
       removeLabel: "{{label}}"
+  # Feeds the software factory (docs/adr/0052): factory-review reviews this PR next.
+  onComplete:
+    emitTo: runs

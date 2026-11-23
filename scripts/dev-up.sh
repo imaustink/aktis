@@ -2,6 +2,10 @@
 # dev-up.sh — one-time/rare cluster prep, then hand off to Skaffold for the
 # actual build+deploy (see skaffold.yaml at repo root).
 #
+# Which local cluster this runs on is a choice (docs/local-cluster.md): ferry
+# on an Apple-silicon Mac that has it, minikube elsewhere, or whatever
+# AKTIS_CLUSTER names -- ferry | minikube | kind | custom.
+#
 # Usage:
 #   ./scripts/dev-up.sh              # prep, then `skaffold run` (one-shot deploy)
 #   ./scripts/dev-up.sh --dev        # prep, then `skaffold dev` (watch + redeploy loop)
@@ -26,10 +30,9 @@
 #   kubectl -n controller-agent create secret generic searxng-secrets \
 #     --from-literal=secret-key="$(openssl rand -hex 32)"
 #
-# All four secrets survive minikube restarts as long as the container is NOT
-# recreated (i.e. normal start/stop). If the minikube container itself is
-# deleted (as happened on 2026-07-12), you must re-create the secrets before
-# running this script.
+# All four secrets survive a cluster stop/start. If the cluster itself is
+# deleted (`./scripts/cluster/cluster.sh down --purge`, `minikube delete`),
+# you must re-create the secrets before running this script.
 
 set -euo pipefail
 
@@ -47,29 +50,18 @@ done
 step() { echo ""; echo "▶ $*"; }
 die()  { echo "✗ $*" >&2; exit 1; }
 
-# ── 0. Docker ────────────────────────────────────────────────────────────────
-step "Checking Docker..."
-if ! docker info >/dev/null 2>&1; then
-  echo "  Docker is not running. Launching Docker Desktop..."
-  open -a Docker
-  echo "  Waiting for Docker daemon..."
-  until docker info >/dev/null 2>&1; do sleep 2; done
-  echo "  Docker is up."
-fi
+# shellcheck source=cluster/lib.sh
+source "$REPO_ROOT/scripts/cluster/lib.sh"
+cluster_load
 
-# ── 1. minikube ──────────────────────────────────────────────────────────────
-step "Starting minikube..."
-# Pass --memory and --cpus so a freshly-recreated profile (after minikube
-# delete) gets the right limits. Flags are silently ignored when the
-# container already exists and is just being restarted.
-minikube start --memory=6144 --cpus=4 --driver=docker
+# ── 1. Local cluster ─────────────────────────────────────────────────────────
+step "Starting the local cluster (provider: $AKTIS_CLUSTER)..."
+# Starts it if it is not running and switches kubectl to its context. Whether
+# Docker is needed at all is the provider's call: ferry builds images itself.
+cluster_up
 
-# Safety check: make sure we're pointing at minikube, not a real cluster.
-# Skaffold auto-targets minikube's Docker daemon based on this same context.
-CURRENT_CONTEXT="$(kubectl config current-context 2>/dev/null || true)"
-if [[ "$CURRENT_CONTEXT" != "minikube" ]]; then
-  die "kubectl context is '$CURRENT_CONTEXT', not 'minikube'. Aborting to avoid touching the wrong cluster."
-fi
+# Safety check: make sure we're pointing at the local cluster, not a real one.
+cluster_require_context
 
 # ── 2. Namespace ─────────────────────────────────────────────────────────────
 step "Ensuring namespace '$NS'..."
@@ -130,14 +122,14 @@ echo "  Applied ${#crds[@]} CRDs."
 case "$MODE" in
   run)
     step "Building images and deploying via Skaffold (one-shot)..."
-    (cd "$REPO_ROOT" && skaffold run)
+    "$REPO_ROOT/scripts/cluster/cluster.sh" skaffold run
     ;;
   dev)
     step "Building images and deploying via Skaffold (watch mode)..."
-    (cd "$REPO_ROOT" && skaffold dev)
+    "$REPO_ROOT/scripts/cluster/cluster.sh" skaffold dev
     ;;
   none)
-    step "Prep done. Run 'skaffold run' or 'skaffold dev' from $REPO_ROOT when ready."
+    step "Prep done. Run './scripts/cluster/cluster.sh skaffold run' (or 'dev') from $REPO_ROOT when ready."
     ;;
 esac
 

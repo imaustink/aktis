@@ -159,6 +159,16 @@ func CaveatLines(in RenderInput) []string {
 			"%d passage(s) matched but the source did not confirm your access to them.",
 			in.Outcome.Denied))
 	}
+	// Candidates the ACL mirror excluded before any probe: the same "it exists
+	// and you may not read it" as Denied, decided one step earlier. Without
+	// this, a caller whose principals the mirror covers never sees a denial at
+	// all — the restricted matches are dropped before the probe could refuse
+	// them — and a partial answer reads as complete.
+	if in.Disclose && in.Outcome.PreFiltered > 0 {
+		lines = append(lines, fmt.Sprintf(
+			"%d passage(s) matched but are outside your access.",
+			in.Outcome.PreFiltered))
+	}
 	if len(in.Outcome.Undetermined) > 0 {
 		sorted := append([]string(nil), in.Outcome.Undetermined...)
 		sort.Strings(sorted)

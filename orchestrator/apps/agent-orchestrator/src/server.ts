@@ -34,6 +34,7 @@ import {
   writeSseStatus,
 } from "./openai/chat-completions.js";
 import { SENDER_ASSERTION_HEADER, verifySenderClaims, type SenderClaims } from "./rbac/sender-assertion.js";
+import type { CallerAuthResult, CallerAuthenticator } from "./rbac/caller-authenticator.js";
 import type { PriorToolCall, TurnEngine, TurnInput, TurnOutcome } from "./engine/types.js";
 import { TRACEPARENT_HEADER } from "./traceparent.js";
 import { startSpan, type TraceSpan } from "./telemetry.js";
@@ -286,8 +287,51 @@ export class InvokeServer {
      * by a replica other than the one that accepted it.
      */
     invocationStore?: InvocationStore,
+    /**
+     * Authenticates whoever starts a turn (docs/adr/0053 follow-up 1).
+     * index.ts always passes one. Absent -> no check, which only unit tests
+     * that are not about authentication rely on.
+     */
+    private readonly callerAuth?: CallerAuthenticator,
   ) {
     this.invocations = invocationStore ?? new InMemoryInvocationStore();
+  }
+
+  /**
+   * The authentication gate in front of every turn-starting route. Returns
+   * true to proceed. On a refusal it has already written the 401, before
+   * anything about the turn (trigger matching, caller tools, the engine) runs.
+   * Logs the reason, never the credential.
+   */
+  private async admitCaller(
+    req: IncomingMessage,
+    res: ServerResponse,
+    route: "/invoke" | "/v1/chat/completions",
+    forwardedUserToken?: string,
+  ): Promise<boolean> {
+    if (!this.callerAuth) return true;
+    let result: CallerAuthResult;
+    try {
+      result = await this.callerAuth.authenticate({
+        bearer: bearerToken(req.headers.authorization),
+        ...(forwardedUserToken ? { forwardedUserToken } : {}),
+      });
+    } catch (err) {
+      // The resolvers fail closed by contract; this is the backstop if one
+      // ever throws instead.
+      result = { ok: false, reason: `authentication error: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    if (result.ok) return true;
+    if (this.callerAuth.mode === "warn") {
+      console.warn(`agent-orchestrator: AGENT_CALLER_AUTH=warn: would reject POST ${route}: ${result.reason}`);
+      return true;
+    }
+    console.warn(`agent-orchestrator: rejected POST ${route}: ${result.reason}`);
+    const message = "unauthorized: could not authenticate the caller";
+    res
+      .writeHead(401, { "content-type": "application/json", "www-authenticate": 'Bearer realm="agent-orchestrator"' })
+      .end(JSON.stringify(route === "/v1/chat/completions" ? openAiError(message, "invalid_api_key") : { error: message }));
+    return false;
   }
 
   /**
@@ -561,6 +605,10 @@ export class InvokeServer {
 
   private async handleInvokeTraced(req: IncomingMessage, res: ServerResponse, span: TraceSpan): Promise<void> {
     const rawBody = await readBody(req);
+    if (!(await this.admitCaller(req, res, "/invoke"))) {
+      span.fail("unauthorized");
+      return;
+    }
 
     let request: string;
     let sessionId: string | undefined;
@@ -854,6 +902,11 @@ export class InvokeServer {
 
   private async handleChatCompletions(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const rawBody = await readBody(req);
+    // Before everything else, including Open WebUI's internal housekeeping
+    // completions below: those spend model tokens too.
+    if (!(await this.admitCaller(req, res, "/v1/chat/completions", headerValue(req.headers[FORWARDED_USER_JWT_HEADER])))) {
+      return;
+    }
     let parsed: {
       messages?: unknown;
       model?: unknown;

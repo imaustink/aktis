@@ -95,12 +95,14 @@ already installed. Then, from the repo root:
 ### 1. Build the image into the cluster
 
 The Job spec uses `image: recipe-publisher:latest` with
-`imagePullPolicy: IfNotPresent`, so for a local minikube cluster build
-straight into its Docker daemon (no registry push needed):
+`imagePullPolicy: IfNotPresent`, so for the local cluster build it straight
+in (no registry push needed). `build-image.sh` does that for whichever local
+cluster is selected — ferry, minikube, kind or your own
+([docs/local-cluster.md](../../../docs/local-cluster.md)):
 
 ```bash
-eval $(minikube docker-env)
-docker build -f catalog/tools/recipe-publisher/Dockerfile -t recipe-publisher:latest .
+./scripts/cluster/build-image.sh -t recipe-publisher:latest \
+  -f catalog/tools/recipe-publisher/Dockerfile .
 ```
 
 ### 2. Create the ServiceAccount

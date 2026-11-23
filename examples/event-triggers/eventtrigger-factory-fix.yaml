@@ -4,9 +4,17 @@
 # PR, not the issue: the review comments live there, and issue triage would
 # open a second PR. Its completion re-enters factory-review.
 #
-# Exactly the complement of factory-handoff among factory-review events: only
-# an explicit changes-requested verdict under the 3-review cap loops. No
-# verdict, "ready", a failed review or the cap all hand off to a human.
+# A review is either factory-review or a human applying `ai-review` to any PR
+# (github-pr-review, which also emits to `runs`), so a PR someone else opened
+# still gets its review feedback addressed -- but only when the PR's branch is
+# in this repository (github-pr-review's headRepository param). A fork PR's
+# author controls what this write-credentialed run would read, and `ai-review`
+# asked only for a review, so that verdict goes to factory-handoff instead.
+#
+# Exactly the complement of factory-handoff among review events: only an
+# explicit changes-requested verdict under the 2-fix cap (so at most 3 reviews
+# per chain, however it started) loops. No verdict, "ready", a failed review or
+# the cap all hand off to a human.
 apiVersion: core.aktis.ai/v1alpha1
 kind: EventTrigger
 metadata:
@@ -16,9 +24,11 @@ spec:
   match:
     cel: >-
       source == "runs" && kind == "run" &&
-      body.trigger == "factory-review" &&
+      body.trigger in ["factory-review", "github-pr-review"] &&
       has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" &&
-      body.chain.counts["factory-review"] < 3
+      (!("factory-fix" in body.chain.counts) || body.chain.counts["factory-fix"] < 2) &&
+      (body.trigger != "github-pr-review" ||
+       (has(body.params.headRepository) && body.params.headRepository == body.params.repository))
   params:
     repository: body.params.repository
     number: body.params.number

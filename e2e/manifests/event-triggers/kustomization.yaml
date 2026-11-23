@@ -56,6 +56,14 @@ patches:
       - op: replace
         path: /spec/target/agentRef
         value: stub-swe-agent
+      # The shipped GitHub triggers stopped linking the gateway session page
+      # (1956119b), but `reply.github.sessionPage` is still supported, and the
+      # readOnly spec's sticky-session case enters the session through the
+      # page the ack links. Re-enabled on this one trigger only, so every
+      # other GitHub trigger is still exercised as shipped.
+      - op: add
+        path: /spec/reply/github/sessionPage
+        value: true
   # A fixture Skill, not cluster-debug-skill: that one's audience needs
   # kubectl-readonly + signoz-query, which this profile neither builds nor
   # backs. e2e/manifests/event-trigger-skill.yaml defines it; the CI spec
@@ -73,7 +81,7 @@ patches:
             url: http://fake-sink.controller-agent.svc.cluster.local/reply/ci-failure-skill
             secretRef: { name: e2e-event-reply, key: secret }
   # web-fetch is enabled by values-minikube-demo.yaml; its image is built into
-  # minikube by e2e/scripts/up.sh (the e2e skaffold profile does not build it).
+  # the cluster by e2e/scripts/up.sh (the e2e skaffold profile does not build it).
   - target: { kind: EventTrigger, name: generic-hmac-tool }
     patch: |
       - op: add

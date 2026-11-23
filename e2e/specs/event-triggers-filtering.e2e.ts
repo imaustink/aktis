@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import { cleanupAgentRunsSince, waitFor } from "../support/k8s.js";
 import { resetFakeGithub } from "../support/fixtures.js";
 import { seedAllClaudeCredentials } from "../support/credential-store.js";
@@ -14,7 +14,7 @@ import {
 } from "../support/events.js";
 import { issueLabeledPayload, issueOpenedPayload, postGithubDelivery, pullRequestPayload } from "../support/webhook.js";
 
-requireMinikubeContext();
+requireLocalClusterContext();
 
 /**
  * What must NOT start a turn, from the `github` EventSource.

@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import {
   kubectl,
   kubectlJson,
@@ -33,7 +33,7 @@ import {
  * namespaced and deleted in afterAll.
  */
 
-requireMinikubeContext();
+requireLocalClusterContext();
 
 const SERVER = "e2e-fake-mcp";
 const BROKER_SERVICE = "agent-controller-mcp-broker";
@@ -168,9 +168,9 @@ describe("the chart grants every process the mcptools it watches", () => {
     expect([...granted]).toContain("mcptools");
   });
 
-  it("lets the orchestrator read MCPTools", async () => {
+  it("does not grant the orchestrator MCPTools: catalog-sync owns the catalog (docs/adr/0053)", async () => {
     const granted = grantedKinds(await roleForSelector("app.kubernetes.io/name=agent-orchestrator"));
-    expect([...granted]).toContain("mcptools");
+    expect([...granted]).not.toContain("mcptools");
   });
 });
 

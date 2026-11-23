@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { requireMinikubeContext } from "../support/guard.js";
+import { requireLocalClusterContext } from "../support/guard.js";
 import { cleanupAgentRunsSince, waitFor } from "../support/k8s.js";
 import { resetFakeGithub } from "../support/fixtures.js";
 import { seedAllClaudeCredentials } from "../support/credential-store.js";
@@ -16,7 +16,7 @@ import {
 } from "../support/events.js";
 import { issueLabeledPayload, postGithubDelivery } from "../support/webhook.js";
 
-requireMinikubeContext();
+requireLocalClusterContext();
 
 /**
  * The `github-issue-triage` EventTrigger, end to end (docs/event-triggers.md,
@@ -58,6 +58,8 @@ const ISSUE_BODY = "The widget is broken.";
 /** The trigger's params for an issue, in their string form (§4) -- what AgentRun.spec.params must carry. */
 function expectedParams(issue: number): Record<string, string> {
   return {
+    // The issue the SWE agent's PR closes (docs/event-triggers.md §6).
+    closesIssue: String(issue),
     description: ISSUE_BODY,
     label: LABEL,
     number: String(issue),
@@ -148,8 +150,11 @@ describe("EventTrigger github-issue-triage", () => {
     const resultIndex = activity.comments.findIndex((c) => c.text.includes(STUB_REPLY_MARKER));
     expect(ackIndex, "the ack comment was never posted").toBeGreaterThanOrEqual(0);
     expect(ackIndex).toBeLessThan(resultIndex);
-    // sessionPage: true + GATEWAY_PUBLIC_URL set in values-e2e -> a link.
-    expect(activity.comments[ackIndex]?.text).toMatch(/\/sessions\/[A-Za-z0-9_-]+/);
+    // No gateway session-page link: the shipped triage trigger dropped
+    // sessionPage (1956119b) -- the agent's own Remote Control link is where a
+    // run is watched. The link itself is still covered, on github-issue-review
+    // (see e2e/manifests/event-triggers and event-triggers-readonly.e2e.ts).
+    expect(activity.comments[ackIndex]?.text).not.toMatch(/\/sessions\/[A-Za-z0-9_-]+/);
     // Exactly one ack and one result: a double relay would post twice.
     expect(activity.comments.filter((c) => c.text.includes(EXAMPLE_ACK_TEXT))).toHaveLength(1);
     expect(activity.comments.filter((c) => c.text.includes(STUB_REPLY_MARKER))).toHaveLength(1);
