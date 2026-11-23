@@ -115,7 +115,7 @@ func delegateToAgent(ctx workflow.Context, actx workflow.Context, state *Convers
 
 	note("Delegating to agent " + agent.ID + "…")
 
-	goal, err := withImageLinks(ctx, actx, in.Message, in.Images)
+	goal, err := withImageLinks(ctx, actx, in.Message, append(in.Images[:len(in.Images):len(in.Images)], in.ContextImages...))
 	if err != nil {
 		return "", *meta, err
 	}

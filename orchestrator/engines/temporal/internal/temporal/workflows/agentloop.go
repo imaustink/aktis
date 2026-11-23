@@ -442,6 +442,7 @@ func runAgentTurn(ctx workflow.Context, actx workflow.Context, state *Conversati
 		if err := workflow.ExecuteActivity(actx, activities.PlanActionActivityName, activities.PlanActionInput{
 			Request:            in.Message,
 			Images:             in.Images,
+			ContextImages:      in.ContextImages,
 			SkillMarkdown:      skillTools.Skill.Markdown,
 			Tools:              planCandidates,
 			History:            history,
@@ -867,6 +868,7 @@ func runAgentTurn(ctx workflow.Context, actx workflow.Context, state *Conversati
 		err := workflow.ExecuteActivity(actx, activities.PlanActionActivityName, activities.PlanActionInput{
 			Request:       in.Message,
 			Images:        in.Images,
+			ContextImages: in.ContextImages,
 			SkillMarkdown: skillTools.Skill.Markdown,
 			Tools:         planCandidates,
 			History:       history,
@@ -1145,9 +1147,10 @@ func runAgentBackedTool(
 func bareAnswer(ctx workflow.Context, actx workflow.Context, in TurnInput) (string, error) {
 	var reply string
 	err := workflow.ExecuteActivity(actx, activities.CompleteTurnActivityName, activities.CompleteTurnInput{
-		SystemPrompt: bareAnswerSystemPrompt,
-		Messages:     []llm.Message{{Role: "user", Content: in.Message}},
-		Images:       in.Images,
+		SystemPrompt:  bareAnswerSystemPrompt,
+		Messages:      []llm.Message{{Role: "user", Content: in.Message}},
+		Images:        in.Images,
+		ContextImages: in.ContextImages,
 	}).Get(ctx, &reply)
 	return reply, err
 }

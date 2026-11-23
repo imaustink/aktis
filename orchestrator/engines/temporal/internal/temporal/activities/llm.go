@@ -20,6 +20,10 @@ type CompleteTurnInput struct {
 	// model. Refs only: the bytes are fetched here, never carried in workflow
 	// history (see package attachments).
 	Images []attachments.Ref `json:"images,omitempty"`
+	// ContextImages are earlier turns' images, attached after Images.
+	// Best-effort: one that fails to load is skipped instead of failing the
+	// turn.
+	ContextImages []attachments.Ref `json:"contextImages,omitempty"`
 }
 
 type LLMActivities struct {
@@ -36,12 +40,15 @@ func (a *LLMActivities) CompleteTurn(ctx context.Context, in CompleteTurnInput) 
 		messages = append(messages, llm.Message{Role: "system", Content: in.SystemPrompt})
 	}
 	messages = append(messages, in.Messages...)
-	if len(in.Images) > 0 && len(in.Messages) > 0 {
+	if len(in.Images)+len(in.ContextImages) > 0 && len(in.Messages) > 0 {
 		images, err := a.Attachments.DataURLs(ctx, in.Images)
 		if err != nil {
 			return "", err
 		}
-		messages[len(messages)-1].Images = images
+		images = append(images, a.Attachments.AvailableDataURLs(ctx, in.ContextImages)...)
+		if len(images) > 0 {
+			messages[len(messages)-1].Images = images
+		}
 	}
 	return a.Client.Complete(ctx, messages)
 }

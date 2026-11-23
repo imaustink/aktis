@@ -155,6 +155,7 @@ func planToolCall(
 	if err := workflow.ExecuteActivity(actx, activities.PlanActionActivityName, activities.PlanActionInput{
 		Request:            in.Message,
 		Images:             in.Images,
+		ContextImages:      in.ContextImages,
 		SkillMarkdown:      fallbackToolMarkdown,
 		Tools:              tools,
 		CallerTools:        offeredCallerTools,

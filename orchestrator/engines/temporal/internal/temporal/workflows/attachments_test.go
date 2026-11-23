@@ -42,7 +42,7 @@ func TestImagesReachTheSkillPlanner(t *testing.T) {
 	require.True(t, strings.HasSuffix(le.planInputs[0].Request, attachments.Note(1)), le.planInputs[0].Request)
 }
 
-// A follow-up turn still shows the model an earlier turn's image, newest first.
+// A follow-up turn still shows the model an earlier turn's stored image.
 func TestEarlierImagesStayInContext(t *testing.T) {
 	le := newLoopEnv(t)
 	le.needsCapability = false // bare path: CompleteTurn
@@ -60,8 +60,14 @@ func TestEarlierImagesStayInContext(t *testing.T) {
 
 	require.Len(t, le.completeTurnInputs, 3)
 	require.Equal(t, []attachments.Ref{first}, le.completeTurnInputs[0].Images)
-	require.Equal(t, []attachments.Ref{second, first}, le.completeTurnInputs[1].Images)
-	require.Equal(t, []attachments.Ref{second, first}, le.completeTurnInputs[2].Images)
+	require.Empty(t, le.completeTurnInputs[0].ContextImages)
+	// This turn's image is resolved strictly; the earlier one best-effort.
+	require.Equal(t, []attachments.Ref{second}, le.completeTurnInputs[1].Images)
+	require.Equal(t, []attachments.Ref{first}, le.completeTurnInputs[1].ContextImages)
+	// An earlier EXTERNAL image is not re-sent: the provider rejects a whole
+	// request over one unfetchable URL, and the engine cannot check it.
+	require.Empty(t, le.completeTurnInputs[2].Images)
+	require.Equal(t, []attachments.Ref{first}, le.completeTurnInputs[2].ContextImages)
 	// An image-only follow-up carries no note; only image-bearing messages do.
 	require.Equal(t, "compare them", le.completeTurnInputs[2].Messages[0].Content)
 }

@@ -20,6 +20,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -82,6 +83,10 @@ func (e *InvalidError) Error() string { return e.msg }
 func invalid(format string, args ...any) error {
 	return &InvalidError{msg: fmt.Sprintf(format, args...)}
 }
+
+// Invalidf returns an InvalidError, for a caller outside this package that
+// finds an image it cannot accept before it gets here.
+func Invalidf(format string, args ...any) error { return invalid(format, args...) }
 
 // allowedMediaTypes are the formats every major vision model accepts.
 var allowedMediaTypes = map[string]string{
@@ -212,6 +217,23 @@ func (r *Resolver) DataURLs(ctx context.Context, refs []Ref) ([]string, error) {
 		out = append(out, b.String())
 	}
 	return out, nil
+}
+
+// AvailableDataURLs is DataURLs for images that are context rather than the
+// request itself (earlier turns' attachments): one that cannot be loaded —
+// expired from the bucket by its lifecycle rule, say, or no store configured —
+// is logged and skipped instead of failing the caller.
+func (r *Resolver) AvailableDataURLs(ctx context.Context, refs []Ref) []string {
+	var out []string
+	for _, ref := range refs {
+		urls, err := r.DataURLs(ctx, []Ref{ref})
+		if err != nil {
+			log.Printf("skipping earlier image attachment %s%s: %v", ref.Key, ref.URL, err)
+			continue
+		}
+		out = append(out, urls...)
+	}
+	return out
 }
 
 // DownloadURLs returns each Ref as a URL an agent pod can fetch with a plain

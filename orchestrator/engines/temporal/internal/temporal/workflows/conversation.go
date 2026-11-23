@@ -121,10 +121,16 @@ type TurnInput struct {
 
 	// Images are the user's image attachments for this turn, already uploaded
 	// by the gateway (package attachments): Refs only, so image bytes never
-	// enter workflow history. The update handler replaces this with the
-	// turn's CONTEXT images — these plus recent earlier ones (contextImages)
-	// — before anything downstream reads it.
+	// enter workflow history. Resolved strictly: an image the user attached to
+	// THIS turn that cannot be loaded fails the turn.
 	Images []attachments.Ref `json:"images,omitempty"`
+
+	// ContextImages are earlier turns' stored images still in the
+	// conversation window, set by the update handler (contextImages). Resolved
+	// best-effort: one that has expired from the bucket or fails to load is
+	// skipped, so a single bad earlier image cannot break every later turn.
+	// Never set by a caller.
+	ContextImages []attachments.Ref `json:"contextImages,omitempty"`
 
 	// Caller is the identity the gateway resolved for this turn; retrieval
 	// and tool access are scoped to it (fail closed on empty subject).
@@ -448,7 +454,7 @@ func ConversationWorkflow(ctx workflow.Context, state *ConversationState) error 
 			in.Message = strings.TrimSpace(in.Message + "\n\n" + attachments.Note(len(in.Images)))
 		}
 		state.History = append(state.History, ChatMessage{Role: "user", Content: in.Message, Images: in.Images})
-		in.Images = contextImages(state.History)
+		in.Images, in.ContextImages = contextImages(state.History)
 
 		// The conversation's read-only mode (see ConversationState.ReadOnly).
 		// Decided here, before anything in the turn reads in.ReadOnly, so no
@@ -613,24 +619,42 @@ func toLLMMessages(history []ChatMessage) []llm.Message {
 	return out
 }
 
-// contextImages is the images a turn shows the model: the newest user
-// messages' attachments first (so this turn's own come first), bounded by
-// attachments.MaxContextImages. Earlier images stay visible only while their
-// message is still in the bounded transcript.
-func contextImages(history []ChatMessage) []attachments.Ref {
-	var out []attachments.Ref
-	for i := len(history) - 1; i >= 0 && len(out) < attachments.MaxContextImages; i-- {
+// contextImages is the images a turn shows the model, bounded together by
+// attachments.MaxContextImages: the current (last) message's own attachments
+// first, then earlier user messages' newest first. Earlier images stay
+// visible only while their message is still in the bounded transcript.
+//
+// The two are returned apart because they fail differently: the current
+// turn's are resolved strictly, earlier ones best-effort. An earlier external
+// (https://) image is not shown again at all — the engine cannot check that
+// the provider can still fetch it, and a provider rejects the whole request
+// over one unfetchable image URL.
+func contextImages(history []ChatMessage) (current, earlier []attachments.Ref) {
+	n := len(history)
+	if n == 0 {
+		return nil, nil
+	}
+	for _, ref := range history[n-1].Images {
+		if len(current) == attachments.MaxContextImages {
+			break
+		}
+		current = append(current, ref)
+	}
+	for i := n - 2; i >= 0 && len(current)+len(earlier) < attachments.MaxContextImages; i-- {
 		if history[i].Role != "user" {
 			continue
 		}
 		for _, ref := range history[i].Images {
-			if len(out) == attachments.MaxContextImages {
+			if len(current)+len(earlier) == attachments.MaxContextImages {
 				break
 			}
-			out = append(out, ref)
+			if ref.Key == "" {
+				continue // external: see above
+			}
+			earlier = append(earlier, ref)
 		}
 	}
-	return out
+	return current, earlier
 }
 
 func trimHistory(history []ChatMessage, max int) []ChatMessage {
