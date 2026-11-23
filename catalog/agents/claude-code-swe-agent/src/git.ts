@@ -394,6 +394,22 @@ export async function countCommitsSince(
 }
 
 /**
+ * True when HEAD has reached a remote: some remote-tracking branch contains
+ * it. git only moves a remote-tracking ref on a fetch or a SUCCESSFUL push, so
+ * a commit whose push failed (e.g. no permission on a fork's branch) is not
+ * contained in any of them. The run outcome's `madeNewCommits` (docs/adr/0052
+ * §2) uses this so "made new commits" means the PR actually got them.
+ */
+export async function isHeadOnRemote(
+  repoDir: string,
+  env: NodeJS.ProcessEnv,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const res = await runCommand("git", ["-C", repoDir, "branch", "-r", "--contains", "HEAD"], { env, signal });
+  return res.code === 0 && res.stdout.trim() !== "";
+}
+
+/**
  * The "---" footer the turn's reply ends with, saying what happened to the
  * pull request. Empty unless the turn pushed new commits, and ALWAYS empty
  * for a read-only turn: its token cannot push, so it never opened or updated

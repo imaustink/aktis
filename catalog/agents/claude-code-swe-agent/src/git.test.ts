@@ -5,6 +5,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   ensureChangeDeliverable,
   ensurePullRequest,
+  isHeadOnRemote,
   isWorkingTreeDirty,
   runCommand,
   setupGitAuth,
@@ -131,6 +132,22 @@ describe("ensureChangeDeliverable", () => {
     const mainTip = await runCommand("git", ["-C", originDir, "rev-parse", "main"], { env });
     const baseTip = await runCommand("git", ["-C", work, "rev-parse", "origin/main"], { env });
     expect(mainTip.stdout.trim()).toBe(baseTip.stdout.trim());
+  });
+
+  it("isHeadOnRemote is false for a commit whose push failed, true once it is pushed", async () => {
+    const work = await freshClone("work-push-failed");
+    await runCommand("git", ["-C", work, "checkout", "-b", "fork-branch"], { env });
+    await runCommand("git", ["-C", work, "commit", "--allow-empty", "-m", "fix"], { env });
+    // A push the remote refuses (here: no such remote; in production, e.g. no
+    // permission on a fork's branch) leaves the commit off every remote.
+    await runCommand("git", ["-C", work, "remote", "set-url", "--push", "origin", join(root, "missing.git")], { env });
+    const published = await ensureChangeDeliverable(work, env);
+    expect(published.pushed).toBe(false);
+    expect(await isHeadOnRemote(work, env)).toBe(false);
+
+    await runCommand("git", ["-C", work, "remote", "set-url", "--push", "origin", originDir], { env });
+    expect((await ensureChangeDeliverable(work, env)).pushed).toBe(true);
+    expect(await isHeadOnRemote(work, env)).toBe(true);
   });
 
   it("reports nothing published for a clean tree still on the default branch", async () => {

@@ -14,6 +14,7 @@ import {
   ensurePullRequest,
   findRepoDir,
   formatPrFooter,
+  isHeadOnRemote,
   resolveGitIdentity,
   runCommand,
   setupGitAuth,
@@ -509,11 +510,23 @@ async function handler(session: AgentSession): Promise<AgentReply> {
     markerHadPr: Boolean(marker?.pr),
   });
 
+  // The outcome's madeNewCommits (docs/adr/0052 §2) is what chained triggers
+  // route on: factory-review re-reviews a fix run only when it is true. So it
+  // means the new commits REACHED a remote, not just that HEAD moved -- a fix
+  // whose push failed (e.g. no permission on a fork's branch) left the PR
+  // unchanged and must hand off rather than re-review.
+  const pushedNewCommits = !readOnly && madeNewCommits && (await isHeadOnRemote(repoDir!, childEnv, session.signal));
+
   return {
     message: `${clip(summary, 1500)}${prLine}${closingNote}`,
     result: encodeSweContinuation(nextMarker),
     // Runner-observed facts for chained triggers (docs/adr/0052 §2).
-    outcome: await collectOutcome({ discovered, madeNewCommits, readOnly, verdictFile: verdict.verdictFile }),
+    outcome: await collectOutcome({
+      discovered,
+      madeNewCommits: pushedNewCommits,
+      readOnly,
+      verdictFile: verdict.verdictFile,
+    }),
   };
 }
 

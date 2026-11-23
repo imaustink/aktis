@@ -20,6 +20,7 @@ import {
   ensureDir,
   findRepoDir,
   formatPrFooter,
+  isHeadOnRemote,
   resolveGitIdentity,
   runCommand,
   setupGitAuth,
@@ -225,11 +226,23 @@ async function runTurn(ctx: TurnContext, instruction: string, marker: SweMarker 
     markerHadPr: Boolean(marker?.pr),
   });
 
+  // The outcome's madeNewCommits (docs/adr/0052 §2) is what chained triggers
+  // route on: factory-review re-reviews a fix run only when it is true. So it
+  // means the new commits REACHED a remote, not just that HEAD moved -- a fix
+  // whose push failed (e.g. no permission on a fork's branch) left the PR
+  // unchanged and must hand off rather than re-review.
+  const pushedNewCommits = !ctx.readOnly && madeNewCommits && (await isHeadOnRemote(repoDir!, ctx.childEnv, ctx.signal));
+
   return {
     reply: `${clip(summary, 1500)}${prLine}${closingNote}`,
     nextMarker,
     succeeded: true,
-    outcome: await collectOutcome({ discovered, madeNewCommits, readOnly: ctx.readOnly, verdictFile: ctx.verdictFile }),
+    outcome: await collectOutcome({
+      discovered,
+      madeNewCommits: pushedNewCommits,
+      readOnly: ctx.readOnly,
+      verdictFile: ctx.verdictFile,
+    }),
   };
 }
 

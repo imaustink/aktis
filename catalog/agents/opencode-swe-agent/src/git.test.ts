@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { appendCoAuthorTrailer, runCommand } from "./git.js";
+import { appendCoAuthorTrailer, isHeadOnRemote, runCommand } from "./git.js";
 
 let workDir: string;
 let bareDir: string;
@@ -79,5 +79,21 @@ describe("appendCoAuthorTrailer", () => {
     expect(applied).toBe(false);
     const msg = (await git(["log", "-1", "--pretty=%B"], repoDir)).stdout;
     expect(msg).not.toContain("Co-authored-by");
+  });
+});
+
+describe("isHeadOnRemote", () => {
+  it("is true once HEAD is pushed, false for a commit whose push never happened or failed", async () => {
+    await git(["commit", "--allow-empty", "-m", "initial"], repoDir);
+    await git(["push", "-u", "origin", "HEAD:refs/heads/main"], repoDir);
+    expect(await isHeadOnRemote(repoDir, process.env)).toBe(true);
+
+    await git(["commit", "--allow-empty", "-m", "local only"], repoDir);
+    expect(await isHeadOnRemote(repoDir, process.env)).toBe(false);
+
+    // A push that fails (here: the remote is gone) leaves it unpushed.
+    await rm(bareDir, { recursive: true, force: true });
+    await git(["push", "origin", "HEAD:refs/heads/main"], repoDir);
+    expect(await isHeadOnRemote(repoDir, process.env)).toBe(false);
   });
 });
