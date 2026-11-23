@@ -141,7 +141,11 @@ func (s *QdrantStore) Index(ctx context.Context, tools []Descriptor) error {
 			Id:      qdrant.NewIDUUID(s.pointID(tool.Hash)),
 			Vectors: qdrant.NewVectors(vectors[i]...),
 			Payload: qdrant.NewValueMap(map[string]any{
-				"hash":       tool.Hash,
+				"hash": tool.Hash,
+				// Observability only (never read back): which function a
+				// point is, for an operator or the e2e suite scrolling the
+				// collection. The TS store wrote the same field.
+				"name":       tool.Name,
 				"descriptor": string(descriptor),
 				"lastSeenAt": now,
 			}),
@@ -225,9 +229,21 @@ func (s *QdrantStore) Search(ctx context.Context, text string, tools []Descripto
 // this the collection grows forever — every definition any caller ever sent,
 // including one-off experiments and every intermediate edit of a schema.
 func (s *QdrantStore) Prune(ctx context.Context, olderThanSeconds int64) (int, error) {
-	cutoff := float64(time.Now().Unix() - olderThanSeconds)
+	now := time.Now()
+	cutoff := float64(now.Unix() - olderThanSeconds)
+	// Points written by the TypeScript agent-orchestrator (before docs/adr/
+	// 0055) carry lastSeenAt in MILLISECONDS and a different point id, so this
+	// store never touches them again. A seconds-only range would never reach
+	// them either; this second range ages them out on the same TTL. Any value
+	// at or above legacyMillisFloor is a millisecond timestamp (in seconds it
+	// would be the year ~5000).
+	legacyFloor := float64(legacyMillisFloor)
+	legacyCutoff := float64(now.UnixMilli() - olderThanSeconds*1000)
 	stale := &qdrant.Filter{
-		Must: []*qdrant.Condition{qdrant.NewRange("lastSeenAt", &qdrant.Range{Lt: &cutoff})},
+		Should: []*qdrant.Condition{
+			qdrant.NewRange("lastSeenAt", &qdrant.Range{Lt: &cutoff}),
+			qdrant.NewRange("lastSeenAt", &qdrant.Range{Gte: &legacyFloor, Lt: &legacyCutoff}),
+		},
 	}
 
 	// Counted before deleting: Delete reports an operation status, not how many
@@ -254,3 +270,7 @@ func (s *QdrantStore) Prune(ctx context.Context, olderThanSeconds int64) (int, e
 	}
 	return int(count), nil
 }
+
+// legacyMillisFloor separates millisecond lastSeenAt values (the TS store's)
+// from second ones: 10^11 seconds is ~year 5138, 10^11 ms is 1973.
+const legacyMillisFloor = int64(100_000_000_000)

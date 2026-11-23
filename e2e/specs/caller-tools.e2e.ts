@@ -4,9 +4,8 @@ import { requireLocalClusterContext } from "../support/guard.js";
 import { fetchThrough, kubectl, kubectlApplyStdin, waitFor, type PortForward } from "../support/k8s.js";
 import { chatToolTurn, type ChatMessage, type ChatToolDefinition } from "../support/chat.js";
 import { invokeStatus, invokeTurn } from "../support/invoke.js";
-import { COLLECTIONS, allPointCounts, listCollections, openQdrant, payloadNames, withQdrant } from "../support/qdrant.js";
-import { QdrantCallerToolStore } from "../../orchestrator/apps/agent-orchestrator/src/caller-tools/qdrant-caller-tool-store.js";
-import { makeCallerTool } from "../../orchestrator/apps/agent-orchestrator/src/caller-tools/parse.js";
+import { COLLECTIONS, allPointCounts, listCollections, openQdrantGrpc, payloadNames, withQdrant } from "../support/qdrant.js";
+import { runGoTests } from "../support/go-test.js";
 
 // Module scope, before any fixture: a suite pointed at the wrong cluster must
 // fail on import, not after it has started creating objects.
@@ -15,7 +14,7 @@ requireLocalClusterContext();
 /**
  * Consumer-supplied tools (docs/adr/0035), end to end.
  *
- * `orchestrator/apps/agent-orchestrator`'s unit tests cover the decisions; they cannot cover
+ * agent-orchestrator's unit tests (Go, internal/facade) cover the decisions; they cannot cover
  * either half of what actually breaks this feature in a cluster:
  *
  * - **Qdrant accepts the queries.** Those tests mock the Qdrant client outright,
@@ -102,139 +101,29 @@ function session(label: string): string {
 }
 
 describe("caller-supplied tools: the store's queries against a real Qdrant", () => {
-  // Its OWN throwaway collection, never the deployment's `caller_tools`. What is
-  // under test is whether Qdrant accepts these query shapes, and that answer is
-  // identical in any collection -- so there is no reason to mutate one the
-  // running orchestrator is serving from.
-  const COLLECTION = `e2e_caller_tools_probe_${process.pid}`;
-
-  /**
-   * A deterministic stand-in for the OpenAI embedder, counting its calls.
-   *
-   * Not a shortcut: the subject here is Qdrant's filter DSL, and paying for real
-   * embeddings would add nondeterminism and cost to a test whose assertions never
-   * look at similarity quality. Vectors are derived from the text so distinct
-   * definitions still land in distinct places and ranking has something to do.
-   *
-   * The call count is what makes the cache assertion about WORK AVOIDED rather
-   * than merely about points not multiplying.
-   */
-  let embedCalls = 0;
-  const embedder = {
-    embed: async (text: string): Promise<number[]> => {
-      embedCalls++;
-      const vector = new Array<number>(1536).fill(0);
-      for (let i = 0; i < text.length; i++) {
-        const slot = (text.charCodeAt(i) * 31 + i) % 1536;
-        vector[slot] = (vector[slot] ?? 0) + 1;
-      }
-      return vector;
-    },
-  };
-
-  const alpha = makeCallerTool("alpha_search", "Search the alpha corpus", { type: "object" });
-  const beta = makeCallerTool("beta_lookup", "Look up a beta record", { type: "object" });
-  const gamma = makeCallerTool("gamma_report", "Generate a gamma report", { type: "object" });
-
-  /** Clock the store reads, so `prune`'s cutoff is exercised without faking timers. */
-  let now = 1_000_000;
-  let forward: PortForward;
-  let baseUrl: string;
-  let store: QdrantCallerToolStore;
-
-  beforeAll(async () => {
-    // One forward held across the whole block: this block makes a dozen small
-    // round trips, and per-call forwarding would spend more time spawning kubectl
-    // than talking to Qdrant.
-    forward = await openQdrant();
-    baseUrl = forward.baseUrl;
-    store = new QdrantCallerToolStore(
-      { url: baseUrl, collection: COLLECTION, vectorSize: 1536 },
-      embedder,
-      undefined,
-      () => now,
-    );
-    await store.ensureCollection();
-  });
-
-  afterAll(async () => {
-    // This spec created the collection, so this spec removes it. Deliberately
-    // NOT a helper in support/qdrant.ts: a shared "delete a collection" helper
-    // would eventually get pointed at the catalog.
-    //
-    // Bounded via `fetchThrough` like every other request here: an un-timed fetch
-    // in an `afterAll` hangs the HOOK, which vitest reports as the whole file
-    // failing rather than as a teardown that could not reach Qdrant.
-    await fetchThrough(forward, `/collections/${COLLECTION}`, { method: "DELETE" }).catch(() => undefined);
-    forward?.close();
-  });
-
-  it("creates its own collection with the configured vector size", async () => {
-    expect(await listCollections(baseUrl)).toContain(COLLECTION);
-  });
-
-  it("indexes definitions Qdrant did not already have", async () => {
-    await store.index([alpha, beta]);
-    expect(await payloadNames(baseUrl, COLLECTION)).toEqual(expect.arrayContaining(["alpha_search", "beta_lookup"]));
-  });
-
-  it("re-indexing the same definitions adds no points and re-embeds nothing", async () => {
-    // The content-hash cache (docs/adr/0035 §2), against a real store. This is
-    // what makes "vectorize just in time" affordable: a client resends the same
-    // array every turn, so the steady state has to cost zero embeddings. A mock
-    // can show the code SKIPPING an embed; only this shows the ids actually
-    // colliding in Qdrant.
-    const embedCallsBefore = embedCalls;
-    now += 5_000;
-
-    await store.index([alpha, beta]);
-
-    const points = await payloadNames(baseUrl, COLLECTION);
-    expect(points.filter((n) => n === "alpha_search")).toHaveLength(1);
-    expect(embedCalls).toBe(embedCallsBefore);
-  });
-
-  it("accepts the has_id-filtered search and ranks within the supplied set only", async () => {
-    // `has_id` IS the isolation boundary for this collection -- there is no RBAC
-    // payload filter -- so a rejected or mis-shaped filter is both a 500 and a
-    // leak. `gamma` is indexed but NOT supplied, and must not come back.
-    await store.index([gamma]);
-
-    const found = await store.search("look up a beta record", [alpha, beta], 5);
-
-    expect(found.map((t) => t.name).sort()).toEqual(["alpha_search", "beta_lookup"]);
-    expect(found.map((t) => t.name)).not.toContain("gamma_report");
-  });
-
-  it("returns at most k results", async () => {
-    expect(await store.search("anything at all", [alpha, beta, gamma], 1)).toHaveLength(1);
-  });
-
-  it("accepts the delete-by-filter prune and drops only definitions past the cutoff", async () => {
-    // `range: { lt: cutoff }` on a payload field, the third hand-written filter
-    // shape. Qdrant has no native TTL, so this sweep is the only thing keeping
-    // the collection bounded -- a shape it rejects means unbounded growth, with
-    // nothing failing loudly.
-    //
-    // The "recent" side is a NEW definition rather than a touched existing one.
-    // Touching takes the `setPayload` path, which the store deliberately issues
-    // with `wait: false` (a lastSeenAt refresh is not worth blocking a turn on),
-    // so a prune racing that write could legitimately delete what was just
-    // touched. Harmless in production -- the real sweep is hourly against a
-    // multi-day TTL -- but in a test it is a coin flip, and asserting through a
-    // fresh `wait: true` upsert exercises the same filter with none of it.
-    now += 60_000;
-    const delta = makeCallerTool("delta_recent", "Indexed after the cutoff", { type: "object" });
-    await store.index([delta]);
-
-    await store.prune(30_000);
-
-    const remaining = await payloadNames(baseUrl, COLLECTION);
-    expect(remaining).toContain("delta_recent");
-    expect(remaining).not.toContain("alpha_search");
-    expect(remaining).not.toContain("beta_lookup");
-    expect(remaining).not.toContain("gamma_report");
-  });
+  // The store is Go (internal/callertools, docs/adr/0055), so its queries are
+  // exercised by TestLiveQdrant*, run here against the cluster's Qdrant over a
+  // gRPC port-forward. They work in their OWN throwaway collection, never the
+  // deployment's `caller_tools`, and check exactly what a mock cannot: that
+  // Qdrant accepts the hash keyword filter (the isolation boundary -- a gamma
+  // indexed but not supplied must never come back), the payload-only
+  // lastSeenAt touch (re-indexing adds no points and embeds NOTHING, against a
+  // counting embedder), `limit`, and the delete-by-range prune, including the
+  // millisecond timestamps the TypeScript store left behind.
+  it("indexes, caches, filters, limits and prunes against a real Qdrant", async () => {
+    const forward = await openQdrantGrpc();
+    try {
+      runGoTests({
+        module: "orchestrator/engines/temporal",
+        pkg: "./internal/callertools",
+        pattern: "^TestLiveQdrant",
+        mustPass: ["TestLiveQdrantIndexSearchAndCache", "TestLiveQdrantPruneDropsOnlyStaleDefinitionsIncludingLegacyMillis"],
+        env: { CALLERTOOLS_QDRANT_ADDR: forward.address },
+      });
+    } finally {
+      forward.close();
+    }
+  }, 300_000);
 });
 
 describe("caller-supplied tools: the round trip through the chat facade", () => {

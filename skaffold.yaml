@@ -60,11 +60,12 @@ build:
       variant: AbbrevCommitSha
   artifacts:
     - image: agent-orchestrator
+      context: orchestrator/engines/temporal
       custom:
-        buildCommand: ./scripts/cluster/build-image.sh -f orchestrator/apps/agent-orchestrator/Dockerfile
+        buildCommand: ../../../scripts/cluster/build-image.sh -f Dockerfile.agent-orchestrator
         dependencies:
           dockerfile:
-            path: orchestrator/apps/agent-orchestrator/Dockerfile
+            path: Dockerfile.agent-orchestrator
     - image: core-controller
       context: orchestrator/controllers/core-controller
       custom:
@@ -203,11 +204,12 @@ profiles:
     build:
       artifacts:
         - image: agent-orchestrator
+          context: orchestrator/engines/temporal
           custom:
-            buildCommand: ./scripts/cluster/build-image.sh -f orchestrator/apps/agent-orchestrator/Dockerfile
+            buildCommand: ../../../scripts/cluster/build-image.sh -f Dockerfile.agent-orchestrator
             dependencies:
               dockerfile:
-                path: orchestrator/apps/agent-orchestrator/Dockerfile
+                path: Dockerfile.agent-orchestrator
         - image: core-controller
           context: orchestrator/controllers/core-controller
           custom:

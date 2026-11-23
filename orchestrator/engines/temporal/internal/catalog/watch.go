@@ -218,6 +218,13 @@ func RunWatch(ctx context.Context, client dynamic.Interface, namespace, kbNamesp
 // into RunWatch would make the trigger table depend on a vector store it
 // never touches. Blocks until ctx is done.
 func RunEventTriggerWatch(ctx context.Context, client dynamic.Interface, namespace string, reg *EventTriggerRegistry) error {
+	return RunEventTriggerWatchNotify(ctx, client, namespace, reg, nil)
+}
+
+// RunEventTriggerWatchNotify is RunEventTriggerWatch, calling synced (when
+// non-nil) once the initial list is indexed — so a process can refuse to
+// serve until its table is populated rather than racing it.
+func RunEventTriggerWatchNotify(ctx context.Context, client dynamic.Interface, namespace string, reg *EventTriggerRegistry, synced func()) error {
 	factory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(client, resyncPeriod, namespace, nil)
 
 	informer := factory.ForResource(EventTriggerGVR).Informer()
@@ -251,6 +258,9 @@ func RunEventTriggerWatch(ctx context.Context, client dynamic.Interface, namespa
 		return err
 	}
 	log.Printf("event trigger watch established: namespace=%s triggers=%d", namespace, reg.Len())
+	if synced != nil {
+		synced()
+	}
 
 	<-ctx.Done()
 	return nil

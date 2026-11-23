@@ -101,7 +101,7 @@ temporal-engine:
       # The Go gateway resolves ITS OWN caller identity from a bearer token --
       # entirely separate from agent-orchestrator's own `config.staticIdentities`
       # below, despite the identical JSON shape. But agent-orchestrator's
-      # internal hop to this gateway (`TemporalEngine`, orchestrator/apps/agent-orchestrator/
+      # internal hop to this gateway (`TemporalEngine`, orchestrator/engines/temporal/internal/facade/
       # src/engine/temporal-engine.ts) sends NO Authorization header at all
       # unless `AGENT_TEMPORAL_ENGINE_TOKEN` is set, which nothing in this
       # chart ever populates (its own secretKeyRef is `optional: true` against

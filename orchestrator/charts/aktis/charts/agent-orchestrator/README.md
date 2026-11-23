@@ -7,9 +7,9 @@
 > `helm install`/Open WebUI/upgrade instructions below are retained only for
 > using this chart on its own. This chart still bundles its own optional Qdrant.
 
-Deploys [orchestrator/apps/agent-orchestrator](../../../../apps/agent-orchestrator/) — the
+Deploys [agent-orchestrator](../../../../engines/temporal/cmd/agent-orchestrator/) — the
 parent orchestrator — to Kubernetes. See that app's
-[README](../../../../apps/agent-orchestrator/README.md) and
+[README](../../../../engines/temporal/cmd/agent-orchestrator/README.md) and
 [docs/orchestrator.md](../../../../../docs/orchestrator.md) for what it does; this
 chart just wires it up as cluster resources.
 
@@ -56,7 +56,7 @@ chart just wires it up as cluster resources.
   distinct from the orchestrator's own ServiceAccount above. The tool
   catalog itself (which tools exist, what they do, how to launch them) is
   baked into the orchestrator image at build time — see
-  [the app README's "Registering a tool"](../../apps/agent-orchestrator/README.md#registering-a-tool)
+  the Tool CRD docs ([docs/crds.md](../../../../../docs/crds.md))
   (ADR 0009) — there's nothing to annotate/create in the cluster for
   discovery purposes.
 
@@ -191,7 +191,7 @@ setting, then re-run the same command above.
 
 ```bash
 # Build the image first (from the repo root):
-docker build -f orchestrator/apps/agent-orchestrator/Dockerfile -t agent-orchestrator:latest .
+docker build -f orchestrator/engines/temporal/Dockerfile.agent-orchestrator -t agent-orchestrator:latest orchestrator/engines/temporal
 
 helm install agent-orchestrator ./charts/agent-orchestrator \
   --set image.repository=agent-orchestrator \
@@ -229,7 +229,7 @@ See [values.yaml](values.yaml) for the full, commented list. Key ones:
 ## Known gaps
 
 Same ones documented in the
-[app README's "Known gaps"](../../apps/agent-orchestrator/README.md#known-gaps-by-design-not-yet-implemented)
+[app README's "Known gaps"](../../../../engines/temporal/cmd/agent-orchestrator/README.md#known-gaps)
 section — this chart doesn't work around any of them (e.g. invocation state
 is in-memory only, so multi-replica/
 `autoscaling.enabled` deployments won't share `/invoke/:id` state across

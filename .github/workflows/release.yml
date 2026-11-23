@@ -44,10 +44,8 @@ jobs:
             workflow:
               - '.github/workflows/release.yml'
             agent-orchestrator:
-              - 'package.json'
-              - 'package-lock.json'
-              - 'framework/messaging/**'
-              - 'orchestrator/apps/agent-orchestrator/**'
+              # A Go binary in the Temporal engine's module (cmd/agent-orchestrator).
+              - 'orchestrator/engines/temporal/**'
             opencode-swe-agent:
               - 'package.json'
               - 'package-lock.json'

@@ -180,7 +180,7 @@ secret injection, and lifecycle tracking.
 
 | App | Docs |
 | --- | ---- |
-| **agent-orchestrator** | [orchestrator/apps/agent-orchestrator/README.md](orchestrator/apps/agent-orchestrator/README.md) |
+| **agent-orchestrator** | [orchestrator/engines/temporal/cmd/agent-orchestrator/README.md](orchestrator/engines/temporal/cmd/agent-orchestrator/README.md) |
 
 The long-lived front door: the OpenAI-compatible chat API, `POST /invoke`,
 event-trigger routing and caller identity. It forwards every turn to the
@@ -260,7 +260,7 @@ paths (as `values-production.yaml` does).
 
 | Image | Built from |
 | ----- | ---------- |
-| `ghcr.io/imaustink/agent-controller/agent-orchestrator` | [orchestrator/apps/agent-orchestrator/Dockerfile](orchestrator/apps/agent-orchestrator/Dockerfile) |
+| `ghcr.io/imaustink/agent-controller/agent-orchestrator` | [orchestrator/engines/temporal/Dockerfile.agent-orchestrator](orchestrator/engines/temporal/Dockerfile.agent-orchestrator) |
 | `ghcr.io/imaustink/agent-controller/opencode-swe-agent` | [catalog/agents/opencode-swe-agent/Dockerfile](catalog/agents/opencode-swe-agent/Dockerfile) |
 | `ghcr.io/imaustink/agent-controller/claude-code-swe-agent` | [catalog/agents/claude-code-swe-agent/Dockerfile](catalog/agents/claude-code-swe-agent/Dockerfile) |
 | `ghcr.io/imaustink/agent-controller/integration-gateway` | [orchestrator/apps/integration-gateway/Dockerfile](orchestrator/apps/integration-gateway/Dockerfile) |

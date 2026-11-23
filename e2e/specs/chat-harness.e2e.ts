@@ -1,6 +1,8 @@
-import { describe, expect, it } from "vitest";
-import { OpenWebUiForwardedUserResolver } from "../../orchestrator/apps/agent-orchestrator/src/rbac/openwebui-forwarded-user-resolver.js";
-import { chatCompletionChunk, toolCallDeltaChunk } from "../../orchestrator/apps/agent-orchestrator/src/openai/chat-completions.js";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { beforeAll, describe, expect, it } from "vitest";
+import { runGoTests } from "../support/go-test.js";
 import {
   assembleSseContent,
   assembleSseToolCalls,
@@ -18,44 +20,66 @@ import {
  * product defect and costs a full stack cycle to disprove. Verifying the
  * agreement here turns that class of failure into a fast, unambiguous red.
  *
- * It imports the REAL resolver rather than reimplementing its expectations: the
- * claim the harness signs and the claim the orchestrator reads have to be the
- * same claim, and only the resolver itself is authoritative about which that is.
+ * It checks against the REAL resolver rather than reimplementing its
+ * expectations: the claim the harness signs and the claim the orchestrator reads
+ * have to be the same claim, and only the resolver itself is authoritative about
+ * which that is. The orchestrator is Go (docs/adr/0055), so this spec mints the
+ * tokens and the Go test `TestE2EHarnessForwardedUserJWT` (internal/facade)
+ * verifies them with the product resolver. Needs `go` on PATH.
  */
-describe("chat harness agrees with the orchestrator's forwarded-user resolver", () => {
-  const SECRET = "e2e-openwebui-forward-jwt-secret";
-  const resolver = new OpenWebUiForwardedUserResolver({ secret: SECRET, roles: ["reader", "writer"] });
 
-  it("mints a JWT the resolver accepts, resolving the subject the specs assert on", async () => {
-    const identity = await resolver.resolve(mintForwardedUserJwt(SECRET, "e2e-chat-user"));
+/**
+ * Real orchestrator SSE output, produced once by `TestE2EHarnessStreams` (the
+ * facade's own handler behind a stub engine) for the stream specs below.
+ */
+let productStreams: { text: string; toolCalls: string };
 
-    expect(identity).toEqual({
-      subject: "openwebui:e2e-chat-user",
-      roles: ["reader", "writer"],
-      // The assertion that makes the chat specs meaningful: without `perUser`
-      // the pre-flight refuses to establish or adopt anything (docs/adr/0031),
-      // so a harness that lost this would silently test the degraded path while
-      // appearing to test convergence.
-      perUser: true,
+function harness(streamOut = ""): Record<string, string> {
+  const secret = "e2e-openwebui-forward-jwt-secret";
+  return {
+    E2E_HARNESS_JWTS: JSON.stringify({
+      valid: mintForwardedUserJwt(secret, "e2e-chat-user"),
+      wrongSecret: mintForwardedUserJwt("not-the-deployments-secret", "e2e-chat-user"),
+      fresh: mintForwardedUserJwt(secret, "e2e-chat-user", { expiresInSeconds: 300 }),
+      expired: mintForwardedUserJwt(secret, "e2e-chat-user", { expiresInSeconds: -60 }),
+      streamOut,
+    }),
+  };
+}
+
+beforeAll(() => {
+  const dir = mkdtempSync(join(tmpdir(), "e2e-harness-"));
+  try {
+    const out = join(dir, "streams.json");
+    runGoTests({
+      module: "orchestrator/engines/temporal",
+      pkg: "./internal/facade",
+      pattern: "^TestE2EHarnessStreams$",
+      mustPass: ["TestE2EHarnessStreams"],
+      env: harness(out),
     });
-  });
+    productStreams = JSON.parse(readFileSync(out, "utf8")) as typeof productStreams;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 300_000);
 
-  it("is rejected when signed with the wrong secret", async () => {
-    // Proves the resolver is actually verifying, so the test above is evidence
-    // of agreement rather than of a resolver that accepts anything.
-    await expect(resolver.resolve(mintForwardedUserJwt("not-the-deployments-secret", "e2e-chat-user"))).resolves.toBeUndefined();
-  });
-
-  // specs/identity-continuity.e2e.ts depends on the harness minting a JWT
-  // the resolver honors the expiry of, exactly as it does Open WebUI's.
-  it("honors the expiry it mints, like Open WebUI's own", async () => {
-    await expect(
-      resolver.resolve(mintForwardedUserJwt(SECRET, "e2e-chat-user", { expiresInSeconds: 300 })),
-    ).resolves.toMatchObject({ subject: "openwebui:e2e-chat-user" });
-    await expect(
-      resolver.resolve(mintForwardedUserJwt(SECRET, "e2e-chat-user", { expiresInSeconds: -60 })),
-    ).resolves.toBeUndefined();
-  });
+describe("chat harness agrees with the orchestrator's forwarded-user resolver", () => {
+  it("mints JWTs the resolver accepts (subject, roles, perUser), refuses on the wrong secret, and honors exp", () => {
+    // One Go test, four verdicts: TestE2EHarnessForwardedUserJWT fails unless
+    // the valid token resolves to openwebui:e2e-chat-user with perUser (without
+    // which docs/adr/0031's pre-flight silently tests the degraded path), the
+    // wrong-secret token is refused (so acceptance is evidence of agreement, not
+    // of a resolver that accepts anything), and exp is honored both ways
+    // (specs/identity-continuity.e2e.ts depends on it).
+    runGoTests({
+      module: "orchestrator/engines/temporal",
+      pkg: "./internal/facade",
+      pattern: "^TestE2EHarnessForwardedUserJWT$",
+      mustPass: ["TestE2EHarnessForwardedUserJWT"],
+      env: harness(),
+    });
+  }, 300_000);
 
   it("assembles the assistant's text out of an OpenAI-style stream", async () => {
     const body = [
@@ -140,18 +164,16 @@ describe("chat harness reads tool calls off an OpenAI-style stream", () => {
 
   it("reads the frames the orchestrator ITSELF produces, not a transcription of them", () => {
     // Every test above feeds hand-written frames, which only prove the harness
-    // agrees with what its author BELIEVED the product emits. This one builds the
-    // body from the orchestrator's own chunk builders -- the same discipline the
-    // JWT tests follow by importing the real resolver -- so a change to the
-    // emitted shape fails here instead of silently draining every caller-tool
-    // spec's `toolCalls` to empty.
-    const calls = [{ id: "call_real", name: "get_device_battery", arguments: '{"serial":"SN-4417"}' }];
-    const body =
-      `data: ${JSON.stringify(toolCallDeltaChunk("chatcmpl-1", "agent-orchestrator", calls))}\n\n` +
-      `data: ${JSON.stringify(chatCompletionChunk("chatcmpl-1", "agent-orchestrator", {}, "tool_calls"))}\n\n` +
-      "data: [DONE]\n\n";
-
-    expect(assembleSseToolCalls(body)).toEqual(calls);
-    expect(sseFinishReason(body)).toBe("tool_calls");
+    // agrees with what its author BELIEVED the product emits. These bodies are
+    // the facade's real streaming output (TestE2EHarnessStreams), so a change to
+    // the emitted shape fails here instead of silently draining every
+    // caller-tool spec's `toolCalls` to empty.
+    expect(assembleSseToolCalls(productStreams.toolCalls)).toEqual([
+      { id: "call_abc", name: "get_device_battery", arguments: '{"serial":"SN-4417"}' },
+    ]);
+    expect(sseFinishReason(productStreams.toolCalls)).toBe("tool_calls");
+    expect(assembleSseContent(productStreams.text)).toBe("To continue, please link your GitHub account");
+    expect(sseFinishReason(productStreams.text)).toBe("stop");
+    expect(assembleSseToolCalls(productStreams.text)).toEqual([]);
   });
 });

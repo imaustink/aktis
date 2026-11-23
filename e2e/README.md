@@ -207,7 +207,7 @@ vitest suites -- the cluster can only show the flag arrives.
 
 ### `caller-tools.e2e.ts` is the only thing that validates the Qdrant filter DSL
 
-`orchestrator/apps/agent-orchestrator`'s unit tests mock the Qdrant client outright, which
+Unit tests cannot show Qdrant accepting the store's queries, which
 means they prove *which method the code meant to call* and nothing about whether
 the query is valid. Caller-supplied tools (ADR 0035) added three hand-written
 filter shapes — `has_id` for the id-restricted search, a payload-only
