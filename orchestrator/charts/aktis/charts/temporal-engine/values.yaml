@@ -172,8 +172,8 @@ gateway:
       cpu: 25m
       memory: 32Mi
     limits:
-      # Headroom for image attachments: a request body may carry up to four
-      # base64 images (attachments.MaxRequestBytes, ~31 MB) while it uploads.
+      # Headroom for image attachments: a request body may carry up to three
+      # base64 images (attachments.MaxRequestBytes, ~24 MB) while it uploads.
       memory: 256Mi
 
 # Image attachments: images a user attaches to a chat message (Open WebUI sends

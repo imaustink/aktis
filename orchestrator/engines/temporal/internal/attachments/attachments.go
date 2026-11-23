@@ -31,8 +31,9 @@ import (
 // models': the gateway holds a whole request body while it uploads, and the
 // worker holds every context image base64-inlined while it calls the model.
 const (
-	// MaxImagesPerTurn bounds how many images one message may carry.
-	MaxImagesPerTurn = 4
+	// MaxImagesPerTurn bounds how many images one message may carry. Never
+	// above MaxContextImages: contextImages would silently drop the extra.
+	MaxImagesPerTurn = MaxContextImages
 	// MaxImageBytes bounds one decoded image. 5 MB is the strictest common
 	// provider limit (Anthropic's), and far above what a vision model keeps
 	// after its own downscaling.
