@@ -43,7 +43,14 @@ history many times per turn.
    5 MB each and four per message. Only a `Ref` (`key`, `mediaType`) enters
    the workflow. An `https://` image URL passes through as an external `Ref`
    and is never fetched by the engine (no SSRF); the model provider fetches
-   it. Images on an event envelope are refused.
+   it. Images on an event envelope are refused. Chat clients resend the
+   whole transcript, earlier images included, on every
+   `/v1/chat/completions` request, so that endpoint streams its body and
+   keeps only the newest four large `data:image/` strings (the last user
+   message's), discarding earlier ones as they pass. Its body may be up to
+   256 MB on the wire, of which at most 8 MB of non-image content is held;
+   more is a 413. `/invoke` carries one turn's images and keeps the ~31 MB
+   cap.
 3. **Resolve at the point of use.** The worker resolves `Ref`s only inside
    activities:
    - `PlanAction` (skill planning) and `CompleteTurn` (plain chat) inline them
@@ -61,7 +68,12 @@ history many times per turn.
 4. **Keep references in the transcript.** `ChatMessage.Images` holds a user
    message's `Ref`s, so a follow-up ("convert it to metric") still shows the
    model the image. A turn uses up to three images, newest messages first,
-   while their messages remain in the bounded history.
+   while their messages remain in the bounded history. The current turn's
+   images are resolved strictly. Earlier ones are best-effort: one that can
+   no longer be loaded (expired by the lifecycle rule, say) is skipped, and an
+   earlier external `https://` image is not sent again, because a provider
+   rejects the whole request over one URL it cannot fetch. One bad earlier
+   image therefore cannot break every later turn.
 5. **Fail loudly.** A turn carrying a `data:` image on a deployment without a
    store is refused (400, "image attachments are not enabled"). It is not
    answered as if the image had been seen. The facade now relays the engine's
@@ -89,7 +101,8 @@ history many times per turn.
 - The configured `OPENAI_MODEL` must accept image input. The default
   (`gpt-4o`) does.
 - Memory limits rose to cover the worst case: the gateway to 256 Mi (it
-  holds a request body of up to about 31 MB) and the worker to 384 Mi (it
+  holds an `/invoke` body of up to about 31 MB, or a chat body's 8 MB of text
+  plus four images) and the worker to 384 Mi (it
   holds up to three inlined images).
 - Tools (ToolRun Jobs) still take one string input and do not receive images.
   A skill reads the image itself in its planner and passes on what it needs
