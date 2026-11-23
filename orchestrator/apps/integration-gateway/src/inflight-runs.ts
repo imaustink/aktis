@@ -65,6 +65,12 @@ export interface InflightRunStore {
    * second gateway.
    */
   lease(key: string, owner: string, ttlMs: number): Promise<boolean>;
+  /**
+   * Whether any run on `sessionId` is still owed a finish. True when the store
+   * cannot be read, so an outage never reads as "finished" (the label
+   * reconciler strips a label on false).
+   */
+  hasRunForSession(sessionId: string): Promise<boolean>;
 }
 
 /** In-memory {@link InflightRunStore}: for tests and Redis-less installs (where nothing survives a restart anyway). */
@@ -92,6 +98,10 @@ export class InMemoryInflightRunStore implements InflightRunStore {
     if (held && held.owner !== owner && held.expiresAt > this.now()) return false;
     this.leases.set(key, { owner, expiresAt: this.now() + ttlMs });
     return true;
+  }
+
+  async hasRunForSession(sessionId: string): Promise<boolean> {
+    return [...this.runs.values()].some((r) => r.trigger.sessionId === sessionId);
   }
 }
 
@@ -151,29 +161,42 @@ export class RedisInflightRunStore implements InflightRunStore {
 
   async list(): Promise<InflightRun[]> {
     try {
-      const keys: string[] = [];
-      let cursor = "0";
-      do {
-        const [next, batch] = await this.redis.scan(cursor, "MATCH", `${this.prefix}run:*`, "COUNT", 100);
-        cursor = next;
-        keys.push(...batch);
-      } while (cursor !== "0");
-      if (keys.length === 0) return [];
-      const raws = await this.redis.mget(keys);
-      const runs: InflightRun[] = [];
-      for (const raw of raws) {
-        if (typeof raw !== "string") continue;
-        try {
-          runs.push(JSON.parse(raw) as InflightRun);
-        } catch {
-          // An unreadable record can never be finished; its TTL reaps it.
-        }
-      }
-      return runs;
+      return await this.listOrThrow();
     } catch (err) {
       console.error("RedisInflightRunStore.list failed (treating as empty):", errorText(err));
       return [];
     }
+  }
+
+  async hasRunForSession(sessionId: string): Promise<boolean> {
+    try {
+      return (await this.listOrThrow()).some((r) => r.trigger.sessionId === sessionId);
+    } catch (err) {
+      console.error("RedisInflightRunStore.hasRunForSession failed (treating as still running):", errorText(err));
+      return true;
+    }
+  }
+
+  private async listOrThrow(): Promise<InflightRun[]> {
+    const keys: string[] = [];
+    let cursor = "0";
+    do {
+      const [next, batch] = await this.redis.scan(cursor, "MATCH", `${this.prefix}run:*`, "COUNT", 100);
+      cursor = next;
+      keys.push(...batch);
+    } while (cursor !== "0");
+    if (keys.length === 0) return [];
+    const raws = await this.redis.mget(keys);
+    const runs: InflightRun[] = [];
+    for (const raw of raws) {
+      if (typeof raw !== "string") continue;
+      try {
+        runs.push(JSON.parse(raw) as InflightRun);
+      } catch {
+        // An unreadable record can never be finished; its TTL reaps it.
+      }
+    }
+    return runs;
   }
 
   async lease(key: string, owner: string, ttlMs: number): Promise<boolean> {
