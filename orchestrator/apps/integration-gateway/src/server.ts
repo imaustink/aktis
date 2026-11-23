@@ -4,7 +4,6 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import {
   buildCronEnvelope,
   buildWebhookEnvelope,
-  evaluate,
   normalizeHeaders,
   parseBody,
   type Envelope,
@@ -31,6 +30,7 @@ import type {
   OrchestratorClient,
   OrchestratorInvokeResult,
   PollHooks,
+  CelResult,
 } from "./orchestrator-client.js";
 import { parseAcceptedTrigger } from "./orchestrator-client.js";
 import type { SenderClaims } from "./sender-assertion.js";
@@ -60,7 +60,6 @@ import type { SessionPageStore } from "./session-page-store.js";
 import { tickUsername, type TokenAuthenticator } from "./tick-auth.js";
 import { gatewayOwedRunTerminal, LabelReconciler, type PendingLabelStore } from "./label-reconciler.js";
 import { DEFAULT_LEASE_MS, InflightRunRecovery, type InflightRun, type InflightRunStore } from "./inflight-runs.js";
-import { couldMatchBeforeSender, type EventTriggerLookup } from "./event-triggers.js";
 import { InMemoryDeferredEventStore, type DeferredEventStore, type HeldRunEvent, type IssueRef } from "./deferred-events.js";
 import { ConflictSweeper, type ConflictCandidate } from "./conflict-sweeper.js";
 import {
@@ -104,13 +103,6 @@ export interface GatewayServerOptions {
    * no sources, every event route 404s.
    */
   eventSources?: EventSourceLookup;
-  /**
-   * A read-only view of the `EventTrigger`s, consulted ONLY to skip sender
-   * resolution (live GitHub API calls) for a delivery no trigger could match
-   * -- see event-triggers.ts. Matching stays the orchestrator's. Absent, or
-   * not loaded yet -> every sender is resolved, as if there were no view.
-   */
-  eventTriggers?: EventTriggerLookup;
   /**
    * Reads the Secrets that `verify.secretRef` and a trigger's
    * `reply.http.secretRef` name (in the CRD namespace). Absent -> every lookup is "missing", so verification fails
@@ -775,17 +767,24 @@ export class GatewayServer {
     let repository: string | undefined;
     if (source.sender) {
       const preliminary = buildWebhookEnvelope({ source: source.name, ...input, now: input.receivedAt });
-      // Resolving a sender costs GitHub API calls; most deliveries (push,
-      // check_run, ...) can't fire any trigger, so they stop here, before
-      // spending any. Only ever drops -- an event that survives is still
-      // verified below and matched by the orchestrator.
-      const triggers = this.options.eventTriggers?.all();
-      if (triggers && !couldMatchBeforeSender(triggers, preliminary)) {
+      // One orchestrator round trip answers both pre-sender questions in CEL
+      // (docs/event-triggers.md §8): could any trigger fire, and what do this
+      // source's sender expressions say. Resolving a sender costs GitHub API
+      // calls; most deliveries (push, check_run, ...) can't fire any trigger,
+      // so they stop here, before spending any. Only ever drops -- an event
+      // that survives is still verified below and matched by the orchestrator.
+      const prefilter = await this.options.orchestratorClient.prefilter(preliminary, source.sender.expressions);
+      if (prefilter.kind === "failed") {
+        this.log(`webhook ${source.name} event ${input.id}: dropped (${prefilter.error})`);
+        span.set({ "aktis.event.outcome": "dropped" });
+        return { status: 202 };
+      }
+      if (!prefilter.couldMatch) {
         this.log(`webhook ${source.name} event ${input.id}: no trigger could match (ignored before sender lookup)`);
         span.set({ "aktis.event.outcome": "ignored" });
         return { status: 202 };
       }
-      const resolved = await this.resolveSender(source.sender, preliminary);
+      const resolved = await this.resolveSender(source.sender, prefilter.sender);
       if (!resolved.ok) {
         // 202 already sent: a dropped event is not the sender's error, and a
         // non-2xx would only make it retry the same drop.
@@ -839,47 +838,52 @@ export class GatewayServer {
   }
 
   /**
-   * Evaluates the source's sender expressions against the preliminary
-   * envelope (sender {} / repository "") and has the provider VERIFY the
-   * login. Every failure -- an expression error, a wrong type, a bot, a login
-   * the provider doesn't recognize -- drops the event: what comes out of here
-   * selects whose credentials a run gets, so "couldn't tell" never means "let
-   * it through".
+   * Reads the source's sender expressions, as the orchestrator evaluated
+   * them over the preliminary envelope (sender {} / repository ""), and has
+   * the provider VERIFY the login. Every failure -- an expression error, a
+   * wrong type, a bot, a login the provider doesn't recognize -- drops the
+   * event: what comes out of here selects whose credentials a run gets, so
+   * "couldn't tell" never means "let it through".
    */
   private async resolveSender(
     sender: CompiledSender,
-    preliminary: Envelope,
+    results: Record<string, CelResult>,
   ): Promise<
     { ok: true; login: string; isBot: boolean; repository: string; accountId?: string } | { ok: false; reason: string }
   > {
-    const login = evaluate(sender.loginFrom, preliminary);
-    if (!login.ok) return { ok: false, reason: `sender.loginFrom failed: ${login.error}` };
-    if (typeof login.value !== "string" || !login.value) return { ok: false, reason: "sender.loginFrom is not a non-empty string" };
+    const result = (field: string): CelResult => results[field] ?? { ok: false, error: "not evaluated" };
+
+    const loginResult = result("loginFrom");
+    if (!loginResult.ok) return { ok: false, reason: `sender.loginFrom failed: ${loginResult.error}` };
+    if (loginResult.type !== "string" || typeof loginResult.value !== "string" || !loginResult.value) {
+      return { ok: false, reason: "sender.loginFrom is not a non-empty string" };
+    }
+    const login = { value: loginResult.value };
 
     let isBot = false;
-    if (sender.isBotFrom) {
-      const r = evaluate(sender.isBotFrom, preliminary);
+    if (sender.expressions.isBotFrom) {
+      const r = result("isBotFrom");
       if (!r.ok) return { ok: false, reason: `sender.isBotFrom failed: ${r.error}` };
-      if (typeof r.value !== "boolean") return { ok: false, reason: "sender.isBotFrom is not a bool" };
+      if (r.type !== "bool" || typeof r.value !== "boolean") return { ok: false, reason: "sender.isBotFrom is not a bool" };
       isBot = r.value;
     }
 
     let repository = "";
-    if (sender.repositoryFrom) {
-      const r = evaluate(sender.repositoryFrom, preliminary);
+    if (sender.expressions.repositoryFrom) {
+      const r = result("repositoryFrom");
       if (!r.ok) return { ok: false, reason: `sender.repositoryFrom failed: ${r.error}` };
-      if (typeof r.value !== "string") return { ok: false, reason: "sender.repositoryFrom is not a string" };
+      if (r.type !== "string" || typeof r.value !== "string") return { ok: false, reason: "sender.repositoryFrom is not a string" };
       repository = r.value;
     }
 
     // The immutable account id (docs/adr/0049 §5). A number in GitHub's
-    // payload, so a bare `body.sender.id` is accepted as well as string(...).
+    // payload, so a bare `body.sender.id` is accepted as well as string(...);
+    // an int arrives as its decimal string.
     let accountId: string | undefined;
-    if (sender.accountIdFrom) {
-      const r = evaluate(sender.accountIdFrom, preliminary);
+    if (sender.expressions.accountIdFrom) {
+      const r = result("accountIdFrom");
       if (!r.ok) return { ok: false, reason: `sender.accountIdFrom failed: ${r.error}` };
-      if (typeof r.value === "string" && r.value) accountId = r.value;
-      else if (typeof r.value === "bigint" || (typeof r.value === "number" && Number.isSafeInteger(r.value))) accountId = String(r.value);
+      if ((r.type === "string" || r.type === "int") && typeof r.value === "string" && r.value) accountId = r.value;
       else return { ok: false, reason: "sender.accountIdFrom is not a non-empty string or integer" };
     }
 

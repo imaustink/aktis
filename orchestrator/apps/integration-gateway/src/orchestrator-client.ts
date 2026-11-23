@@ -114,6 +114,25 @@ export interface AcceptedTrigger {
 }
 
 /** Outcome of {@link OrchestratorClient.submitEvent}. */
+/** An EventSource's `spec.sender` CEL expressions, as sent to `/events/prefilter`. */
+export interface SenderExpressions {
+  loginFrom: string;
+  isBotFrom?: string;
+  repositoryFrom?: string;
+  accountIdFrom?: string;
+}
+
+/**
+ * One CEL evaluation from the orchestrator. `type` is the CEL type name
+ * (`string`, `bool`, `int`, ...); an `int` arrives as its decimal string so an
+ * account id never meets a JSON number's 2^53 limit.
+ */
+export type CelResult = { ok: true; type: string; value: unknown } | { ok: false; error: string };
+
+export type PrefilterResult =
+  | { kind: "ok"; couldMatch: boolean; sender: Record<string, CelResult> }
+  | { kind: "failed"; error: string };
+
 export type EventSubmitResult =
   /** 200 `{"status":"ignored"}` -- no trigger matched; no turn ran. */
   | { kind: "ignored" }
@@ -381,6 +400,61 @@ export class OrchestratorClient {
       }
     }
     return { networkError };
+  }
+
+  /**
+   * Asks the orchestrator, before any sender lookup, whether a webhook
+   * delivery could fire a trigger at all, and what the source's sender
+   * expressions evaluate to over the preliminary envelope
+   * (`POST /events/prefilter`, docs/event-triggers.md §8). CEL is evaluated
+   * there, by the same Go evaluator that matches triggers -- this process has
+   * no CEL runtime of its own.
+   *
+   * Retried past a connection failure like `/invoke`; any other failure
+   * (non-2xx, bad body) is returned as `failed`, which the caller treats as a
+   * drop: what comes out of here decides whose credentials a run gets, so
+   * "couldn't tell" never means "let it through".
+   */
+  async prefilter(envelope: Envelope, sender: SenderExpressions | undefined): Promise<PrefilterResult> {
+    const post = async (): Promise<Response> =>
+      this.fetchImpl(`${this.baseUrl()}/events/prefilter`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${await this.resolveToken()}` },
+        body: JSON.stringify({ envelope, ...(sender ? { sender } : {}) }),
+      });
+    let res: Response | undefined;
+    let networkError: unknown;
+    for (let attempt = 1; attempt <= ACCEPT_RETRY_ATTEMPTS && !res; attempt++) {
+      try {
+        res = await post();
+      } catch (err) {
+        networkError = err;
+        if (attempt < ACCEPT_RETRY_ATTEMPTS) await this.sleep(ACCEPT_RETRY_DELAY_MS);
+      }
+    }
+    if (!res) return { kind: "failed", error: `/events/prefilter unreachable: ${errorText(networkError)}` };
+    const text = await res.text();
+    if (!res.ok) return { kind: "failed", error: `/events/prefilter failed: ${res.status} ${text}` };
+    let body: unknown;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      return { kind: "failed", error: `/events/prefilter returned non-JSON: ${text}` };
+    }
+    if (!isPlainObject(body) || typeof body.couldMatch !== "boolean") {
+      return { kind: "failed", error: "/events/prefilter returned an unexpected body" };
+    }
+    const results: Record<string, CelResult> = {};
+    if (isPlainObject(body.sender)) {
+      for (const [field, raw] of Object.entries(body.sender)) {
+        if (!isPlainObject(raw)) continue;
+        results[field] =
+          raw.ok === true
+            ? { ok: true, type: typeof raw.type === "string" ? raw.type : "", value: raw.value }
+            : { ok: false, error: typeof raw.error === "string" ? raw.error : "evaluation failed" };
+      }
+    }
+    return { kind: "ok", couldMatch: body.couldMatch, sender: results };
   }
 
   /**

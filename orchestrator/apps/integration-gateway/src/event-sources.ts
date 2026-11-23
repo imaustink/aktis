@@ -1,11 +1,6 @@
 import * as k8s from "@kubernetes/client-node";
-import {
-  compileExpression,
-  type CompiledExpression,
-  type CronSource,
-  type EventSourceResource,
-  type WebhookSource,
-} from "@aktis/event-triggers";
+import type { CronSource, EventSourceResource, WebhookSource } from "@aktis/event-triggers";
+import type { SenderExpressions } from "./orchestrator-client.js";
 import { CrdTable, crdApisFromKubeConfig, type CrdTableOptions } from "./crd-table.js";
 
 /**
@@ -14,12 +9,13 @@ import { CrdTable, crdApisFromKubeConfig, type CrdTableOptions } from "./crd-tab
  * is the orchestrator's business; the gateway reads them only to skip sender
  * lookups for deliveries none could match (event-triggers.ts).
  *
- * A source is compiled once, when it is seen, so a request never compiles CEL
- * or re-validates the spec. A source that fails to compile is UNUSABLE -- its
- * route answers 404 exactly as if it did not exist, and the reason is logged.
- * That is the fail-closed choice: a half-understood source (say, a sender
- * block whose `loginFrom` doesn't compile) must not run as if it had no sender
- * gate at all.
+ * A source is validated once, when it is seen. A source whose spec is
+ * malformed is UNUSABLE -- its route answers 404 exactly as if it did not
+ * exist, and the reason is logged. Sender CEL is not compiled here: this
+ * process has no CEL runtime. The orchestrator evaluates it per delivery
+ * (`/events/prefilter`), and an expression that doesn't compile fails that
+ * evaluation, which drops the delivery -- the same fail-closed outcome: a
+ * half-understood sender gate never runs as if there were none.
  *
  * The gateway does not gate on the CR's `Ready` condition. core-controller
  * computes that independently (and its cron Readiness depends on its own tick
@@ -31,11 +27,13 @@ export const EVENT_SOURCE_PLURAL = "eventsources";
 
 export interface CompiledSender {
   provider: "github";
-  loginFrom: CompiledExpression;
-  isBotFrom?: CompiledExpression;
-  repositoryFrom?: CompiledExpression;
-  /** The sender's immutable account id (docs/adr/0049 §5); see `EventSender.accountIdFrom`. */
-  accountIdFrom?: CompiledExpression;
+  /**
+   * The CEL, as written. Evaluated per delivery by the orchestrator
+   * (`/events/prefilter`), the one CEL runtime; core-controller's Ready
+   * condition reports an expression that doesn't compile (InvalidCEL), and
+   * such an expression drops every delivery here, never runs without a gate.
+   */
+  expressions: SenderExpressions;
   /** Default true: bot-authored events are dropped (self-trigger guard). */
   dropBots: boolean;
 }
@@ -72,13 +70,11 @@ export type CompileSourceResult = { ok: true; source: CompiledEventSource } | { 
 
 const VERIFY_SCHEMES = new Set(["hmacSha256", "slackV0", "bearer"]);
 
-function compileField(field: string, expr: string | undefined): { ok: true; expression: CompiledExpression } | { ok: false; error: string } {
+function checkField(field: string, expr: string | undefined): { ok: true; expression: string } | { ok: false; error: string } {
   if (typeof expr !== "string" || !expr.trim()) return { ok: false, error: `${field} is empty` };
-  const compiled = compileExpression(expr);
-  return compiled.ok ? compiled : { ok: false, error: `${field}: ${compiled.error}` };
+  return { ok: true, expression: expr };
 }
 
-/** Validates and compiles one EventSource CR. Mirrors the CRD's own CEL rules, so a CR that slipped past them (or an older CRD) still fails closed here. */
 export function compileEventSource(resource: EventSourceResource): CompileSourceResult {
   const name = resource?.metadata?.name;
   if (!name) return { ok: false, error: "missing metadata.name" };
@@ -138,34 +134,16 @@ export function compileEventSource(resource: EventSourceResource): CompileSource
     if (spec.sender.provider !== "github") {
       return { ok: false, error: `spec.sender.provider ${JSON.stringify(spec.sender.provider)} is not supported (only "github")` };
     }
-    const login = compileField("spec.sender.loginFrom", spec.sender.loginFrom);
+    const login = checkField("spec.sender.loginFrom", spec.sender.loginFrom);
     if (!login.ok) return login;
-    let isBot: CompiledExpression | undefined;
-    if (spec.sender.isBotFrom !== undefined) {
-      const c = compileField("spec.sender.isBotFrom", spec.sender.isBotFrom);
+    const expressions: SenderExpressions = { loginFrom: login.expression };
+    for (const field of ["isBotFrom", "repositoryFrom", "accountIdFrom"] as const) {
+      if (spec.sender[field] === undefined) continue;
+      const c = checkField(`spec.sender.${field}`, spec.sender[field]);
       if (!c.ok) return c;
-      isBot = c.expression;
+      expressions[field] = c.expression;
     }
-    let repository: CompiledExpression | undefined;
-    if (spec.sender.repositoryFrom !== undefined) {
-      const c = compileField("spec.sender.repositoryFrom", spec.sender.repositoryFrom);
-      if (!c.ok) return c;
-      repository = c.expression;
-    }
-    let accountId: CompiledExpression | undefined;
-    if (spec.sender.accountIdFrom !== undefined) {
-      const c = compileField("spec.sender.accountIdFrom", spec.sender.accountIdFrom);
-      if (!c.ok) return c;
-      accountId = c.expression;
-    }
-    sender = {
-      provider: "github",
-      loginFrom: login.expression,
-      ...(isBot ? { isBotFrom: isBot } : {}),
-      ...(repository ? { repositoryFrom: repository } : {}),
-      ...(accountId ? { accountIdFrom: accountId } : {}),
-      dropBots: spec.sender.dropBots ?? true,
-    };
+    sender = { provider: "github", expressions, dropBots: spec.sender.dropBots ?? true };
   }
 
   return { ok: true, source: { name, kind: "webhook", webhook, ...(sender ? { sender } : {}) } };

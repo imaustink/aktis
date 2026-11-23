@@ -19,6 +19,11 @@ document; where code and this document disagree, one of them is a bug.
  orchestrator ─► Temporal engine: match EventTriggers (CEL) ─► params ─► target
 ```
 
+All CEL runs in Go, in one evaluator (`orchestrator/engines/temporal/internal/catalog`):
+agent-orchestrator matches triggers with it, core-controller compiles against
+the same environment for `Ready`, and integration-gateway — which has no CEL
+runtime of its own — asks agent-orchestrator over `POST /events/prefilter` (§7).
+
 ## 1. CRDs (`core.aktis.ai/v1alpha1`, namespaced)
 
 Both kinds live in the release namespace (the one agent-orchestrator,
@@ -209,9 +214,13 @@ Every source produces exactly this JSON object. It is both the `event` field of
 
 ## 3. CEL
 
-One environment, used identically by core-controller (compile-only), the TS
-orchestrator + gateway (`@aktis/event-triggers`, `@marcbachmann/cel-js`)
-and the Temporal gateway (`cel-go`):
+One environment and one runtime, `cel-go`: core-controller compiles against
+it for `Ready`; agent-orchestrator and the Temporal gateway match with it
+(`orchestrator/engines/temporal/internal/catalog`); integration-gateway's
+pre-sender checks are evaluated by agent-orchestrator on its behalf (§7).
+Until [ADR 0055](adr/0055-agent-orchestrator-in-go.md) a second, TypeScript
+runtime (`@marcbachmann/cel-js`) evaluated the same expressions, which is why
+the rules below are written to mean the same in both:
 
 - Variables: `source`, `kind`, `id`, `time`, `repository` (string), `headers`
   (map<string,string>), `body` (dyn), `sender` (map<string,dyn>).
@@ -233,10 +242,9 @@ and the Temporal gateway (`cel-go`):
   value must be JSON-representable (null/bool/int/double/string/list/map, finite
   doubles) — anything else is a `params` error. A `params` evaluation error after a
   match fails the event (`422`, §5) — never a silent empty value.
-- The shared fixture file `orchestrator/packages/event-triggers/fixtures/cel-parity.json` is the
-  executable definition of this section: every case runs in the TS package's
-  tests and in the Temporal engine's Go tests, and both must produce the listed
-  verdict / value.
+- The fixture file `orchestrator/engines/temporal/internal/catalog/testdata/cel-parity.json`
+  is the executable definition of this section: every case runs in the Go
+  tests and must produce the listed verdict / value.
 
 ## 4. Matching, params, templates
 
@@ -331,11 +339,18 @@ opencode-swe-agent) act on one by name:
   verification; `202` otherwise (relay continues in the background). Dropped
   events (bot, unresolved sender) are `202` + a log line, so senders don't retry.
   Before resolving a source's `sender` (live GitHub API calls), the gateway
-  checks its read-only view of the EventTriggers: a delivery no trigger for this
-  source could match is dropped there (`202` + log line), so pushes, check runs
-  and other unwatched events cost no API calls. A trigger whose `match.cel` reads
-  `sender` or `repository` can't be decided before resolution and counts as a
-  possible match. This view only ever drops early; matching stays the
+  sends the preliminary envelope (`sender {}`, `repository ""`) and the
+  source's `sender.*From` expressions to agent-orchestrator's
+  `POST /events/prefilter` (its `/invoke` bearer):
+  `{envelope, sender?} → {couldMatch, sender: {<field>: {ok, type, value} | {ok:false, error}}}`.
+  `couldMatch:false` — no Ready trigger for this source could match — drops the
+  delivery (`202` + log line), so pushes, check runs and other unwatched events
+  cost no API calls. A trigger whose `match.cel` references `sender` or
+  `repository` can't be decided before resolution and counts as a possible
+  match. The sender results (an `int` as its decimal string) are then checked
+  for type exactly as before; an expression that doesn't compile is an
+  `ok:false` result and drops the delivery, as does a prefilter that cannot be
+  reached after a few retries. This only ever drops early; matching stays the
   orchestrator's, and an event that survives is still sender-verified.
 - `POST /events/:source/tick` — `Authorization: Bearer <projected SA token>`.
   The gateway verifies it against the cluster's ServiceAccount issuer keys

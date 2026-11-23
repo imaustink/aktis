@@ -4,13 +4,21 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseBody, type Envelope, type EventSourceResource } from "@aktis/event-triggers";
 import type { ClaudeTokenStore } from "./claude-auth/store.js";
 import { StaticEventSourceRegistry, type SecretLookup } from "./event-sources.js";
-import { StaticEventTriggerTable } from "./event-triggers.js";
 import type { GithubReplyClient } from "./github-client.js";
 import { GithubIdentityResolver } from "./identity.js";
 import { InMemoryPendingLabelStore } from "./label-reconciler.js";
 import { InMemoryInflightRunStore, type InflightRun } from "./inflight-runs.js";
 import { InMemoryDeferredEventStore } from "./deferred-events.js";
-import type { AcceptedTrigger, EventSubmitResult, OrchestratorClient, OrchestratorInvokeResult, PollHooks } from "./orchestrator-client.js";
+import type {
+  AcceptedTrigger,
+  CelResult,
+  EventSubmitResult,
+  OrchestratorClient,
+  OrchestratorInvokeResult,
+  PollHooks,
+  PrefilterResult,
+  SenderExpressions,
+} from "./orchestrator-client.js";
 import { GatewayServer, type GatewayServerOptions } from "./server.js";
 import { InMemorySessionPageStore } from "./session-page-store.js";
 import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
@@ -109,6 +117,41 @@ const SOURCES: EventSourceResource[] = [
   { metadata: { name: "pr-conflicts" }, spec: { conflicts: { author: "app/k5s-bot", skipLabels: ["ai-triage"] } } },
 ];
 
+/**
+ * Stands in for the orchestrator's CEL (`/events/prefilter`), which is Go and
+ * tested there (internal/catalog, internal/facade). Understands exactly the
+ * expression shapes SOURCES uses -- a body path, or a body path == "literal"
+ * -- with CEL's semantics for them: a missing key is an evaluation error, and
+ * a JSON integer is an `int`, sent as its decimal string.
+ */
+function fakeCel(expr: string, envelope: Envelope): CelResult {
+  const read = (path: string): unknown =>
+    path.split(".").reduce<unknown>((value, key) => {
+      if (value === undefined || typeof value !== "object" || value === null || !(key in value)) return undefined;
+      return (value as Record<string, unknown>)[key];
+    }, { body: envelope.body });
+  const missing = (path: string): CelResult => ({ ok: false, error: `no such key: ${path}` });
+  const eq = /^(body(?:\.\w+)+) == "(.*)"$/.exec(expr);
+  if (eq) {
+    const value = read(eq[1]!);
+    return value === undefined ? missing(eq[1]!) : { ok: true, type: "bool", value: value === eq[2] };
+  }
+  const bare = /^(body(?:\.\w+)+)$/.exec(expr);
+  if (!bare) throw new Error(`fakeCel does not understand ${expr}`);
+  const value = read(bare[1]!);
+  if (value === undefined) return missing(bare[1]!);
+  if (typeof value === "string") return { ok: true, type: "string", value };
+  if (typeof value === "boolean") return { ok: true, type: "bool", value };
+  if (typeof value === "number" && Number.isInteger(value)) return { ok: true, type: "int", value: String(value) };
+  return { ok: true, type: "dyn", value };
+}
+
+function fakePrefilter(envelope: Envelope, sender: SenderExpressions | undefined): PrefilterResult {
+  const results: Record<string, CelResult> = {};
+  for (const [field, expr] of Object.entries(sender ?? {})) if (expr) results[field] = fakeCel(expr, envelope);
+  return { kind: "ok", couldMatch: true, sender: results };
+}
+
 const DEFAULT_TRIGGER: AcceptedTrigger = {
   name: "github-review",
   sessionId: "github:acme/widgets#7",
@@ -131,6 +174,7 @@ interface Harness {
   order: string[];
   logs: string[];
   submitEvent: ReturnType<typeof vi.fn>;
+  prefilter: ReturnType<typeof vi.fn>;
   poll: ReturnType<typeof vi.fn>;
   invoke: ReturnType<typeof vi.fn>;
   postIssueComment: ReturnType<typeof vi.fn>;
@@ -166,6 +210,7 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
   const identityResolver = new GithubIdentityResolver(new Map([["alice", { subject: "alice", roles: ["reporter"] }]]), "agent-controller[bot]");
   const resolve = vi.spyOn(identityResolver, "resolve");
   const submitEvent = vi.fn(async (): Promise<EventSubmitResult> => ({ kind: "accepted", id: "inv-1", trigger: DEFAULT_TRIGGER }));
+  const prefilter = vi.fn(async (envelope: Envelope, sender?: SenderExpressions): Promise<PrefilterResult> => fakePrefilter(envelope, sender));
   const poll = vi.fn(async (_id: string, _hooks?: PollHooks): Promise<OrchestratorInvokeResult> => {
     order.push("poll");
     return { status: "succeeded", result: "Looks good." };
@@ -212,7 +257,7 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
     tickAuthenticator: { authenticate: async (token: string) => TICK_IDENTITIES[token] },
     tickNamespace: "agents",
     identityResolver,
-    orchestratorClient: { submitEvent, poll, invoke, checkLive: vi.fn().mockResolvedValue({ live: false }) } as unknown as OrchestratorClient,
+    orchestratorClient: { submitEvent, prefilter, poll, invoke, checkLive: vi.fn().mockResolvedValue({ live: false }) } as unknown as OrchestratorClient,
     githubReplyClient: {
       postIssueComment,
       updateIssueComment,
@@ -245,6 +290,7 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
     order,
     logs,
     submitEvent,
+    prefilter,
     poll,
     invoke,
     postIssueComment,
@@ -524,17 +570,28 @@ describe("sender verification", () => {
 });
 
 describe("sender lookups are skipped for deliveries no trigger could match", () => {
-  const reviewTrigger = {
-    metadata: { name: "github-pr-review" },
-    spec: {
-      sourceRef: "github",
-      match: { cel: 'headers["x-github-event"] == "pull_request" && body.action == "labeled" && body.label.name == "ai-review"' },
-      target: { agentRef: "swe", promptTemplate: "go" },
-    },
-  };
+  // WHETHER a trigger could match is the orchestrator's CEL, tested in Go
+  // (internal/catalog CouldMatchBeforeSender). What is tested here is what the
+  // gateway does with each answer.
 
-  it("a push no trigger matches never reaches the identity resolver (no GitHub API call) or the orchestrator", async () => {
-    const h = await start({ eventTriggers: new StaticEventTriggerTable([reviewTrigger]) });
+  it("asks the orchestrator with the PRELIMINARY envelope and the source's sender expressions", async () => {
+    const h = await start();
+    await postGithub(h);
+    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
+    const [envelope, sender] = h.prefilter.mock.calls[0] as [Envelope, SenderExpressions];
+    expect(envelope.sender).toEqual({});
+    expect(envelope.repository).toBe("");
+    expect(envelope.source).toBe("github");
+    expect(sender).toEqual({
+      loginFrom: "body.sender.login",
+      isBotFrom: 'body.sender.type == "Bot"',
+      repositoryFrom: "body.repository.full_name",
+    });
+  });
+
+  it("couldMatch false: never reaches the identity resolver (no GitHub API call) or the orchestrator's /invoke", async () => {
+    const h = await start();
+    h.prefilter.mockResolvedValueOnce({ kind: "ok", couldMatch: false, sender: {} });
     const res = await postGithub(h, { ref: "refs/heads/main", repository: { full_name: "acme/widgets" }, sender: { login: "alice", type: "User" } }, {
       extraHeaders: { "x-github-event": "push" },
     });
@@ -545,36 +602,47 @@ describe("sender lookups are skipped for deliveries no trigger could match", () 
     expect(h.logs.join("\n")).toMatch(/webhook github event delivery-123: no trigger could match \(ignored before sender lookup\)/);
   });
 
-  it("a delivery a trigger matches is still sender-verified before it is relayed", async () => {
-    const h = await start({ eventTriggers: new StaticEventTriggerTable([reviewTrigger]) });
+  it("couldMatch true: the sender is still verified before the event is relayed", async () => {
+    const h = await start();
     await postGithub(h);
     await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
     expect(h.resolve).toHaveBeenCalledWith("alice", false, { owner: "acme", repo: "widgets" });
     expect(h.submitEvent.mock.calls[0]?.[1]).toEqual({ login: "alice" });
   });
 
-  it("a trigger that reads `sender` can't be decided early, so the sender is resolved", async () => {
-    const senderTrigger = { metadata: { name: "by-alice" }, spec: { sourceRef: "github", match: { cel: 'sender.login == "alice"' }, target: { agentRef: "swe", promptTemplate: "go" } } };
-    const h = await start({ eventTriggers: new StaticEventTriggerTable([senderTrigger]) });
-    await postGithub(h, { ...GITHUB_PAYLOAD, action: "opened" });
-    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
-    expect(h.resolve).toHaveBeenCalled();
-  });
-
-  it("triggers for OTHER sources don't count", async () => {
-    const slackOnly = { ...reviewTrigger, metadata: { name: "slack-only" }, spec: { ...reviewTrigger.spec, sourceRef: "slack" } };
-    const h = await start({ eventTriggers: new StaticEventTriggerTable([slackOnly]) });
-    await postGithub(h);
+  it("a prefilter that fails (orchestrator down, bad answer) drops the delivery: no sender is trusted unevaluated", async () => {
+    const h = await start();
+    h.prefilter.mockResolvedValueOnce({ kind: "failed", error: "/events/prefilter unreachable: ECONNREFUSED" });
+    expect((await postGithub(h)).status).toBe(202);
     await settle();
     expect(h.resolve).not.toHaveBeenCalled();
     expect(h.submitEvent).not.toHaveBeenCalled();
+    expect(h.logs.join("\n")).toMatch(/dropped \(\/events\/prefilter unreachable: ECONNREFUSED\)/);
   });
 
-  it("an unloaded trigger table resolves every sender, as before", async () => {
-    const h = await start({ eventTriggers: { all: () => undefined } });
-    await postGithub(h, { ...GITHUB_PAYLOAD, action: "opened" });
+  it("a sender expression of the wrong CEL type drops the delivery", async () => {
+    const h = await start();
+    h.prefilter.mockResolvedValueOnce({
+      kind: "ok",
+      couldMatch: true,
+      sender: { loginFrom: { ok: true, type: "int", value: "42" }, isBotFrom: { ok: true, type: "bool", value: false } },
+    });
+    await postGithub(h);
+    await settle();
+    expect(h.resolve).not.toHaveBeenCalled();
+    expect(h.logs.join("\n")).toMatch(/dropped \(sender.loginFrom is not a non-empty string\)/);
+  });
+
+  it("a source without `sender` is never prefiltered: every delivery goes to the orchestrator", async () => {
+    const h = await start();
+    const body = JSON.stringify(GITHUB_PAYLOAD);
+    await fetch(`http://localhost:${h.port}/webhooks/plain`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-sig": hmacHex("gh-secret", body) },
+      body,
+    });
     await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
-    expect(h.resolve).toHaveBeenCalled();
+    expect(h.prefilter).not.toHaveBeenCalled();
   });
 });
 
