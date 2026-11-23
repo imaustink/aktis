@@ -50,7 +50,7 @@ import { ClaudeCredentialRefresher, ClaudeCredentialSweeper } from "./claude-aut
 import { renderSessionPage } from "./session-page.js";
 import type { SessionPageStore } from "./session-page-store.js";
 import { tickUsername, type TokenAuthenticator } from "./tick-auth.js";
-import { LabelReconciler, type PendingLabelStore } from "./label-reconciler.js";
+import { gatewayOwedRunTerminal, LabelReconciler, type PendingLabelStore } from "./label-reconciler.js";
 import { DEFAULT_LEASE_MS, InflightRunRecovery, type InflightRun, type InflightRunStore } from "./inflight-runs.js";
 import { couldMatchBeforeSender, type EventTriggerLookup } from "./event-triggers.js";
 import {
@@ -337,6 +337,8 @@ export class GatewayServer {
   private readonly instanceId = `${hostname()}-${randomUUID().slice(0, 8)}`;
   /** Runs this process is finishing right now, by key. */
   private readonly runningRuns = new Set<string>();
+  /** Runs this process is finishing, counted per session -- the label reconciler's "still going" signal. */
+  private readonly runningSessions = new Map<string, number>();
   private readonly eventSources: EventSourceLookup;
   private readonly log: (line: string) => void;
   private readonly now: () => Date;
@@ -425,19 +427,16 @@ export class GatewayServer {
         : undefined;
     // Durable self-heal for a trigger-declared label whose in-process `finally`
     // was lost to a mid-turn pod restart/OOM. Only built when a pending-label
-    // store is wired; a run that is no longer live (orchestrator liveness
-    // probe) and that THIS gateway recorded is treated as terminal and its
-    // label removed.
+    // store is wired; a run THIS gateway recorded and no longer owes a finish
+    // (not running here, no in-flight record left) is treated as terminal and
+    // its label removed.
     this.labelReconciler = options.pendingLabelStore
       ? new LabelReconciler({
           store: options.pendingLabelStore,
-          // `probeLive`, NOT `checkLive`: a run is terminal ONLY on a POSITIVE
-          // confirmed not-live answer. A transient probe failure (orchestrator
-          // blip/rollout -> network error or non-ok) reads as "unknown", which
-          // is treated as still-live here so a label is never stripped mid-run
-          // on a run that is merely unreachable (that would let a re-applied
-          // label spawn a duplicate run).
-          isRunTerminal: async (sessionId) => (await options.orchestratorClient.probeLive(sessionId)).status === "not-live",
+          isRunTerminal: gatewayOwedRunTerminal({
+            isRunningHere: (sessionId) => (this.runningSessions.get(sessionId) ?? 0) > 0,
+            ...(options.inflightRunStore ? { inflightRunStore: options.inflightRunStore } : {}),
+          }),
           removeLabel: (owner, repo, issueNumber, label) =>
             options.githubReplyClient.removeIssueLabel(owner, repo, issueNumber, label),
           onError: this.report,
@@ -988,6 +987,8 @@ export class GatewayServer {
     const store = this.options.inflightRunStore;
     const leaseMs = this.options.inflightRunLeaseMs ?? DEFAULT_LEASE_MS;
     this.runningRuns.add(run.key);
+    const sessionId = run.trigger.sessionId;
+    this.runningSessions.set(sessionId, (this.runningSessions.get(sessionId) ?? 0) + 1);
     let renew: ReturnType<typeof setInterval> | undefined;
     try {
       if (store) {
@@ -1009,6 +1010,9 @@ export class GatewayServer {
       if (renew) clearInterval(renew);
       await store?.clear(run.key);
       this.runningRuns.delete(run.key);
+      const left = (this.runningSessions.get(sessionId) ?? 1) - 1;
+      if (left > 0) this.runningSessions.set(sessionId, left);
+      else this.runningSessions.delete(sessionId);
     }
   }
 

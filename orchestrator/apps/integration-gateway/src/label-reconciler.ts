@@ -1,4 +1,5 @@
 import { Redis } from "ioredis";
+import type { InflightRunStore } from "./inflight-runs.js";
 
 /**
  * The durable half of the deterministic label-removal fix.
@@ -153,12 +154,10 @@ export interface LabelReconcilerOptions {
   store: PendingLabelStore;
   /**
    * Whether the run behind a recorded label has reached a TERMINAL state and
-   * so is safe to strip the label from. In production this is wired to the
-   * orchestrator's real-time liveness probe (`checkLive`): a run THIS gateway
-   * recorded that is no longer live has either finished or died, and in both
-   * cases no in-process `finally` will ever remove its label. Kept injectable
-   * so the orchestrator-reachable terminal signal can evolve without changing
-   * the sweep, and so tests can drive it exactly.
+   * so is safe to strip the label from. In production this is
+   * {@link gatewayOwedRunTerminal}: a run THIS gateway recorded that it no
+   * longer owes a finish has either finished or died with no takeover left,
+   * and in both cases no `finally` will ever remove its label.
    */
   isRunTerminal: (sessionId: string) => Promise<boolean>;
   /** Idempotent label removal -- {@link GithubReplyClient.removeIssueLabel} (404 == success, retried internally). */
@@ -167,11 +166,9 @@ export interface LabelReconcilerOptions {
   intervalMs?: number;
   /**
    * How old a record must be before the sweep will act on it. Guards the race
-   * between `/invoke` accept and its pod becoming live, where a run could read
-   * as "not live" = terminal and be stripped prematurely. (A transient probe
-   * failure is handled separately and more directly: `isRunTerminal` requires a
-   * POSITIVE confirmed not-live signal, so an unreachable orchestrator reads as
-   * still-live, never terminal -- see the wiring in server.ts.) A legitimately
+   * between recording the owed removal and the run being tracked as in
+   * flight. (An unreadable in-flight store reads as still running, never
+   * terminal -- see {@link gatewayOwedRunTerminal}.) A legitimately
    * owed removal is only ever LATE, never wrong, so waiting out the grace costs
    * nothing.
    */
@@ -179,6 +176,31 @@ export interface LabelReconcilerOptions {
   onError?: (error: unknown) => void;
   /** Injectable clock, for tests. */
   now?: () => number;
+}
+
+/**
+ * The production `isRunTerminal`: a run is over once the gateway that accepted
+ * it no longer owes it a finish -- no process here is running it, and (with
+ * Redis) no in-flight record is waiting for a takeover. Both are the gateway's
+ * own bookkeeping, so this needs nothing from the engine.
+ *
+ * It used to ask the orchestrator's `GET /sessions/live`, but that only ever
+ * described a pod the old in-process engine launched; on Temporal it answers a
+ * confirmed `{ live: false }` for every session. The sweep then stripped the
+ * label from any run still going after the grace window -- a software-factory
+ * fix run lost `ai-triage` about 12 minutes in, long before its result comment.
+ */
+export function gatewayOwedRunTerminal(options: {
+  /** Whether a run on this session is being finished by THIS process right now. */
+  isRunningHere: (sessionId: string) => boolean;
+  /** The durable in-flight store, when Redis is configured. */
+  inflightRunStore?: Pick<InflightRunStore, "hasRunForSession">;
+}): (sessionId: string) => Promise<boolean> {
+  return async (sessionId) => {
+    if (options.isRunningHere(sessionId)) return false;
+    if (options.inflightRunStore && (await options.inflightRunStore.hasRunForSession(sessionId))) return false;
+    return true;
+  };
 }
 
 const DEFAULT_INTERVAL_MS = 5 * 60 * 1000;

@@ -129,10 +129,11 @@ describe("label durability: a trigger label always comes off, even on the unhapp
     // for this turn goes away mid-flight.
     await rollGateway();
 
-    // The REPLACEMENT pod heals it: its startup sweep (and then its periodic
-    // reconciler) finds the owed removal in the durable outbox, confirms the run
-    // is no longer live, and removes the stranded label idempotently. Generous
-    // budget: this depends on the reconciler's interval/grace, not on the turn.
+    // The REPLACEMENT pod heals it: it takes over the in-flight run once the
+    // old pod's lease lapses and removes the label when the run finishes; the
+    // reconciler backstops any removal still owed after that (it never strips
+    // a label while a run is still owed a finish). Generous budget: the run
+    // itself narrates for two minutes.
     const deleted = await labelRemoved(issueNumber, 600_000);
     expect(deleted).toBeDefined();
 

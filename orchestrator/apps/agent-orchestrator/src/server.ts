@@ -481,10 +481,10 @@ export class InvokeServer {
    *
    * The live-session tunnel (ADR 0026) proxied into an agent Pod the
    * in-process engine had launched; the Temporal engine launches and owns its
-   * runs, so this process never has one to tunnel into. The route still
-   * answers, with a CONFIRMED not-live, because integration-gateway's label
-   * reconciler only clears a run's label on a positive terminal signal (a 404
-   * reads as "unknown" and would pin the label forever).
+   * runs, so this process never has one to tunnel into. It says nothing about
+   * whether a turn is still running -- integration-gateway's label reconciler
+   * must not use it as a terminal signal (it once did, and stripped labels
+   * from runs still in progress); it uses the gateway's own in-flight records.
    */
   private handleSessionLive(req: IncomingMessage, res: ServerResponse, url: URL): void {
     if (!bearerToken(req.headers.authorization)) {
