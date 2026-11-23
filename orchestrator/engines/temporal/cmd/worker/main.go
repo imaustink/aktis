@@ -14,6 +14,7 @@ import (
 	"k8s.io/client-go/dynamic"
 
 	"github.com/aktisai/orchestrator/engines/temporal/internal/agentrun"
+	"github.com/aktisai/orchestrator/engines/temporal/internal/attachments"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/authz"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/identitylink"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/kubeconfig"
@@ -84,12 +85,28 @@ func main() {
 	w.RegisterWorkflowWithOptions(workflows.IdentityCheckWorkflow, workflow.RegisterOptions{
 		Name: workflows.IdentityCheckWorkflowName,
 	})
-	w.RegisterActivityWithOptions((&activities.LLMActivities{Client: llmClient}).CompleteTurn, activity.RegisterOptions{
+	// Image attachments (package attachments): the gateway uploads, the
+	// worker reads back for vision calls and presigns for agent pods. Unset
+	// (no IMAGE_S3_BUCKET), a turn carrying a stored image fails loudly.
+	var attachmentResolver *attachments.Resolver
+	if s3cfg, ok := attachments.S3ConfigFromEnv(); ok {
+		store, err := attachments.NewS3Store(context.Background(), s3cfg)
+		if err != nil {
+			log.Fatalf("image attachment store: %v", err)
+		}
+		attachmentResolver = &attachments.Resolver{Store: store, PresignTTL: activities.DefaultPresignTTL}
+		log.Printf("image attachments enabled: bucket=%s prefix=%s", s3cfg.Bucket, s3cfg.Prefix)
+	}
+	w.RegisterActivityWithOptions((&activities.LLMActivities{Client: llmClient, Attachments: attachmentResolver}).CompleteTurn, activity.RegisterOptions{
 		Name: activities.CompleteTurnActivityName,
+	})
+	w.RegisterActivityWithOptions((&activities.AttachmentActivities{Attachments: attachmentResolver}).PresignAttachments, activity.RegisterOptions{
+		Name: activities.PresignAttachmentsActivityName,
 	})
 
 	agentLoop := &activities.AgentLoopActivities{
-		LLM: llmClient,
+		LLM:         llmClient,
+		Attachments: attachmentResolver,
 		// Resolves a repository a chat request names without its owner, for a
 		// deployment that belongs to one organization. Unset, such a request
 		// is asked which repository it meant.

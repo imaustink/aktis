@@ -15,6 +15,7 @@ import (
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 
+	"github.com/aktisai/orchestrator/engines/temporal/internal/attachments"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/callertools"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/catalog"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/rbac"
@@ -121,6 +122,12 @@ type invokeRequest struct {
 	// envelope.repository). Absent, a matched envelope's own repository is
 	// used.
 	TargetRepository string `json:"targetRepository,omitempty"`
+
+	// Images are a chat turn's image attachments, as data: or https:// URLs
+	// (agent-orchestrator forwards the ones on the user's latest message).
+	// Uploaded here, so only Refs reach the workflow (package attachments).
+	// Refused on an event turn: an event's content is its envelope.
+	Images []attachments.Image `json:"images,omitempty"`
 }
 
 type invokeAccepted struct {
@@ -237,6 +244,7 @@ var (
 	// errEventWithDispatch: an event is always matched here, never paired with
 	// a pre-resolved dispatch.
 	errEventWithDispatch = errors.New("an event cannot be sent together with a dispatch assertion")
+	errEventWithImages   = errors.New("images can only accompany a chat request, not an event")
 )
 
 // resolveInvokeCaller prefers a trusted, signed caller identity
@@ -301,6 +309,9 @@ func shapeInvokeTurn(
 	}
 	if req.Event != nil && dispatchHeader != "" {
 		return shapedInvoke{}, errEventWithDispatch
+	}
+	if req.Event != nil && len(req.Images) > 0 {
+		return shapedInvoke{}, errEventWithImages
 	}
 
 	// Read the sender login OUTSIDE trigger matching, deliberately: the
@@ -394,7 +405,8 @@ func shapeInvokeTurn(
 		// A forced tool's input is ToolInput, so its prompt may legitimately
 		// be empty (a toolRef trigger needs no promptTemplate). Anything else
 		// with nothing to say is a malformed request.
-		if turn.Message == "" && turn.ForcedToolID == "" {
+		// Images alone are a real message too.
+		if turn.Message == "" && turn.ForcedToolID == "" && len(req.Images) == 0 {
 			return shapedInvoke{}, errEmptyRequest
 		}
 		return shapedInvoke{turn: turn, sessionID: sessionID}, nil
@@ -519,6 +531,15 @@ func (s *Server) handleInvoke(c *gin.Context) {
 		refuseIdentity(c, ie, shaped.match, sessionID)
 		return
 	}
+	// Uploaded only once the turn is known to run, so a refused turn leaves
+	// nothing behind in the bucket.
+	images, err := s.uploadImages(c.Request.Context(), sessionID, req.Images)
+	if err != nil {
+		writeImageError(c, err)
+		return
+	}
+	turn.Images = images
+
 	workflowID := "conversation-" + sanitizeID(sessionID)
 	updateID := uuid.NewString()
 

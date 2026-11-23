@@ -22,6 +22,7 @@ import (
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/client"
 
+	"github.com/aktisai/orchestrator/engines/temporal/internal/attachments"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/callertools"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/catalog"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/rbac"
@@ -66,6 +67,12 @@ type Server struct {
 	// taskCompleter answers a chat UI's housekeeping requests. Nil returns
 	// empty text, which is what those requests get today.
 	taskCompleter TaskCompleter
+
+	// attachments stores a turn's uploaded images (package attachments) under
+	// attachmentPrefix. Nil: a turn carrying a data: image is refused (400)
+	// rather than run without it.
+	attachments      attachments.Store
+	attachmentPrefix string
 }
 
 // TaskCompleter answers a chat UI's internal housekeeping completions (title,
@@ -105,6 +112,27 @@ func WithTaskCompleter(completer TaskCompleter) Option {
 	return func(s *Server) { s.taskCompleter = completer }
 }
 
+func WithAttachments(store attachments.Store, keyPrefix string) Option {
+	return func(s *Server) {
+		s.attachments = store
+		s.attachmentPrefix = keyPrefix
+	}
+}
+
+// uploadImages stores a turn's images once, here at the edge, and returns
+// the Refs the workflow carries instead of the bytes. Objects are grouped by
+// conversation so a bucket lifecycle rule (or a person) can find them.
+func (s *Server) uploadImages(ctx context.Context, sessionID string, images []attachments.Image) ([]attachments.Ref, error) {
+	if len(images) == 0 {
+		return nil, nil
+	}
+	prefix := strings.Trim(s.attachmentPrefix, "/")
+	if prefix == "" {
+		prefix = "attachments"
+	}
+	return attachments.Upload(ctx, s.attachments, prefix+"/"+sanitizeID(sessionID), uuid.NewString, images)
+}
+
 func NewServer(temporal client.Client, taskQueue string, identity rbac.Resolver, opts ...Option) *Server {
 	s := &Server{
 		temporal: temporal, taskQueue: taskQueue, identity: identity,
@@ -124,8 +152,13 @@ func (s *Server) Handler() http.Handler {
 		c.String(http.StatusOK, "ok")
 	})
 	router.GET("/v1/models", s.handleModels)
-	router.POST("/v1/chat/completions", s.handleChatCompletions)
-	router.POST("/invoke", s.handleInvoke)
+	// The two routes that may carry base64 images get a body cap, so a hostile
+	// or runaway client cannot hold the gateway's memory with one request.
+	// /v1/chat/completions carries the client's whole transcript, earlier
+	// images included, so its wire cap is wider and readChatBody keeps memory
+	// bounded instead (chatbody.go).
+	router.POST("/v1/chat/completions", limitBody(maxChatWireBytes), s.handleChatCompletions)
+	router.POST("/invoke", limitBody(attachments.MaxRequestBytes), s.handleInvoke)
 	router.POST("/invoke/check", s.handleInvokeCheck)
 	router.GET("/invoke/:id", s.handleInvokeStatus)
 	// docs/adr/0050 §4: one server span per request, continuing an inbound W3C
@@ -215,8 +248,19 @@ func (s *Server) handleModels(c *gin.Context) {
 }
 
 func (s *Server) handleChatCompletions(c *gin.Context) {
+	// Earlier messages' images are dropped as the body streams in; only the
+	// newest few are stashed, for the last user message (chatbody.go).
+	body, stash, err := readChatBody(c.Request.Body)
+	if err != nil {
+		if errors.Is(err, errChatBodyTooLarge) {
+			writeError(c, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
+		writeInvalidRequestError(c, "could not read request body: "+err.Error())
+		return
+	}
 	var req chatCompletionRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		writeInvalidRequestError(c, "invalid JSON body: "+err.Error())
 		return
 	}
@@ -269,6 +313,20 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 	if len(seedHistory) > 0 {
 		turnInput.SeedHistory = seedHistory
 	}
+	// Images on the user's turn, uploaded here so only Refs enter the
+	// workflow. Earlier turns' images are not re-uploaded: the conversation
+	// workflow keeps its own Refs for those.
+	turnImages, err := stash.resolve(messageImages(req.Messages[lastUserIndex].Content))
+	if err != nil {
+		writeImageError(c, err)
+		return
+	}
+	images, err := s.uploadImages(c.Request.Context(), sessionID, turnImages)
+	if err != nil {
+		writeImageError(c, err)
+		return
+	}
+	turnInput.Images = images
 
 	if ephemeral {
 		log.Printf("serving ephemeral turn (no session header): workflow=%s", workflowID)
@@ -440,7 +498,8 @@ func splitMessages(messages []callertools.WireMessage) (string, []workflows.Chat
 	if lastUser >= 0 {
 		userContent = messageContent(messages[lastUser].Content)
 	}
-	if lastUser < 0 || strings.TrimSpace(userContent) == "" {
+	// An image with no text is a real message ("what is this?" left unsaid).
+	if lastUser < 0 || (strings.TrimSpace(userContent) == "" && len(messageImages(messages[lastUser].Content)) == 0) {
 		return "", nil, -1, fmt.Errorf("messages must contain a non-empty user message")
 	}
 
@@ -485,6 +544,49 @@ func messageContent(raw json.RawMessage) string {
 		return b.String()
 	}
 	return ""
+}
+
+// limitBody caps a request body; reading past it fails the JSON bind (400).
+func limitBody(max int64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, max)
+		c.Next()
+	}
+}
+
+// messageImages reads the image parts of a multi-part message content
+// (OpenAI's `{"type":"image_url","image_url":{"url":...}}`). A plain-string
+// content has none.
+func messageImages(raw json.RawMessage) []attachments.Image {
+	var parts []struct {
+		Type     string `json:"type"`
+		ImageURL *struct {
+			URL string `json:"url"`
+		} `json:"image_url"`
+	}
+	if len(raw) == 0 || json.Unmarshal(raw, &parts) != nil {
+		return nil
+	}
+	var images []attachments.Image
+	for _, p := range parts {
+		if p.Type == "image_url" && p.ImageURL != nil && strings.TrimSpace(p.ImageURL.URL) != "" {
+			images = append(images, attachments.Image{URL: p.ImageURL.URL})
+		}
+	}
+	return images
+}
+
+// writeImageError answers a turn whose images could not be accepted: a 400
+// for anything the caller can fix (bad type, too large, attachments off).
+// A store outage is the server's fault and says so.
+func writeImageError(c *gin.Context, err error) {
+	var invalid *attachments.InvalidError
+	if errors.Is(err, attachments.ErrNotConfigured) || errors.As(err, &invalid) {
+		writeInvalidRequestError(c, err.Error())
+		return
+	}
+	log.Printf("image attachment upload failed: %v", err)
+	writeError(c, http.StatusBadGateway, "could not store the attached image: "+err.Error())
 }
 
 // resolveCaller maps the bearer token to an identity. Unresolved callers get

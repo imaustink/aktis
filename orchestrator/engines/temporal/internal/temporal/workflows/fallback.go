@@ -154,6 +154,8 @@ func planToolCall(
 	var plan activities.PlannedAction
 	if err := workflow.ExecuteActivity(actx, activities.PlanActionActivityName, activities.PlanActionInput{
 		Request:            in.Message,
+		Images:             in.Images,
+		ContextImages:      in.ContextImages,
 		SkillMarkdown:      fallbackToolMarkdown,
 		Tools:              tools,
 		CallerTools:        offeredCallerTools,
@@ -221,7 +223,7 @@ func noMatchFallback(
 	}
 
 	meta.Path = "fallback-bare"
-	reply, err := bareAnswer(ctx, actx, in.Message)
+	reply, err := bareAnswer(ctx, actx, in)
 	if err != nil {
 		return "", *meta, nil, err
 	}

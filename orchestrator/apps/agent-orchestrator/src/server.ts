@@ -16,6 +16,7 @@ import { parseEnvelope, type EventTriggerSelector } from "./routing/crd-event-tr
 import type { Envelope, RenderedReply } from "@aktis/event-triggers";
 import {
   buildAgentRequest,
+  type ChatImage,
   chatCompletionChunk,
   chatCompletionId,
   chatCompletionResponse,
@@ -930,7 +931,7 @@ export class InvokeServer {
       );
       return;
     }
-    const { request, priorToolCalls } = built;
+    const { request, priorToolCalls, images } = built;
 
     const model = typeof parsed.model === "string" && parsed.model ? parsed.model : MODEL_ID;
     const sessionId = headerValue(req.headers[CHAT_ID_HEADER]);
@@ -981,6 +982,7 @@ export class InvokeServer {
         forwardedUserToken,
         callerTools,
         identityLinkFlow,
+        images,
       );
       return;
     }
@@ -992,6 +994,7 @@ export class InvokeServer {
       forwardedUserToken,
       callerTools,
       identityLinkFlow,
+      images,
     );
   }
 
@@ -1080,6 +1083,7 @@ export class InvokeServer {
     forwardedUserToken?: string,
     callerTools?: CallerToolTurn,
     identityLinkFlow?: "device" | "authcode",
+    images: ChatImage[] = [],
   ): Promise<void> {
     // A Remote Control session URL is deliberately NOT surfaced on the
     // non-streaming path: RC's whole value is a LIVE session to watch/steer,
@@ -1097,6 +1101,7 @@ export class InvokeServer {
       undefined,
       callerTools,
     );
+    if (images.length > 0) turnInput.images = images;
     const outcome = await this.engine.invoke(turnInput);
     if (outcome.error) {
       const { status, code } = errorStatusAndCode(outcome.error);
@@ -1129,6 +1134,7 @@ export class InvokeServer {
     forwardedUserToken?: string,
     callerTools?: CallerToolTurn,
     identityLinkFlow?: "device" | "authcode",
+    images: ChatImage[] = [],
   ): Promise<void> {
     const id = chatCompletionId();
     res.writeHead(200, {
@@ -1248,6 +1254,7 @@ export class InvokeServer {
         openStatusLabel = label;
         writeSseStatus(res, label, false);
       }, identityLinkFlow, forwardedUserToken, undefined, undefined, callerTools);
+      if (images.length > 0) turnInput.images = images;
       // Started now and awaited inside the iterable, so `withHeartbeat` is
       // already racing it when the first keep-alive is due: a turn can run for
       // many minutes with no progress line, and an idle SSE connection would

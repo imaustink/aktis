@@ -60,3 +60,19 @@ engine's tracer is a no-op.
   value: {{ $obs.contentCapture | default "metadata" | quote }}
 {{- end }}
 {{- end -}}
+
+{{/*
+Image attachments (orchestrator/engines/temporal/internal/attachments): the
+whole S3 connection profile comes from one Secret, in the same key shape as
+the image-gen tool's (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, IMAGE_S3_BUCKET,
+IMAGE_S3_REGION, IMAGE_S3_ENDPOINT, IMAGE_S3_FORCE_PATH_STYLE; optional
+ATTACHMENTS_S3_PREFIX), so a deployment can point both at one bucket. The
+gateway uploads and the worker reads back and presigns, so both mount it.
+*/}}
+{{- define "temporal-engine.attachmentsEnvFrom" -}}
+{{- if .Values.attachments.s3.secretName }}
+envFrom:
+  - secretRef:
+      name: {{ .Values.attachments.s3.secretName }}
+{{- end }}
+{{- end -}}

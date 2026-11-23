@@ -818,6 +818,40 @@ describe("InvokeServer OpenAI-compatible chat completions (ADR 0007)", () => {
     await server.close();
   });
 
+  // Regression: an Open WebUI message with an attached image used to be
+  // refused with 'messages must include a non-empty "user" message'.
+  it("POST /v1/chat/completions forwards an Open WebUI image attachment to the engine (both modes)", async () => {
+    const engine = fakeEngine({ result: "ok" });
+    const server = new InvokeServer(engine);
+    const port = await listenOn(server);
+    const dataUrl = "data:image/png;base64,iVBORw0KGgo=";
+    const messages = [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Extract this recipe: https://www.tiktok.com/t/ZP8TbWREM/" },
+          { type: "image_url", image_url: { url: dataUrl } },
+        ],
+      },
+    ];
+
+    const blocking = await chat(port, { messages });
+    expect(blocking.status).toBe(200);
+    const streaming = await chat(port, { messages, stream: true });
+    expect(streaming.status).toBe(200);
+    await streaming.text();
+
+    expect(engine.invoke).toHaveBeenCalledTimes(2);
+    for (const [input] of engine.invoke.mock.calls) {
+      expect(input).toMatchObject({
+        request: "Extract this recipe: https://www.tiktok.com/t/ZP8TbWREM/",
+        images: [{ url: dataUrl }],
+      });
+    }
+
+    await server.close();
+  });
+
   it("POST /v1/chat/completions omits forwardedUserToken when Open WebUI sends no such header", async () => {
     const engine = fakeEngine();
     const server = new InvokeServer(engine);

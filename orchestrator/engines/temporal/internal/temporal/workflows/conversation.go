@@ -9,6 +9,7 @@ import (
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 
+	"github.com/aktisai/orchestrator/engines/temporal/internal/attachments"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/authz"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/callertools"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/llm"
@@ -110,10 +111,26 @@ const (
 type ChatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// Images are a user message's image attachments, as Refs (never bytes),
+	// kept so a follow-up turn can still show them to the model.
+	Images []attachments.Ref `json:"images,omitempty"`
 }
 
 type TurnInput struct {
 	Message string `json:"message"`
+
+	// Images are the user's image attachments for this turn, already uploaded
+	// by the gateway (package attachments): Refs only, so image bytes never
+	// enter workflow history. Resolved strictly: an image the user attached to
+	// THIS turn that cannot be loaded fails the turn.
+	Images []attachments.Ref `json:"images,omitempty"`
+
+	// ContextImages are earlier turns' stored images still in the
+	// conversation window, set by the update handler (contextImages). Resolved
+	// best-effort: one that has expired from the bucket or fails to load is
+	// skipped, so a single bad earlier image cannot break every later turn.
+	// Never set by a caller.
+	ContextImages []attachments.Ref `json:"contextImages,omitempty"`
 
 	// Caller is the identity the gateway resolved for this turn; retrieval
 	// and tool access are scoped to it (fail closed on empty subject).
@@ -430,7 +447,14 @@ func ConversationWorkflow(ctx workflow.Context, state *ConversationState) error 
 		if len(state.History) == 0 && len(in.SeedHistory) > 0 {
 			state.History = append(state.History, in.SeedHistory...)
 		}
-		state.History = append(state.History, ChatMessage{Role: "user", Content: in.Message})
+		// An image-bearing message gets a deterministic text marker, so every
+		// text-only consumer (retrieval, routing, the transcript, a delegated
+		// agent's goal) knows the images exist even though it cannot see them.
+		if len(in.Images) > 0 {
+			in.Message = strings.TrimSpace(in.Message + "\n\n" + attachments.Note(len(in.Images)))
+		}
+		state.History = append(state.History, ChatMessage{Role: "user", Content: in.Message, Images: in.Images})
+		in.Images, in.ContextImages = contextImages(state.History)
 
 		// The conversation's read-only mode (see ConversationState.ReadOnly).
 		// Decided here, before anything in the turn reads in.ReadOnly, so no
@@ -593,6 +617,44 @@ func toLLMMessages(history []ChatMessage) []llm.Message {
 		out[i] = llm.Message{Role: m.Role, Content: m.Content}
 	}
 	return out
+}
+
+// contextImages is the images a turn shows the model, bounded together by
+// attachments.MaxContextImages: the current (last) message's own attachments
+// first, then earlier user messages' newest first. Earlier images stay
+// visible only while their message is still in the bounded transcript.
+//
+// The two are returned apart because they fail differently: the current
+// turn's are resolved strictly, earlier ones best-effort. An earlier external
+// (https://) image is not shown again at all — the engine cannot check that
+// the provider can still fetch it, and a provider rejects the whole request
+// over one unfetchable image URL.
+func contextImages(history []ChatMessage) (current, earlier []attachments.Ref) {
+	n := len(history)
+	if n == 0 {
+		return nil, nil
+	}
+	for _, ref := range history[n-1].Images {
+		if len(current) == attachments.MaxContextImages {
+			break
+		}
+		current = append(current, ref)
+	}
+	for i := n - 2; i >= 0 && len(current)+len(earlier) < attachments.MaxContextImages; i-- {
+		if history[i].Role != "user" {
+			continue
+		}
+		for _, ref := range history[i].Images {
+			if len(current)+len(earlier) == attachments.MaxContextImages {
+				break
+			}
+			if ref.Key == "" {
+				continue // external: see above
+			}
+			earlier = append(earlier, ref)
+		}
+	}
+	return current, earlier
 }
 
 func trimHistory(history []ChatMessage, max int) []ChatMessage {

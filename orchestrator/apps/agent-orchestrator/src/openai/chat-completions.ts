@@ -26,7 +26,45 @@ export function listModelsResponse(): unknown {
   };
 }
 
-/** Finds the index of the most recent message with the given `role`, searching backward from `before`. */
+/** One image attached to a chat message: a `data:` URL or an `https://` URL, as the client sent it. */
+export interface ChatImage {
+  url: string;
+}
+
+/**
+ * A message's text. OpenAI's content is either a plain string or -- for any
+ * message carrying an image (Open WebUI sends one whenever the user attaches a
+ * picture) -- an array of typed parts. Treating only the string form as text
+ * made every image-bearing user message look empty, so the whole turn was
+ * refused with 'messages must include a non-empty "user" message'.
+ */
+export function messageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter(
+      (part): part is { type: "text"; text: string } =>
+        !!part && typeof part === "object" && part.type === "text" && typeof part.text === "string",
+    )
+    .map((part) => part.text)
+    .join("\n");
+}
+
+/** A message's `image_url` parts, in order. A plain-string content has none. */
+export function messageImages(content: unknown): ChatImage[] {
+  if (!Array.isArray(content)) return [];
+  const images: ChatImage[] = [];
+  for (const part of content as { type?: unknown; image_url?: unknown }[]) {
+    if (!part || typeof part !== "object" || part.type !== "image_url") continue;
+    // OpenAI's shape is `{ url }`; some clients send the bare string.
+    const raw = part.image_url;
+    const url = typeof raw === "string" ? raw : (raw as { url?: unknown } | undefined)?.url;
+    if (typeof url === "string" && url.trim() !== "") images.push({ url: url.trim() });
+  }
+  return images;
+}
+
+/** Finds the index of the most recent non-empty message (text or images) with the given `role`. */
 function findLastMessageIndex(messages: ChatMessage[], role: string, before: number = messages.length): number {
   for (let i = before - 1; i >= 0; i--) {
     const message = messages[i];
@@ -34,8 +72,7 @@ function findLastMessageIndex(messages: ChatMessage[], role: string, before: num
       message &&
       typeof message === "object" &&
       message.role === role &&
-      typeof message.content === "string" &&
-      message.content.trim() !== ""
+      (messageText(message.content).trim() !== "" || messageImages(message.content).length > 0)
     ) {
       return i;
     }
@@ -53,6 +90,12 @@ export interface AgentRequest {
    * for every ordinary turn.
    */
   priorToolCalls: PriorCallerToolCall[];
+  /**
+   * Images on the new user message, forwarded to the engine, which uploads
+   * them and shows them to the model. Earlier messages' images are not
+   * re-sent: the engine's conversation keeps its own references to them.
+   */
+  images: ChatImage[];
 }
 
 /** Most recent prior messages folded into the request (see {@link buildAgentRequest}). */
@@ -115,7 +158,8 @@ export function buildAgentRequest(messages: unknown): AgentRequest | undefined {
   const arr = messages as ChatMessage[];
   const userIdx = findLastMessageIndex(arr, "user");
   if (userIdx === -1) return undefined;
-  const userContent = arr[userIdx]!.content as string;
+  const userContent = messageText(arr[userIdx]!.content);
+  const images = messageImages(arr[userIdx]!.content);
   // Tool calls the CLIENT already executed for us, lifted out as structured
   // history rather than folded into the prose below (docs/adr/0035 §1).
   const priorToolCalls = collectPriorToolCalls(arr, userIdx);
@@ -126,8 +170,9 @@ export function buildAgentRequest(messages: unknown): AgentRequest | undefined {
     const message = arr[i];
     if (!message || typeof message !== "object") continue;
     if (message.role !== "user" && message.role !== "assistant") continue;
-    if (typeof message.content !== "string" || message.content.trim() === "") continue;
-    const content = message.role === "assistant" ? stripSelfImprovementFooter(message.content) : message.content;
+    const text = messageText(message.content);
+    if (text.trim() === "") continue;
+    const content = message.role === "assistant" ? stripSelfImprovementFooter(text) : text;
     prior.unshift({ role: message.role, content });
   }
   // Enforce the char budget by dropping oldest first.
@@ -135,12 +180,13 @@ export function buildAgentRequest(messages: unknown): AgentRequest | undefined {
   while (prior.length > 0 && total > HISTORY_MAX_CHARS) {
     total -= prior.shift()!.content.length;
   }
-  if (prior.length === 0) return { request: userContent, priorToolCalls };
+  if (prior.length === 0) return { request: userContent, priorToolCalls, images };
 
   const history = prior.map((m) => `<message role="${m.role}">\n${m.content}\n</message>`).join("\n");
   return {
     request: `<conversation_history>\n${history}\n</conversation_history>\n\n${userContent}`,
     priorToolCalls,
+    images,
   };
 }
 

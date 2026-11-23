@@ -134,6 +134,7 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.llm.secretName }}
                   key: OPENAI_API_KEY
+          {{- include "temporal-engine.attachmentsEnvFrom" . | nindent 10 }}
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
 {{- end }}

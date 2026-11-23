@@ -108,6 +108,17 @@ interface ForwardedCaller {
 /** A turn carried a per-user identity that could not be verified or forwarded. */
 const UNRESOLVED = Symbol("unresolved-forwarded-caller");
 
+/** The engine gateway's error text: `{"error":{"message":...}}` or `{"error":"..."}`. Best-effort. */
+async function engineErrorMessage(res: Response): Promise<string | undefined> {
+  try {
+    const body = (await res.json()) as { error?: string | { message?: unknown } };
+    const message = typeof body.error === "string" ? body.error : body.error?.message;
+    return typeof message === "string" && message.trim() !== "" ? message.trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function splitNarrationLine(line: string): [stage: string, message: string] {
   for (const stage of CONTENT_NARRATION_PREFIXES) {
     const prefix = `${stage}: `;
@@ -333,7 +344,11 @@ export class TemporalEngine implements TurnEngine {
       status = res.status;
       hop.set({ "http.response.status_code": res.status });
       if (!res.ok) {
-        throw new Error(`temporal engine /invoke failed: ${res.status}`);
+        // A 400 is a request the user can fix (e.g. an image the engine will
+        // not accept, or attachments not enabled), so its reason is worth
+        // showing them; anything else stays the bare status.
+        const reason = res.status === 400 ? await engineErrorMessage(res) : undefined;
+        throw new Error(`temporal engine /invoke failed: ${res.status}${reason ? ` (${reason})` : ""}`);
       }
       const id = ((await res.json()) as InvokeAccepted).id;
       hop.set({ "aktis.invocation_id": id });
@@ -460,6 +475,9 @@ export class TemporalEngine implements TurnEngine {
       body: JSON.stringify({
         request: input.request,
         sessionId: input.sessionId,
+        // The engine gateway uploads these and carries only references into
+        // the workflow (engines/temporal/internal/attachments).
+        ...(input.images?.length ? { images: input.images } : {}),
         // Every turn, not just the triggering one: on a follow-up turn
         // `input.readOnly` carries this process's sticky session flag, and the
         // engine keeps its own per-conversation flag too. Sent only as `true`;

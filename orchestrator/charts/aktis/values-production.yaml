@@ -188,6 +188,14 @@ temporal-engine:
     # The worker and gateway register this namespace on startup if it is missing.
     namespace: default
 
+  # Chat image attachments (docs/adr/0054): same bucket and credentials as the
+  # image-gen tool. The image-gen-s3 Secret lives in this namespace, and its IAM
+  # policy covers recipe-agent-images/*. homelab's Bucket CR expires the
+  # attachments/ prefix after 30 days.
+  attachments:
+    s3:
+      secretName: image-gen-s3
+
   # The subchart's image names have no registry, so containerd would look for
   # them on Docker Hub. `Always` for the same reason as every other image here:
   # `:latest` is mutable.

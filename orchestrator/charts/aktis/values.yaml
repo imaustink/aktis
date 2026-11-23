@@ -91,6 +91,7 @@ temporal-engine:
   #   temporal: { address: temporal-frontend.temporal.svc:7233 }
   #   qdrant: { host: agent-controller-qdrant, collectionPrefix: te- }
   #   nats: { url: nats://agent-controller-nats:4222 }
+  #   attachments: { s3: { secretName: image-gen-s3 } }  # chat image uploads
 
 # ---------------------------------------------------------------------------
 # GitHub Issues adapter (charts/integration-gateway) -- phase 1 of
