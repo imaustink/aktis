@@ -1,8 +1,12 @@
-# Software factory, step 2 (docs/adr/0052 §4): when issue triage or a fix run
-# succeeds with an open PR, review that PR read-only. Routed by the run event,
+# Software factory, step 2 (docs/adr/0052 §4): when issue triage, PR triage or
+# a fix run succeeds with an open PR, review that PR read-only. Routed by the run event,
 # not a GitHub label: the bot's own label/PR webhooks are dropped (self-trigger
 # guard), so the chain never crosses GitHub. The `ai-review` label is only a
 # status display, added at acceptance and removed when the review ends.
+#
+# A fix run that pushed nothing (`outcome.madeNewCommits` false -- e.g. it
+# could not push to a fork's branch, or only replied to comments) is not
+# re-reviewed: factory-handoff gives the PR to a human instead.
 #
 # Loop bound: at most 3 reviews per chain (`body.chain.counts`), on top of the
 # gateway's global RUN_EVENT_MAX_DEPTH. A readOnly run's runner appends the
@@ -10,8 +14,10 @@
 # for the review; the recorded verdict arrives as `body.outcome.verdict` on the
 # review's own run event, which factory-fix / factory-handoff route on.
 #
-# `number` reads the PR from the finished run's outcome, which match.cel
-# guarantees is present (issue triage ran on the issue, not the PR).
+# `number` reads the PR from the finished run's outcome. A run that was already
+# on the PR (github-pr-triage, factory-fix) falls back to its own number; issue
+# triage never does -- match.cel requires its outcome PR, since its own number
+# is the issue.
 apiVersion: core.aktis.ai/v1alpha1
 kind: EventTrigger
 metadata:
@@ -21,13 +27,15 @@ spec:
   match:
     cel: >-
       source == "runs" && kind == "run" &&
-      body.trigger in ["github-issue-triage", "factory-fix"] &&
+      body.trigger in ["github-issue-triage", "github-pr-triage", "factory-fix"] &&
       body.status == "succeeded" &&
-      has(body.outcome.pullRequest) &&
+      (has(body.outcome.pullRequest) || body.trigger in ["github-pr-triage", "factory-fix"]) &&
+      (body.trigger != "factory-fix" || (has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits)) &&
       (!("factory-review" in body.chain.counts) || body.chain.counts["factory-review"] < 3)
   params:
     repository: body.params.repository
-    number: body.outcome.pullRequest.number
+    number: >-
+      has(body.outcome.pullRequest) ? body.outcome.pullRequest.number : body.params.number
   # The PR, so fix runs and re-reviews share one session per PR.
   sessionKey: "github:{{repository}}#{{number}}"
   target:

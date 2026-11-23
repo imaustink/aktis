@@ -396,7 +396,10 @@ body: {
 The SWE agents (claude-code-swe-agent, opencode-swe-agent) report the outcome
 from the runner, not the model:
 `{pullRequest?: {number, url}, madeNewCommits, verdict?}`. `pullRequest` is set
-when the turn ended with an open PR. `verdict` is set only on `readOnly` runs:
+when the turn ended with an open PR. `madeNewCommits` is true only when a
+non-`readOnly` turn moved HEAD **and** the new HEAD reached a remote (some
+remote-tracking branch contains it), so a commit whose push failed counts as no
+new work. `verdict` is set only on `readOnly` runs:
 the runner tells the model to run `aktis-verdict changes-requested` or
 `aktis-verdict ready` once after posting its review, validates what it recorded,
 and reports `"none"` for a missing or invalid one.
@@ -411,7 +414,7 @@ bot-drop guard (§1) is untouched.
 **Loop bounds.** Two, both deterministic:
 
 - Per trigger, in CEL: a trigger caps itself on `body.chain.counts`, e.g.
-  `!("factory-review" in body.chain.counts) || body.chain.counts["factory-review"] < 3`.
+  `!("factory-fix" in body.chain.counts) || body.chain.counts["factory-fix"] < 2`.
 - Global, in the gateway: `RUN_EVENT_MAX_DEPTH` (default 12). A run event past
   it is dropped and logged, and the gateway comments on the issue/PR it would
   have replied to. No trigger config can exceed it.
@@ -432,17 +435,44 @@ Shipped as `examples/event-triggers/` (`eventsource-runs.yaml`,
 
 | Trigger | Matches | Target | Reply |
 | --- | --- | --- | --- |
-| `github-issue-triage` | `ai-triage` applied to an issue (webhook) | SWE agent | ack, result, `removeLabel`; `onComplete.emitTo: runs` |
-| `factory-review` | `source == "runs" && kind == "run" && body.trigger in ["github-issue-triage", "factory-fix"] && body.status == "succeeded" && has(body.outcome.pullRequest) && (!("factory-review" in body.chain.counts) \|\| body.chain.counts["factory-review"] < 3)` | SWE agent, `readOnly` | on the PR: ack + session page, result, `addLabels: [ai-review]`, `removeLabel: ai-review`; `emitTo: runs` |
-| `factory-fix` | `body.trigger == "factory-review" && has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" && body.chain.counts["factory-review"] < 3` | SWE agent (PR-triage prompt) | on the PR: ack, result, `addLabels: [ai-triage]`, `removeLabel: ai-triage`; `emitTo: runs` |
-| `factory-handoff` | `body.trigger == "factory-review" && !(has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" && body.chain.counts["factory-review"] < 3)` | `none` | param `assignee: sender.login`; on the PR: ack with the reason, `assignees: ["{{assignee}}"]` |
+| `github-issue-triage` / `github-issue-autotriage` | `ai-triage` applied to an issue / a new issue (webhook) | SWE agent | ack, result, `removeLabel`; `onComplete.emitTo: runs` |
+| `github-pr-triage` | `ai-triage` applied to a PR (webhook) | SWE agent (PR-triage prompt) | ack, result, `removeLabel`; `onComplete.emitTo: runs` |
+| `github-pr-review` | `ai-review` applied to any PR, whoever opened it (webhook); param `headRepository` (`body.pull_request.head.repo.full_name`, `""` for a deleted fork) | SWE agent, `readOnly` | ack, result, `removeLabel`; `onComplete.emitTo: runs` |
+| `factory-review` | `source == "runs" && kind == "run" && body.trigger in ["github-issue-triage", "github-pr-triage", "factory-fix"] && body.status == "succeeded" && (has(body.outcome.pullRequest) \|\| body.trigger in ["github-pr-triage", "factory-fix"]) && (body.trigger != "factory-fix" \|\| (has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits)) && (!("factory-review" in body.chain.counts) \|\| body.chain.counts["factory-review"] < 3)` | SWE agent, `readOnly` | on the PR: ack + session page, result, `addLabels: [ai-review]`, `removeLabel: ai-review`; `emitTo: runs` |
+| `factory-fix` | `body.trigger in ["factory-review", "github-pr-review"] && has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" && (!("factory-fix" in body.chain.counts) \|\| body.chain.counts["factory-fix"] < 2) && (body.trigger != "github-pr-review" \|\| (has(body.params.headRepository) && body.params.headRepository == body.params.repository))` | SWE agent (PR-triage prompt) | on the PR: ack, result, `addLabels: [ai-triage]`, `removeLabel: ai-triage`; `emitTo: runs` |
+| `factory-handoff` | a review (`factory-review` / `github-pr-review`) that `factory-fix` doesn't take, or a `factory-fix` run that didn't succeed or pushed no commits | `none` | param `assignee: sender.login`; on the PR: ack with the reason, `assignees: ["{{assignee}}"]` |
 
-So: triage opens a PR → review → a `changes-requested` verdict sends it to a fix
-run, whose completion re-enters review; after at most 3 reviews, or on `ready`,
-no verdict, or a failed review, the PR is assigned to the human who applied the
-original `ai-triage`. `factory-review` takes the PR number from
-`body.outcome.pullRequest.number` (its match guarantees one) and the fix and
-handoff triggers from the review's own `body.params.number`. All three use the
-PR as `sessionKey`, so fix runs and re-reviews share one session per PR. The
-fix loop runs on the PR, not the issue: the review comments live there, and
-issue triage would open a second PR.
+So the chain runs to the end however it starts:
+
+- **`ai-triage` on an issue** (or a new issue on an auto-triage repo): triage
+  opens a PR → review → …
+- **`ai-triage` on a PR**: the PR is picked up and fixed → review → …
+- **`ai-review` on a PR**, including one someone else opened: the review's
+  verdict routes like `factory-review`'s → …, except on a PR from a fork (see
+  below).
+
+… a `changes-requested` verdict sends the PR to a fix run, whose completion
+re-enters review; after at most 2 fix rounds (so 3 reviews), or on `ready`, no
+verdict, a failed review, or a fix run that failed or pushed nothing, the PR is assigned to the human who applied the
+original label. The cap counts `factory-fix` rather than reviews because a
+chain's first review may be either `github-pr-review` or `factory-review`, and
+every entry point puts exactly one review ahead of each fix.
+`factory-review` takes the PR number from `body.outcome.pullRequest.number`,
+falling back to `body.params.number` for a run that was already on the PR
+(`github-pr-triage`, `factory-fix`; issue triage must report an outcome PR,
+since its own number is the issue). The fix and handoff triggers take the
+review's own `body.params.number`. All use the PR as `sessionKey`, so fix runs
+and re-reviews share one session per PR. The fix loop runs on the PR, not the
+issue: the review comments live there, and issue triage would open a second PR.
+**Fork PRs.** `factory-fix` holds write credentials and reads content the PR's
+author controls (the diff, description and review comments), and the verdict
+that starts it comes from a review of that same content. `ai-review` asks only
+for a review, so a `changes-requested` verdict from `github-pr-review` starts a
+fix only when the PR's branch is in the same repository
+(`body.params.headRepository == body.params.repository`). On a fork PR, or a
+run that has no `headRepository` param, `factory-handoff` assigns the PR
+instead, with the reason that its branch is not in this repository. `ai-triage`
+on a fork PR is an explicit request for writes and is not gated. Whatever
+starts a fix, one that can't push (e.g. to a fork's branch the App can't write)
+reports `madeNewCommits: false`, so `factory-handoff` assigns the PR rather than
+re-reviewing unchanged code.
