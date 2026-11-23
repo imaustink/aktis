@@ -154,7 +154,10 @@ func (s *Server) Handler() http.Handler {
 	router.GET("/v1/models", s.handleModels)
 	// The two routes that may carry base64 images get a body cap, so a hostile
 	// or runaway client cannot hold the gateway's memory with one request.
-	router.POST("/v1/chat/completions", limitBody(attachments.MaxRequestBytes), s.handleChatCompletions)
+	// /v1/chat/completions carries the client's whole transcript, earlier
+	// images included, so its wire cap is wider and readChatBody keeps memory
+	// bounded instead (chatbody.go).
+	router.POST("/v1/chat/completions", limitBody(maxChatWireBytes), s.handleChatCompletions)
 	router.POST("/invoke", limitBody(attachments.MaxRequestBytes), s.handleInvoke)
 	router.POST("/invoke/check", s.handleInvokeCheck)
 	router.GET("/invoke/:id", s.handleInvokeStatus)
@@ -245,8 +248,19 @@ func (s *Server) handleModels(c *gin.Context) {
 }
 
 func (s *Server) handleChatCompletions(c *gin.Context) {
+	// Earlier messages' images are dropped as the body streams in; only the
+	// newest few are stashed, for the last user message (chatbody.go).
+	body, stash, err := readChatBody(c.Request.Body)
+	if err != nil {
+		if errors.Is(err, errChatBodyTooLarge) {
+			writeError(c, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
+		writeInvalidRequestError(c, "could not read request body: "+err.Error())
+		return
+	}
 	var req chatCompletionRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := json.Unmarshal(body, &req); err != nil {
 		writeInvalidRequestError(c, "invalid JSON body: "+err.Error())
 		return
 	}
@@ -302,7 +316,12 @@ func (s *Server) handleChatCompletions(c *gin.Context) {
 	// Images on the user's turn, uploaded here so only Refs enter the
 	// workflow. Earlier turns' images are not re-uploaded: the conversation
 	// workflow keeps its own Refs for those.
-	images, err := s.uploadImages(c.Request.Context(), sessionID, messageImages(req.Messages[lastUserIndex].Content))
+	turnImages, err := stash.resolve(messageImages(req.Messages[lastUserIndex].Content))
+	if err != nil {
+		writeImageError(c, err)
+		return
+	}
+	images, err := s.uploadImages(c.Request.Context(), sessionID, turnImages)
 	if err != nil {
 		writeImageError(c, err)
 		return

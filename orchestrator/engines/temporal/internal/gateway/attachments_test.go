@@ -167,3 +167,88 @@ func TestSplitMessagesAcceptsAnImageOnlyTurn(t *testing.T) {
 	require.Equal(t, "", text)
 	require.Equal(t, []attachments.Image{{URL: "https://example.com/a.png"}}, messageImages(messages[idx].Content))
 }
+
+// bigPNGDataURL is a data URL of a valid PNG padded to about size bytes, so
+// it is large enough to be streamed out of a chat body rather than buffered.
+func bigPNGDataURL(size int) string {
+	data := append(append([]byte(nil), onePixelPNG...), make([]byte, size)...)
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(data)
+}
+
+func imageMessage(role, text, url string) map[string]any {
+	return map[string]any{"role": role, "content": []map[string]any{
+		{"type": "text", "text": text},
+		{"type": "image_url", "image_url": map[string]string{"url": url}},
+	}}
+}
+
+// A chat client resends every earlier image inline. Together they may far
+// exceed one turn's cap; the turn must still go through, with only the last
+// user message's image uploaded.
+func TestChatCompletionsToleratesEarlierImagesBeyondTheTurnCap(t *testing.T) {
+	c, got := capturingClient(t)
+	store := &memStore{}
+	s := NewServer(c, "tq", nil, WithAttachments(store, "attachments"))
+
+	var messages []map[string]any
+	earlier := bigPNGDataURL(4 << 20)
+	for i := 0; i < 8; i++ { // 8 × ~5.3 MB of base64: well past MaxRequestBytes
+		messages = append(messages,
+			imageMessage("user", "and this one?", earlier),
+			map[string]any{"role": "assistant", "content": "A photo."})
+	}
+	current := bigPNGDataURL(64 << 10)
+	messages = append(messages, imageMessage("user", "and the last one?", current))
+	body, _ := json.Marshal(map[string]any{"messages": messages})
+	require.Greater(t, len(body), attachments.MaxRequestBytes)
+
+	_ = postJSON(s, "/v1/chat/completions", string(body))
+	require.Equal(t, "and the last one?", got.Message)
+	require.Len(t, got.Images, 1)
+	_, want, err := attachments.DecodeDataURL(current)
+	require.NoError(t, err)
+	require.Equal(t, want, store.objects[got.Images[0].Key], "the LAST user message's image, not an earlier one")
+	require.Len(t, got.SeedHistory, maxSeedHistoryMessages)
+}
+
+// An image on the current turn that is over the per-image limit still gets
+// a clear 400, not a JSON bind error.
+func TestChatCompletionsRefusesAnOversizedCurrentImage(t *testing.T) {
+	s := NewServer(nil, "tq", nil, WithAttachments(&memStore{}, "attachments"))
+	body, _ := json.Marshal(map[string]any{"messages": []map[string]any{
+		imageMessage("user", "what is this?", bigPNGDataURL(attachments.MaxImageBytes+1)),
+	}})
+	rec := postJSON(s, "/v1/chat/completions", string(body))
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Contains(t, rec.Body.String(), "image too large")
+}
+
+// Text beyond the in-memory cap is a 413 that says so.
+func TestChatCompletionsRefusesTooMuchText(t *testing.T) {
+	s := NewServer(nil, "tq", nil)
+	body, _ := json.Marshal(map[string]any{"messages": []map[string]any{
+		{"role": "user", "content": strings.Repeat("x", maxChatTextBytes+1)},
+	}})
+	rec := postJSON(s, "/v1/chat/completions", string(body))
+	require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
+	require.Contains(t, rec.Body.String(), "too large")
+}
+
+func TestReadChatBodyLeavesOrdinaryStringsAlone(t *testing.T) {
+	in := `{"a":"data:image/png;base64,short","b":"x\"y\\","c":"` + strings.Repeat("data:", 400) + `"}`
+	out, _, err := readChatBody(strings.NewReader(in))
+	require.NoError(t, err)
+	require.Equal(t, in, string(out))
+}
+
+// Some encoders escape "/" as "\/"; a stashed image is unescaped as JSON.
+func TestReadChatBodyRestoresEscapedImages(t *testing.T) {
+	url := bigPNGDataURL(4 << 10)
+	escaped := strings.ReplaceAll(url, "/", `\/`)
+	out, stash, err := readChatBody(strings.NewReader(`{"u":"` + escaped + `"}`))
+	require.NoError(t, err)
+	require.Equal(t, `{"u":"`+stashPrefix+`0"}`, string(out))
+	images, err := stash.resolve([]attachments.Image{{URL: stashPrefix + "0"}})
+	require.NoError(t, err)
+	require.Equal(t, []attachments.Image{{URL: url}}, images)
+}
