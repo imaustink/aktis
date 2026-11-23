@@ -1,8 +1,9 @@
 # Software factory, step 3b (docs/adr/0052 §4): every review completion
 # (factory-review or github-pr-review) that factory-fix does not take --
 # verdict "ready", no valid verdict ("none"), a review run that did not
-# succeed, or the 2-fix cap reached -- and every factory-fix run that failed or
-# pushed nothing (which factory-review won't pick up) assigns the PR to the human who started the
+# succeed, the 2-fix cap reached, or changes requested by `ai-review` on a
+# fork PR -- and every factory-fix run that failed or pushed nothing (which
+# factory-review won't pick up) assigns the PR to the human who started the
 # chain, so no chain ends without an owner. target.none runs nothing: no
 # agent, no identity check, only the reply side effects.
 #
@@ -21,7 +22,9 @@ spec:
       source == "runs" && kind == "run" &&
       ((body.trigger in ["factory-review", "github-pr-review"] &&
         !(has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" &&
-          (!("factory-fix" in body.chain.counts) || body.chain.counts["factory-fix"] < 2))) ||
+          (!("factory-fix" in body.chain.counts) || body.chain.counts["factory-fix"] < 2) &&
+          (body.trigger != "github-pr-review" ||
+           (has(body.params.headRepository) && body.params.headRepository == body.params.repository)))) ||
        (body.trigger == "factory-fix" &&
         (body.status != "succeeded" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))
   params:
@@ -33,6 +36,8 @@ spec:
       body.trigger == "factory-fix" ? "the automated fix run pushed no changes" :
       body.status != "succeeded" ? "the review run did not succeed" :
       (has(body.outcome.verdict) && body.outcome.verdict == "ready") ? "the reviewer judged it ready to merge" :
+      (body.trigger == "github-pr-review" && has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" &&
+       !(has(body.params.headRepository) && body.params.headRepository == body.params.repository)) ? "changes were requested, but the pull request's branch is not in this repository, so it is not fixed automatically" :
       (has(body.outcome.verdict) && body.outcome.verdict == "changes-requested") ? "it reached the limit of 3 automated review rounds with changes still requested" :
       "the reviewer did not record a verdict"
   target:

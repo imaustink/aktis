@@ -1049,6 +1049,11 @@ extraManifests:
         title: body.pull_request.title
         description: body.pull_request.body
         label: body.label.name
+        # The PR branch's repository. factory-fix only pushes to a branch in
+        # this repository; a fork PR's changes-requested verdict is handed off.
+        # A deleted fork has no head repo: "", which never matches.
+        headRepository: >-
+          body.pull_request.head.repo != null ? body.pull_request.head.repo.full_name : ""
       sessionKey: "github:{{`{{repository}}`}}#{{`{{number}}`}}"
       target:
         agentRef: "claude-code-swe-agent"
@@ -1131,7 +1136,9 @@ extraManifests:
           removeLabel: "{{`{{label}}`}}"
       # Feeds the software factory, whoever opened the PR: the runner records
       # this readOnly run's verdict, and factory-fix / factory-handoff route it
-      # exactly like a factory-review verdict.
+      # like a factory-review verdict -- except that factory-fix only takes it
+      # for a PR whose branch is in this repository (headRepository), so a
+      # review label on a fork PR never leads to a write-credentialed run.
       onComplete:
         emitTo: runs
   # eventtrigger-factory-review
@@ -1255,7 +1262,9 @@ extraManifests:
           source == "runs" && kind == "run" &&
           body.trigger in ["factory-review", "github-pr-review"] &&
           has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" &&
-          (!("factory-fix" in body.chain.counts) || body.chain.counts["factory-fix"] < 2)
+          (!("factory-fix" in body.chain.counts) || body.chain.counts["factory-fix"] < 2) &&
+          (body.trigger != "github-pr-review" ||
+           (has(body.params.headRepository) && body.params.headRepository == body.params.repository))
       params:
         repository: body.params.repository
         number: body.params.number
@@ -1335,7 +1344,9 @@ extraManifests:
           source == "runs" && kind == "run" &&
           ((body.trigger in ["factory-review", "github-pr-review"] &&
             !(has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" &&
-              (!("factory-fix" in body.chain.counts) || body.chain.counts["factory-fix"] < 2))) ||
+              (!("factory-fix" in body.chain.counts) || body.chain.counts["factory-fix"] < 2) &&
+              (body.trigger != "github-pr-review" ||
+               (has(body.params.headRepository) && body.params.headRepository == body.params.repository)))) ||
            (body.trigger == "factory-fix" &&
             (body.status != "succeeded" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))
       params:
@@ -1347,6 +1358,8 @@ extraManifests:
           body.trigger == "factory-fix" ? "the automated fix run pushed no changes" :
           body.status != "succeeded" ? "the review run did not succeed" :
           (has(body.outcome.verdict) && body.outcome.verdict == "ready") ? "the reviewer judged it ready to merge" :
+          (body.trigger == "github-pr-review" && has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" &&
+           !(has(body.params.headRepository) && body.params.headRepository == body.params.repository)) ? "changes were requested, but the pull request's branch is not in this repository, so it is not fixed automatically" :
           (has(body.outcome.verdict) && body.outcome.verdict == "changes-requested") ? "it reached the limit of 3 automated review rounds with changes still requested" :
           "the reviewer did not record a verdict"
       target:

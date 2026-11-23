@@ -150,7 +150,8 @@ it into the run event's `body.outcome`.
 
 - `pullRequest: { number, url }` when the turn ended with an open PR. The runner
   already discovers this for the footer and the `Closes #N` fix (#345, #348).
-- `madeNewCommits: bool`.
+- `madeNewCommits: bool`: the turn made new commits **and** they reached a
+  remote (amended 2026-11-23; before, a commit whose push failed counted).
 - `verdict` on read-only (review) runs, below.
 
 **The verdict is the model's judgment, recorded deterministically.** Deciding
@@ -216,12 +217,19 @@ to a PR ran one step and stopped. Now:
 - `factory-fix` and `factory-handoff` treat a `github-pr-review` verdict like a
   `factory-review` one. So `ai-review` on a PR someone else opened gets its
   feedback fixed automatically, then re-reviewed, then handed to whoever
-  applied the label.
+  applied the label. The exception is a PR whose branch is in another
+  repository (a fork): `github-pr-review` records the branch's repository as
+  `headRepository`, and `factory-fix` only takes its verdict when that equals
+  `repository`. Otherwise `ai-review`, which asks only for a review, would hand
+  a write-credentialed run to content an outside contributor controls, steered
+  by a verdict that same content can influence. A fork PR's
+  `changes-requested` verdict is handed off instead.
 - The cap counts fixes (`counts["factory-fix"] < 2`) instead of reviews, since
   a chain's first review can now come from either trigger. Every entry point
   puts one review ahead of each fix, so this still means at most 3 reviews.
 - A `factory-fix` run that failed or reported `madeNewCommits: false` (for
-  example, it couldn't push to a fork's branch) isn't re-reviewed.
+  example, it couldn't push to a fork's branch: `madeNewCommits` now requires
+  the commits to have reached a remote) isn't re-reviewed.
   `factory-handoff` assigns the PR instead, so no chain ends without an owner.
 
 ## Consequences

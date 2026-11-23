@@ -659,7 +659,8 @@
         "status": "succeeded",
         "params": {
           "repository": "acme/widgets",
-          "number": "12"
+          "number": "12",
+          "headRepository": "acme/widgets"
         },
         "outcome": {
           "madeNewCommits": false,
@@ -694,7 +695,8 @@
         "status": "succeeded",
         "params": {
           "repository": "acme/widgets",
-          "number": "12"
+          "number": "12",
+          "headRepository": "acme/widgets"
         },
         "outcome": {
           "pullRequest": {
@@ -933,6 +935,139 @@
           "origin": {
             "login": "octocat",
             "repository": "acme/widgets"
+          }
+        }
+      },
+      "sender": {
+        "login": "octocat",
+        "isBot": false
+      },
+      "repository": "acme/widgets"
+    },
+    "factory_pr_review_changes_fork": {
+      "source": "runs",
+      "kind": "run",
+      "id": "r-20",
+      "time": "2026-10-13T12:05:00Z",
+      "headers": {},
+      "body": {
+        "trigger": "github-pr-review",
+        "status": "succeeded",
+        "params": {
+          "repository": "acme/widgets",
+          "number": "12",
+          "headRepository": "contributor/widgets"
+        },
+        "outcome": {
+          "madeNewCommits": false,
+          "verdict": "changes-requested"
+        },
+        "chain": {
+          "id": "d-2",
+          "depth": 1,
+          "counts": {
+            "github-pr-review": 1
+          },
+          "origin": {
+            "login": "octocat",
+            "repository": "acme/widgets"
+          }
+        }
+      },
+      "sender": {
+        "login": "octocat",
+        "isBot": false
+      },
+      "repository": "acme/widgets"
+    },
+    "factory_pr_review_changes_no_head_repo": {
+      "source": "runs",
+      "kind": "run",
+      "id": "r-21",
+      "time": "2026-10-13T12:05:00Z",
+      "headers": {},
+      "body": {
+        "trigger": "github-pr-review",
+        "status": "succeeded",
+        "params": {
+          "repository": "acme/widgets",
+          "number": "12"
+        },
+        "outcome": {
+          "madeNewCommits": false,
+          "verdict": "changes-requested"
+        },
+        "chain": {
+          "id": "d-2",
+          "depth": 1,
+          "counts": {
+            "github-pr-review": 1
+          },
+          "origin": {
+            "login": "octocat",
+            "repository": "acme/widgets"
+          }
+        }
+      },
+      "sender": {
+        "login": "octocat",
+        "isBot": false
+      },
+      "repository": "acme/widgets"
+    },
+    "pr_review_label_fork": {
+      "source": "github",
+      "kind": "webhook",
+      "id": "d-30",
+      "time": "2026-10-13T12:00:00Z",
+      "headers": {
+        "x-github-event": "pull_request"
+      },
+      "body": {
+        "action": "labeled",
+        "label": {
+          "name": "ai-review"
+        },
+        "repository": {
+          "full_name": "acme/widgets"
+        },
+        "pull_request": {
+          "number": 12,
+          "head": {
+            "ref": "feature",
+            "repo": {
+              "full_name": "contributor/widgets"
+            }
+          }
+        }
+      },
+      "sender": {
+        "login": "octocat",
+        "isBot": false
+      },
+      "repository": "acme/widgets"
+    },
+    "pr_review_label_deleted_fork": {
+      "source": "github",
+      "kind": "webhook",
+      "id": "d-31",
+      "time": "2026-10-13T12:00:00Z",
+      "headers": {
+        "x-github-event": "pull_request"
+      },
+      "body": {
+        "action": "labeled",
+        "label": {
+          "name": "ai-review"
+        },
+        "repository": {
+          "full_name": "acme/widgets"
+        },
+        "pull_request": {
+          "number": 12,
+          "head": {
+            "ref": "feature",
+            "repo": null
           }
         }
       },
@@ -1915,7 +2050,7 @@
     {
       "name": "factory entry points (any start): fix gate: PR review requested changes",
       "envelope": "factory_pr_review_changes",
-      "expr": "source == \"runs\" && kind == \"run\" && body.trigger in [\"factory-review\", \"github-pr-review\"] && has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2)",
+      "expr": "source == \"runs\" && kind == \"run\" && body.trigger in [\"factory-review\", \"github-pr-review\"] && has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2) && (body.trigger != \"github-pr-review\" || (has(body.params.headRepository) && body.params.headRepository == body.params.repository))",
       "expect": {
         "value": true,
         "type": "bool"
@@ -1924,7 +2059,7 @@
     {
       "name": "factory entry points (any start): fix gate: PR review ready",
       "envelope": "factory_pr_review_ready",
-      "expr": "source == \"runs\" && kind == \"run\" && body.trigger in [\"factory-review\", \"github-pr-review\"] && has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2)",
+      "expr": "source == \"runs\" && kind == \"run\" && body.trigger in [\"factory-review\", \"github-pr-review\"] && has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2) && (body.trigger != \"github-pr-review\" || (has(body.params.headRepository) && body.params.headRepository == body.params.repository))",
       "expect": {
         "value": false,
         "type": "bool"
@@ -1933,7 +2068,7 @@
     {
       "name": "factory entry points (any start): fix gate: factory review requested changes, no fix yet",
       "envelope": "factory_review_changes",
-      "expr": "source == \"runs\" && kind == \"run\" && body.trigger in [\"factory-review\", \"github-pr-review\"] && has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2)",
+      "expr": "source == \"runs\" && kind == \"run\" && body.trigger in [\"factory-review\", \"github-pr-review\"] && has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2) && (body.trigger != \"github-pr-review\" || (has(body.params.headRepository) && body.params.headRepository == body.params.repository))",
       "expect": {
         "value": true,
         "type": "bool"
@@ -1942,7 +2077,7 @@
     {
       "name": "factory entry points (any start): fix gate: fix cap reached",
       "envelope": "factory_review_after_two_fixes",
-      "expr": "source == \"runs\" && kind == \"run\" && body.trigger in [\"factory-review\", \"github-pr-review\"] && has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2)",
+      "expr": "source == \"runs\" && kind == \"run\" && body.trigger in [\"factory-review\", \"github-pr-review\"] && has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2) && (body.trigger != \"github-pr-review\" || (has(body.params.headRepository) && body.params.headRepository == body.params.repository))",
       "expect": {
         "value": false,
         "type": "bool"
@@ -1951,7 +2086,7 @@
     {
       "name": "factory entry points (any start): fix gate: a fix run is not a review",
       "envelope": "factory_fix_pushed",
-      "expr": "source == \"runs\" && kind == \"run\" && body.trigger in [\"factory-review\", \"github-pr-review\"] && has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2)",
+      "expr": "source == \"runs\" && kind == \"run\" && body.trigger in [\"factory-review\", \"github-pr-review\"] && has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2) && (body.trigger != \"github-pr-review\" || (has(body.params.headRepository) && body.params.headRepository == body.params.repository))",
       "expect": {
         "value": false,
         "type": "bool"
@@ -1960,7 +2095,7 @@
     {
       "name": "factory entry points (any start): handoff: PR review requested changes is not handed off",
       "envelope": "factory_pr_review_changes",
-      "expr": "source == \"runs\" && kind == \"run\" && ((body.trigger in [\"factory-review\", \"github-pr-review\"] && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2))) || (body.trigger == \"factory-fix\" && (body.status != \"succeeded\" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))",
+      "expr": "source == \"runs\" && kind == \"run\" && ((body.trigger in [\"factory-review\", \"github-pr-review\"] && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2) && (body.trigger != \"github-pr-review\" || (has(body.params.headRepository) && body.params.headRepository == body.params.repository)))) || (body.trigger == \"factory-fix\" && (body.status != \"succeeded\" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))",
       "expect": {
         "value": false,
         "type": "bool"
@@ -1969,7 +2104,7 @@
     {
       "name": "factory entry points (any start): handoff: PR review ready",
       "envelope": "factory_pr_review_ready",
-      "expr": "source == \"runs\" && kind == \"run\" && ((body.trigger in [\"factory-review\", \"github-pr-review\"] && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2))) || (body.trigger == \"factory-fix\" && (body.status != \"succeeded\" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))",
+      "expr": "source == \"runs\" && kind == \"run\" && ((body.trigger in [\"factory-review\", \"github-pr-review\"] && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2) && (body.trigger != \"github-pr-review\" || (has(body.params.headRepository) && body.params.headRepository == body.params.repository)))) || (body.trigger == \"factory-fix\" && (body.status != \"succeeded\" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))",
       "expect": {
         "value": true,
         "type": "bool"
@@ -1978,7 +2113,7 @@
     {
       "name": "factory entry points (any start): handoff: fix cap reached",
       "envelope": "factory_review_after_two_fixes",
-      "expr": "source == \"runs\" && kind == \"run\" && ((body.trigger in [\"factory-review\", \"github-pr-review\"] && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2))) || (body.trigger == \"factory-fix\" && (body.status != \"succeeded\" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))",
+      "expr": "source == \"runs\" && kind == \"run\" && ((body.trigger in [\"factory-review\", \"github-pr-review\"] && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2) && (body.trigger != \"github-pr-review\" || (has(body.params.headRepository) && body.params.headRepository == body.params.repository)))) || (body.trigger == \"factory-fix\" && (body.status != \"succeeded\" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))",
       "expect": {
         "value": true,
         "type": "bool"
@@ -1987,7 +2122,7 @@
     {
       "name": "factory entry points (any start): handoff: factory review ready",
       "envelope": "factory_review_ready",
-      "expr": "source == \"runs\" && kind == \"run\" && ((body.trigger in [\"factory-review\", \"github-pr-review\"] && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2))) || (body.trigger == \"factory-fix\" && (body.status != \"succeeded\" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))",
+      "expr": "source == \"runs\" && kind == \"run\" && ((body.trigger in [\"factory-review\", \"github-pr-review\"] && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2) && (body.trigger != \"github-pr-review\" || (has(body.params.headRepository) && body.params.headRepository == body.params.repository)))) || (body.trigger == \"factory-fix\" && (body.status != \"succeeded\" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))",
       "expect": {
         "value": true,
         "type": "bool"
@@ -1996,7 +2131,7 @@
     {
       "name": "factory entry points (any start): handoff: fix that pushed commits is not handed off",
       "envelope": "factory_fix_pushed",
-      "expr": "source == \"runs\" && kind == \"run\" && ((body.trigger in [\"factory-review\", \"github-pr-review\"] && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2))) || (body.trigger == \"factory-fix\" && (body.status != \"succeeded\" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))",
+      "expr": "source == \"runs\" && kind == \"run\" && ((body.trigger in [\"factory-review\", \"github-pr-review\"] && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2) && (body.trigger != \"github-pr-review\" || (has(body.params.headRepository) && body.params.headRepository == body.params.repository)))) || (body.trigger == \"factory-fix\" && (body.status != \"succeeded\" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))",
       "expect": {
         "value": false,
         "type": "bool"
@@ -2005,7 +2140,7 @@
     {
       "name": "factory entry points (any start): handoff: fix that pushed nothing",
       "envelope": "factory_fix_no_commits",
-      "expr": "source == \"runs\" && kind == \"run\" && ((body.trigger in [\"factory-review\", \"github-pr-review\"] && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2))) || (body.trigger == \"factory-fix\" && (body.status != \"succeeded\" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))",
+      "expr": "source == \"runs\" && kind == \"run\" && ((body.trigger in [\"factory-review\", \"github-pr-review\"] && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2) && (body.trigger != \"github-pr-review\" || (has(body.params.headRepository) && body.params.headRepository == body.params.repository)))) || (body.trigger == \"factory-fix\" && (body.status != \"succeeded\" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))",
       "expect": {
         "value": true,
         "type": "bool"
@@ -2014,7 +2149,7 @@
     {
       "name": "factory entry points (any start): handoff: failed fix",
       "envelope": "factory_fix_failed",
-      "expr": "source == \"runs\" && kind == \"run\" && ((body.trigger in [\"factory-review\", \"github-pr-review\"] && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2))) || (body.trigger == \"factory-fix\" && (body.status != \"succeeded\" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))",
+      "expr": "source == \"runs\" && kind == \"run\" && ((body.trigger in [\"factory-review\", \"github-pr-review\"] && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2) && (body.trigger != \"github-pr-review\" || (has(body.params.headRepository) && body.params.headRepository == body.params.repository)))) || (body.trigger == \"factory-fix\" && (body.status != \"succeeded\" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))",
       "expect": {
         "value": true,
         "type": "bool"
@@ -2023,7 +2158,7 @@
     {
       "name": "factory entry points (any start): handoff: triage runs are never handed off",
       "envelope": "factory_triage_pr",
-      "expr": "source == \"runs\" && kind == \"run\" && ((body.trigger in [\"factory-review\", \"github-pr-review\"] && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2))) || (body.trigger == \"factory-fix\" && (body.status != \"succeeded\" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))",
+      "expr": "source == \"runs\" && kind == \"run\" && ((body.trigger in [\"factory-review\", \"github-pr-review\"] && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2) && (body.trigger != \"github-pr-review\" || (has(body.params.headRepository) && body.params.headRepository == body.params.repository)))) || (body.trigger == \"factory-fix\" && (body.status != \"succeeded\" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))",
       "expect": {
         "value": false,
         "type": "bool"
@@ -2044,6 +2179,78 @@
       "expr": "has(body.outcome.pullRequest) ? body.outcome.pullRequest.number : body.params.number",
       "expect": {
         "value": "12",
+        "type": "string"
+      }
+    },
+    {
+      "name": "factory entry points (any start): fix gate: PR review on a fork PR requested changes",
+      "envelope": "factory_pr_review_changes_fork",
+      "expr": "source == \"runs\" && kind == \"run\" && body.trigger in [\"factory-review\", \"github-pr-review\"] && has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2) && (body.trigger != \"github-pr-review\" || (has(body.params.headRepository) && body.params.headRepository == body.params.repository))",
+      "expect": {
+        "value": false,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory entry points (any start): fix gate: PR review run without headRepository",
+      "envelope": "factory_pr_review_changes_no_head_repo",
+      "expr": "source == \"runs\" && kind == \"run\" && body.trigger in [\"factory-review\", \"github-pr-review\"] && has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2) && (body.trigger != \"github-pr-review\" || (has(body.params.headRepository) && body.params.headRepository == body.params.repository))",
+      "expect": {
+        "value": false,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory entry points (any start): handoff: PR review on a fork PR requested changes",
+      "envelope": "factory_pr_review_changes_fork",
+      "expr": "source == \"runs\" && kind == \"run\" && ((body.trigger in [\"factory-review\", \"github-pr-review\"] && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2) && (body.trigger != \"github-pr-review\" || (has(body.params.headRepository) && body.params.headRepository == body.params.repository)))) || (body.trigger == \"factory-fix\" && (body.status != \"succeeded\" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))",
+      "expect": {
+        "value": true,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory entry points (any start): handoff: PR review run without headRepository",
+      "envelope": "factory_pr_review_changes_no_head_repo",
+      "expr": "source == \"runs\" && kind == \"run\" && ((body.trigger in [\"factory-review\", \"github-pr-review\"] && !(has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && (!(\"factory-fix\" in body.chain.counts) || body.chain.counts[\"factory-fix\"] < 2) && (body.trigger != \"github-pr-review\" || (has(body.params.headRepository) && body.params.headRepository == body.params.repository)))) || (body.trigger == \"factory-fix\" && (body.status != \"succeeded\" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))",
+      "expect": {
+        "value": true,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory entry points (any start): handoff reason: fork PR",
+      "envelope": "factory_pr_review_changes_fork",
+      "expr": "(body.trigger == \"factory-fix\" && body.status != \"succeeded\") ? \"the automated fix run did not succeed\" : body.trigger == \"factory-fix\" ? \"the automated fix run pushed no changes\" : body.status != \"succeeded\" ? \"the review run did not succeed\" : (has(body.outcome.verdict) && body.outcome.verdict == \"ready\") ? \"the reviewer judged it ready to merge\" : (body.trigger == \"github-pr-review\" && has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && !(has(body.params.headRepository) && body.params.headRepository == body.params.repository)) ? \"changes were requested, but the pull request's branch is not in this repository, so it is not fixed automatically\" : (has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\") ? \"it reached the limit of 3 automated review rounds with changes still requested\" : \"the reviewer did not record a verdict\"",
+      "expect": {
+        "value": "changes were requested, but the pull request's branch is not in this repository, so it is not fixed automatically",
+        "type": "string"
+      }
+    },
+    {
+      "name": "factory entry points (any start): handoff reason: fix cap reached",
+      "envelope": "factory_review_after_two_fixes",
+      "expr": "(body.trigger == \"factory-fix\" && body.status != \"succeeded\") ? \"the automated fix run did not succeed\" : body.trigger == \"factory-fix\" ? \"the automated fix run pushed no changes\" : body.status != \"succeeded\" ? \"the review run did not succeed\" : (has(body.outcome.verdict) && body.outcome.verdict == \"ready\") ? \"the reviewer judged it ready to merge\" : (body.trigger == \"github-pr-review\" && has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\" && !(has(body.params.headRepository) && body.params.headRepository == body.params.repository)) ? \"changes were requested, but the pull request's branch is not in this repository, so it is not fixed automatically\" : (has(body.outcome.verdict) && body.outcome.verdict == \"changes-requested\") ? \"it reached the limit of 3 automated review rounds with changes still requested\" : \"the reviewer did not record a verdict\"",
+      "expect": {
+        "value": "it reached the limit of 3 automated review rounds with changes still requested",
+        "type": "string"
+      }
+    },
+    {
+      "name": "factory entry points (any start): param: PR review headRepository",
+      "envelope": "pr_review_label_fork",
+      "expr": "body.pull_request.head.repo != null ? body.pull_request.head.repo.full_name : \"\"",
+      "expect": {
+        "value": "contributor/widgets",
+        "type": "string"
+      }
+    },
+    {
+      "name": "factory entry points (any start): param: PR review headRepository of a deleted fork",
+      "envelope": "pr_review_label_deleted_fork",
+      "expr": "body.pull_request.head.repo != null ? body.pull_request.head.repo.full_name : \"\"",
+      "expect": {
+        "value": "",
         "type": "string"
       }
     }

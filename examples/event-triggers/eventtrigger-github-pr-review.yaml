@@ -4,9 +4,12 @@
 # from github-pr-triage -- same pull_request/labeled event -- by the label in
 # match.cel.
 #
-# Its completion enters the software factory: a "changes-requested" verdict
-# sends the PR to factory-fix (and then back to review), anything else hands it
-# to the human who applied the label.
+# Its completion enters the software factory: a "changes-requested" verdict on a
+# PR whose branch is in this repository sends it to factory-fix (and then back
+# to review); anything else, including any verdict on a fork PR, hands it to
+# the human who applied the label. The fork check matters because the fix run
+# holds write credentials and reads content the PR's author controls: a label
+# that asked only for a review must not hand an outside contributor's PR to it.
 #
 # target.readOnly is the deterministic write gate (AgentRun.spec.readOnly ->
 # AGENT_READ_ONLY): the SWE agent denies `git push` / `gh pr create|merge|...`
@@ -28,6 +31,11 @@ spec:
     title: body.pull_request.title
     description: body.pull_request.body
     label: body.label.name
+    # The PR branch's repository. factory-fix only pushes to a branch in this
+    # repository; a fork PR's changes-requested verdict is handed off. A deleted
+    # fork has no head repo: "", which never matches.
+    headRepository: >-
+      body.pull_request.head.repo != null ? body.pull_request.head.repo.full_name : ""
   sessionKey: "github:{{repository}}#{{number}}"
   target:
     agentRef: "opencode-swe-agent"
