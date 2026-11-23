@@ -138,7 +138,7 @@ Kubernetes. Either half can be adopted without the other.
 │   ├── tools/                  # on-demand tool containers (recipe-scraper, github, web-search, …)
 │   └── tools-local/            # in-pod LocalTool examples (Go, Node, Python, shell)
 ├── orchestrator/               # runs agents at scale; depends only on the framework
-│   ├── apps/                   # agent-orchestrator (facade), integration-gateway, connection-broker, mcp-broker
+│   ├── apps/                   # agent-orchestrator (facade), integration-gateway, connection-broker, mcp-broker (Go)
 │   ├── engines/temporal/       # the Temporal execution engine (Go)
 │   ├── controllers/core-controller/  # Go controller — CRDs + reconcilers, launches Jobs
 │   ├── packages/event-triggers/      # EventSource/EventTrigger contract: envelope, CEL, matching (ADR 0048)

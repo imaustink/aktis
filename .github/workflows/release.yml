@@ -69,9 +69,8 @@ jobs:
               - 'package.json'
               - 'package-lock.json'
               - 'orchestrator/apps/connection-broker/**'
+            # A standalone Go module (no npm workspace), so only its own tree.
             mcp-broker:
-              - 'package.json'
-              - 'package-lock.json'
               - 'orchestrator/apps/mcp-broker/**'
             recipe-scraper:
               - 'package.json'

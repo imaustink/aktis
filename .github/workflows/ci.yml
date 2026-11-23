@@ -235,6 +235,44 @@ jobs:
       - name: Test
         run: go test ./...
 
+  mcp-broker:
+    name: Go mcp-broker (build, vet, test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: orchestrator/apps/mcp-broker
+    steps:
+      - uses: actions/checkout@v5
+
+      # Its own job for the same reason as temporal-engine: a go.sum worth
+      # caching. `go test` includes the contract suite (contract_test.go),
+      # which reads the Temporal engine's source from this checkout to prove
+      # the broker and its only client still agree on the route, the
+      # x-delegated-token header, the {result,isError} reply and the MCPTool
+      # spec fields (ADR 0045).
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: orchestrator/apps/mcp-broker/go.mod
+          cache-dependency-path: orchestrator/apps/mcp-broker/go.sum
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files are not gofmt-clean; run 'gofmt -w .':"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
   temporal-engine-chart:
     name: Helm temporal-engine (lint, render)
     runs-on: ubuntu-latest
