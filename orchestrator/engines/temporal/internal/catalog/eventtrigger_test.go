@@ -106,6 +106,10 @@ func TestEventTriggerInvalidTargetsNeverMatch(t *testing.T) {
 		"two targets":         {SkillRef: "s", AgentRef: "a", PromptTemplate: "x"},
 		"no target":           {PromptTemplate: "x"},
 		"no prompt for skill": {SkillRef: "s"},
+		// docs/adr/0055
+		"unknown outcome":         {AgentRef: "a", PromptTemplate: "x", ReadOnly: true, Outcome: "approve"},
+		"outcome on writable run": {AgentRef: "a", PromptTemplate: "x", Outcome: "coordination"},
+		"outcome on a skill":      {SkillRef: "s", PromptTemplate: "x", ReadOnly: true, Outcome: "verdict"},
 	} {
 		d := catalog.NewEventTriggerDescriptor(name, catalog.EventTriggerSpec{Target: target}, true)
 		require.Error(t, d.Invalid(), name)
@@ -308,4 +312,51 @@ func TestAnIdentityOverrideOnAToolTriggerIsInvalid(t *testing.T) {
 		Target: catalog.EventTriggerTarget{AgentRef: "swe", PromptTemplate: "p", Identity: "agent"},
 	}, true)
 	require.NoError(t, ok.Invalid())
+}
+
+// docs/adr/0055 §2-3: the new onComplete fields decode from the CR.
+func TestEventTriggerOnCompleteWaitAndSerializeDecode(t *testing.T) {
+	d, err := catalog.DecodeEventTrigger(triggerCR("factory-park", map[string]any{
+		"match":  map[string]any{"cel": `kind == "run"`},
+		"params": map[string]any{"repository": "body.params.repository", "waitFor": "body.outcome.coordination.number"},
+		"target": map[string]any{"none": map[string]any{}},
+		"onComplete": map[string]any{
+			"emitTo":          "runs",
+			"waitUntilClosed": map[string]any{"repositoryParam": "repository", "numberParam": "waitFor"},
+			"serialize":       map[string]any{"group": "factory-coordinate", "keyParam": "repository"},
+		},
+	}, "True"))
+	require.NoError(t, err)
+	require.NoError(t, d.Invalid())
+	oc := d.Spec.OnComplete
+	require.NotNil(t, oc.WaitUntilClosed)
+	require.Equal(t, "repository", oc.WaitUntilClosed.RepositoryParam)
+	require.Equal(t, "waitFor", oc.WaitUntilClosed.NumberParam)
+	require.NotNil(t, oc.Serialize)
+	require.Equal(t, "factory-coordinate", oc.Serialize.Group)
+	require.Equal(t, "repository", oc.Serialize.KeyParam)
+}
+
+// docs/adr/0055 §1: a conflict-kind envelope matches like any other.
+func TestEventTriggerMatchesConflictKind(t *testing.T) {
+	d, err := catalog.DecodeEventTrigger(triggerCR("factory-resync", map[string]any{
+		"match":  map[string]any{"cel": `kind == "conflict" && body.pullRequest.number == 12`},
+		"params": map[string]any{"number": "body.pullRequest.number"},
+		"target": map[string]any{"none": map[string]any{}},
+	}, "True"))
+	require.NoError(t, err)
+	require.NoError(t, d.Invalid())
+	env := catalog.Envelope{Source: "pr-conflicts", Kind: "conflict", ID: "c-1", Body: map[string]any{"pullRequest": map[string]any{"number": int64(12)}}}
+	m, err := catalog.MatchEventTriggers([]*catalog.EventTriggerDescriptor{d}, env, "")
+	require.NoError(t, err)
+	require.NotNil(t, m)
+	require.Equal(t, "12", m.StringParams["number"])
+}
+
+// docs/adr/0055: a read-only agent target may name its outcome.
+func TestEventTriggerOutcomeOnAReadOnlyAgent(t *testing.T) {
+	d := catalog.NewEventTriggerDescriptor("c", catalog.EventTriggerSpec{Target: catalog.EventTriggerTarget{
+		AgentRef: "a", PromptTemplate: "x", ReadOnly: true, Outcome: catalog.OutcomeCoordination,
+	}}, true)
+	require.NoError(t, d.Invalid())
 }

@@ -93,8 +93,8 @@ type EventSourceReconciler struct {
 
 // Reconcile reports whether an EventSource can deliver events, and for a cron
 // source materializes the CronJob that ticks it (docs/event-triggers.md §8).
-// A run source (docs/adr/0052) is always Ready: it has no external delivery to
-// verify.
+// A run source (docs/adr/0052) and a conflicts source (docs/adr/0055) are
+// always Ready: neither has an external delivery to verify.
 //
 // A webhook source is only Ready when the gateway could actually verify a
 // delivery with it: the Secret and key it names exist, and every sender CEL
@@ -144,11 +144,19 @@ func (r *EventSourceReconciler) reconcile(ctx context.Context, source *corev1alp
 			"receives completions of runs whose EventTrigger sets onComplete.emitTo: "+source.Name, 0)
 	}
 
+	if source.Spec.Conflicts != nil {
+		// Like a run source: the gateway synthesizes its events from its own
+		// GitHub sweep (docs/adr/0055 §1), so there is no Secret to check and
+		// nothing to materialize. Admission rejects a sender block on it.
+		return r.setReady(ctx, source, metav1.ConditionTrue, "ConflictSweep",
+			"receives one event per open pull request by "+source.Spec.Conflicts.Author+" that conflicts with its base", 0)
+	}
+
 	if source.Spec.Webhook == nil {
 		// Admission's oneOf rule makes this unreachable; report it rather than
 		// guess.
 		return r.setReady(ctx, source, metav1.ConditionFalse, "InvalidSpec",
-			"exactly one of webhook, cron or run must be set", 0)
+			"exactly one of webhook, cron, run or conflicts must be set", 0)
 	}
 
 	if msg := checkSenderCEL(source.Spec.Sender); msg != "" {

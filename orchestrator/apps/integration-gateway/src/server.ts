@@ -45,7 +45,15 @@ interface WebhookOutcome {
   status: number;
   body?: unknown;
   after?: () => Promise<void>;
+  /** How the orchestrator answered the relay (absent when nothing was relayed). */
+  relay?: "ignored" | "rejected" | "failed" | "identity-required" | "accepted";
 }
+
+/**
+ * How publishing a run event ended: accepted; delivered but not accepted (or
+ * stopped by a gate) -- final; or "failed", a transport failure worth retrying.
+ */
+type EmitRunEventResult = "accepted" | "not-accepted" | "failed";
 import { ClaudeCredentialRefresher, ClaudeCredentialSweeper } from "./claude-auth/credential-refresher.js";
 import { renderSessionPage } from "./session-page.js";
 import type { SessionPageStore } from "./session-page-store.js";
@@ -53,6 +61,8 @@ import { tickUsername, type TokenAuthenticator } from "./tick-auth.js";
 import { gatewayOwedRunTerminal, LabelReconciler, type PendingLabelStore } from "./label-reconciler.js";
 import { DEFAULT_LEASE_MS, InflightRunRecovery, type InflightRun, type InflightRunStore } from "./inflight-runs.js";
 import { couldMatchBeforeSender, type EventTriggerLookup } from "./event-triggers.js";
+import { InMemoryDeferredEventStore, type DeferredEventStore, type HeldRunEvent, type IssueRef } from "./deferred-events.js";
+import { ConflictSweeper, type ConflictCandidate } from "./conflict-sweeper.js";
 import {
   StaticEventSourceRegistry,
   type CompiledEventSource,
@@ -237,9 +247,52 @@ export interface GatewayServerOptions {
    * `RUN_EVENT_MAX_DEPTH`). Absent -> {@link DEFAULT_RUN_EVENT_MAX_DEPTH}.
    */
   runEventMaxDepth?: number;
+  /**
+   * Held run events and serialize queues (docs/adr/0055 §2), plus the conflict
+   * sweep's once-marks (§1). Absent -> in memory: holds work, but a restart
+   * forgets them.
+   */
+  deferredEventStore?: DeferredEventStore;
+  /** How often held run events are re-checked. */
+  deferredEventSweepIntervalMs?: number;
+  /**
+   * How often a held `waitUntilClosed` event's issues are re-read from GitHub
+   * (docs/adr/0055 §2), shared across replicas through the deferred store.
+   * Absent -> {@link DEFAULT_HELD_EVENT_STATE_CHECK_MS}; 0 checks every pass.
+   */
+  heldEventStateCheckIntervalMs?: number;
+  /** How often the conflict sweeper checks whether a `conflicts` source is due. */
+  conflictSweepTickMs?: number;
 }
 
 export const DEFAULT_RUN_EVENT_MAX_DEPTH = 12;
+const DEFAULT_DEFERRED_SWEEP_MS = 30_000;
+/** A held queue without an in-flight store to renew it: longer than any poll (8h). */
+const UNRENEWED_QUEUE_TTL_MS = 9 * 60 * 60 * 1000;
+/**
+ * How long a held run event keeps being retried after its first failed
+ * publish. "failed" covers an unreachable orchestrator, but also permanent
+ * errors (a 400/401/404, a deterministic throw), so retrying must end: long
+ * enough to ride out an orchestrator outage, short enough that a poison event
+ * stops calling the orchestrator every sweep.
+ */
+const HELD_EVENT_RETRY_WINDOW_MS = 24 * 60 * 60 * 1000;
+/**
+ * A held `waitUntilClosed` event re-reads its issues' state at most this
+ * often (across all replicas). Waiting on a human merge does not need 30s
+ * latency, and two GitHub calls per parked ticket per pass per replica would
+ * exhaust the App installation's rate limit with a modest backlog.
+ */
+const DEFAULT_HELD_EVENT_STATE_CHECK_MS = 5 * 60 * 1000;
+
+/** A positive integer from a string param (params arrive in their §4 string form). */
+function positiveInt(value: string | undefined): number | undefined {
+  if (typeof value !== "string" || !/^[1-9][0-9]*$/.test(value.trim())) return undefined;
+  const n = Number(value.trim());
+  return Number.isSafeInteger(n) ? n : undefined;
+}
+
+const refKey = (r: IssueRef): string => `${r.owner}/${r.repo}#${r.number}`.toLowerCase();
 
 /**
  * The chain a run belongs to (docs/adr/0052 §1), carried in every run event's
@@ -333,6 +386,11 @@ export class GatewayServer {
   private readonly claudeCredentialSweeper: ClaudeCredentialSweeper | undefined;
   private readonly labelReconciler: LabelReconciler | undefined;
   private readonly inflightRecovery: InflightRunRecovery | undefined;
+  private readonly deferredStore: DeferredEventStore;
+  private readonly conflictSweeper: ConflictSweeper;
+  private deferredTimer: ReturnType<typeof setInterval> | undefined;
+  private deferredSweeping = false;
+  private deferredSweepAgain = false;
   /** This process's lease owner id (inflight-runs.ts). */
   private readonly instanceId = `${hostname()}-${randomUUID().slice(0, 8)}`;
   /** Runs this process is finishing right now, by key. */
@@ -455,6 +513,30 @@ export class GatewayServer {
           ...(options.inflightRunSweepIntervalMs ? { intervalMs: options.inflightRunSweepIntervalMs } : {}),
         })
       : undefined;
+    this.deferredStore = options.deferredEventStore ?? new InMemoryDeferredEventStore();
+    this.conflictSweeper = new ConflictSweeper({
+      sources: () =>
+        this.eventSources.all().flatMap((s) => (s.kind === "conflicts" ? [{ name: s.name, conflicts: s.conflicts }] : [])),
+      github: options.githubReplyClient,
+      store: this.deferredStore,
+      verify: async (login, owner, repo) => {
+        try {
+          return Boolean(await options.identityResolver.resolve(login, false, { owner, repo }));
+        } catch (error) {
+          this.report(error);
+          return false;
+        }
+      },
+      emit: (source, candidate) => this.emitConflictEvent(source, candidate),
+      log: (line) => this.log(line),
+      onError: this.report,
+      ...(options.conflictSweepTickMs ? { tickMs: options.conflictSweepTickMs } : {}),
+    });
+  }
+
+  /** How long a serialize queue is held before it must be renewed (docs/adr/0055 §2). */
+  private queueTtlMs(): number {
+    return this.options.inflightRunStore ? 3 * (this.options.inflightRunLeaseMs ?? DEFAULT_LEASE_MS) : UNRENEWED_QUEUE_TTL_MS;
   }
 
   listen(port: number): Promise<void> {
@@ -472,6 +554,15 @@ export class GatewayServer {
       this.labelReconciler?.start();
       // Likewise picks up, at once, any run a previous pod died finishing.
       this.inflightRecovery?.start();
+      // docs/adr/0055: held run events (checked at once, then periodically)
+      // and the conflict sweep.
+      this.kickHeldEvents();
+      this.deferredTimer = setInterval(
+        () => this.kickHeldEvents(),
+        this.options.deferredEventSweepIntervalMs ?? DEFAULT_DEFERRED_SWEEP_MS,
+      );
+      this.deferredTimer.unref?.();
+      this.conflictSweeper.start();
       this.server.listen(port, resolve);
     });
   }
@@ -481,6 +572,9 @@ export class GatewayServer {
       this.claudeCredentialSweeper?.stop();
       this.labelReconciler?.stop();
       this.inflightRecovery?.stop();
+      if (this.deferredTimer) clearInterval(this.deferredTimer);
+      this.deferredTimer = undefined;
+      this.conflictSweeper.stop();
       if (!this.server) return resolve();
       this.server.close((err) => (err ? reject(err) : resolve()));
     });
@@ -866,21 +960,26 @@ export class GatewayServer {
    * an accepted event has side effects, and only the ones its trigger's
    * `reply` declares.
    */
-  private async relayEvent(envelope: Envelope, sender: SenderClaims | undefined, span: TraceSpan): Promise<WebhookOutcome> {
+  private async relayEvent(
+    envelope: Envelope,
+    sender: SenderClaims | undefined,
+    span: TraceSpan,
+    holdsQueue?: InflightRun["holdsQueue"],
+  ): Promise<WebhookOutcome> {
     const submitted = await this.options.orchestratorClient.submitEvent(envelope, sender, span.traceparent);
     this.log(`event ${envelope.source}/${envelope.id}: trace ${span.traceId}`);
     span.set({ "aktis.event.outcome": submitted.kind });
     switch (submitted.kind) {
       case "ignored":
         this.log(`event ${envelope.source}/${envelope.id}: no trigger matched (ignored)`);
-        return { status: 202 };
+        return { status: 202, relay: "ignored" };
       case "rejected":
         this.log(`event ${envelope.source}/${envelope.id}: trigger matched but failed for this event (422): ${submitted.error}`);
-        return { status: 202 };
+        return { status: 202, relay: "rejected" };
       case "failed":
         this.log(`event ${envelope.source}/${envelope.id}: relay failed: ${submitted.error}`);
         span.fail("relay_failed");
-        return { status: 202 };
+        return { status: 202, relay: "failed" };
       case "identity-required":
         this.log(`event ${envelope.source}/${envelope.id}: refused, ${submitted.body.error.code} for sender ${sender?.login ?? "?"}`);
         // docs/adr/0050 §4: a refused delivery is a short trace ending in an
@@ -892,12 +991,14 @@ export class GatewayServer {
           status: 403,
           body: submitted.body,
           after: () => this.postIdentityError(submitted.body),
+          relay: "identity-required",
         };
       case "accepted":
         span.set({ "aktis.trigger": submitted.trigger.name, "aktis.invocation_id": submitted.id });
         return {
           status: 202,
-          after: () => this.runAcceptedEvent(envelope, sender, submitted.id, submitted.trigger, span.traceparent),
+          after: () => this.runAcceptedEvent(envelope, sender, submitted.id, submitted.trigger, span.traceparent, holdsQueue),
+          relay: "accepted",
         };
     }
   }
@@ -958,6 +1059,7 @@ export class GatewayServer {
     invocationId: string,
     trigger: AcceptedTrigger,
     traceparent?: string,
+    holdsQueue?: InflightRun["holdsQueue"],
   ): Promise<void> {
     await this.finishRun(
       {
@@ -967,6 +1069,7 @@ export class GatewayServer {
         ...(sender ? { sender } : {}),
         trigger,
         ...(traceparent ? { traceparent } : {}),
+        ...(holdsQueue ? { holdsQueue } : {}),
         recordedAt: this.now().getTime(),
       },
       false,
@@ -997,10 +1100,13 @@ export class GatewayServer {
           await store.lease(run.key, this.instanceId, leaseMs);
           await store.save(run);
         }
-        renew = setInterval(
-          () => void store.lease(run.key, this.instanceId, leaseMs).catch(this.report),
-          Math.max(1, Math.floor(leaseMs / 3)),
-        );
+        const held = run.holdsQueue;
+        renew = setInterval(() => {
+          void store.lease(run.key, this.instanceId, leaseMs).catch(this.report);
+          // docs/adr/0055 §2: the serialize queue lives exactly as long as the
+          // run that holds it, renewed by whoever is finishing it.
+          if (held) void this.deferredStore.acquireQueue(held.queue, held.holder, this.queueTtlMs()).catch(this.report);
+        }, Math.max(1, Math.floor(leaseMs / 3)));
         renew.unref?.();
       }
       await this.runAcceptedEventSteps(run, takenOver, async () => {
@@ -1008,6 +1114,13 @@ export class GatewayServer {
       });
     } finally {
       if (renew) clearInterval(renew);
+      if (run.holdsQueue) {
+        // Released AFTER the run's own completion event went out (inside
+        // runAcceptedEventSteps), so the next run in the queue starts only
+        // once this one's next hop -- and its status labels -- exist.
+        await this.deferredStore.releaseQueue(run.holdsQueue.queue, run.holdsQueue.holder).catch(this.report);
+        this.kickHeldEvents();
+      }
       await store?.clear(run.key);
       this.runningRuns.delete(run.key);
       const left = (this.runningSessions.get(sessionId) ?? 1) - 1;
@@ -1194,11 +1307,277 @@ export class GatewayServer {
       run.emitted = true;
       await persist();
       try {
-        await this.emitRunEvent(envelope, sender, trigger, finished, gh, traceparent);
+        if (trigger.onComplete.waitUntilClosed || trigger.onComplete.serialize) {
+          await this.holdRunEvent(envelope, sender, trigger, finished, gh, traceparent);
+        } else {
+          await this.emitRunEvent(envelope, sender, trigger, finished, gh, traceparent);
+        }
       } catch (error) {
         this.report(error);
       }
     }
+  }
+
+  /**
+   * docs/adr/0055 §2: records a completion whose trigger holds it --
+   * `waitUntilClosed` (until an issue/PR is closed) and/or `serialize` (until
+   * no other run holds the same queue) -- for {@link processHeldEvents} to
+   * publish once every hold is released. A hold whose params are unusable is
+   * dropped with a log line, and with no hold left the event goes out now:
+   * a broken hold degrades to today's behaviour, never to a stalled chain.
+   *
+   * Two deterministic guards on `waitUntilClosed`, both of which also publish
+   * at once rather than wait:
+   *  - waiting on the run's own issue (it could never close first);
+   *  - a cycle: the issue waited on is itself held waiting -- directly or
+   *    through others -- on this run's issue. Two pieces of work that each
+   *    decided to wait for the other would otherwise wait forever.
+   */
+  private async holdRunEvent(
+    envelope: Envelope,
+    sender: SenderClaims | undefined,
+    trigger: AcceptedTrigger,
+    finished: FinishedRun,
+    gh: GithubReplyTarget | undefined,
+    traceparent: string | undefined,
+  ): Promise<void> {
+    const oc = trigger.onComplete!;
+    const params = trigger.params ?? {};
+    const tag = `run event ${trigger.name || "trigger"} -> ${oc.emitTo}`;
+    const parkedOn: IssueRef | undefined = gh ? { owner: gh.owner, repo: gh.repo, number: gh.issueNumber } : undefined;
+
+    let waitFor: IssueRef | undefined;
+    let blocked = false;
+    if (oc.waitUntilClosed) {
+      const repoMatch = REPOSITORY.exec(params[oc.waitUntilClosed.repositoryParam] ?? "");
+      const number = positiveInt(params[oc.waitUntilClosed.numberParam]);
+      const candidate = repoMatch && number ? { owner: repoMatch[1] as string, repo: repoMatch[2] as string, number } : undefined;
+      if (!candidate) {
+        this.log(`${tag}: not waiting (waitUntilClosed params ${oc.waitUntilClosed.repositoryParam}/${oc.waitUntilClosed.numberParam} are not a repository and number)`);
+      } else if (parkedOn && refKey(candidate) === refKey(parkedOn)) {
+        this.log(`${tag}: not waiting (it would wait on its own issue ${refKey(candidate)})`);
+      } else if (parkedOn && (await this.waitsOn(candidate, parkedOn))) {
+        this.log(`${tag}: not waiting (${refKey(candidate)} is already waiting on ${refKey(parkedOn)}; that would be a cycle)`);
+      } else {
+        let state: "open" | "closed" | "missing" = "open";
+        try {
+          state = await this.options.githubReplyClient.getIssueState(candidate.owner, candidate.repo, candidate.number);
+        } catch (error) {
+          // Unknown: hold it, and let the sweep find out.
+          this.report(error);
+        }
+        if (state === "open") {
+          waitFor = candidate;
+          blocked = true;
+        } else {
+          this.log(`${tag}: not waiting (${refKey(candidate)} is already ${state})`);
+        }
+      }
+    }
+
+    let queue: string | undefined;
+    if (oc.serialize) {
+      const key = params[oc.serialize.keyParam];
+      if (key) queue = `${oc.serialize.group}:${key}`;
+      else this.log(`${tag}: not serializing (param ${oc.serialize.keyParam} is empty)`);
+    }
+
+    if (!waitFor && !queue) {
+      await this.emitRunEvent(envelope, sender, trigger, finished, gh, traceparent);
+      return;
+    }
+    const held: HeldRunEvent = {
+      id: randomUUID(),
+      createdAt: this.now().getTime(),
+      envelope,
+      ...(sender ? { sender } : {}),
+      trigger,
+      finished,
+      ...(traceparent ? { traceparent } : {}),
+      ...(waitFor ? { waitFor } : {}),
+      ...(waitFor && parkedOn ? { parkedOn } : {}),
+      ...(queue ? { queue } : {}),
+      ...(blocked ? { blocked } : {}),
+    };
+    await this.deferredStore.save(held);
+    this.log(
+      `${tag}: held${waitFor ? ` until ${refKey(waitFor)} is closed` : ""}${waitFor && queue ? " and" : ""}${queue ? ` until queue ${queue} is free` : ""}`,
+    );
+    this.kickHeldEvents();
+  }
+
+  /** Whether `from` is held waiting -- directly or through other held events -- on `target`. */
+  private async waitsOn(from: IssueRef, target: IssueRef): Promise<boolean> {
+    const next = new Map<string, IssueRef>();
+    for (const e of await this.deferredStore.list()) {
+      if (e.parkedOn && e.waitFor) next.set(refKey(e.parkedOn), e.waitFor);
+    }
+    const goal = refKey(target);
+    const seen = new Set<string>();
+    let cur: IssueRef | undefined = from;
+    while (cur) {
+      const k = refKey(cur);
+      if (k === goal) return true;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      cur = next.get(k);
+    }
+    return false;
+  }
+
+  /** Runs {@link processHeldEvents} now, or once more right after the pass in progress. */
+  private kickHeldEvents(): void {
+    if (this.deferredSweeping) {
+      this.deferredSweepAgain = true;
+      return;
+    }
+    this.deferredSweeping = true;
+    void (async () => {
+      try {
+        do {
+          this.deferredSweepAgain = false;
+          await this.processHeldEvents();
+        } while (this.deferredSweepAgain);
+      } catch (error) {
+        this.report(error);
+      } finally {
+        this.deferredSweeping = false;
+      }
+    })();
+  }
+
+  /**
+   * One pass over the held run events, oldest first (so a serialize queue is
+   * FIFO). An event is published when its issue to wait on is closed (or
+   * gone) and it can take its queue. It is claimed (deleted) before it is
+   * published, so of several gateway replicas exactly one publishes it; a
+   * replica that took the queue but lost the claim gives the queue back.
+   * Waiting is abandoned when the held run's own issue is closed.
+   */
+  private async processHeldEvents(): Promise<void> {
+    const events = (await this.deferredStore.list()).sort((a, b) => a.createdAt - b.createdAt);
+    for (const ev of events) {
+      try {
+        if (ev.waitFor) {
+          // At most one state check per interval for this event, shared by
+          // every replica and every kick; skipped while another pass's mark
+          // is live (or the store is unreachable -- not checking keeps it held).
+          const checkMs = this.options.heldEventStateCheckIntervalMs ?? DEFAULT_HELD_EVENT_STATE_CHECK_MS;
+          if (checkMs > 0 && !(await this.deferredStore.markOnce(`waitcheck:${ev.id}`, checkMs))) continue;
+          const gh = this.options.githubReplyClient;
+          if (ev.parkedOn && (await gh.getIssueState(ev.parkedOn.owner, ev.parkedOn.repo, ev.parkedOn.number)) !== "open") {
+            if (await this.deferredStore.claim(ev.id)) {
+              this.log(`held run event ${ev.trigger.name}: abandoned (its issue ${refKey(ev.parkedOn)} was closed while waiting)`);
+            }
+            continue;
+          }
+          if ((await gh.getIssueState(ev.waitFor.owner, ev.waitFor.repo, ev.waitFor.number)) === "open") continue;
+        }
+        const holder = `${ev.id}:${this.instanceId}`;
+        if (ev.queue && !(await this.deferredStore.acquireQueue(ev.queue, holder, this.queueTtlMs()))) continue;
+        if (!(await this.deferredStore.claim(ev.id))) {
+          if (ev.queue) await this.deferredStore.releaseQueue(ev.queue, holder);
+          continue;
+        }
+        // Stays "failed" if emitRunEvent throws: treated like a transport failure.
+        let result: EmitRunEventResult = "failed";
+        try {
+          result = await this.emitRunEvent(ev.envelope, ev.sender, ev.trigger, ev.finished, this.githubReplyTarget(ev.trigger), ev.traceparent, {
+            resetDepth: ev.blocked === true,
+            ...(ev.queue ? { holdsQueue: { queue: ev.queue, holder } } : {}),
+          });
+        } finally {
+          // Nothing started that could release it.
+          if (ev.queue && result !== "accepted") await this.deferredStore.releaseQueue(ev.queue, holder);
+          // The orchestrator was unreachable (or publishing threw): put the
+          // event back, same id and createdAt so it keeps its place in line,
+          // and the next sweep retries it -- until HELD_EVENT_RETRY_WINDOW_MS
+          // after the first failure, since "failed" may be permanent. A
+          // delivered-but-not-accepted outcome (ignored, rejected, depth,
+          // verify) is final and dropped.
+          if (result === "failed") {
+            const now = this.now().getTime();
+            const publishFailure = { firstAt: ev.publishFailure?.firstAt ?? now, attempts: (ev.publishFailure?.attempts ?? 0) + 1 };
+            if (now - publishFailure.firstAt >= HELD_EVENT_RETRY_WINDOW_MS) {
+              this.log(
+                `held run event ${ev.trigger.name}: publish failed ${publishFailure.attempts} times since ${new Date(publishFailure.firstAt).toISOString()}; dropped`,
+              );
+              // Say so where the held run replied: a parked ticket would
+              // otherwise keep looking like it is still waiting.
+              await this.commentHeldEventDropped(ev);
+            } else {
+              await this.deferredStore.save({ ...ev, publishFailure });
+              this.log(`held run event ${ev.trigger.name}: publish failed (attempt ${publishFailure.attempts}); held again for the next sweep`);
+            }
+          }
+        }
+      } catch (error) {
+        this.report(error);
+      }
+    }
+  }
+
+  /** Best-effort notice on the held run's issue that its follow-up will never be published. */
+  private async commentHeldEventDropped(ev: HeldRunEvent): Promise<void> {
+    const gh = this.githubReplyTarget(ev.trigger);
+    const target = gh ? { owner: gh.owner, repo: gh.repo, number: gh.issueNumber } : ev.parkedOn;
+    if (!target) return;
+    try {
+      await this.options.githubReplyClient.postIssueComment(
+        target.owner,
+        target.repo,
+        target.number,
+        "Stopped the automated chain here: its next step could not be delivered after retrying for 24 hours. This needs a human to pick it up.",
+      );
+    } catch (error) {
+      this.report(error);
+    }
+  }
+
+  /**
+   * One `conflict` event (docs/adr/0055 §1) for a pull request the conflict
+   * sweep found conflicting with its base, acting as its verified assignee.
+   * A fresh chain: the PR's earlier chain ended when it was handed off.
+   * True unless the orchestrator could not be reached (the sweep then retries).
+   */
+  private async emitConflictEvent(source: string, c: ConflictCandidate): Promise<boolean> {
+    const claims = await this.senderClaims(source, c.assignee);
+    const envelope: Envelope = {
+      source,
+      kind: "conflict",
+      id: randomUUID(),
+      time: this.now().toISOString(),
+      headers: {},
+      sender: { login: c.assignee.login, isBot: false },
+      repository: `${c.owner}/${c.repo}`,
+      body: {
+        pullRequest: {
+          number: c.pr.number,
+          url: c.pr.url,
+          title: c.pr.title,
+          baseRef: c.pr.baseRef,
+          baseSha: c.pr.baseSha,
+          headRef: c.pr.headRef,
+          headSha: c.pr.headSha,
+        },
+      },
+    };
+    const span = startSpan("conflict event", undefined, {
+      kind: "client",
+      attributes: { "aktis.event_source": source, "aktis.event_id": envelope.id },
+    });
+    let relayed: WebhookOutcome;
+    try {
+      relayed = await this.relayEvent(envelope, claims, span);
+    } catch (error) {
+      span.fail("internal_error");
+      this.report(error);
+      return false;
+    } finally {
+      span.end();
+    }
+    relayed.after?.().catch(this.report);
+    return relayed.relay !== "failed";
   }
 
   /**
@@ -1238,23 +1617,29 @@ export class GatewayServer {
     finished: FinishedRun,
     gh: GithubReplyTarget | undefined,
     traceparent: string | undefined,
-  ): Promise<void> {
+    opts: {
+      /** docs/adr/0055 §2: a hold that really blocked on a human restarts the depth count (counts are kept). */
+      resetDepth?: boolean;
+      /** The serialize queue the next hop's run will hold. */
+      holdsQueue?: InflightRun["holdsQueue"];
+    } = {},
+  ): Promise<EmitRunEventResult> {
     const emitTo = trigger.onComplete!.emitTo;
     const tag = `run event ${trigger.name || "trigger"} -> ${emitTo}`;
     const target = this.eventSources.get(emitTo);
     if (!target || target.kind !== "run") {
       this.log(`${tag}: skipped (${target ? `source is kind ${target.kind}, not run` : "no such usable EventSource"})`);
-      return;
+      return "not-accepted";
     }
     const chain = this.chainOf(envelope, sender);
     if (!chain) {
       this.log(`${tag}: skipped (the run's chain metadata is unreadable)`);
-      return;
+      return "not-accepted";
     }
     const origin = chain.origin;
     if (!origin) {
       this.log(`${tag}: skipped (the chain has no verified human sender to act as)`);
-      return;
+      return "not-accepted";
     }
     const comment = async (text: string): Promise<void> => {
       if (!gh) return;
@@ -1267,7 +1652,10 @@ export class GatewayServer {
 
     const next: RunChain = {
       id: chain.id,
-      depth: chain.depth + 1,
+      // A hold that waited on a human merging something is not a runaway
+      // loop: the depth restarts there. Counts are kept, so per-trigger caps
+      // (e.g. how many times a ticket may wait) still bound the chain.
+      depth: opts.resetDepth ? 1 : chain.depth + 1,
       counts: { ...chain.counts, [trigger.name]: (chain.counts[trigger.name] ?? 0) + 1 },
       origin,
     };
@@ -1275,7 +1663,7 @@ export class GatewayServer {
     if (next.depth > maxDepth) {
       this.log(`${tag}: dropped, chain ${chain.id} would reach depth ${next.depth} (max ${maxDepth})`);
       await comment(`Stopped the automated chain here: it exceeded ${maxDepth} steps.`);
-      return;
+      return "not-accepted";
     }
 
     // Per-hop re-verification, exactly as resolveSender verifies a webhook's
@@ -1286,13 +1674,16 @@ export class GatewayServer {
     try {
       identity = await this.options.identityResolver.resolve(origin.login, false, repoContext);
     } catch (error) {
+      // A GitHub or identity-link blip is not "no longer verifies": report it
+      // as a transport failure, so a held event is kept and retried.
       this.report(error);
-      identity = undefined;
+      this.log(`${tag}: chain origin ${origin.login} could not be re-verified right now (resolver error)`);
+      return "failed";
     }
     if (!identity) {
       this.log(`${tag}: dropped, chain origin ${origin.login} no longer verifies`);
       await comment(`Stopped the automated chain here: ${origin.login} could not be re-verified for the next step.`);
-      return;
+      return "not-accepted";
     }
     const claims = await this.senderClaims(emitTo, { login: origin.login, ...(origin.accountId ? { accountId: origin.accountId } : {}) });
 
@@ -1324,7 +1715,7 @@ export class GatewayServer {
     });
     let relayed: WebhookOutcome;
     try {
-      relayed = await this.relayEvent(event, claims, span);
+      relayed = await this.relayEvent(event, claims, span, opts.holdsQueue);
     } catch (error) {
       span.fail("internal_error");
       throw error;
@@ -1333,6 +1724,8 @@ export class GatewayServer {
     }
     // The next hop's run is its own lifecycle; this one is done.
     relayed.after?.().catch(this.report);
+    if (relayed.relay === "failed") return "failed";
+    return relayed.relay === "accepted" ? "accepted" : "not-accepted";
   }
 
   /**

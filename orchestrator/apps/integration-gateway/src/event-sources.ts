@@ -49,7 +49,24 @@ export type CompiledEventSource =
    * deliver to it, which is what lets a run event carry a sender the gateway
    * re-verified itself rather than one a caller claimed.
    */
-  | { name: string; kind: "run" };
+  | { name: string; kind: "run" }
+  /**
+   * docs/adr/0055 §1: the gateway sweeps `author`'s open pull requests and
+   * emits a `conflict` event for each one that conflicts with its base. No
+   * route either -- the gateway itself is the only producer.
+   */
+  | { name: string; kind: "conflicts"; conflicts: CompiledConflicts };
+
+export interface CompiledConflicts {
+  author: string;
+  intervalMs: number;
+  skipLabels: string[];
+}
+
+/** Mirrors the CRD's pattern for `spec.conflicts.author` (a GitHub search `author:` qualifier). */
+const CONFLICTS_AUTHOR = /^(app\/)?[A-Za-z0-9][A-Za-z0-9-]*(\[bot\])?$/;
+export const DEFAULT_CONFLICTS_INTERVAL_SECONDS = 300;
+const MIN_CONFLICTS_INTERVAL_SECONDS = 60;
 
 export type CompileSourceResult = { ok: true; source: CompiledEventSource } | { ok: false; error: string };
 
@@ -66,8 +83,29 @@ export function compileEventSource(resource: EventSourceResource): CompileSource
   const name = resource?.metadata?.name;
   if (!name) return { ok: false, error: "missing metadata.name" };
   const spec = resource.spec ?? {};
-  if ([spec.webhook, spec.cron, spec.run].filter(Boolean).length !== 1) {
-    return { ok: false, error: "exactly one of spec.webhook / spec.cron / spec.run must be set" };
+  if ([spec.webhook, spec.cron, spec.run, spec.conflicts].filter(Boolean).length !== 1) {
+    return { ok: false, error: "exactly one of spec.webhook / spec.cron / spec.run / spec.conflicts must be set" };
+  }
+
+  if (spec.conflicts) {
+    // Like a run source, its events' sender is chosen and verified by the
+    // gateway (the PR's assignee), never evaluated out of a body.
+    if (spec.sender) return { ok: false, error: "spec.sender is only valid with spec.webhook" };
+    const { author, intervalSeconds, skipLabels } = spec.conflicts;
+    if (typeof author !== "string" || !CONFLICTS_AUTHOR.test(author)) {
+      return { ok: false, error: `spec.conflicts.author ${JSON.stringify(author)} is not a GitHub login or app/<slug>` };
+    }
+    const interval = intervalSeconds ?? DEFAULT_CONFLICTS_INTERVAL_SECONDS;
+    if (!Number.isSafeInteger(interval) || interval < MIN_CONFLICTS_INTERVAL_SECONDS) {
+      return { ok: false, error: `spec.conflicts.intervalSeconds must be an integer >= ${MIN_CONFLICTS_INTERVAL_SECONDS}` };
+    }
+    if (skipLabels !== undefined && (!Array.isArray(skipLabels) || skipLabels.some((l) => typeof l !== "string" || !l))) {
+      return { ok: false, error: "spec.conflicts.skipLabels must be non-empty strings" };
+    }
+    return {
+      ok: true,
+      source: { name, kind: "conflicts", conflicts: { author, intervalMs: interval * 1000, skipLabels: skipLabels ?? [] } },
+    };
   }
 
   if (spec.run) {
@@ -136,6 +174,8 @@ export function compileEventSource(resource: EventSourceResource): CompileSource
 /** What the HTTP routes need: a usable source by name, or nothing. */
 export interface EventSourceLookup {
   get(name: string): CompiledEventSource | undefined;
+  /** Every usable source -- the conflict sweeper walks these (docs/adr/0055 §1). */
+  all(): CompiledEventSource[];
 }
 
 /** A fixed set of sources -- tests, and a deployment with no CRD namespace (empty). */
@@ -152,6 +192,10 @@ export class StaticEventSourceRegistry implements EventSourceLookup {
 
   get(name: string): CompiledEventSource | undefined {
     return this.sources.get(name);
+  }
+
+  all(): CompiledEventSource[] {
+    return [...this.sources.values()];
   }
 }
 
@@ -187,6 +231,10 @@ export class CrdEventSourceRegistry implements EventSourceLookup {
 
   get(name: string): CompiledEventSource | undefined {
     return this.table.get(name);
+  }
+
+  all(): CompiledEventSource[] {
+    return [...this.table.values()];
   }
 
   /** Lists once (resolving when the first list lands, or failing if it can't), then keeps the table current in the background. */

@@ -1,0 +1,59 @@
+# Software factory, step 2b (docs/adr/0055 §3): the coordinator decided this
+# issue builds directly on open pull request #N (`aktis-coordinate stack <N>`),
+# so the work branches from #N's branch and its PR targets that branch. When
+# #N merges, GitHub retargets the stacked PR to #N's base; if that leaves a
+# conflict, the conflict sweep (factory-resync) resolves it.
+apiVersion: core.aktis.ai/v1alpha1
+kind: EventTrigger
+metadata:
+  name: factory-triage-stacked
+spec:
+  sourceRef: runs
+  match:
+    cel: >-
+      source == "runs" && kind == "run" &&
+      body.trigger == "factory-coordinate" && body.status == "succeeded" &&
+      has(body.outcome.coordination) && body.outcome.coordination.decision == "stack" &&
+      has(body.outcome.coordination.number) &&
+      string(body.outcome.coordination.number) != body.params.number
+  params:
+    repository: body.params.repository
+    number: body.params.number
+    closesIssue: body.params.number
+    title: body.params.title
+    stackOn: string(body.outcome.coordination.number)
+  sessionKey: "github:{{repository}}#{{number}}"
+  target:
+    agentRef: "opencode-swe-agent"
+    promptTemplate: |
+      Resolve GitHub issue {{repository}}#{{number}}: "{{title}}". Read it
+      first with `gh issue view {{number}} --repo {{repository}} --comments`.
+
+      This issue builds on open pull request #{{stackOn}}, which is not merged
+      yet, so your work must be STACKED on it:
+      1. Find its branch: `gh pr view {{stackOn}} --repo {{repository}} --json state,headRefName`.
+      2. If #{{stackOn}} is still open, check out its branch and create your
+         feature branch from it. Open your pull request with
+         `--base <that branch>`, and state in its description that it is
+         stacked on #{{stackOn}} and must be merged after it.
+      3. If #{{stackOn}} is no longer open, work from the default branch
+         instead, as usual.
+
+      Investigate and implement the fix or feature in {{repository}}. Do not
+      create a new repository and do not substitute any other repository -- if
+      you cannot complete the task in {{repository}} as given, stop and post a
+      comment explaining exactly what's blocking you. If the issue is unclear,
+      post a comment asking a clarifying question instead of guessing.
+
+      Once you open a pull request, an automated review of it starts on its
+      own, so do not ask anyone to apply review labels.
+  reply:
+    github:
+      repository: "{{repository}}"
+      issueNumber: "{{number}}"
+      ack: "🤖 Starting work on this now, stacked on #{{stackOn}}."
+      sessionPage: true
+      result: true
+      removeLabel: "ai-triage"
+  onComplete:
+    emitTo: runs

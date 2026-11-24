@@ -53,6 +53,37 @@ spec:
           spec:
             description: spec defines the desired state of EventSource
             properties:
+              conflicts:
+                description: |-
+                  conflicts makes this a merge-conflict sweep source: integration-gateway
+                  emits one event per open pull request (by author) whose branch
+                  conflicts with its base (docs/adr/0055).
+                properties:
+                  author:
+                    description: |-
+                      author is the GitHub search `author:` qualifier of the pull requests to
+                      watch -- the factory's own bot, e.g. "app/k5s-bot".
+                    maxLength: 100
+                    minLength: 1
+                    pattern: ^(app/)?[A-Za-z0-9][A-Za-z0-9-]*(\[bot\])?$
+                    type: string
+                  intervalSeconds:
+                    default: 300
+                    description: intervalSeconds between sweeps.
+                    format: int32
+                    minimum: 60
+                    type: integer
+                  skipLabels:
+                    description: |-
+                      skipLabels: a pull request carrying any of these labels is left alone
+                      (work already in flight on it, or a human hold).
+                    items:
+                      type: string
+                    maxItems: 20
+                    type: array
+                required:
+                - author
+                type: object
               cron:
                 description: cron makes this a timer source.
                 properties:
@@ -183,8 +214,8 @@ spec:
                 type: object
             type: object
             x-kubernetes-validations:
-            - message: exactly one of webhook, cron or run must be set
-              rule: (has(self.webhook)?1:0)+(has(self.cron)?1:0)+(has(self.run)?1:0)==1
+            - message: exactly one of webhook, cron, run or conflicts must be set
+              rule: (has(self.webhook)?1:0)+(has(self.cron)?1:0)+(has(self.run)?1:0)+(has(self.conflicts)?1:0)==1
             - message: sender is only valid for webhook sources
               rule: '!has(self.sender) || has(self.webhook)'
           status:

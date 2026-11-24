@@ -53,6 +53,10 @@ type EventTriggerTarget struct {
 	ToolRef        string    `json:"toolRef,omitempty"`
 	PromptTemplate string    `json:"promptTemplate,omitempty"`
 	ReadOnly       bool      `json:"readOnly,omitempty"`
+	// Outcome names the structured outcome a read-only agent run reports
+	// (docs/adr/0055): "verdict" (the default) or "coordination". It reaches
+	// the runner as AgentRun.spec.outcome, never through the prompt.
+	Outcome string `json:"outcome,omitempty"`
 	// Identity overrides the identity mode of every agent the turn
 	// authorizes (docs/adr/0049); see authz.ResolveMode.
 	Identity string `json:"identity,omitempty"`
@@ -65,6 +69,12 @@ const (
 	TargetSkill        = "skill"
 	TargetAgent        = "agent"
 	TargetTool         = "tool"
+)
+
+// Outcome kinds a read-only agent run can report (target.outcome).
+const (
+	OutcomeVerdict      = "verdict"
+	OutcomeCoordination = "coordination"
 )
 
 // Kind names which of the (mutually exclusive) targets is set. A descriptor
@@ -134,6 +144,26 @@ type EventTriggerSpec struct {
 // it in the accepted response; integration-gateway emits the event.
 type EventTriggerOnComplete struct {
 	EmitTo string `json:"emitTo,omitempty"`
+	// WaitUntilClosed and Serialize (docs/adr/0055 §2-3) are passed through
+	// unchanged: each names params of this trigger, and integration-gateway
+	// reads their rendered values from the accepted response's params when
+	// it decides when to emit the completion event.
+	WaitUntilClosed *OnCompleteWaitUntilClosed `json:"waitUntilClosed,omitempty"`
+	Serialize       *OnCompleteSerialize       `json:"serialize,omitempty"`
+}
+
+// OnCompleteWaitUntilClosed names the params holding the GitHub issue/PR the
+// completion event waits on.
+type OnCompleteWaitUntilClosed struct {
+	RepositoryParam string `json:"repositoryParam"`
+	NumberParam     string `json:"numberParam"`
+}
+
+// OnCompleteSerialize names the queue (group + key param) completion events
+// are emitted through one at a time.
+type OnCompleteSerialize struct {
+	Group    string `json:"group"`
+	KeyParam string `json:"keyParam"`
 }
 
 // --- the envelope (docs/event-triggers.md §2) ---
@@ -566,6 +596,16 @@ func (d *EventTriggerDescriptor) compile() error {
 		}
 	} else if d.Spec.Target.ToolRef == "" && strings.TrimSpace(d.Spec.Target.PromptTemplate) == "" {
 		return fmt.Errorf("promptTemplate is required unless toolRef or none is set")
+	}
+	// The runner reports a structured outcome only for a read-only agent run
+	// (docs/adr/0055).
+	if o := d.Spec.Target.Outcome; o != "" {
+		if o != OutcomeVerdict && o != OutcomeCoordination {
+			return fmt.Errorf("outcome must be %q or %q, got %q", OutcomeVerdict, OutcomeCoordination, o)
+		}
+		if d.Spec.Target.AgentRef == "" || !d.Spec.Target.ReadOnly {
+			return fmt.Errorf("outcome requires agentRef and readOnly")
+		}
 	}
 	// Identity modes apply to agent runs; a tool has none (docs/adr/0049).
 	if d.Spec.Target.ToolRef != "" && d.Spec.Target.Identity != "" {

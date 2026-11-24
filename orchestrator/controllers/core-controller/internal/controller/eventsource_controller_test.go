@@ -413,7 +413,7 @@ var _ = Describe("EventSource Controller", func() {
 			source.Spec.Cron = &corev1alpha1.CronSource{Schedule: "0 7 * * *"}
 			err := k8sClient.Create(ctx, source)
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("exactly one of webhook, cron or run"))
+			Expect(err.Error()).To(ContainSubstring("exactly one of webhook, cron, run or conflicts"))
 		})
 
 		It("is rejected at admission with a sender block", func() {
@@ -425,6 +425,76 @@ var _ = Describe("EventSource Controller", func() {
 			err := k8sClient.Create(ctx, source)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("sender is only valid for webhook sources"))
+		})
+	})
+
+	Context("a conflicts source (docs/adr/0055)", func() {
+		conflictsSource := func(name string) *corev1alpha1.EventSource {
+			return &corev1alpha1.EventSource{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+				Spec: corev1alpha1.EventSourceSpec{Conflicts: &corev1alpha1.ConflictsSource{
+					Author:     "app/k5s-bot",
+					SkipLabels: []string{"ai-triage", "ai-review"},
+				}},
+			}
+		}
+
+		It("is Ready with no Secret, CronJob or ServiceAccount, and defaults its interval", func() {
+			source := conflictsSource("pr-conflicts")
+			Expect(k8sClient.Create(ctx, source)).To(Succeed())
+			defer cleanup(source)
+
+			res := reconcileWith(reconciler(testTickURL), "pr-conflicts")
+
+			cond := ready("pr-conflicts")
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(cond.Reason).To(Equal("ConflictSweep"))
+			Expect(cond.Message).To(ContainSubstring("app/k5s-bot"))
+			Expect(res.RequeueAfter).To(BeZero())
+			_, err := cronJob("pr-conflicts")
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(), "a conflicts source owns no CronJob")
+			_, err = serviceAccount("pr-conflicts")
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(), "a conflicts source owns no ServiceAccount")
+
+			got := stored("pr-conflicts")
+			Expect(got.Spec.Conflicts.IntervalSeconds).NotTo(BeNil())
+			Expect(*got.Spec.Conflicts.IntervalSeconds).To(Equal(int32(300)))
+		})
+
+		It("is rejected at admission alongside another kind", func() {
+			source := conflictsSource("conflicts-and-run")
+			source.Spec.Run = &corev1alpha1.RunSource{}
+			err := k8sClient.Create(ctx, source)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("exactly one of webhook, cron, run or conflicts"))
+		})
+
+		It("is rejected at admission with a sender block", func() {
+			source := conflictsSource("conflicts-with-sender")
+			source.Spec.Sender = &corev1alpha1.EventSender{
+				Provider:  corev1alpha1.EventSenderProviderGitHub,
+				LoginFrom: "body.sender.login",
+			}
+			err := k8sClient.Create(ctx, source)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("sender is only valid for webhook sources"))
+		})
+
+		It("rejects an author that is not a GitHub login or app/<slug>", func() {
+			source := conflictsSource("conflicts-bad-author")
+			source.Spec.Conflicts.Author = "k5s-bot is:open"
+			err := k8sClient.Create(ctx, source)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("author"))
+		})
+
+		It("rejects an interval under 60 seconds", func() {
+			source := conflictsSource("conflicts-fast")
+			fast := int32(10)
+			source.Spec.Conflicts.IntervalSeconds = &fast
+			err := k8sClient.Create(ctx, source)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("intervalSeconds"))
 		})
 	})
 

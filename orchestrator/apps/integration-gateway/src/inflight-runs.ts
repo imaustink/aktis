@@ -43,6 +43,11 @@ export interface InflightRun {
   remoteControlPosted?: boolean;
   resultPosted?: boolean;
   emitted?: boolean;
+  /**
+   * The serialize queue this run holds (docs/adr/0055 §2): renewed while it
+   * runs -- by whichever gateway is finishing it -- and released when it ends.
+   */
+  holdsQueue?: { queue: string; holder: string };
   /** Epoch ms the run was accepted. */
   recordedAt: number;
 }

@@ -45,6 +45,7 @@ type NoneTarget struct{}
 // +kubebuilder:validation:XValidation:rule="!has(self.none) || !has(self.readOnly) || !self.readOnly",message="readOnly cannot be set with none: nothing runs to restrict"
 // +kubebuilder:validation:XValidation:rule="!has(self.none) || !has(self.identity)",message="identity cannot be set with none: nothing runs to authorize"
 // +kubebuilder:validation:XValidation:rule="!has(self.identity) || !has(self.toolRef)",message="identity applies to agent runs; it cannot be set with toolRef"
+// +kubebuilder:validation:XValidation:rule="!has(self.outcome) || (has(self.agentRef) && has(self.readOnly) && self.readOnly)",message="outcome requires agentRef and readOnly"
 type EventTriggerTarget struct {
 	// orchestrator runs a conversational turn on the rendered prompt.
 	// +optional
@@ -77,6 +78,13 @@ type EventTriggerTarget struct {
 	// suppresses write credentials. It can only restrict.
 	// +optional
 	ReadOnly bool `json:"readOnly,omitempty"`
+
+	// outcome names the structured outcome the read-only agent run reports
+	// (docs/adr/0055): verdict (the default) or coordination. It reaches the
+	// agent as AgentRun.spec.outcome, never through the prompt, so nothing in
+	// an event body can switch it.
+	// +optional
+	Outcome RunOutcome `json:"outcome,omitempty"`
 
 	// identity overrides the identity mode of every agent this turn
 	// authorizes (docs/adr/0049): agent, delegated or hybrid, in place of the
@@ -172,6 +180,50 @@ type EventTriggerOnComplete struct {
 	// +required
 	// +kubebuilder:validation:MinLength=1
 	EmitTo string `json:"emitTo"`
+
+	// waitUntilClosed holds the completion event back until the GitHub issue
+	// or pull request named by two of this trigger's params is closed
+	// (merged or not), docs/adr/0055 §2. The gateway records the held event
+	// durably and re-checks it on a sweep; it is dropped instead if the issue
+	// the run replied to is closed first.
+	// +optional
+	WaitUntilClosed *OnCompleteWaitUntilClosed `json:"waitUntilClosed,omitempty"`
+
+	// serialize emits completion events one at a time per group and key: an
+	// event is held while the run started by the previous event with the same
+	// group and key is still going (docs/adr/0055 §3).
+	// +optional
+	Serialize *OnCompleteSerialize `json:"serialize,omitempty"`
+}
+
+// OnCompleteWaitUntilClosed names the params holding the issue/PR to wait on.
+type OnCompleteWaitUntilClosed struct {
+	// repositoryParam names the spec.params key holding "owner/name".
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	RepositoryParam string `json:"repositoryParam"`
+
+	// numberParam names the spec.params key holding the issue/PR number.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	NumberParam string `json:"numberParam"`
+}
+
+// OnCompleteSerialize names a queue: one in-flight run per group and key.
+type OnCompleteSerialize struct {
+	// group is the queue's name, shared by every trigger that serializes
+	// into it.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Group string `json:"group"`
+
+	// keyParam names the spec.params key whose value partitions the group
+	// (e.g. the repository, so each repository has its own queue).
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	KeyParam string `json:"keyParam"`
 }
 
 // EventTriggerSpec defines what a matching event dispatches.

@@ -9,6 +9,7 @@ import type { GithubReplyClient } from "./github-client.js";
 import { GithubIdentityResolver } from "./identity.js";
 import { InMemoryPendingLabelStore } from "./label-reconciler.js";
 import { InMemoryInflightRunStore, type InflightRun } from "./inflight-runs.js";
+import { InMemoryDeferredEventStore } from "./deferred-events.js";
 import type { AcceptedTrigger, EventSubmitResult, OrchestratorClient, OrchestratorInvokeResult, PollHooks } from "./orchestrator-client.js";
 import { GatewayServer, type GatewayServerOptions } from "./server.js";
 import { InMemorySessionPageStore } from "./session-page-store.js";
@@ -105,6 +106,7 @@ const SOURCES: EventSourceResource[] = [
   { metadata: { name: "nightly" }, spec: { cron: { schedule: "0 7 * * *", payload: { repo: "acme/widgets", n: 3 } } } },
   // docs/adr/0052 §1: receives the gateway's own run-completion events.
   { metadata: { name: "runs" }, spec: { run: {} } },
+  { metadata: { name: "pr-conflicts" }, spec: { conflicts: { author: "app/k5s-bot", skipLabels: ["ai-triage"] } } },
 ];
 
 const DEFAULT_TRIGGER: AcceptedTrigger = {
@@ -136,6 +138,10 @@ interface Harness {
   removeIssueLabel: ReturnType<typeof vi.fn>;
   addIssueLabels: ReturnType<typeof vi.fn>;
   addIssueAssignees: ReturnType<typeof vi.fn>;
+  getIssueState: ReturnType<typeof vi.fn>;
+  searchOpenPullRequests: ReturnType<typeof vi.fn>;
+  getPullRequest: ReturnType<typeof vi.fn>;
+  getAssignmentActors: ReturnType<typeof vi.fn>;
   replyFetch: ReturnType<typeof vi.fn>;
   secretsGet: ReturnType<typeof vi.fn>;
   resolve: ReturnType<typeof vi.spyOn>;
@@ -182,6 +188,10 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
   const addIssueAssignees = vi.fn(async (_o: string, _r: string, _n: number, logins: string[]) => {
     order.push(`assign:${logins.join(",")}`);
   });
+  const getIssueState = vi.fn(async (): Promise<"open" | "closed" | "missing"> => "open");
+  const searchOpenPullRequests = vi.fn(async (): Promise<Array<{ owner: string; repo: string; number: number }>> => []);
+  const getPullRequest = vi.fn(async (): Promise<unknown> => undefined);
+  const getAssignmentActors = vi.fn(async (): Promise<Map<string, string>> => new Map());
   const replyFetch = vi.fn(async () => {
     order.push("http");
     return new Response(null, { status: 204 });
@@ -203,7 +213,17 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
     tickNamespace: "agents",
     identityResolver,
     orchestratorClient: { submitEvent, poll, invoke, checkLive: vi.fn().mockResolvedValue({ live: false }) } as unknown as OrchestratorClient,
-    githubReplyClient: { postIssueComment, updateIssueComment, removeIssueLabel, addIssueLabels, addIssueAssignees } as unknown as GithubReplyClient,
+    githubReplyClient: {
+      postIssueComment,
+      updateIssueComment,
+      removeIssueLabel,
+      addIssueLabels,
+      addIssueAssignees,
+      getIssueState,
+      searchOpenPullRequests,
+      getPullRequest,
+      getAssignmentActors,
+    } as unknown as GithubReplyClient,
     replyFetch: replyFetch as unknown as typeof fetch,
     log: (line) => logs.push(line),
     onBackgroundError,
@@ -212,6 +232,9 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
     labelReconcilerGraceMs: 60 * 60 * 1000,
     sessionPageStore,
     publicBaseUrl: "https://gateway.example.com",
+    // Re-read a held event's issues on every pass, so tests can kick freely;
+    // the throttle has its own test.
+    heldEventStateCheckIntervalMs: 0,
     ...overrides,
   });
   await server.listen(0);
@@ -229,6 +252,10 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
     removeIssueLabel,
     addIssueLabels,
     addIssueAssignees,
+    getIssueState,
+    searchOpenPullRequests,
+    getPullRequest,
+    getAssignmentActors,
     replyFetch,
     secretsGet,
     resolve,
@@ -1454,6 +1481,386 @@ describe("in-flight run takeover (a gateway restarted mid-run)", () => {
     const h = await start({ inflightRunStore: store });
     h.submitEvent.mockResolvedValue({ kind: "ignored" });
     await vi.waitFor(() => expect(h.poll).toHaveBeenCalledWith("inv-resubmitted", expect.anything()));
+  });
+});
+
+describe("held run events and conflict events (docs/adr/0055)", () => {
+  const PARK: AcceptedTrigger = {
+    name: "factory-park",
+    sessionId: "event:park",
+    reply: { github: { repository: "acme/widgets", issueNumber: 7 } },
+    params: { repository: "acme/widgets", number: "7", waitFor: "5" },
+    onComplete: { emitTo: "runs", waitUntilClosed: { repositoryParam: "repository", numberParam: "waitFor" } },
+  };
+  const INTAKE: AcceptedTrigger = {
+    name: "factory-intake",
+    sessionId: "event:intake",
+    reply: { github: { repository: "acme/widgets", issueNumber: 7 } },
+    params: { repository: "acme/widgets", number: "7" },
+    onComplete: { emitTo: "runs", serialize: { group: "coord", keyParam: "repository" } },
+  };
+  const COORDINATE: AcceptedTrigger = {
+    name: "factory-coordinate",
+    sessionId: "factory-coordinate:acme/widgets#7",
+    reply: { github: { repository: "acme/widgets", issueNumber: 7 } },
+    params: { repository: "acme/widgets", number: "7" },
+  };
+
+  function chain(h: Harness, ...queue: AcceptedTrigger[]): void {
+    let n = 0;
+    h.submitEvent.mockImplementation(async (): Promise<EventSubmitResult> => {
+      const trigger = queue[n];
+      n++;
+      return trigger ? { kind: "accepted", id: `inv-${n}`, trigger } : { kind: "ignored" };
+    });
+  }
+  const runEvents = (h: Harness): Envelope[] => h.submitEvent.mock.calls.map((c) => c[0] as Envelope).filter((e) => e.kind === "run");
+  const kick = (h: Harness): void => (h.server as unknown as { kickHeldEvents: () => void }).kickHeldEvents();
+  const settle = (): Promise<void> => new Promise((r) => setTimeout(r, 30));
+
+  it("holds a waitUntilClosed completion while the issue is open, and publishes it once it closes", async () => {
+    const store = new InMemoryDeferredEventStore();
+    const h = await start({ deferredEventStore: store });
+    chain(h, PARK);
+    await postGithub(h);
+    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
+    expect(runEvents(h)).toHaveLength(0);
+    expect(h.getIssueState).toHaveBeenCalledWith("acme", "widgets", 5);
+    expect(h.logs.some((l) => l.includes("held until acme/widgets#5 is closed"))).toBe(true);
+
+    kick(h);
+    await settle();
+    expect(runEvents(h)).toHaveLength(0);
+
+    h.getIssueState.mockImplementation(async (_o: string, _r: string, n: number) => (n === 5 ? "closed" : "open"));
+    kick(h);
+    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    expect(runEvents(h)[0]?.body).toMatchObject({ trigger: "factory-park", params: { waitFor: "5" } });
+    expect(await store.list()).toHaveLength(0);
+  });
+
+  it("keeps a held event whose publish hits a failed relay, and publishes it on a later sweep", async () => {
+    const store = new InMemoryDeferredEventStore();
+    const h = await start({ deferredEventStore: store });
+    chain(h, PARK);
+    await postGithub(h);
+    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
+    const [held] = await store.list();
+
+    h.getIssueState.mockImplementation(async (_o: string, _r: string, n: number) => (n === 5 ? "closed" : "open"));
+    h.submitEvent.mockResolvedValueOnce({ kind: "failed", error: "orchestrator down" });
+    kick(h);
+    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
+    // Same record: its place in line holds.
+    expect((await store.list())[0]).toMatchObject({ id: held!.id, createdAt: held!.createdAt });
+    expect(h.logs.some((l) => l.includes("held again for the next sweep"))).toBe(true);
+
+    h.submitEvent.mockResolvedValue({ kind: "ignored" });
+    kick(h);
+    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(2));
+    expect(runEvents(h)[1]?.body).toMatchObject({ trigger: "factory-park", params: { waitFor: "5" } });
+    await vi.waitFor(async () => expect(await store.list()).toHaveLength(0));
+  });
+
+  it("stops retrying a held event whose publish keeps failing, and frees its queue", async () => {
+    const store = new InMemoryDeferredEventStore();
+    let clock = Date.parse("2026-01-01T00:00:00Z");
+    const h = await start({ deferredEventStore: store, now: () => new Date(clock) });
+    chain(h, INTAKE);
+    h.submitEvent.mockResolvedValue({ kind: "failed", error: "404 not found" });
+    h.submitEvent.mockResolvedValueOnce({ kind: "accepted", id: "inv-1", trigger: INTAKE });
+    await postGithub(h);
+    // Held for its queue, published at once, and the publish fails.
+    await vi.waitFor(async () => expect((await store.list())[0]?.publishFailure).toEqual({ firstAt: clock, attempts: 1 }));
+    const [held] = await store.list();
+    const queue = held!.queue!;
+    const firstAt = clock;
+    clock += 60 * 60 * 1000;
+    kick(h);
+    await vi.waitFor(async () => expect((await store.list())[0]?.publishFailure).toEqual({ firstAt, attempts: 2 }));
+    expect((await store.list())[0]).toMatchObject({ id: held!.id, createdAt: held!.createdAt });
+
+    clock = firstAt + 24 * 60 * 60 * 1000;
+    kick(h);
+    await vi.waitFor(() => expect(h.logs.some((l) => l.includes("publish failed 3 times") && l.includes("dropped"))).toBe(true));
+    expect(await store.list()).toHaveLength(0);
+    // A human is told, where the held run replied.
+    await vi.waitFor(() =>
+      expect(h.postIssueComment).toHaveBeenCalledWith("acme", "widgets", 7, expect.stringContaining("could not be delivered after retrying")),
+    );
+    // Its queue was released: another holder can take it.
+    expect(await store.acquireQueue(queue, "other", 60_000)).toBe(true);
+  });
+
+  it("keeps a held event whose sender re-verification throws, and publishes it once the resolver recovers", async () => {
+    const store = new InMemoryDeferredEventStore();
+    const h = await start({ deferredEventStore: store });
+    chain(h, PARK);
+    await postGithub(h);
+    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
+    const [held] = await store.list();
+
+    h.getIssueState.mockImplementation(async (_o: string, _r: string, n: number) => (n === 5 ? "closed" : "open"));
+    h.resolve.mockRejectedValueOnce(new Error("GitHub 502"));
+    kick(h);
+    await vi.waitFor(async () => expect((await store.list())[0]?.publishFailure?.attempts).toBe(1));
+    expect((await store.list())[0]).toMatchObject({ id: held!.id, createdAt: held!.createdAt });
+    expect(runEvents(h)).toHaveLength(0);
+    expect(h.postIssueComment).not.toHaveBeenCalledWith("acme", "widgets", 7, expect.stringContaining("could not be re-verified"));
+
+    h.submitEvent.mockResolvedValue({ kind: "ignored" });
+    kick(h);
+    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    expect(runEvents(h)[0]?.body).toMatchObject({ trigger: "factory-park" });
+    await vi.waitFor(async () => expect(await store.list()).toHaveLength(0));
+  });
+
+  it("re-reads a held event's issues from GitHub at most once per check interval", async () => {
+    const store = new InMemoryDeferredEventStore();
+    const h = await start({ deferredEventStore: store, heldEventStateCheckIntervalMs: 60 * 60 * 1000 });
+    chain(h, PARK);
+    await postGithub(h);
+    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
+    kick(h);
+    await settle();
+    const calls = h.getIssueState.mock.calls.length;
+
+    kick(h);
+    await settle();
+    kick(h);
+    await settle();
+    expect(h.getIssueState.mock.calls.length).toBe(calls);
+    expect(await store.list()).toHaveLength(1);
+
+    // Once the mark lapses, the next pass checks again (and publishes).
+    await store.unmark(`waitcheck:${(await store.list())[0]!.id}`);
+    h.getIssueState.mockImplementation(async (_o: string, _r: string, n: number) => (n === 5 ? "closed" : "open"));
+    kick(h);
+    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
+  });
+
+  it("drops a held event the orchestrator delivered but did not accept", async () => {
+    const store = new InMemoryDeferredEventStore();
+    const h = await start({ deferredEventStore: store });
+    chain(h, PARK);
+    await postGithub(h);
+    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
+    h.getIssueState.mockImplementation(async (_o: string, _r: string, n: number) => (n === 5 ? "closed" : "open"));
+    h.submitEvent.mockResolvedValue({ kind: "rejected", error: "bad params" });
+    kick(h);
+    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    await settle();
+    expect(await store.list()).toHaveLength(0);
+  });
+
+  it("restarts the chain depth when the wait really blocked (counts are kept)", async () => {
+    const store = new InMemoryDeferredEventStore();
+    const FIRST: AcceptedTrigger = { ...PARK, name: "factory-coordinate", onComplete: { emitTo: "runs" } };
+    const h = await start({ deferredEventStore: store, runEventMaxDepth: 1 });
+    chain(h, FIRST, PARK);
+    await postGithub(h);
+    // webhook -> coordinate (its event at depth 1) -> park, held.
+    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
+    h.getIssueState.mockImplementation(async (_o: string, _r: string, n: number) => (n === 5 ? "closed" : "open"));
+    kick(h);
+    // Without the reset this would be depth 2 > max 1, and dropped.
+    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(2));
+    expect((runEvents(h)[1]?.body as { chain: unknown }).chain).toMatchObject({
+      depth: 1,
+      counts: { "factory-coordinate": 1, "factory-park": 1 },
+    });
+  });
+
+  it("abandons a wait when the held run's own issue is closed", async () => {
+    const store = new InMemoryDeferredEventStore();
+    const h = await start({ deferredEventStore: store });
+    chain(h, PARK);
+    await postGithub(h);
+    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
+    h.getIssueState.mockImplementation(async (_o: string, _r: string, n: number) => (n === 7 ? "closed" : "open"));
+    kick(h);
+    await vi.waitFor(async () => expect(await store.list()).toHaveLength(0));
+    expect(runEvents(h)).toHaveLength(0);
+    expect(h.logs.some((l) => l.includes("abandoned"))).toBe(true);
+  });
+
+  it.each([
+    ["its own issue", { waitFor: "7" }, "its own issue"],
+    ["an unusable number", { waitFor: "none" }, "are not a repository and number"],
+  ])("does not wait on %s -- publishes at once", async (_, params, why) => {
+    const store = new InMemoryDeferredEventStore();
+    const h = await start({ deferredEventStore: store });
+    chain(h, { ...PARK, params: { ...PARK.params!, ...params } });
+    await postGithub(h);
+    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    expect(await store.list()).toHaveLength(0);
+    expect(h.logs.some((l) => l.includes(why))).toBe(true);
+  });
+
+  it("does not wait on an issue that is already closed", async () => {
+    const h = await start();
+    h.getIssueState.mockResolvedValue("closed");
+    chain(h, PARK);
+    await postGithub(h);
+    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    expect(h.logs.some((l) => l.includes("is already closed"))).toBe(true);
+  });
+
+  it("refuses a wait cycle: #7 waiting on #5 while #5 waits on #7 publishes at once", async () => {
+    const store = new InMemoryDeferredEventStore();
+    await store.save({
+      id: "other",
+      createdAt: 0,
+      envelope: { source: "runs", kind: "run", id: "e", time: "t", headers: {}, sender: {}, repository: "acme/widgets", body: {} },
+      trigger: { ...PARK, reply: { github: { repository: "acme/widgets", issueNumber: 5 } } },
+      finished: { status: "succeeded" },
+      waitFor: { owner: "acme", repo: "widgets", number: 7 },
+      parkedOn: { owner: "acme", repo: "widgets", number: 5 },
+      blocked: true,
+    });
+    const h = await start({ deferredEventStore: store });
+    chain(h, PARK);
+    await postGithub(h);
+    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    expect(runEvents(h)[0]?.body).toMatchObject({ trigger: "factory-park" });
+    expect(h.logs.some((l) => l.includes("would be a cycle"))).toBe(true);
+    expect((await store.list()).map((e) => e.id)).toEqual(["other"]);
+  });
+
+  it("serializes: a second completion in the same queue waits until the run the first one started finishes", async () => {
+    const store = new InMemoryDeferredEventStore();
+    const h = await start({ deferredEventStore: store });
+    chain(h, INTAKE, COORDINATE, INTAKE, COORDINATE);
+    let finishFirst!: () => void;
+    const firstCoordinate = new Promise<OrchestratorInvokeResult>((resolve) => {
+      finishFirst = () => resolve({ status: "succeeded", result: "decided" });
+    });
+    h.poll.mockImplementation(async (id: string) => (id === "inv-2" ? firstCoordinate : { status: "succeeded", result: "ok" }));
+
+    await postGithub(h);
+    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    // The coordinate run (inv-2) now holds queue coord:acme/widgets.
+    await postGithub(h);
+    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
+    kick(h);
+    await settle();
+    expect(runEvents(h)).toHaveLength(1);
+
+    finishFirst();
+    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(2));
+    expect(await store.list()).toHaveLength(0);
+  });
+
+  it("frees the queue when the held event is not accepted", async () => {
+    const store = new InMemoryDeferredEventStore();
+    const h = await start({ deferredEventStore: store });
+    chain(h, INTAKE); // its run event is then "ignored"
+    await postGithub(h);
+    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    await vi.waitFor(async () => expect(await store.acquireQueue("coord:acme/widgets", "probe", 1000)).toBe(true));
+  });
+
+  describe("conflict sweep", () => {
+    const DIRTY = {
+      number: 12,
+      state: "open",
+      draft: false,
+      title: "Add widgets",
+      url: "https://github.com/acme/widgets/pull/12",
+      mergeable: false,
+      mergeableState: "dirty",
+      baseRef: "main",
+      baseSha: "base1",
+      headRef: "feature",
+      headSha: "head1",
+      labels: [] as string[],
+      assignees: [{ login: "alice", id: 42 }],
+    };
+    const sweep = (h: Harness): Promise<void> =>
+      (h.server as unknown as { conflictSweeper: { sweepSource: (n: string, c: unknown) => Promise<void> } }).conflictSweeper.sweepSource(
+        "pr-conflicts",
+        { author: "app/k5s-bot", intervalMs: 300_000, skipLabels: ["ai-triage"] },
+      );
+
+    const appAssigned = (h: Harness, ...logins: string[]): void => {
+      h.getAssignmentActors.mockResolvedValue(new Map(logins.map((l) => [l, "k5s-bot[bot]"])));
+    };
+
+    it("emits one conflict event per PR and base commit, acting as the verified assignee", async () => {
+      const h = await start();
+      appAssigned(h, "alice");
+      h.submitEvent.mockResolvedValue({ kind: "ignored" });
+      h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
+      h.getPullRequest.mockResolvedValue(DIRTY);
+      await sweep(h);
+      expect(h.searchOpenPullRequests).toHaveBeenCalledWith("app/k5s-bot");
+      expect(h.submitEvent).toHaveBeenCalledTimes(1);
+      expect(submittedEnvelope(h)).toMatchObject({
+        source: "pr-conflicts",
+        kind: "conflict",
+        sender: { login: "alice", isBot: false },
+        repository: "acme/widgets",
+        body: { pullRequest: { number: 12, baseRef: "main", baseSha: "base1", headSha: "head1", url: DIRTY.url } },
+      });
+      expect(h.submitEvent.mock.calls[0]?.[1]).toMatchObject({ login: "alice", accountId: "42" });
+
+      await sweep(h);
+      expect(h.submitEvent).toHaveBeenCalledTimes(1);
+      // The base moved: once more.
+      h.getPullRequest.mockResolvedValue({ ...DIRTY, baseSha: "base2" });
+      await sweep(h);
+      expect(h.submitEvent).toHaveBeenCalledTimes(2);
+    });
+
+    it.each([
+      ["mergeable", { mergeable: true, mergeableState: "clean" }],
+      ["not computed yet", { mergeable: null, mergeableState: "unknown" }],
+      ["a draft", { draft: true }],
+      ["carrying a skip label", { labels: ["ai-triage"] }],
+      ["unassigned", { assignees: [] }],
+      ["assigned only to someone who does not verify", { assignees: [{ login: "mallory", id: 1 }] }],
+    ])("skips a PR that is %s", async (_, patch) => {
+      const h = await start();
+      appAssigned(h, "alice", "mallory");
+      h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
+      h.getPullRequest.mockResolvedValue({ ...DIRTY, ...patch });
+      await sweep(h);
+      expect(h.submitEvent).not.toHaveBeenCalled();
+    });
+
+    it("skips an assignee a person assigned, even one who verifies", async () => {
+      const h = await start();
+      h.getAssignmentActors.mockResolvedValue(new Map([["alice", "some-triager"]]));
+      h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
+      h.getPullRequest.mockResolvedValue(DIRTY);
+      await sweep(h);
+      expect(h.getAssignmentActors).toHaveBeenCalledWith("acme", "widgets", 12);
+      expect(h.submitEvent).not.toHaveBeenCalled();
+      expect(h.logs.some((l) => l.includes("not running as assignee alice (assigned by some-triager"))).toBe(true);
+    });
+
+    it("uses the App-assigned assignee and passes over one a person added", async () => {
+      const h = await start();
+      h.getAssignmentActors.mockResolvedValue(new Map([["mallory", "some-triager"], ["alice", "K5S-Bot[bot]"]]));
+      h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
+      h.getPullRequest.mockResolvedValue({ ...DIRTY, assignees: [{ login: "mallory", id: 1 }, { login: "alice", id: 42 }] });
+      h.submitEvent.mockResolvedValue({ kind: "ignored" });
+      await sweep(h);
+      expect(h.submitEvent).toHaveBeenCalledTimes(1);
+      expect(submittedEnvelope(h)).toMatchObject({ sender: { login: "alice", isBot: false } });
+    });
+
+    it("retries next sweep when the orchestrator was unreachable", async () => {
+      const h = await start();
+      appAssigned(h, "alice");
+      h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
+      h.getPullRequest.mockResolvedValue(DIRTY);
+      h.submitEvent.mockResolvedValueOnce({ kind: "failed", error: "down" }).mockResolvedValue({ kind: "ignored" });
+      await sweep(h);
+      await sweep(h);
+      expect(h.submitEvent).toHaveBeenCalledTimes(2);
+    });
   });
 });
 

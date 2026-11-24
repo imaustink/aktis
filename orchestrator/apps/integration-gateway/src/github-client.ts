@@ -28,9 +28,34 @@ export interface GithubReplyClientOptions extends GithubAuthConfig {
   sleep?: (ms: number) => Promise<void>;
 }
 
+/** What the conflict sweep reads off a pull request (docs/adr/0055 §1). */
+export interface PullRequestState {
+  number: number;
+  state: "open" | "closed";
+  draft: boolean;
+  title: string;
+  url: string;
+  /** GitHub computes this lazily: null until it has, right after the base moved. */
+  mergeable: boolean | null;
+  /** "dirty" = merge conflicts. */
+  mergeableState: string;
+  baseRef: string;
+  baseSha: string;
+  headRef: string;
+  headSha: string;
+  labels: string[];
+  assignees: Array<{ login: string; id?: number }>;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 /** A few attempts over a few seconds -- a transient-blip retry, not a general backoff policy (mirrors OrchestratorClient's accept retry). */
 const DEFAULT_REMOVE_LABEL_RETRY_ATTEMPTS = 3;
 const DEFAULT_REMOVE_LABEL_RETRY_DELAY_MS = 500;
+/** Timeline pages {@link GithubReplyClient.getAssignmentActors} reads: 1000 events is far past any factory PR's. */
+const TIMELINE_MAX_PAGES = 10;
 
 /** Minimal GitHub REST client: posts a reply comment on an issue, and removes a trigger label once a run finishes. */
 export class GithubReplyClient {
@@ -159,6 +184,105 @@ export class GithubReplyClient {
    */
   async addIssueAssignees(owner: string, repo: string, issueNumber: number, assignees: string[]): Promise<void> {
     await this.postIssueField(owner, repo, issueNumber, "assignees", assignees);
+  }
+
+  /**
+   * Open, non-archived pull requests by `author` (a search `author:`
+   * qualifier, e.g. `app/k5s-bot`) across every repository the credential
+   * can see -- the conflict sweep's candidate list (docs/adr/0055 §1). One
+   * page of 100: more than that many open bot PRs is a backlog no sweep
+   * should be resyncing anyway.
+   */
+  async searchOpenPullRequests(author: string): Promise<Array<{ owner: string; repo: string; number: number }>> {
+    const q = `is:pr is:open archived:false author:${author}`;
+    const body = await this.getJson(`/search/issues?q=${encodeURIComponent(q)}&per_page=100&sort=updated&order=desc`);
+    const items = isRecord(body) && Array.isArray(body.items) ? body.items : [];
+    const out: Array<{ owner: string; repo: string; number: number }> = [];
+    for (const item of items) {
+      if (!isRecord(item) || typeof item.number !== "number" || typeof item.repository_url !== "string") continue;
+      const m = /\/repos\/([^/]+)\/([^/]+)$/.exec(item.repository_url);
+      if (m) out.push({ owner: m[1] as string, repo: m[2] as string, number: item.number });
+    }
+    return out;
+  }
+
+  /** One pull request's merge state, labels and assignees (docs/adr/0055 §1). Undefined on 404. */
+  async getPullRequest(owner: string, repo: string, number: number): Promise<PullRequestState | undefined> {
+    const body = await this.getJson(`/repos/${owner}/${repo}/pulls/${number}`, true);
+    if (!isRecord(body)) return undefined;
+    const base = isRecord(body.base) ? body.base : {};
+    const head = isRecord(body.head) ? body.head : {};
+    const names = (list: unknown, key: string): string[] =>
+      Array.isArray(list) ? list.flatMap((x) => (isRecord(x) && typeof x[key] === "string" ? [x[key] as string] : [])) : [];
+    const assignees = Array.isArray(body.assignees)
+      ? body.assignees.flatMap((a) =>
+          isRecord(a) && typeof a.login === "string" ? [{ login: a.login, ...(typeof a.id === "number" ? { id: a.id } : {}) }] : [],
+        )
+      : [];
+    return {
+      number,
+      state: body.state === "open" ? "open" : "closed",
+      draft: body.draft === true,
+      title: typeof body.title === "string" ? body.title : "",
+      url: typeof body.html_url === "string" ? body.html_url : "",
+      mergeable: typeof body.mergeable === "boolean" ? body.mergeable : null,
+      mergeableState: typeof body.mergeable_state === "string" ? body.mergeable_state : "unknown",
+      baseRef: typeof base.ref === "string" ? base.ref : "",
+      baseSha: typeof base.sha === "string" ? base.sha : "",
+      headRef: typeof head.ref === "string" ? head.ref : "",
+      headSha: typeof head.sha === "string" ? head.sha : "",
+      labels: names(body.labels, "name"),
+      assignees,
+    };
+  }
+
+  /**
+   * Who most recently assigned each login to an issue or pull request: from
+   * its timeline's `assigned` events, assignee login (lowercased) -> the
+   * actor's login. The conflict sweep only runs as an assignee the App
+   * itself assigned (docs/adr/0055 §1) -- anyone with triage access can set
+   * assignees. Reads up to {@link TIMELINE_MAX_PAGES} pages of 100.
+   */
+  async getAssignmentActors(owner: string, repo: string, number: number): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    for (let page = 1; page <= TIMELINE_MAX_PAGES; page++) {
+      const body = await this.getJson(`/repos/${owner}/${repo}/issues/${number}/timeline?per_page=100&page=${page}`, true);
+      const items = Array.isArray(body) ? body : [];
+      for (const item of items) {
+        if (!isRecord(item) || item.event !== "assigned") continue;
+        const assignee = isRecord(item.assignee) && typeof item.assignee.login === "string" ? item.assignee.login : undefined;
+        const actor = isRecord(item.actor) && typeof item.actor.login === "string" ? item.actor.login : undefined;
+        // Chronological: a later assignment overwrites an earlier one.
+        if (assignee && actor) out.set(assignee.toLowerCase(), actor);
+      }
+      if (items.length < 100) break;
+    }
+    return out;
+  }
+
+  /**
+   * Whether an issue or pull request (one number space) is open, closed, or
+   * gone -- what a held `waitUntilClosed` completion waits on (docs/adr/0055 §2).
+   */
+  async getIssueState(owner: string, repo: string, number: number): Promise<"open" | "closed" | "missing"> {
+    const body = await this.getJson(`/repos/${owner}/${repo}/issues/${number}`, true);
+    if (!isRecord(body)) return "missing";
+    return body.state === "open" ? "open" : "closed";
+  }
+
+  /** GET a REST path; `undefined` on 404 when `allow404`, throws on any other failure. */
+  private async getJson(path: string, allow404 = false): Promise<unknown> {
+    const token = await resolveGithubToken(this.options);
+    const res = await this.fetchImpl(`${this.options.githubApiUrl}${path}`, {
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: "application/vnd.github+json",
+        "x-github-api-version": "2022-11-28",
+      },
+    });
+    if (allow404 && (res.status === 404 || res.status === 410)) return undefined;
+    if (!res.ok) throw new Error(`GitHub GET ${path.split("?")[0]} failed: ${res.status} ${await res.text()}`);
+    return res.json();
   }
 
   private async postIssueField(owner: string, repo: string, issueNumber: number, field: "labels" | "assignees", values: string[]): Promise<void> {

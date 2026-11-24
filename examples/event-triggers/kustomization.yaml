@@ -13,6 +13,7 @@ resources:
   - eventsource-generic-hmac.yaml
   - eventsource-nightly-sweep.yaml
   - eventsource-runs.yaml
+  - eventsource-pr-conflicts.yaml
   - eventtrigger-github-issue-triage.yaml
   - eventtrigger-github-issue-review.yaml
   - eventtrigger-github-pr-triage.yaml
@@ -24,3 +25,9 @@ resources:
   - eventtrigger-factory-review.yaml
   - eventtrigger-factory-fix.yaml
   - eventtrigger-factory-handoff.yaml
+  - eventtrigger-factory-intake.yaml
+  - eventtrigger-factory-coordinate.yaml
+  - eventtrigger-factory-park.yaml
+  - eventtrigger-factory-triage.yaml
+  - eventtrigger-factory-triage-stacked.yaml
+  - eventtrigger-factory-resync.yaml

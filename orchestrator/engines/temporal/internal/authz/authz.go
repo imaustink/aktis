@@ -317,6 +317,10 @@ type PendingLink struct {
 	// The resume replays Request under it, so a delegated trigger's request
 	// cannot come back as an agent-mode one, or vice versa.
 	IdentityOverride string `json:"identityOverride,omitempty"`
+	// Outcome is the parked forced agent's trigger outcome (docs/adr/0055).
+	// The resume is a different turn whose own trigger fields say nothing
+	// about this agent, so the launch takes the outcome from here.
+	Outcome string `json:"outcome,omitempty"`
 }
 
 // LinkOwner is the part of a turn's identity that decides whose credentials

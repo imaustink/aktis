@@ -172,6 +172,12 @@ type TurnInput struct {
 	// AgentRun.spec.params the turn launches.
 	Params map[string]string `json:"params,omitempty"`
 
+	// Outcome is the matched trigger's target.outcome (docs/adr/0055): which
+	// structured outcome the forced agent's run reports. Set only from a
+	// matched trigger or a verified dispatch assertion; carried onto the
+	// forced agent's AgentRun.spec.outcome, not onto sub-agents.
+	Outcome string `json:"outcome,omitempty"`
+
 	// TriggerName is the EventTrigger that produced this turn. Besides logs
 	// and narration, it marks the turn as trigger-produced, which makes its
 	// ReadOnly the conversation's mode (ConversationState.applyReadOnly). Set

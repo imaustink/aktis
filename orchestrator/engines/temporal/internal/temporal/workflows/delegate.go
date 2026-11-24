@@ -93,6 +93,7 @@ func delegateToAgent(ctx workflow.Context, actx workflow.Context, state *Convers
 			anchor.Request = in.Message
 			anchor.ReadOnly = in.ReadOnly
 			anchor.IdentityOverride = in.IdentityOverride
+			anchor.Outcome = launchOutcome(in, agent.ID, pending)
 			anchor.RequestedBy = &authz.LinkOwner{
 				Subject:     in.Caller.Subject,
 				PerUser:     in.Caller.PerUser,
@@ -139,7 +140,10 @@ func delegateToAgent(ctx workflow.Context, actx workflow.Context, state *Convers
 		Credentials: credentials{SecretName: verdict.SecretName, EnvVars: verdict.EnvVarNames},
 		ReadOnly:    in.ReadOnly,
 		Params:      in.Params,
-		Launch:      launch,
+		// Only the agent the trigger forced reports the trigger's outcome;
+		// a planner-chosen delegation in the same turn keeps the default.
+		Outcome: launchOutcome(in, agent.ID, pending),
+		Launch:  launch,
 	})
 	// Wait for the start (not completion): the update handler returns while
 	// the child keeps running under this conversation. ParentClosePolicy
@@ -252,4 +256,17 @@ func handleAgentUp(ctx workflow.Context, state *ConversationState, agentID, chil
 			return u.Message, nil, false
 		}
 	}
+}
+
+// launchOutcome is the trigger outcome (docs/adr/0055) an agent launch
+// carries: a resumed launch keeps the one its anchor parked with; otherwise
+// the turn's, when agentID is the agent its trigger forced, else "".
+func launchOutcome(in TurnInput, agentID string, pending *authz.PendingLink) string {
+	if pending != nil {
+		return pending.Outcome
+	}
+	if in.ForcedAgentID != "" && in.ForcedAgentID == agentID {
+		return in.Outcome
+	}
+	return ""
 }

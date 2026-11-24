@@ -2,9 +2,9 @@
 # (factory-review or github-pr-review) that factory-fix does not take --
 # verdict "ready", no valid verdict ("none"), a review run that did not
 # succeed, the 2-fix cap reached, or changes requested by `ai-review` on a
-# fork PR -- and every factory-fix run that failed or pushed nothing (which
-# factory-review won't pick up) assigns the PR to the human who started the
-# chain, so no chain ends without an owner. target.none runs nothing: no
+# fork PR -- and every factory-fix or factory-resync run that failed or pushed
+# nothing (which factory-review won't pick up) assigns the PR to the human who
+# started the chain, so no chain ends without an owner. target.none runs nothing: no
 # agent, no identity check, only the reply side effects.
 #
 # `assignee` is the run event's sender: the human who applied the original
@@ -25,7 +25,7 @@ spec:
           (!("factory-fix" in body.chain.counts) || body.chain.counts["factory-fix"] < 2) &&
           (body.trigger != "github-pr-review" ||
            (has(body.params.headRepository) && body.params.headRepository == body.params.repository)))) ||
-       (body.trigger == "factory-fix" &&
+       (body.trigger in ["factory-fix", "factory-resync"] &&
         (body.status != "succeeded" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))
   params:
     repository: body.params.repository
@@ -34,6 +34,8 @@ spec:
     reason: >-
       (body.trigger == "factory-fix" && body.status != "succeeded") ? "the automated fix run did not succeed" :
       body.trigger == "factory-fix" ? "the automated fix run pushed no changes" :
+      (body.trigger == "factory-resync" && body.status != "succeeded") ? "the automated conflict resolution did not succeed" :
+      body.trigger == "factory-resync" ? "the automated conflict resolution pushed no changes, so the conflicts need a human" :
       body.status != "succeeded" ? "the review run did not succeed" :
       (has(body.outcome.verdict) && body.outcome.verdict == "ready") ? "the reviewer judged it ready to merge" :
       (body.trigger == "github-pr-review" && has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" &&

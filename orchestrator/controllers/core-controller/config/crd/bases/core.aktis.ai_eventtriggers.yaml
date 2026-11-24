@@ -74,6 +74,52 @@ spec:
                       Ready until the source exists and is a run source.
                     minLength: 1
                     type: string
+                  serialize:
+                    description: |-
+                      serialize emits completion events one at a time per group and key: an
+                      event is held while the run started by the previous event with the same
+                      group and key is still going (docs/adr/0055 §3).
+                    properties:
+                      group:
+                        description: |-
+                          group is the queue's name, shared by every trigger that serializes
+                          into it.
+                        maxLength: 63
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                        type: string
+                      keyParam:
+                        description: |-
+                          keyParam names the spec.params key whose value partitions the group
+                          (e.g. the repository, so each repository has its own queue).
+                        minLength: 1
+                        type: string
+                    required:
+                    - group
+                    - keyParam
+                    type: object
+                  waitUntilClosed:
+                    description: |-
+                      waitUntilClosed holds the completion event back until the GitHub issue
+                      or pull request named by two of this trigger's params is closed
+                      (merged or not), docs/adr/0055 §2. The gateway records the held event
+                      durably and re-checks it on a sweep; it is dropped instead if the issue
+                      the run replied to is closed first.
+                    properties:
+                      numberParam:
+                        description: numberParam names the spec.params key holding
+                          the issue/PR number.
+                        minLength: 1
+                        type: string
+                      repositoryParam:
+                        description: repositoryParam names the spec.params key holding
+                          "owner/name".
+                        minLength: 1
+                        type: string
+                    required:
+                    - numberParam
+                    - repositoryParam
+                    type: object
                 required:
                 - emitTo
                 type: object
@@ -211,6 +257,16 @@ spec:
                     description: orchestrator runs a conversational turn on the rendered
                       prompt.
                     type: object
+                  outcome:
+                    description: |-
+                      outcome names the structured outcome the read-only agent run reports
+                      (docs/adr/0055): verdict (the default) or coordination. It reaches the
+                      agent as AgentRun.spec.outcome, never through the prompt, so nothing in
+                      an event body can switch it.
+                    enum:
+                    - verdict
+                    - coordination
+                    type: string
                   promptTemplate:
                     description: promptTemplate is the request, with {{param}} placeholders.
                     type: string
@@ -245,6 +301,9 @@ spec:
                   rule: '!has(self.none) || !has(self.identity)'
                 - message: identity applies to agent runs; it cannot be set with toolRef
                   rule: '!has(self.identity) || !has(self.toolRef)'
+                - message: outcome requires agentRef and readOnly
+                  rule: '!has(self.outcome) || (has(self.agentRef) && has(self.readOnly)
+                    && self.readOnly)'
             required:
             - target
             type: object

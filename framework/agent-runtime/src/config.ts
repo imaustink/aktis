@@ -28,6 +28,12 @@ export interface AgentRuntimeConfig {
    */
   params: Record<string, string>;
   /**
+   * The structured outcome a read-only run reports (AGENT_OUTCOME, set from
+   * `AgentRun.spec.outcome`; docs/adr/0055), e.g. "verdict" or
+   * "coordination". Absent when unset; the agent decides its default.
+   */
+  outcome?: string;
+  /**
    * How long to keep re-offering a concluding message that has not been acked
    * (AGENT_REPLY_ACK_TIMEOUT_MS), and how often (AGENT_REPLY_ACK_RETRY_MS) —
    * see `runtime.ts`'s `publishHeld`.
@@ -92,6 +98,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, argv: string[] 
     goal: goal!,
     readOnly: env.AGENT_READ_ONLY === "true",
     params: parseParams(env.AGENT_PARAMS),
+    ...(env.AGENT_OUTCOME ? { outcome: env.AGENT_OUTCOME } : {}),
     ...numeric("replyAckTimeoutMs", env.AGENT_REPLY_ACK_TIMEOUT_MS),
     ...numeric("replyAckRetryMs", env.AGENT_REPLY_ACK_RETRY_MS),
     ...telemetryFrom(env),

@@ -3,7 +3,11 @@
 // params and templates. Pure logic; no Kubernetes client.
 
 export type {
+  AcceptedOnComplete,
   Condition,
+  ConflictsSource,
+  OnCompleteSerialize,
+  OnCompleteWaitUntilClosed,
   CronSource,
   Envelope,
   EnvelopeKind,
@@ -23,6 +27,7 @@ export type {
   HttpReplySpec,
   ObjectMeta,
   RenderedReply,
+  RunOutcome,
   RunSource,
   SecretKeySelector,
   TriggerTarget,
@@ -31,6 +36,8 @@ export type {
   WebhookVerify,
   WebhookVerifyScheme,
 } from "./types.js";
+
+export { RUN_OUTCOMES } from "./types.js";
 
 export {
   canonicalJson,

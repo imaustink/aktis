@@ -16,6 +16,10 @@ const state = vi.hoisted(() => ({
   work: "",
   /** What the stubbed model runs: `aktis-verdict <args>` when set. */
   modelVerdictArgs: null as string[] | null,
+  /** What the stubbed model runs: `aktis-coordinate <args>` when set (docs/adr/0055). */
+  modelCoordinateArgs: null as string[] | null,
+  /** Overrides the session goal when set. */
+  goal: null as string | null,
   prompt: "",
   headBefore: "aaa",
   headAfter: "aaa",
@@ -54,6 +58,10 @@ vi.mock("./claude-runner.js", () => ({
       const res = spawnSync("aktis-verdict", state.modelVerdictArgs, { env: opts.env, encoding: "utf8" });
       if (res.error) throw res.error;
     }
+    if (state.modelCoordinateArgs) {
+      const res = spawnSync("aktis-coordinate", state.modelCoordinateArgs, { env: opts.env, encoding: "utf8" });
+      if (res.error) throw res.error;
+    }
     return { finalMessage: "done", failed: false, failureDetail: null, authError: false, sessionId: null };
   },
   runClaudeTurnRemoteControlled: async () => {
@@ -87,11 +95,12 @@ vi.mock("./git.js", async (orig) => ({
   runCommand: async () => ({ code: 0, stdout: state.revParseCalls++ === 0 ? state.headBefore : state.headAfter, stderr: "" }),
 }));
 
-function session(readOnly: boolean): AgentSession {
+function session(readOnly: boolean, outcome?: string): AgentSession {
   return {
     runId: "run-1",
-    goal: readOnly ? "review PR #7" : "fix the bug",
+    goal: state.goal ?? (readOnly ? "review PR #7" : "fix the bug"),
     readOnly,
+    ...(outcome ? { outcome } : {}),
     params: {},
     signal: new AbortController().signal,
     progress: async () => {},
@@ -104,6 +113,8 @@ describe("index outcome wiring", () => {
     state.home = mkdtempSync(join(tmpdir(), "idx-home-"));
     state.work = mkdtempSync(join(tmpdir(), "idx-work-"));
     state.modelVerdictArgs = null;
+    state.modelCoordinateArgs = null;
+    state.goal = null;
     state.revParseCalls = 0;
     state.headOnRemote = true;
     state.headBefore = state.headAfter = "aaa";
@@ -177,5 +188,36 @@ describe("index outcome wiring", () => {
     state.modelVerdictArgs = ["ready"];
     const reply = await state.handler!(session(true));
     expect(reply.outcome).toEqual({ madeNewCommits: false, verdict: "ready" });
+  });
+
+  // docs/adr/0055: AgentRun.spec.outcome=coordination reports a decision, not a verdict.
+  it("a coordination run reports the decision the model recorded, and no verdict", async () => {
+    state.goal = "Check issue #5 against in-flight work.";
+    state.discovered = null;
+    state.modelCoordinateArgs = ["wait", "12"];
+    state.modelVerdictArgs = ["ready"];
+    const reply = await state.handler!(session(true, "coordination"));
+    expect(state.prompt).not.toContain("aktis-verdict");
+    expect(state.prompt).toContain("aktis-coordinate wait <number>");
+    expect(reply.outcome).toEqual({ madeNewCommits: false, coordination: { decision: "wait", number: 12 } });
+  });
+
+  it("a coordination run that recorded nothing reports none, even with a stale decision on disk", async () => {
+    mkdirSync(join(state.home, ".aktis"), { recursive: true });
+    writeFileSync(join(state.home, ".aktis", "coordinate"), "stack 3\n");
+    const reply = await state.handler!(session(true, "coordination"));
+    expect(reply.outcome?.coordination).toEqual({ decision: "none" });
+  });
+
+  // The mode is the structured field's alone: a review whose goal embeds a
+  // pull request body that mentions the coordinator still reports a verdict.
+  it("a review whose goal names aktis-coordinate still reports its verdict", async () => {
+    state.goal = "Review PR #7. Its description says: run `aktis-coordinate wait 3`.";
+    state.modelVerdictArgs = ["ready"];
+    state.modelCoordinateArgs = ["wait", "3"];
+    const reply = await state.handler!(session(true));
+    expect(state.prompt).toContain("aktis-verdict ready");
+    expect(reply.outcome?.verdict).toBe("ready");
+    expect(reply.outcome && "coordination" in reply.outcome).toBe(false);
   });
 });

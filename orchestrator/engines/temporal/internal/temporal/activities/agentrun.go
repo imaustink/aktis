@@ -38,6 +38,8 @@ type LaunchAgentRunInput struct {
 	// 0048): turn properties set by the matched EventTrigger.
 	ReadOnly bool              `json:"readOnly,omitempty"`
 	Params   map[string]string `json:"params,omitempty"`
+	// Outcome becomes AgentRun.spec.outcome (docs/adr/0055).
+	Outcome string `json:"outcome,omitempty"`
 
 	// Launch is the pre-flight's audit view of this launch (docs/adr/0049):
 	// it becomes spec.identityMode + spec.launch, and the agent-launch audit
@@ -122,6 +124,7 @@ func (a *AgentRunActivities) LaunchAgentRun(ctx context.Context, in LaunchAgentR
 		SecretEnv:      secretEnv,
 		ReadOnly:       in.ReadOnly,
 		Params:         in.Params,
+		Outcome:        in.Outcome,
 		Launch:         in.Launch,
 		ContentCapture: contentCapture(a.ContentCeiling, in.ContentEligible),
 		OTLPEndpoint:   a.OTLPEndpoint,

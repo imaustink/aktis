@@ -1,0 +1,22 @@
+# A conflict-sweep source (docs/adr/0055 §1, docs/event-triggers.md §10).
+# Nothing outside the cluster delivers to it: every intervalSeconds,
+# integration-gateway searches the open pull requests `author` opened and, for
+# each one GitHub reports as conflicting with its base (mergeable_state
+# "dirty"), synthesizes ONE kind "conflict" event -- once per base commit, so a
+# conflict a resync couldn't resolve is retried only after the base moves again.
+#
+# Skipped: drafts, PRs carrying a skipLabels label (a factory run is already on
+# them and syncs the branch itself), PRs GitHub hasn't computed mergeability
+# for yet, and PRs with no assignee who still verifies -- the event's sender is
+# that assignee (the factory's handoff assigns the human who started the
+# chain), never the bot. No Secret, no CronJob, no sender block.
+apiVersion: core.aktis.ai/v1alpha1
+kind: EventSource
+metadata:
+  name: pr-conflicts
+spec:
+  conflicts:
+    # The GitHub App's search author qualifier: app/<app slug>.
+    author: "app/k5s-bot"
+    intervalSeconds: 300
+    skipLabels: ["ai-triage", "ai-review", "ai-waiting"]

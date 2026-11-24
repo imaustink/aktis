@@ -26,6 +26,7 @@ installs production's GitHub triggers. `extraManifests` runs each entry through
 | `eventsource-generic-hmac.yaml` | `POST /webhooks/generic-hmac` | `hmacSha256` (`x-signature-256: sha256=<hex>`) | `generic-hmac-event-source`, key `secret` |
 | `eventsource-nightly-sweep.yaml` | cron `0 7 * * *` | the tick's own ServiceAccount (issuer keys) | none |
 | `eventsource-runs.yaml` | none: run-completion events, synthesized by the gateway (ADR 0052) | the chain's origin sender, re-verified per hop | none |
+| `eventsource-pr-conflicts.yaml` | none: `conflict` events from the gateway's sweep of the App's open PRs (ADR 0055) | the PR's assignee, verified by the gateway | none |
 
 ## Triggers
 
@@ -41,7 +42,13 @@ installs production's GitHub triggers. `extraManifests` runs each entry through
 | `eventtrigger-nightly-stale-sweep.yaml` | nightly-sweep | agent, `readOnly` | a scheduled report; params come from the cron payload |
 | `eventtrigger-factory-review.yaml` | runs | agent, `readOnly` | factory: review the PR an issue-triage/PR-triage/fix run ended on (max 3 reviews per chain); `addLabels: [ai-review]` |
 | `eventtrigger-factory-fix.yaml` | runs | agent | factory: a `changes-requested` verdict (from `factory-review` or `github-pr-review`) sends the PR to a fix run, which loops back to review (max 2 fix rounds); a `github-pr-review` verdict only for a same-repo branch |
-| `eventtrigger-factory-handoff.yaml` | runs | `none` | factory: any other review outcome assigns the PR to the human who started the chain |
+| `eventtrigger-factory-handoff.yaml` | runs | `none` | factory: any other review outcome (or a fix/resync that failed or pushed nothing) assigns the PR to the human who started the chain |
+| `eventtrigger-factory-intake.yaml` | github | `none` | coordination: `ai-triage` on an issue (priority 10, beats `github-issue-triage`) queues it; `onComplete.serialize` coordinates a repository's issues one at a time |
+| `eventtrigger-factory-coordinate.yaml` | runs | agent, `readOnly`, `outcome: coordination` | coordination: compares the issue with in-flight PRs/issues and records `aktis-coordinate proceed \| wait <N> \| stack <N>` |
+| `eventtrigger-factory-park.yaml` | runs | `none` | coordination: `wait <N>` holds the issue (`onComplete.waitUntilClosed`) until #N merges or closes, then coordinates it again (max 5 waits) |
+| `eventtrigger-factory-triage.yaml` | runs | agent | coordination: `proceed` (or no decision) works the issue from the default branch |
+| `eventtrigger-factory-triage-stacked.yaml` | runs | agent | coordination: `stack <N>` branches from open PR #N and targets its branch |
+| `eventtrigger-factory-resync.yaml` | pr-conflicts | agent | conflict sweep: merge the base into a factory PR that now conflicts, as its assignee; re-reviewed after |
 
 Each trigger names the agent, skill or tool it runs (`opencode-swe-agent`,
 `cluster-debug-skill`, `web-fetch` from community-components). A trigger whose
@@ -54,3 +61,10 @@ The three `factory-*` triggers plus `eventsource-runs.yaml` and the
 `onComplete` on the issue-triage, PR-triage and PR-review triggers make up the label-driven software factory of
 [ADR 0052](../../docs/adr/0052-run-events-and-software-factory.md); see
 [docs/event-triggers.md §9](../../docs/event-triggers.md#9-run-events-and-the-software-factory).
+
+The intake / coordinate / park / triage / triage-stacked triggers and
+`eventsource-pr-conflicts.yaml` with `factory-resync` keep concurrent factory
+work from colliding ([ADR 0055](../../docs/adr/0055-factory-coordination.md),
+[docs/event-triggers.md §10](../../docs/event-triggers.md#10-coordinating-concurrent-work)).
+Apply `github-issue-triage` without `factory-intake` for label -> triage with
+no coordination.

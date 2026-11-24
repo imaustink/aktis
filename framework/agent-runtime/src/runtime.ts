@@ -23,6 +23,11 @@ export interface AgentSession {
   readonly readOnly: boolean;
   /** Structured run parameters (AgentRun.spec.params, ADR 0048); `{}` when unset. */
   readonly params: Readonly<Record<string, string>>;
+  /**
+   * The structured outcome this run reports (AgentRun.spec.outcome, docs/adr/
+   * 0055). A structured field, never read from the goal; absent when unset.
+   */
+  readonly outcome?: string;
   /** Where this run's telemetry goes (ADR 0050 §3c), or undefined when it exports nothing. */
   readonly telemetry?: Readonly<AgentTelemetry>;
   /** Fires when the orchestrator sends `cancel` (user abandoned, timeout, etc.). */
@@ -322,6 +327,7 @@ export async function runAgent(handler: AgentHandler, opts: RunAgentOptions = {}
     goal: config.goal,
     readOnly: config.readOnly,
     params: Object.freeze({ ...config.params }),
+    ...(config.outcome ? { outcome: config.outcome } : {}),
     ...(config.telemetry ? { telemetry: Object.freeze({ ...config.telemetry }) } : {}),
     signal: abort.signal,
     progress: (message, o) => publishUp({ type: "progress", message, stage: o?.stage, pct: o?.pct }),

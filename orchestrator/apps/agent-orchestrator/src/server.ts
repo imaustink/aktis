@@ -13,7 +13,7 @@ import type { SessionStore } from "./session/types.js";
 import { InMemoryInvocationStore, type InvocationStore } from "./invocation/types.js";
 import { checkOutcome } from "./invocation/outcome.js";
 import { parseEnvelope, type EventTriggerSelector } from "./routing/crd-event-trigger-registry.js";
-import type { Envelope, RenderedReply } from "@aktis/event-triggers";
+import type { AcceptedOnComplete, Envelope, RenderedReply, RunOutcome } from "@aktis/event-triggers";
 import {
   buildAgentRequest,
   type ChatImage,
@@ -126,8 +126,8 @@ interface TriggerResponse {
   reply: RenderedReply | null;
   /** Every rendered param in §4 string form; the gateway threads these into the run-completion event. */
   params: Record<string, string>;
-  /** Present only when the trigger sets `onComplete.emitTo`. */
-  onComplete?: { emitTo: string };
+  /** Present only when the trigger sets `onComplete.emitTo` (with its ADR 0055 waitUntilClosed/serialize, when set). */
+  onComplete?: AcceptedOnComplete;
 }
 
 /** How often to emit an SSE keep-alive comment while a turn is running on the engine. */
@@ -201,6 +201,8 @@ interface TriggerTurn {
   forcedToolId?: string;
   toolInput?: string;
   readOnly: boolean;
+  /** `target.outcome` (docs/adr/0055); see `TurnInput.outcome`. */
+  outcome?: RunOutcome;
   params: Record<string, string>;
   /** `target.identity` (docs/adr/0049); see `TurnInput.identityOverride`. */
   identity?: string;
@@ -385,6 +387,7 @@ export class InvokeServer {
         input.toolInput = trigger.toolInput ?? "";
       }
       if (trigger.readOnly) input.readOnly = true;
+      if (trigger.outcome) input.outcome = trigger.outcome;
       if (Object.keys(trigger.params).length > 0) input.params = trigger.params;
       if (trigger.identity) input.identityOverride = trigger.identity;
     }
@@ -722,6 +725,7 @@ export class InvokeServer {
         ...(target.kind === "agent" ? { forcedAgentId: target.ref } : {}),
         ...(target.kind === "tool" ? { forcedToolId: target.ref, toolInput: selection.toolInput } : {}),
         readOnly: target.readOnly,
+        ...(target.outcome ? { outcome: target.outcome } : {}),
         params: selection.stringParams,
         ...(target.identity ? { identity: target.identity } : {}),
       };

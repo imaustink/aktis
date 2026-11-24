@@ -44,6 +44,10 @@ type LaunchSpec struct {
 	// Params sets spec.params (AGENT_PARAMS=<json>): the matched
 	// EventTrigger's params in their string form.
 	Params map[string]string
+	// Outcome sets spec.outcome (AGENT_OUTCOME in the pod; docs/adr/0055):
+	// which structured outcome a read-only run reports. Like ReadOnly, the
+	// runner reads it from here alone, never from the goal text.
+	Outcome string
 	// Launch sets spec.identityMode (AGENT_IDENTITY_MODE) and the immutable
 	// spec.launch audit record (docs/adr/0049). Zero sets neither.
 	Launch audit.Launch
@@ -94,6 +98,9 @@ func (l *K8sLauncher) Launch(ctx context.Context, spec LaunchSpec) error {
 	}
 	if spec.ReadOnly {
 		crSpec["readOnly"] = true
+	}
+	if spec.Outcome != "" {
+		crSpec["outcome"] = spec.Outcome
 	}
 	if len(spec.Params) > 0 {
 		params := make(map[string]any, len(spec.Params))

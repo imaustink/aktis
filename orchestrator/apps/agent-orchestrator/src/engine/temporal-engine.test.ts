@@ -276,6 +276,22 @@ describe("TemporalEngine", () => {
     expect(JSON.parse(Buffer.from(payloadB64!, "base64url").toString("utf8"))).toMatchObject({ identity: "delegated" });
   });
 
+  // docs/adr/0055: which outcome the run reports is a trigger decision, so it
+  // rides only inside the signed dispatch.
+  it("signs a trigger's outcome into the dispatch, never the body", async () => {
+    const { impl, calls } = scriptedFetch([{ id: "x", status: "succeeded", result: "ok" }]);
+    const engine = new TemporalEngine({ baseUrl: BASE, fetchImpl: impl, senderAssertionSecret: ASSERTION_SECRET });
+
+    await engine.invoke(
+      input({ request: "coordinate", sessionId: "s", forcedAgentId: "swe", triggerName: "t", readOnly: true, outcome: "coordination" }),
+    );
+
+    const init = calls[0]!.init!;
+    expect(JSON.parse(String(init.body))).not.toHaveProperty("outcome");
+    const [payloadB64] = (init.headers as Record<string, string>)[DISPATCH_ASSERTION_HEADER]!.split(".");
+    expect(JSON.parse(Buffer.from(payloadB64!, "base64url").toString("utf8"))).toMatchObject({ outcome: "coordination" });
+  });
+
   // A trigger turn the engine can only accept signed: without the secret it
   // must fail here, not run as an undispatched chat turn.
   it("refuses an event-triggered turn when there is no secret to sign its dispatch", async () => {

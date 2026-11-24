@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { compileEventSource, CrdEventSourceRegistry, SecretKeyReader, type CrdWatchApi } from "./event-sources.js";
+import { compileEventSource, CrdEventSourceRegistry, SecretKeyReader, StaticEventSourceRegistry, type CrdWatchApi } from "./event-sources.js";
 
 const webhook = (name: string, extra: Record<string, unknown> = {}) => ({
   metadata: { name },
@@ -42,6 +42,41 @@ describe("compileEventSource run sources (docs/adr/0052 §1)", () => {
     expect(compileEventSource(webhook("x", { run: {} }) as never).ok).toBe(false);
     expect(compileEventSource({ metadata: { name: "x" }, spec: { run: {}, cron: { schedule: "* * * * *" } } } as never).ok).toBe(false);
     expect(compileEventSource({ metadata: { name: "x" }, spec: { run: {}, sender: { provider: "github", loginFrom: "''" } } } as never).ok).toBe(false);
+  });
+});
+
+describe("compileEventSource conflicts sources (docs/adr/0055 §1)", () => {
+  const conflicts = (c: unknown, extra: Record<string, unknown> = {}) =>
+    compileEventSource({ metadata: { name: "pr-conflicts" }, spec: { conflicts: c, ...extra } } as never);
+
+  it("compiles with defaults", () => {
+    expect(conflicts({ author: "app/k5s-bot" })).toEqual({
+      ok: true,
+      source: { name: "pr-conflicts", kind: "conflicts", conflicts: { author: "app/k5s-bot", intervalMs: 300_000, skipLabels: [] } },
+    });
+    expect(conflicts({ author: "k5s-bot[bot]", intervalSeconds: 60, skipLabels: ["ai-triage"] })).toMatchObject({
+      ok: true,
+      source: { conflicts: { author: "k5s-bot[bot]", intervalMs: 60_000, skipLabels: ["ai-triage"] } },
+    });
+  });
+
+  it.each([
+    ["a query-injecting author", { author: "x is:closed" }],
+    ["no author", {}],
+    ["an interval under 60s", { author: "a", intervalSeconds: 10 }],
+    ["an empty skip label", { author: "a", skipLabels: [""] }],
+  ])("rejects %s", (_, c) => {
+    expect(conflicts(c).ok).toBe(false);
+  });
+
+  it("rejects a sender block and a second kind", () => {
+    expect(conflicts({ author: "a" }, { sender: { provider: "github", loginFrom: "''" } }).ok).toBe(false);
+    expect(conflicts({ author: "a" }, { run: {} }).ok).toBe(false);
+  });
+
+  it("is listed by all()", () => {
+    const reg = new StaticEventSourceRegistry([{ metadata: { name: "c" }, spec: { conflicts: { author: "a" } } } as never], () => {});
+    expect(reg.all().map((s) => s.kind)).toEqual(["conflicts"]);
   });
 });
 

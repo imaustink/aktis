@@ -222,6 +222,24 @@ describe("compileTrigger", () => {
     expect(tool.ready).toBe(false);
     expect(tool.error).toMatch(/identity cannot be set with toolRef/);
   });
+  // docs/adr/0055
+  it("carries target.outcome on a read-only agent target", () => {
+    const t = compileTrigger(
+      trigger("c", { target: { agentRef: "swe", readOnly: true, promptTemplate: "p", outcome: "coordination" } }),
+    );
+    expect(t.ready).toBe(true);
+    expect(t.target).toEqual({ kind: "agent", ref: "swe", readOnly: true, promptTemplate: "p", outcome: "coordination" });
+  });
+  it.each([
+    ["an unknown value", { agentRef: "swe", readOnly: true, promptTemplate: "p", outcome: "approve" }, /outcome must be one of/],
+    ["a writable run", { agentRef: "swe", promptTemplate: "p", outcome: "coordination" }, /requires agentRef and readOnly/],
+    ["a skill target", { skillRef: "s", readOnly: true, promptTemplate: "p", outcome: "verdict" }, /requires agentRef and readOnly/],
+    ["a none target", { none: {}, outcome: "verdict" }, /outcome cannot be set with none/],
+  ] as Array<[string, EventTriggerResource["spec"]["target"], RegExp]>)("refuses target.outcome on %s", (_, target, error) => {
+    const t = compileTrigger(trigger("c", { target }));
+    expect(t.ready).toBe(false);
+    expect(t.error).toMatch(error);
+  });
   it("toolRef does not need a promptTemplate", () => {
     expect(compileTrigger(trigger("t", { target: { toolRef: "http-get" } })).ready).toBe(true);
   });
@@ -374,6 +392,35 @@ describe("target.none / onComplete / addLabels+assignees (ADR 0052)", () => {
     );
     if (without.status !== "matched") throw new Error(JSON.stringify(without));
     expect("onComplete" in without).toBe(false);
+  });
+  it("echoes onComplete.waitUntilClosed and serialize (ADR 0055)", () => {
+    const r = selectTrigger(
+      [
+        compileTrigger(
+          trigger("t", {
+            target: { none: {} },
+            onComplete: {
+              emitTo: "runs",
+              waitUntilClosed: { repositoryParam: "repository", numberParam: "waitFor" },
+              serialize: { group: "coord", keyParam: "repository" },
+            },
+          }),
+        ),
+      ],
+      env({}),
+    );
+    expect(r.status === "matched" && r.onComplete).toEqual({
+      emitTo: "runs",
+      waitUntilClosed: { repositoryParam: "repository", numberParam: "waitFor" },
+      serialize: { group: "coord", keyParam: "repository" },
+    });
+  });
+  it("matches a conflict-kind envelope", () => {
+    const r = selectTrigger(
+      [compileTrigger(trigger("t", { sourceRef: "pr-conflicts", match: { cel: 'kind == "conflict" && body.pullRequest.number == 7' }, target: { none: {} } }))],
+      env({ pullRequest: { number: 7 } }, { source: "pr-conflicts", kind: "conflict" }),
+    );
+    expect(r.status).toBe("matched");
   });
   it("matches a run-kind envelope", () => {
     const r = selectTrigger(

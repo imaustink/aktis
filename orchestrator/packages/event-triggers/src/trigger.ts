@@ -3,12 +3,15 @@
 import { compileExpression, evaluate, prepareActivation, type CompiledExpression } from "./cel.js";
 import { renderTemplate } from "./template.js";
 import type {
+  AcceptedOnComplete,
   Envelope,
   EventTriggerReplySpec,
   EventTriggerResource,
   RenderedReply,
+  RunOutcome,
   TriggerTarget,
 } from "./types.js";
+import { RUN_OUTCOMES } from "./types.js";
 import {
   canonicalJson,
   paramToString,
@@ -41,7 +44,7 @@ export interface CompiledTrigger {
   target?: TriggerTarget;
   reply?: EventTriggerReplySpec;
   /** spec.onComplete when it names an emitTo source (docs/adr/0052 §1). */
-  onComplete?: { emitTo: string };
+  onComplete?: AcceptedOnComplete;
   resource: EventTriggerResource;
 }
 
@@ -73,7 +76,7 @@ export type SelectResult =
        * it in the 202 and integration-gateway knows where to emit the run's
        * completion event. Absent when the trigger does not set emitTo.
        */
-      onComplete?: { emitTo: string };
+      onComplete?: AcceptedOnComplete;
     };
 
 export interface SelectOptions {
@@ -103,6 +106,7 @@ function resolveTarget(resource: EventTriggerResource): TriggerTarget | string {
     if (t.promptTemplate) return "spec.target.promptTemplate cannot be set with none";
     if (t.readOnly) return "spec.target.readOnly cannot be set with none";
     if (t.identity) return "spec.target.identity cannot be set with none";
+    if (t.outcome) return "spec.target.outcome cannot be set with none";
     return { kind, readOnly: false };
   }
   if (kind !== "tool" && !t.promptTemplate) {
@@ -114,6 +118,13 @@ function resolveTarget(resource: EventTriggerResource): TriggerTarget | string {
   if (t.identity) {
     if (kind === "tool") return "spec.target.identity cannot be set with toolRef";
     target.identity = t.identity;
+  }
+  if (t.outcome !== undefined && t.outcome !== "") {
+    if (!(RUN_OUTCOMES as readonly string[]).includes(t.outcome)) {
+      return `spec.target.outcome must be one of ${RUN_OUTCOMES.join(", ")}`;
+    }
+    if (kind !== "agent" || !target.readOnly) return "spec.target.outcome requires agentRef and readOnly";
+    target.outcome = t.outcome as RunOutcome;
   }
   return target;
 }
@@ -135,7 +146,14 @@ export function compileTrigger(resource: EventTriggerResource): CompiledTrigger 
   if (spec.sourceRef) compiled.sourceRef = spec.sourceRef;
   if (spec.sessionKey) compiled.sessionKey = spec.sessionKey;
   if (spec.reply) compiled.reply = spec.reply;
-  if (spec.onComplete?.emitTo) compiled.onComplete = { emitTo: spec.onComplete.emitTo };
+  if (spec.onComplete?.emitTo) {
+    const oc = spec.onComplete;
+    compiled.onComplete = {
+      emitTo: spec.onComplete.emitTo,
+      ...(oc.waitUntilClosed ? { waitUntilClosed: { ...oc.waitUntilClosed } } : {}),
+      ...(oc.serialize ? { serialize: { ...oc.serialize } } : {}),
+    };
+  }
 
   const notReady = (error: string): CompiledTrigger => {
     compiled.ready = false;

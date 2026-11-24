@@ -59,3 +59,12 @@ describe("loadConfig GitHub host resolution", () => {
     expect(config.githubBaseUrl).toBe("https://github.com");
   });
 });
+
+describe("loadConfig GATEWAY_HELD_EVENT_STATE_CHECK_INTERVAL_MS (docs/adr/0055 §2)", () => {
+  it("is unset by default (the gateway's default applies) and reads a non-negative number", () => {
+    expect(loadConfig({}).heldEventStateCheckIntervalMs).toBeUndefined();
+    expect(loadConfig({ GATEWAY_HELD_EVENT_STATE_CHECK_INTERVAL_MS: "60000" }).heldEventStateCheckIntervalMs).toBe(60000);
+    expect(loadConfig({ GATEWAY_HELD_EVENT_STATE_CHECK_INTERVAL_MS: "0" }).heldEventStateCheckIntervalMs).toBe(0);
+    expect(loadConfig({ GATEWAY_HELD_EVENT_STATE_CHECK_INTERVAL_MS: "soon" }).heldEventStateCheckIntervalMs).toBeUndefined();
+  });
+});

@@ -8,8 +8,11 @@ import type { JsonValue } from "./values.js";
 // §2 envelope
 // ---------------------------------------------------------------------------
 
-/** `run`: a trigger-dispatched run finished (docs/adr/0052 §1). */
-export type EnvelopeKind = "webhook" | "cron" | "run";
+/**
+ * `run`: a trigger-dispatched run finished (docs/adr/0052 §1).
+ * `conflict`: a watched pull request conflicts with its base (docs/adr/0055 §1).
+ */
+export type EnvelopeKind = "webhook" | "cron" | "run" | "conflict";
 
 export interface EnvelopeSender {
   login?: string;
@@ -98,10 +101,25 @@ export interface EventSender {
  */
 export type RunSource = Record<string, never>;
 
+/**
+ * A `conflicts` source (docs/adr/0055 §1): the gateway sweeps the open pull
+ * requests `author` opened and emits one `conflict` event per PR that
+ * conflicts with its base, once per base commit.
+ */
+export interface ConflictsSource {
+  /** GitHub search `author:` qualifier, e.g. "app/k5s-bot". */
+  author: string;
+  /** Seconds between sweeps; min 60, default 300. */
+  intervalSeconds?: number;
+  /** PRs carrying any of these labels are skipped (work already in flight). */
+  skipLabels?: string[];
+}
+
 export interface EventSourceSpec {
   webhook?: WebhookSource;
   cron?: CronSource;
   run?: RunSource;
+  conflicts?: ConflictsSource;
   sender?: EventSender;
 }
 
@@ -131,6 +149,8 @@ export interface EventTriggerTargetSpec {
   toolRef?: string;
   promptTemplate?: string;
   readOnly?: boolean;
+  /** Structured outcome a read-only agent run reports (docs/adr/0055). */
+  outcome?: string;
   /** Identity-mode override for the agents this turn launches (docs/adr/0049). */
   identity?: string;
 }
@@ -171,10 +191,34 @@ export interface EventTriggerSpec {
   onComplete?: EventTriggerOnComplete;
 }
 
-/** docs/adr/0052 §1. */
+/** docs/adr/0052 §1, docs/adr/0055 §2. */
 export interface EventTriggerOnComplete {
   /** A `run` EventSource (same namespace) that receives this trigger's run-completion events. */
   emitTo?: string;
+  /** Hold the completion event until the GitHub issue/PR named by these params is closed. */
+  waitUntilClosed?: OnCompleteWaitUntilClosed;
+  /** Emit at most one completion event at a time per (group, key): held until the run the previous one started finishes. */
+  serialize?: OnCompleteSerialize;
+}
+
+export interface OnCompleteWaitUntilClosed {
+  /** Name of the param holding `owner/repo`. */
+  repositoryParam: string;
+  /** Name of the param holding the issue/PR number. */
+  numberParam: string;
+}
+
+export interface OnCompleteSerialize {
+  group: string;
+  /** Name of the param whose value keys the queue (e.g. `repository`). */
+  keyParam: string;
+}
+
+/** What an accepted trigger echoes back for the gateway (only when emitTo is set). */
+export interface AcceptedOnComplete {
+  emitTo: string;
+  waitUntilClosed?: OnCompleteWaitUntilClosed;
+  serialize?: OnCompleteSerialize;
 }
 
 export interface EventTriggerStatus {
@@ -193,6 +237,10 @@ export interface EventTriggerResource {
 // Resolved dispatch (§4-§5)
 // ---------------------------------------------------------------------------
 
+/** Structured outcomes a read-only agent run can report (docs/adr/0055). */
+export const RUN_OUTCOMES = ["verdict", "coordination"] as const;
+export type RunOutcome = (typeof RUN_OUTCOMES)[number];
+
 export type TriggerTargetKind = "orchestrator" | "skill" | "agent" | "tool" | "none";
 
 export interface TriggerTarget {
@@ -201,6 +249,12 @@ export interface TriggerTarget {
   ref?: string;
   readOnly: boolean;
   promptTemplate?: string;
+  /**
+   * `target.outcome` (docs/adr/0055): the structured outcome the forced
+   * read-only agent run reports. Forwarded inside the signed dispatch
+   * assertion and handed to the run as `AgentRun.spec.outcome`.
+   */
+  outcome?: RunOutcome;
   /**
    * `target.identity` (docs/adr/0049): the identity mode every agent the turn
    * authorizes runs in. Can widen what a run reaches, so it is forwarded only
