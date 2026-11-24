@@ -140,7 +140,10 @@ describe("EventTrigger target.readOnly reaches the run", () => {
     expect(review.agentRef).toBe("stub-agent");
     expect(triage.agentRef).toBe("stub-agent");
 
-    await assertReadOnlyAllTheWayDown(review, params(reviewPr, "ai-review"), (await stubReplyOn(reviewPr)).text);
+    // github-pr-review also passes the PR branch's repository (factory-fix
+    // only pushes to a same-repository branch).
+    const reviewParams = { ...params(reviewPr, "ai-review"), headRepository: `${OWNER}/${REPO}` };
+    await assertReadOnlyAllTheWayDown(review, reviewParams, (await stubReplyOn(reviewPr)).text);
 
     // The control: same event type, same agent, different label -> writable.
     expect(triage.readOnly).toBe(false);

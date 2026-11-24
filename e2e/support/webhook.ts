@@ -278,6 +278,10 @@ export function pullRequestPayload({
       title,
       body,
       labels: label !== undefined && action !== "unlabeled" ? [{ name: label }] : [],
+      // A same-repository branch, as GitHub sends for a non-fork PR.
+      // github-pr-review's headRepository param reads it, and CEL fails the
+      // whole trigger on a missing key.
+      head: { ref: `e2e-pr-${number}`, repo: { full_name: `${owner}/${repo}` } },
     },
     repository: githubRepository(owner, repo),
     sender: githubSender(senderLogin),
