@@ -505,8 +505,10 @@ async function main(): Promise<void> {
   // docs/adr/0055 §1: one sweep workflow per `conflicts` source. A source that
   // appears is picked up within a minute; one that goes away ends its own.
   const conflictSources = (): string[] => (eventSources?.all() ?? []).flatMap((s) => (s.kind === "conflicts" ? [s.name] : []));
-  void runs.ensureConflictSweeps(conflictSources());
-  const conflictTimer = setInterval(() => void runs.ensureConflictSweeps(conflictSources()), 60_000);
+  // A sweep that starts takes the pre-0057 Redis marks with it (legacy-drain.ts).
+  const seedMarks = drain ? (source: string) => drain.conflictMarks(source) : undefined;
+  void runs.ensureConflictSweeps(conflictSources(), seedMarks);
+  const conflictTimer = setInterval(() => void runs.ensureConflictSweeps(conflictSources(), seedMarks), 60_000);
   conflictTimer.unref();
 
   await server.listen(config.httpPort);

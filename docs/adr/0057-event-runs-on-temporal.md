@@ -112,7 +112,10 @@ The stack already runs Temporal for the engine.
 - `inflight-runs.ts`, `label-reconciler.ts` and `deferred-events.ts` no longer
   record anything. `src/runs/legacy-drain.ts` hands what pre-0057 gateways
   left in Redis to the workflows (lapsed in-flight runs, held events claimed
-  as the old sweep claimed them, owed label removals). **Remove the drain and
+  as the old sweep claimed them, owed label removals, and the conflict
+  sweep's once-marks, which seed a `conflictSweep` when it is started so the
+  cutover sends no conflict event twice; a sweep is not started while those
+  marks can't be read). **Remove the drain and
   those modules one release after this ships.** During the rolling update an
   old pod may still hold a Redis serialize queue while a new run takes the
   Temporal one, so two runs of one queue can overlap once.

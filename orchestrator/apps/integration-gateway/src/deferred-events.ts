@@ -79,6 +79,12 @@ export interface DeferredEventStore {
   markOnce(key: string, ttlMs: number): Promise<boolean>;
   /** Clears a {@link markOnce} key (an emit that could not be delivered). */
   unmark(key: string): Promise<void>;
+  /**
+   * The live {@link markOnce} keys starting with `prefix`, and how long each
+   * has left. Throws when the store is unreachable: a caller seeding dedupe
+   * state from it must not mistake "unknown" for "none".
+   */
+  listMarks(prefix: string): Promise<Array<{ key: string; expiresInMs: number }>>;
 }
 
 export class InMemoryDeferredEventStore implements DeferredEventStore {
@@ -131,6 +137,15 @@ export class InMemoryDeferredEventStore implements DeferredEventStore {
 
   async unmark(key: string): Promise<void> {
     this.holds.delete(`mark:${key}`);
+  }
+
+  async listMarks(prefix: string): Promise<Array<{ key: string; expiresInMs: number }>> {
+    const out: Array<{ key: string; expiresInMs: number }> = [];
+    for (const k of [...this.holds.keys()]) {
+      if (!k.startsWith(`mark:${prefix}`) || this.live(k) === undefined) continue;
+      out.push({ key: k.slice("mark:".length), expiresInMs: this.holds.get(k)!.expiresAt - this.now() });
+    }
+    return out;
   }
 }
 
@@ -252,6 +267,30 @@ export class RedisDeferredEventStore implements DeferredEventStore {
     }
   }
 
+  async listMarks(prefix: string): Promise<Array<{ key: string; expiresInMs: number }>> {
+    const markPrefix = `${this.prefix}mark:`;
+    const keys: string[] = [];
+    let cursor = "0";
+    do {
+      const [next, batch] = await this.redis.scan(cursor, "MATCH", `${globEscape(markPrefix + prefix)}*`, "COUNT", 100);
+      cursor = next;
+      keys.push(...batch);
+    } while (cursor !== "0");
+    if (keys.length === 0) return [];
+    const pipeline = this.redis.pipeline();
+    for (const k of keys) pipeline.pttl(k);
+    const ttls = (await pipeline.exec()) ?? [];
+    const out: Array<{ key: string; expiresInMs: number }> = [];
+    keys.forEach((k, i) => {
+      const [err, ttl] = ttls[i] ?? [];
+      if (err) throw err;
+      // -2: gone since the scan. -1: no expiry (never written that way), so read as unbounded.
+      if (typeof ttl !== "number" || ttl === -2) return;
+      out.push({ key: k.slice(markPrefix.length), expiresInMs: ttl === -1 ? Number.POSITIVE_INFINITY : ttl });
+    });
+    return out;
+  }
+
   async close(): Promise<void> {
     await this.redis.quit();
   }
@@ -259,4 +298,9 @@ export class RedisDeferredEventStore implements DeferredEventStore {
 
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** Escapes Redis MATCH glob characters, so a key prefix matches only itself. */
+function globEscape(s: string): string {
+  return s.replace(/[*?[\]\\]/g, (c) => `\\${c}`);
 }

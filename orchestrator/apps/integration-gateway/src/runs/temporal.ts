@@ -114,19 +114,41 @@ export class TemporalRuns implements RunStarter {
     }
   }
 
-  /** Makes sure one sweep workflow runs per `conflicts` source (docs/adr/0055 §1); one already running is left alone. */
-  async ensureConflictSweeps(sources: string[]): Promise<void> {
+  /**
+   * Makes sure one sweep workflow runs per `conflicts` source (docs/adr/0055
+   * §1); one already running is left alone. `seedMarks` gives a sweep that is
+   * not running the marks to start with -- the pre-0057 Redis marks
+   * (LegacyRunDrain.conflictMarks), so the cutover does not emit a conflict
+   * event a second time. If they can't be read, the sweep is not started
+   * this time; the next call tries again.
+   */
+  async ensureConflictSweeps(sources: string[], seedMarks?: (source: string) => Promise<Record<string, number>>): Promise<void> {
     for (const source of sources) {
+      const workflowId = workflowIds.conflictSweep(this.o.taskQueue, source);
       try {
+        let marks: Record<string, number> | undefined;
+        if (seedMarks) {
+          if (await this.isRunning(workflowId)) continue;
+          marks = await seedMarks(source);
+        }
         await this.o.client.workflow.start<typeof conflictSweep>("conflictSweep", {
           taskQueue: this.o.taskQueue,
-          workflowId: workflowIds.conflictSweep(this.o.taskQueue, source),
-          args: [{ source }],
+          workflowId,
+          args: [{ source, ...(marks && Object.keys(marks).length > 0 ? { marks } : {}) }],
           workflowIdConflictPolicy: "USE_EXISTING",
         });
       } catch (error) {
         if (!(error instanceof WorkflowExecutionAlreadyStartedError)) this.log(`conflicts ${source}: could not start its sweep: ${errorText(error)}`);
       }
+    }
+  }
+
+  private async isRunning(workflowId: string): Promise<boolean> {
+    try {
+      return (await this.o.client.workflow.getHandle(workflowId).describe()).status.name === "RUNNING";
+    } catch (error) {
+      if (error instanceof WorkflowNotFoundError) return false;
+      throw error;
     }
   }
 }

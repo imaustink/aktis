@@ -2082,6 +2082,35 @@ describe("held run events and conflict events (docs/adr/0055)", () => {
       expect(desc.status.name).toBe("RUNNING");
     });
 
+    it("does not emit again for a PR the pre-0057 sweep already marked in Redis", async () => {
+      const deferredEventStore = new InMemoryDeferredEventStore();
+      await deferredEventStore.markOnce("conflict:pr-conflicts:acme/widgets#12@base1", 30 * 24 * 60 * 60 * 1000);
+      const h = await start({ eventSources: fastConflicts() });
+      appAssigned(h, "alice");
+      h.submitEvent.mockResolvedValue({ kind: "ignored" });
+      h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
+      h.getPullRequest.mockResolvedValue(DIRTY);
+      const drain = new LegacyRunDrain({ runs: h.temporal.runs, deferredEventStore, removeLabel: async () => {} });
+      await h.temporal.runs.ensureConflictSweeps(["pr-conflicts"], (source) => drain.conflictMarks(source));
+      await waitFor(() => expect(h.searchOpenPullRequests.mock.calls.length).toBeGreaterThanOrEqual(3));
+      expect(h.submitEvent).not.toHaveBeenCalled();
+
+      // A new base commit is a new conflict: emitted once.
+      h.getPullRequest.mockResolvedValue({ ...DIRTY, baseSha: "base2" });
+      await waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(1));
+      expect(submittedEnvelope(h)).toMatchObject({ body: { pullRequest: { baseSha: "base2" } } });
+    });
+
+    it("does not start a sweep while the pre-0057 marks can't be read", async () => {
+      const h = await sweeping((h) => h.searchOpenPullRequests.mockResolvedValue([]));
+      const id = `${h.temporal.taskQueue}/conflict-sweep:pr-conflicts`;
+      await h.temporal.runs.client.workflow.getHandle(id).terminate("test");
+      await h.temporal.runs.ensureConflictSweeps(["pr-conflicts"], async () => {
+        throw new Error("redis down");
+      });
+      expect((await h.temporal.runs.client.workflow.getHandle(id).describe()).status.name).toBe("TERMINATED");
+    });
+
     it("one sweep per source, however often it is ensured", async () => {
       const h = await sweeping((h) => h.searchOpenPullRequests.mockResolvedValue([]));
       await h.temporal.runs.ensureConflictSweeps(["pr-conflicts"]);
