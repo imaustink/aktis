@@ -66,6 +66,43 @@ The stack already runs Temporal for the engine.
    gateway needs a worker for the activities either way; Go workflows would
    only move GitHub-reply rules into the engine and add a cross-language
    contract on every step.
+7. **A change to a workflow's commands is gated with `patched()`.** These
+   workflows outlive a release: `heldRunEvent` waits for weeks, `runQueue`
+   holds a turn for up to `queueHoldTimeoutMs`, `eventRun` for hours, and a
+   new pod has no workflow cache, so it replays each one from its history.
+   Any change to the commands a workflow issues -- an activity, timer, signal
+   or child added, removed or reordered, or a changed activity type or child
+   workflow id -- breaks that replay with a `NonDeterminismError`, and
+   the workflow task then retries forever. So every such change keeps the old
+   path for histories that already took it:
+
+   ```ts
+   import { patched, deprecatePatch } from "@temporalio/workflow";
+
+   // Release N: new workflows take the new step; old histories replay without it.
+   if (patched("claim-queue-on-start")) await signalQueue(hold, claimSignal);
+
+   // Release N+1, once no workflow started before N can still be running
+   // (for heldRunEvent that is weeks): keep the marker, drop the old branch.
+   deprecatePatch("claim-queue-on-start");
+   await signalQueue(hold, claimSignal);
+
+   // Release N+2: remove deprecatePatch.
+   ```
+
+   Worker Versioning (build ids) is the alternative for a change too large
+   to patch; it needs the namespace's deployment settings, so it is not the
+   default here. During a rolling update a workflow task an old pod cannot
+   replay fails and is retried, and lands on a new pod once the old ones are
+   gone. Changes that only touch activity code (`effects.ts`,
+   `activities.ts`) or a log line's text need none of this.
+
+   `src/runs/replay.test.ts` enforces this: it replays the histories
+   committed in `src/runs/__histories__` (one or more per workflow type,
+   captured by `src/runs/capture-histories.test.ts`) against the current
+   workflow code and fails on any determinism error. A failure there means
+   the change needs a patch, not new histories. Re-capture only to add a
+   path worth covering, or after a patch has been fully removed.
 
 ## Consequences
 

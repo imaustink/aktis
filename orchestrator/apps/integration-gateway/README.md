@@ -60,6 +60,20 @@ POST /events/:source/tick   Authorization: Bearer <projected token of SA eventso
   replica, not the run. Held completions, serialize queues and conflict sweeps
   (docs/adr/0055) are workflows too. `src/runs/legacy-drain.ts` hands over
   what pre-0057 gateways left in Redis; it goes one release later.
+- **Changing a workflow** (`src/runs/workflows.ts`): running workflows are
+  replayed by the new code after a rollout, so a change to the commands a
+  workflow issues must be gated with `patched()` (docs/adr/0057 §7).
+  `src/runs/replay.test.ts` replays the histories in `src/runs/__histories__`
+  and fails on a change that isn't. To add or refresh those histories (a new
+  path worth covering, or after a patch has been fully removed -- never just
+  to make the replay test pass), run, from this directory:
+
+  ```
+  CAPTURE_WORKFLOW_HISTORIES=1 npx vitest run src/runs/capture-histories.test.ts
+  ```
+
+  It drives each workflow on a Temporal dev server with stubbed activities
+  and writes one JSON history per scenario; commit them with the change.
 
 ## Configuration
 

@@ -43,6 +43,18 @@ import {
  *
  * Workflow code is deterministic: every side effect is an activity
  * (activities.ts), and time is workflow time.
+ *
+ * CHANGING A WORKFLOW (docs/adr/0057 §7): these workflows outlive a release
+ * (heldRunEvent for weeks), and a new pod replays each from its history. Any
+ * change to the commands one issues -- an activity, timer, signal or child
+ * added, removed or reordered -- must keep the old path for running
+ * workflows, behind `patched()`:
+ *
+ *   if (patched("claim-queue-on-start")) await signalQueue(hold, claimSignal);
+ *
+ * then `deprecatePatch()` a release later. src/runs/replay.test.ts replays
+ * committed histories (src/runs/__histories__) against this file and fails
+ * on a change that is not gated; fix the change, don't re-capture them.
  */
 
 /** Short side effects: comments, labels, relays. Each is best effort inside, so a retry only covers a crashed worker. */
