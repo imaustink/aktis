@@ -675,14 +675,46 @@ describe("a source whose sender CEL does not compile is served as unknown (404)"
     expect(h.compile.mock.calls[0]?.[0]).toEqual(["body.sender.login", 'body.sender.type == "Bot"', "body.repository.full_name"]);
   });
 
-  it("an orchestrator that cannot answer leaves the source served (the prefilter still gates each delivery), and is asked again next time", async () => {
-    const h = await start();
+  it("an orchestrator that cannot answer leaves the source served (the prefilter still gates each delivery), and is asked again after the backoff", async () => {
+    let clock = Date.parse("2026-01-01T00:00:00Z");
+    const h = await start({ now: () => new Date(clock) });
     h.compile.mockResolvedValueOnce({ kind: "failed", error: "/events/compile unreachable: ECONNREFUSED" });
     expect((await postGithub(h)).status).toBe(202);
     await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
     expect(h.prefilter).toHaveBeenCalled();
+    clock += 10_000;
     await postGithub(h);
     expect(h.compile).toHaveBeenCalledTimes(2);
+  });
+
+  it("during an orchestrator outage, repeated requests make at most one compile call per backoff window", async () => {
+    let clock = Date.parse("2026-01-01T00:00:00Z");
+    const h = await start({ now: () => new Date(clock) });
+    h.compile.mockResolvedValue({ kind: "failed", error: "/events/compile unreachable: ECONNREFUSED" });
+    for (let i = 0; i < 5; i++) {
+      expect((await postGithub(h)).status).toBe(202);
+      clock += 1_000;
+    }
+    expect(h.compile).toHaveBeenCalledTimes(1);
+    clock += 5_000;
+    expect((await postGithub(h)).status).toBe(202);
+    expect(h.compile).toHaveBeenCalledTimes(2);
+  });
+
+  it("a negative verdict is re-checked after its TTL, and the source is served once it compiles", async () => {
+    let clock = Date.parse("2026-01-01T00:00:00Z");
+    const h = await start({ now: () => new Date(clock) });
+    h.compile.mockResolvedValueOnce({ kind: "ok", errors: { "body.sender.login": "undeclared reference to 'body'" } });
+    expect((await postGithub(h)).status).toBe(404);
+    clock += 59_000;
+    expect((await postGithub(h)).status).toBe(404);
+    expect(h.compile).toHaveBeenCalledTimes(1);
+    clock += 1_000;
+    expect((await postGithub(h)).status).toBe(202);
+    expect(h.compile).toHaveBeenCalledTimes(2);
+    // Only the expression with the expired negative verdict is asked again.
+    expect(h.compile.mock.calls[1]?.[0]).toEqual(["body.sender.login"]);
+    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
   });
 
   it("a source without `sender` is never compiled", async () => {

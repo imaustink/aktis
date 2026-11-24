@@ -714,6 +714,29 @@ describe("OrchestratorClient side-effect-free reads (/events/prefilter, /events/
     expect(JSON.parse((fetchImpl.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({ expressions: ["body.a", "body.("] });
   });
 
+  it("bounds each attempt: an orchestrator that never answers times out and is retried", async () => {
+    // Resolves only when the request's signal aborts, like a stuck pod that accepted the connection.
+    const fetchImpl = vi.fn(
+      (_url: string, init: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+        }),
+    );
+    const stuck = new OrchestratorClient({
+      baseUrl: "http://orchestrator:8081",
+      token: "tok",
+      pollIntervalMs: 1,
+      pollTimeoutMs: 1,
+      sleep: noopSleep,
+      readTimeoutMs: 10,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const result = await stuck.compile(["body.a"]);
+    expect(result.kind).toBe("failed");
+    expect(result.kind === "failed" && result.error).toMatch(/^\/events\/compile unreachable: /);
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
   it("compile rejects an unexpected body", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(json(200, { nope: true }));
     expect(await client(fetchImpl).compile(["body.a"])).toEqual({ kind: "failed", error: "/events/compile returned an unexpected body" });

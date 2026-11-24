@@ -21,6 +21,15 @@ import { TRACEPARENT_HEADER } from "./traceparent.js";
 // backoff policy.
 const ACCEPT_RETRY_ATTEMPTS = 3;
 const ACCEPT_RETRY_DELAY_MS = 1000;
+/**
+ * Per-attempt bound on a side-effect-free read (`/events/compile`,
+ * `/events/prefilter`), response body included. `/events/compile` runs inside
+ * a webhook request, before the 202, and providers give up on a delivery
+ * after ~10s (GitHub); without a bound, an orchestrator that accepts the
+ * connection but never answers would hold that request open for undici's
+ * 300s header timeout per attempt.
+ */
+const READ_TIMEOUT_MS = 3000;
 // Consecutive poll failures tolerated before the turn is reported unreachable.
 // Small on purpose: the gateway holds a relay for as long as a poll runs, so
 // waiting out the whole poll budget on a dead orchestrator starves the next
@@ -74,6 +83,8 @@ export interface OrchestratorClientOptions {
   /** Injectable for tests; defaults to a real timer. */
   sleep?: (ms: number) => Promise<void>;
   fetchImpl?: typeof fetch;
+  /** Per-attempt timeout for `/events/compile` and `/events/prefilter`; defaults to {@link READ_TIMEOUT_MS}. */
+  readTimeoutMs?: number;
 }
 
 /** Optional callbacks fired while polling a turn. */
@@ -463,24 +474,27 @@ export class OrchestratorClient {
    * Because nothing is written, a 5xx is retried as well as a connection
    * failure -- unlike `/invoke`, where a retried 5xx could start a turn twice.
    * That covers the window in which a draining orchestrator pod still receives
-   * traffic during a rollout.
+   * traffic during a rollout. Each attempt is bounded by `readTimeoutMs`; a
+   * timed-out attempt counts as a connection failure and is retried.
    */
   private async postRead(path: string, payload: unknown): Promise<{ kind: "ok"; body: unknown } | { kind: "failed"; error: string }> {
     let lastError = "";
     for (let attempt = 1; attempt <= ACCEPT_RETRY_ATTEMPTS; attempt++) {
       if (attempt > 1) await this.sleep(ACCEPT_RETRY_DELAY_MS);
       let res: Response;
+      let text: string;
       try {
         res = await this.fetchImpl(`${this.baseUrl()}${path}`, {
           method: "POST",
           headers: { "content-type": "application/json", authorization: `Bearer ${await this.resolveToken()}` },
           body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(this.options.readTimeoutMs ?? READ_TIMEOUT_MS),
         });
+        text = await res.text();
       } catch (err) {
         lastError = `${path} unreachable: ${errorText(err)}`;
         continue;
       }
-      const text = await res.text();
       if (res.status >= 500) {
         lastError = `${path} failed: ${res.status} ${text}`;
         continue;
