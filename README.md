@@ -165,9 +165,17 @@ flowchart TD
     Plan -->|call a tool| Kind{What does the chosen\ncandidate point at?}
     Kind -->|container tool| ToolRun[ToolRun CR → Tool Job]
     Kind -->|agent-backed tool or skill agentRef| Child[child agent workflow:\ndeclarative loop, step Jobs,\nor AgentRun CR → Agent Job]
+    Kind -->|LocalTool, ADR 0014| Local[executor sidecar activity\nno Job]
+    Kind -->|knowledge-base tool, ADR 0039| KB[in-worker search / lookup / read\nno Job]
+    Kind -->|MCP tool, ADR 0045| MCP[mcp-broker activity\nno Job]
+    Kind -->|caller tool, ADR 0035| CallerTool([turn ends: client runs the tool\nno Job])
     ToolRun --> Await[await result\nHMAC callback → workflow signal]
     Child --> Await
-    Await -->|fold result into state,\nup to 8 plan steps| Plan
+    Await --> Fold[fold result into state]
+    Local --> Fold
+    KB --> Fold
+    MCP --> Fold
+    Fold -->|up to 8 plan steps| Plan
 ```
 
 Things that are easy to miss:
@@ -180,7 +188,9 @@ Things that are easy to miss:
   `allowedRoles` of their own. A skill's audience is the intersection of its
   tools' `allowedRoles`, computed at index time. The Qdrant filter uses it,
   and tool ids are checked again when they are resolved.
-- **Many turns end at `plan-action` and launch no Job.**
+- **Many turns end at `plan-action` and launch no Job.** Not every tool call
+  launches one either: LocalTools, knowledge-base tools and MCP tools run as
+  activities, and a caller tool ends the turn for the client to run.
 - **Sub-agents reach a turn two ways.** The combined selector can delegate
   the whole turn to a retrieved agent directly. Inside a skill, an
   agent-backed tool or one of the skill's own `agentRefs` (ADR 0021) is a
