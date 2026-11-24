@@ -1,4 +1,4 @@
-# 0055. agent-orchestrator and mcp-broker move to Go; one CEL evaluator
+# 0056. agent-orchestrator and mcp-broker move to Go; one CEL evaluator
 
 Date: 2026-11-23
 

@@ -96,7 +96,7 @@ Needs `node`, `kubectl` and a Go toolchain (`go`, the version in
 `orchestrator/engines/temporal/go.mod`) on PATH. Three specs --
 `chat-harness`, `caller-tools` and `mcp-broker-contract` -- drive Go tests
 against the live cluster (`support/go-test.ts`), because the code they check
-is Go (docs/adr/0055).
+is Go (docs/adr/0056).
 
 Tests are **serial** (`fileParallelism: false`, `maxConcurrency: 1`): they
 share one cluster, and several assert on global state (Redis keys, AgentRun

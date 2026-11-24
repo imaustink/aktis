@@ -23,7 +23,7 @@ import {
  * It checks against the REAL resolver rather than reimplementing its
  * expectations: the claim the harness signs and the claim the orchestrator reads
  * have to be the same claim, and only the resolver itself is authoritative about
- * which that is. The orchestrator is Go (docs/adr/0055), so this spec mints the
+ * which that is. The orchestrator is Go (docs/adr/0056), so this spec mints the
  * tokens and the Go test `TestE2EHarnessForwardedUserJWT` (internal/facade)
  * verifies them with the product resolver. Needs `go` on PATH.
  */

@@ -11,7 +11,7 @@ export const REPO_ROOT = fileURLToPath(new URL("../../", import.meta.url));
  * arrive must read as a failure here, or the spec would be green while checking
  * nothing.
  *
- * Used where the product code a spec has to agree with is Go (docs/adr/0055):
+ * Used where the product code a spec has to agree with is Go (docs/adr/0056):
  * the spec supplies what only it can (minted tokens, a port-forward), and the
  * Go test exercises the real implementation.
  *

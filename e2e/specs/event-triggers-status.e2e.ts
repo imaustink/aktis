@@ -205,7 +205,7 @@ describe("EventSource / EventTrigger status", () => {
       throw new Error(`e2e: ${SOURCE} never ${what} (last status ${last})`);
     };
 
-    // The gateway has no CEL compiler (docs/adr/0055); it asks the
+    // The gateway has no CEL compiler (docs/adr/0056); it asks the
     // orchestrator's /events/compile, and must still 404 such a source exactly
     // as an unknown one. Proven against a control: the same source with a
     // valid expression is served, before and after.

@@ -218,7 +218,7 @@ One environment and one runtime, `cel-go`: core-controller compiles against
 it for `Ready`; agent-orchestrator and the Temporal gateway match with it
 (`orchestrator/engines/temporal/internal/catalog`); integration-gateway's
 pre-sender checks are evaluated by agent-orchestrator on its behalf (§7).
-Until [ADR 0055](adr/0055-agent-orchestrator-in-go.md) a second, TypeScript
+Until [ADR 0056](adr/0056-agent-orchestrator-in-go.md) a second, TypeScript
 runtime (`@marcbachmann/cel-js`) evaluated the same expressions, which is why
 the rules below are written to mean the same in both:
 

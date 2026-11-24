@@ -135,7 +135,7 @@ func TestLegacyPointIDMatchesTheTypeScriptStore(t *testing.T) {
 	require.Equal(t, "d554f00d-7ae5-544b-9061-f5b186ebffac", legacyPointID(strings.Repeat("a", 64)))
 }
 
-func TestLiveQdrantReusesAPre0055VectorInsteadOfEmbedding(t *testing.T) {
+func TestLiveQdrantReusesATypeScriptVectorInsteadOfEmbedding(t *testing.T) {
 	store, client, embedder := liveStore(t)
 	ctx := context.Background()
 	migrated := mustTool(t, "migrated_tool", "Embedded by the TypeScript store")

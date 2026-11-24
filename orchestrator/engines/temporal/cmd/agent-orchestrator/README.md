@@ -7,7 +7,7 @@ OpenAI-compatible chat API (ADR 0007) — and forwards every turn to the engine'
 gateway, which runs the agent loop as a durable workflow (ADR 0036).
 
 A Go binary in the engine's module since
-[ADR 0055](../../../../../docs/adr/0055-agent-orchestrator-in-go.md), so it shares
+[ADR 0056](../../../../../docs/adr/0056-agent-orchestrator-in-go.md), so it shares
 the engine's EventTrigger/CEL, caller-tool and assertion code instead of keeping
 TypeScript copies; it also evaluates integration-gateway's pre-sender CEL
 (`POST /events/prefilter`, docs/event-triggers.md §7).

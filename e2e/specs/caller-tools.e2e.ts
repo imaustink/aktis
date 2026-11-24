@@ -101,7 +101,7 @@ function session(label: string): string {
 }
 
 describe("caller-supplied tools: the store's queries against a real Qdrant", () => {
-  // The store is Go (internal/callertools, docs/adr/0055), so its queries are
+  // The store is Go (internal/callertools, docs/adr/0056), so its queries are
   // exercised by TestLiveQdrant*, run here against the cluster's Qdrant over a
   // gRPC port-forward. They work in their OWN throwaway collection, never the
   // deployment's `caller_tools`, and check exactly what a mock cannot: that
@@ -120,7 +120,7 @@ describe("caller-supplied tools: the store's queries against a real Qdrant", () 
         pattern: "^TestLiveQdrant",
         mustPass: [
           "TestLiveQdrantIndexSearchAndCache",
-          "TestLiveQdrantReusesAPre0055VectorInsteadOfEmbedding",
+          "TestLiveQdrantReusesATypeScriptVectorInsteadOfEmbedding",
           "TestLiveQdrantPruneDropsOnlyStaleDefinitionsIncludingLegacyMillis",
         ],
         env: { CALLERTOOLS_QDRANT_ADDR: forward.address },

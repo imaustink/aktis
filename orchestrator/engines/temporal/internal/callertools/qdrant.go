@@ -195,7 +195,7 @@ func (s *QdrantStore) Index(ctx context.Context, tools []Descriptor) error {
 }
 
 // legacyVectors returns, by hash, the vectors the TypeScript agent-orchestrator
-// (before docs/adr/0055) stored for any of tools. Its points live in the same
+// (before docs/adr/0056) stored for any of tools. Its points live in the same
 // collection under legacyPointID; a payload whose hash disagrees is ignored.
 func (s *QdrantStore) legacyVectors(ctx context.Context, tools []Descriptor) (map[string][]float32, error) {
 	ids := make([]*qdrant.PointId, len(tools))
@@ -209,7 +209,7 @@ func (s *QdrantStore) legacyVectors(ctx context.Context, tools []Descriptor) (ma
 		WithVectors:    qdrant.NewWithVectors(true),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("look up %d pre-0055 caller tools: %w", len(ids), err)
+		return nil, fmt.Errorf("look up %d pre-0056 caller tools: %w", len(ids), err)
 	}
 	out := map[string][]float32{}
 	for _, p := range points {
@@ -307,7 +307,7 @@ func (s *QdrantStore) Prune(ctx context.Context, olderThanSeconds int64) (int, e
 	now := time.Now()
 	cutoff := float64(now.Unix() - olderThanSeconds)
 	// Points written by the TypeScript agent-orchestrator (before docs/adr/
-	// 0055) carry lastSeenAt in MILLISECONDS and a different point id, so this
+	// 0056) carry lastSeenAt in MILLISECONDS and a different point id, so this
 	// store never touches them again. A seconds-only range would never reach
 	// them either; this second range ages them out on the same TTL. Any value
 	// at or above legacyMillisFloor is a millisecond timestamp (in seconds it

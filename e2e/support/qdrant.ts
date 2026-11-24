@@ -65,7 +65,7 @@ const QDRANT_GRPC_PORT = 6334;
 
 /**
  * A port-forward to Qdrant's gRPC port, for Go tests that drive the real
- * store (docs/adr/0055). Readiness is a TCP connect, not an HTTP request:
+ * store (docs/adr/0056). Readiness is a TCP connect, not an HTTP request:
  * the gRPC listener does not answer HTTP/1.1.
  */
 export async function openQdrantGrpc(): Promise<{ address: string; close: () => void }> {
