@@ -53,9 +53,13 @@ event through the usual `/invoke` path, **once per (PR, base commit)**.
   still `null`, because GitHub computes it lazily after the base moves and the
   next sweep will see it.
 - **Sender:** the PR's first assignee who still verifies through the identity
-  resolver. Factory handoff assigns the human who started the chain, so that is
-  normally them. It is never the bot and never whoever merged the other PR. A
-  PR with no verifying assignee is skipped and logged.
+  resolver and whom the App itself assigned (the latest `assigned` timeline
+  event for that login has `author` as its actor). Factory handoff assigns the
+  human who started the chain, so that is normally them. It is never the bot
+  and never whoever merged the other PR. Anyone with triage access can set
+  assignees, so an assignment a person made is not trusted: otherwise they
+  could choose whose identity and credentials a write run uses. A PR with no
+  such assignee is skipped and logged.
 - **Bounded:** the (PR, base sha) mark means a conflict the resync couldn't
   resolve costs one run per merge to the base, not one per sweep. A delivery
   the orchestrator couldn't receive is unmarked and retried. A per-interval

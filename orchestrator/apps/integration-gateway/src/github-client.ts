@@ -54,6 +54,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 /** A few attempts over a few seconds -- a transient-blip retry, not a general backoff policy (mirrors OrchestratorClient's accept retry). */
 const DEFAULT_REMOVE_LABEL_RETRY_ATTEMPTS = 3;
 const DEFAULT_REMOVE_LABEL_RETRY_DELAY_MS = 500;
+/** Timeline pages {@link GithubReplyClient.getAssignmentActors} reads: 1000 events is far past any factory PR's. */
+const TIMELINE_MAX_PAGES = 10;
 
 /** Minimal GitHub REST client: posts a reply comment on an issue, and removes a trigger label once a run finishes. */
 export class GithubReplyClient {
@@ -232,6 +234,30 @@ export class GithubReplyClient {
       labels: names(body.labels, "name"),
       assignees,
     };
+  }
+
+  /**
+   * Who most recently assigned each login to an issue or pull request: from
+   * its timeline's `assigned` events, assignee login (lowercased) -> the
+   * actor's login. The conflict sweep only runs as an assignee the App
+   * itself assigned (docs/adr/0055 §1) -- anyone with triage access can set
+   * assignees. Reads up to {@link TIMELINE_MAX_PAGES} pages of 100.
+   */
+  async getAssignmentActors(owner: string, repo: string, number: number): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    for (let page = 1; page <= TIMELINE_MAX_PAGES; page++) {
+      const body = await this.getJson(`/repos/${owner}/${repo}/issues/${number}/timeline?per_page=100&page=${page}`, true);
+      const items = Array.isArray(body) ? body : [];
+      for (const item of items) {
+        if (!isRecord(item) || item.event !== "assigned") continue;
+        const assignee = isRecord(item.assignee) && typeof item.assignee.login === "string" ? item.assignee.login : undefined;
+        const actor = isRecord(item.actor) && typeof item.actor.login === "string" ? item.actor.login : undefined;
+        // Chronological: a later assignment overwrites an earlier one.
+        if (assignee && actor) out.set(assignee.toLowerCase(), actor);
+      }
+      if (items.length < 100) break;
+    }
+    return out;
   }
 
   /**

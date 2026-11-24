@@ -141,6 +141,7 @@ interface Harness {
   getIssueState: ReturnType<typeof vi.fn>;
   searchOpenPullRequests: ReturnType<typeof vi.fn>;
   getPullRequest: ReturnType<typeof vi.fn>;
+  getAssignmentActors: ReturnType<typeof vi.fn>;
   replyFetch: ReturnType<typeof vi.fn>;
   secretsGet: ReturnType<typeof vi.fn>;
   resolve: ReturnType<typeof vi.spyOn>;
@@ -190,6 +191,7 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
   const getIssueState = vi.fn(async (): Promise<"open" | "closed" | "missing"> => "open");
   const searchOpenPullRequests = vi.fn(async (): Promise<Array<{ owner: string; repo: string; number: number }>> => []);
   const getPullRequest = vi.fn(async (): Promise<unknown> => undefined);
+  const getAssignmentActors = vi.fn(async (): Promise<Map<string, string>> => new Map());
   const replyFetch = vi.fn(async () => {
     order.push("http");
     return new Response(null, { status: 204 });
@@ -220,6 +222,7 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
       getIssueState,
       searchOpenPullRequests,
       getPullRequest,
+      getAssignmentActors,
     } as unknown as GithubReplyClient,
     replyFetch: replyFetch as unknown as typeof fetch,
     log: (line) => logs.push(line),
@@ -249,6 +252,7 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
     getIssueState,
     searchOpenPullRequests,
     getPullRequest,
+    getAssignmentActors,
     replyFetch,
     secretsGet,
     resolve,
@@ -1699,8 +1703,13 @@ describe("held run events and conflict events (docs/adr/0055)", () => {
         { author: "app/k5s-bot", intervalMs: 300_000, skipLabels: ["ai-triage"] },
       );
 
+    const appAssigned = (h: Harness, ...logins: string[]): void => {
+      h.getAssignmentActors.mockResolvedValue(new Map(logins.map((l) => [l, "k5s-bot[bot]"])));
+    };
+
     it("emits one conflict event per PR and base commit, acting as the verified assignee", async () => {
       const h = await start();
+      appAssigned(h, "alice");
       h.submitEvent.mockResolvedValue({ kind: "ignored" });
       h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
       h.getPullRequest.mockResolvedValue(DIRTY);
@@ -1733,14 +1742,38 @@ describe("held run events and conflict events (docs/adr/0055)", () => {
       ["assigned only to someone who does not verify", { assignees: [{ login: "mallory", id: 1 }] }],
     ])("skips a PR that is %s", async (_, patch) => {
       const h = await start();
+      appAssigned(h, "alice", "mallory");
       h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
       h.getPullRequest.mockResolvedValue({ ...DIRTY, ...patch });
       await sweep(h);
       expect(h.submitEvent).not.toHaveBeenCalled();
     });
 
+    it("skips an assignee a person assigned, even one who verifies", async () => {
+      const h = await start();
+      h.getAssignmentActors.mockResolvedValue(new Map([["alice", "some-triager"]]));
+      h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
+      h.getPullRequest.mockResolvedValue(DIRTY);
+      await sweep(h);
+      expect(h.getAssignmentActors).toHaveBeenCalledWith("acme", "widgets", 12);
+      expect(h.submitEvent).not.toHaveBeenCalled();
+      expect(h.logs.some((l) => l.includes("not running as assignee alice (assigned by some-triager"))).toBe(true);
+    });
+
+    it("uses the App-assigned assignee and passes over one a person added", async () => {
+      const h = await start();
+      h.getAssignmentActors.mockResolvedValue(new Map([["mallory", "some-triager"], ["alice", "K5S-Bot[bot]"]]));
+      h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
+      h.getPullRequest.mockResolvedValue({ ...DIRTY, assignees: [{ login: "mallory", id: 1 }, { login: "alice", id: 42 }] });
+      h.submitEvent.mockResolvedValue({ kind: "ignored" });
+      await sweep(h);
+      expect(h.submitEvent).toHaveBeenCalledTimes(1);
+      expect(submittedEnvelope(h)).toMatchObject({ sender: { login: "alice", isBot: false } });
+    });
+
     it("retries next sweep when the orchestrator was unreachable", async () => {
       const h = await start();
+      appAssigned(h, "alice");
       h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
       h.getPullRequest.mockResolvedValue(DIRTY);
       h.submitEvent.mockResolvedValueOnce({ kind: "failed", error: "down" }).mockResolvedValue({ kind: "ignored" });

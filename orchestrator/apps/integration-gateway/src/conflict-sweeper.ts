@@ -15,6 +15,10 @@ import type { DeferredEventStore } from "./deferred-events.js";
  * no assignee who still verifies. The assignee is who the resync runs as:
  * the factory's handoff assigns the human who started the PR's chain, and a
  * run must act as a verified person, never the bot or whoever clicked merge.
+ * Only an assignment the App itself made counts (the latest `assigned`
+ * timeline event for that login has `author` as its actor): anyone with
+ * triage access can set assignees, and must not be able to pick whose
+ * identity and credentials a write run uses.
  *
  * Once per (PR, base sha): a resync that couldn't resolve the conflict is not
  * retried until the base moves again, so a hard conflict costs one run per
@@ -33,6 +37,8 @@ export interface ConflictSweeperOptions {
   github: {
     searchOpenPullRequests(author: string): Promise<Array<{ owner: string; repo: string; number: number }>>;
     getPullRequest(owner: string, repo: string, number: number): Promise<PullRequestState | undefined>;
+    /** Assignee login (lowercased) -> who most recently assigned them. */
+    getAssignmentActors(owner: string, repo: string, number: number): Promise<Map<string, string>>;
   };
   store: DeferredEventStore;
   /** True when `login` still verifies against the repository (the run-event per-hop check). */
@@ -126,14 +132,21 @@ export class ConflictSweeper {
     }
     const markKey = `conflict:${name}:${owner}/${repo}#${number}@${pr.baseSha}`;
     let assignee: ConflictCandidate["assignee"] | undefined;
+    const app = actorLogin(conflicts.author).toLowerCase();
+    const actors = pr.assignees.length > 0 ? await this.options.github.getAssignmentActors(owner, repo, number) : new Map<string, string>();
     for (const a of pr.assignees) {
+      const by = actors.get(a.login.toLowerCase());
+      if (by?.toLowerCase() !== app) {
+        this.log(`${tag}: not running as assignee ${a.login} (assigned by ${by ?? "unknown"}, not ${actorLogin(conflicts.author)})`);
+        continue;
+      }
       if (await this.options.verify(a.login, owner, repo)) {
         assignee = { login: a.login, ...(a.id !== undefined ? { accountId: String(a.id) } : {}) };
         break;
       }
     }
     if (!assignee) {
-      this.log(`${tag}: conflicts, but skipped (no assignee who verifies to run the resync as)`);
+      this.log(`${tag}: conflicts, but skipped (no App-assigned assignee who verifies to run the resync as)`);
       return;
     }
     if (!(await this.options.store.markOnce(markKey, MARK_TTL_MS))) return;
@@ -146,4 +159,9 @@ export class ConflictSweeper {
       if (!delivered) await this.options.store.unmark(markKey);
     }
   }
+}
+
+/** The login a `conflicts.author` search qualifier acts as on GitHub: `app/<slug>` is `<slug>[bot]`. */
+export function actorLogin(author: string): string {
+  return author.startsWith("app/") ? `${author.slice(4)}[bot]` : author;
 }

@@ -73,6 +73,26 @@ describe("GithubReplyClient conflict-sweep reads (docs/adr/0055)", () => {
     expect(await client.getIssueState("a", "b", 1)).toBe("missing");
     await expect(client.getIssueState("a", "b", 1)).rejects.toThrow(/500/);
   });
+
+  it("getAssignmentActors: the latest assigned event's actor per assignee, across pages", async () => {
+    const assigned = (assignee: string, actor: string) => ({ event: "assigned", assignee: { login: assignee }, actor: { login: actor } });
+    const filler = Array.from({ length: 98 }, () => ({ event: "commented", actor: { login: "x" } }));
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(json(200, [assigned("Alice", "k5s-bot[bot]"), assigned("bob", "k5s-bot[bot]"), ...filler]))
+      .mockResolvedValueOnce(json(200, [assigned("bob", "triager"), { event: "unassigned", assignee: { login: "alice" }, actor: { login: "y" } }]));
+    const client = new GithubReplyClient({ ...baseConfig, fetchImpl });
+    const actors = await client.getAssignmentActors("acme", "widgets", 12);
+    expect(actors).toEqual(
+      new Map([
+        ["alice", "k5s-bot[bot]"],
+        ["bob", "triager"],
+      ]),
+    );
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(String(fetchImpl.mock.calls[0]?.[0])).toContain("/repos/acme/widgets/issues/12/timeline?per_page=100&page=1");
+    expect(String(fetchImpl.mock.calls[1]?.[0])).toContain("page=2");
+  });
 });
 
 describe("GithubReplyClient.postIssueComment", () => {

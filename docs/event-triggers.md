@@ -575,8 +575,11 @@ not resolve is retried only after the base moves again.
 Skipped: drafts; PRs carrying a `skipLabels` label (a factory run is already on
 them and syncs the branch itself); PRs whose mergeability GitHub hasn't computed
 yet (`null` right after the base moved; the next sweep sees it); and PRs with
-no assignee who verifies through the identity resolver. The event's sender is
-that assignee (the factory's handoff assigns the human who started the chain),
+no assignee who verifies through the identity resolver and was assigned by
+the App itself (the latest `assigned` timeline event for that login has
+`author` as its actor; an assignment a person made is never trusted). The
+event's sender is that assignee (the factory's handoff assigns the human who
+started the chain),
 never the bot or whoever merged the other PR; it starts a new chain. One gateway
 replica sweeps each interval. `factory-resync` (examples, production) merges the
 base into the branch as that person, and its completion goes to review or
