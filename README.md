@@ -77,10 +77,19 @@ Modelling tools and agents as custom resources flips this:
 
 ## System architecture
 
+Two separate things touch the Tool / Skill / Agent catalog. **Indexing**
+watches the custom resources continuously and embeds them into Qdrant
+([ADR 0020](docs/adr/0020-crd-catalog-hot-reload-via-k8s-watch.md)). **Lookup** happens on
+every turn, inside the agent loop, and chooses which skill, tool or sub-agent
+(if any) handles the request.
+
 ```mermaid
 graph TD
     User([User / Chat client])
-    Orchestrator[agent-orchestrator\nDeployment]
+    Orchestrator[agent-orchestrator\nfacade · identity · event triggers]
+    Gateway[Temporal engine gateway\nHMAC callback → signal bridge]
+    Worker[Temporal worker\nConversationWorkflow = per-turn agent loop]
+    CatalogSync[catalog-sync\nwatches CRs live]
     Controller[core-controller\nDeployment]
 
     subgraph CRDs["Custom Resources (core.aktis.ai/v1alpha1)"]
@@ -91,24 +100,81 @@ graph TD
         AgentRunCR[AgentRun CR\nagentRef · goal · callback]
     end
 
+    subgraph Qdrant["Qdrant (vector store)"]
+        SkillsCol[(skills collection\n+ derived audience roles)]
+        ToolsCol[(tool / agent records\nby id + allowedRoles)]
+    end
+
     subgraph Jobs["Kubernetes Jobs (one-shot)"]
         ToolJob[Tool Job pod]
         AgentJob[Agent Job pod]
     end
 
-    CallbackSrv[CallbackReceiver\nport 8080]
-    Qdrant[(Qdrant\nvector store)]
+    %% Indexing: continuous, not per turn
+    ToolCR & SkillCR & AgentCR -.->|watch, ADR 0020| CatalogSync
+    CatalogSync -.->|embed skills; audience = ∩ of tools' allowedRoles, ADR 0011| SkillsCol
+    CatalogSync -.->|upsert tools / agents| ToolsCol
 
-    User -->|POST /v1/chat/completions| Orchestrator
-    Orchestrator -->|RAG skill + tool selection| Qdrant
-    Orchestrator -->|reads CRs at startup| ToolCR & SkillCR
-    Orchestrator -->|kubectl create| ToolRunCR & AgentRunCR
+    %% Per turn
+    User -->|POST /v1/chat/completions · /invoke| Orchestrator
+    Orchestrator -->|signed caller identity + turn| Gateway
+    Gateway -->|update-with-start| Worker
+    Worker -->|RAG, filtered to caller's roles| SkillsCol
+    Worker -->|getByIds on the chosen skill's toolIds, RBAC re-check| ToolsCol
+    Worker -->|create, only if the plan calls one| ToolRunCR & AgentRunCR
     Controller -->|watches + reconciles| ToolRunCR & AgentRunCR & ToolCR & SkillCR & AgentCR
     Controller -->|creates Job with secret injection| ToolJob & AgentJob
-    ToolJob & AgentJob -->|HMAC POST /callback/:id| CallbackSrv
-    CallbackSrv -->|resolves pending promise| Orchestrator
+    ToolJob & AgentJob -->|HMAC POST /callback/:id| Gateway
+    Gateway -->|signal| Worker
+    Worker -->|reply| Orchestrator
     Orchestrator -->|final SSE chunk| User
 ```
+
+Dotted edges are indexing, which runs all the time. Solid edges are one turn.
+
+### How a turn finds its skill, tool or agent
+
+The loop runs as a durable Temporal workflow
+([ADR 0036](docs/adr/0036-temporal-execution-engine.md)). Every LLM,
+Qdrant and Kubernetes call in it is an activity. The steps match the agent
+core in [docs/orchestrator.md](docs/orchestrator.md#1-agent-core), which also
+has a step-by-step [sequence diagram](docs/orchestrator.md#high-level-flow).
+
+```mermaid
+flowchart TD
+    Start([Turn arrives]) --> Identity[resolve identity → subject + roles\nfail closed]
+    Identity --> Active{Conversation has an\nactive skill? ADR 0012}
+    Active -->|yes| Fit[re-fetch skill under the caller's current roles\n+ cheap fit check]
+    Fit -->|fits| Load
+    Fit -->|miss, not an error| Gate
+    Active -->|no| Gate{Capability gate:\nconversational turn?}
+    Gate -->|yes| Done
+    Gate -->|needs capabilities| Retrieve[retrieve-skills\nRAG over the skills collection,\nonly skills whose derived audience\nincludes the caller, ADR 0008 / 0011]
+    Retrieve --> Select[select-skill]
+    Select --> Load[load-skill-tools\nresolve skill.toolIds directly with getByIds,\nno second semantic search; RBAC re-checked]
+    Load --> Plan{plan-action\nskill markdown as system prompt}
+    Plan -->|respond| Done([Reply: no Job launched])
+    Plan -->|call a tool| Kind{What does the chosen\ntool id point at?}
+    Kind -->|container tool| ToolRun[ToolRun CR → Tool Job]
+    Kind -->|agent-backed tool / sub-agent| Child[child agent workflow:\ndeclarative loop, step Jobs,\nor AgentRun CR → Agent Job]
+    ToolRun --> Await[await result\nHMAC callback → workflow signal]
+    Child --> Await
+    Await -->|fold result into state,\nup to 4 plan steps| Plan
+```
+
+Things that are easy to miss:
+
+- **Retrieval has two layers.** RAG runs only over *skills*. A selected
+  skill's tools are looked up by id. There is no flat search over the whole
+  tool catalog.
+- **RBAC applies before anything reaches the LLM.** Skills have no
+  `allowedRoles` of their own. A skill's audience is the intersection of its
+  tools' `allowedRoles`, computed at index time. The Qdrant filter uses it,
+  and tool ids are checked again when they are resolved.
+- **Many turns end at `plan-action` and launch no Job.**
+- **Sub-agents use the same step as tools.** An agent is picked the same way
+  as a tool: it is one of the selected skill's tool ids. It runs as a child
+  workflow under the same plan/await step, not through a separate code path.
 
 > The diagram shows the original five CRDs. The full custom-resource reference —
 > all 14 kinds across tools, agents, knowledge bases, MCP, events and identity —
