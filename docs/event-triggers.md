@@ -529,7 +529,9 @@ in-flight runs) and a sweep publishes it once every hold is released:
 
 Both together hold until both are released. The sweep runs every 30s and
 immediately after a hold or a queue release; of several gateway replicas,
-exactly one publishes each completion (it is claimed before it is sent).
+exactly one publishes each completion (it is claimed before it is sent). A
+completion whose publish fails in transport (orchestrator unreachable or 5xx)
+is saved back in its place and retried on the next sweep.
 
 ### The coordinator
 

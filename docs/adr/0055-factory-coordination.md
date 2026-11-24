@@ -90,8 +90,11 @@ beside the in-flight runs) and publishes it once every hold is released:
   - **Not accepted:** a completion nobody accepted frees the queue at once.
 
 The record is claimed (deleted) before it is published, so of several replicas
-exactly one publishes it. The sweep runs every 30s, and also immediately after
-a hold or a queue release.
+exactly one publishes it. If the publish then fails in transport (the
+orchestrator is unreachable or answers 5xx), the replica saves the record
+back, with the same id and creation time, so the next sweep retries it in
+order. A delivered completion that nobody accepted is dropped. The sweep runs
+every 30s, and also immediately after a hold or a queue release.
 
 **Depth.** A wait that really blocked (its target was open when the run ended)
 restarts the chain's `depth` at 1 when it is published. Progress there was

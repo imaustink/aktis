@@ -48,6 +48,12 @@ interface WebhookOutcome {
   /** How the orchestrator answered the relay (absent when nothing was relayed). */
   relay?: "ignored" | "rejected" | "failed" | "identity-required" | "accepted";
 }
+
+/**
+ * How publishing a run event ended: accepted; delivered but not accepted (or
+ * stopped by a gate) -- final; or "failed", a transport failure worth retrying.
+ */
+type EmitRunEventResult = "accepted" | "not-accepted" | "failed";
 import { ClaudeCredentialRefresher, ClaudeCredentialSweeper } from "./claude-auth/credential-refresher.js";
 import { renderSessionPage } from "./session-page.js";
 import type { SessionPageStore } from "./session-page-store.js";
@@ -1447,16 +1453,24 @@ export class GatewayServer {
           if (ev.queue) await this.deferredStore.releaseQueue(ev.queue, holder);
           continue;
         }
-        let accepted = false;
+        // Stays "failed" if emitRunEvent throws: treated like a transport failure.
+        let result: EmitRunEventResult = "failed";
         try {
-          accepted =
-            (await this.emitRunEvent(ev.envelope, ev.sender, ev.trigger, ev.finished, this.githubReplyTarget(ev.trigger), ev.traceparent, {
-              resetDepth: ev.blocked === true,
-              ...(ev.queue ? { holdsQueue: { queue: ev.queue, holder } } : {}),
-            })) === "accepted";
+          result = await this.emitRunEvent(ev.envelope, ev.sender, ev.trigger, ev.finished, this.githubReplyTarget(ev.trigger), ev.traceparent, {
+            resetDepth: ev.blocked === true,
+            ...(ev.queue ? { holdsQueue: { queue: ev.queue, holder } } : {}),
+          });
         } finally {
           // Nothing started that could release it.
-          if (ev.queue && !accepted) await this.deferredStore.releaseQueue(ev.queue, holder);
+          if (ev.queue && result !== "accepted") await this.deferredStore.releaseQueue(ev.queue, holder);
+          // The orchestrator was unreachable (or publishing threw): put the
+          // event back, same id and createdAt so it keeps its place in line,
+          // and the next sweep retries it. A delivered-but-not-accepted
+          // outcome (ignored, rejected, depth, verify) is final and dropped.
+          if (result === "failed") {
+            await this.deferredStore.save(ev);
+            this.log(`held run event ${ev.trigger.name}: publish failed; held again for the next sweep`);
+          }
         }
       } catch (error) {
         this.report(error);
@@ -1553,7 +1567,7 @@ export class GatewayServer {
       /** The serialize queue the next hop's run will hold. */
       holdsQueue?: InflightRun["holdsQueue"];
     } = {},
-  ): Promise<"accepted" | "not-accepted"> {
+  ): Promise<EmitRunEventResult> {
     const emitTo = trigger.onComplete!.emitTo;
     const tag = `run event ${trigger.name || "trigger"} -> ${emitTo}`;
     const target = this.eventSources.get(emitTo);
@@ -1651,6 +1665,7 @@ export class GatewayServer {
     }
     // The next hop's run is its own lifecycle; this one is done.
     relayed.after?.().catch(this.report);
+    if (relayed.relay === "failed") return "failed";
     return relayed.relay === "accepted" ? "accepted" : "not-accepted";
   }
 

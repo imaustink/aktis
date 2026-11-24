@@ -1532,6 +1532,44 @@ describe("held run events and conflict events (docs/adr/0055)", () => {
     expect(await store.list()).toHaveLength(0);
   });
 
+  it("keeps a held event whose publish hits a failed relay, and publishes it on a later sweep", async () => {
+    const store = new InMemoryDeferredEventStore();
+    const h = await start({ deferredEventStore: store });
+    chain(h, PARK);
+    await postGithub(h);
+    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
+    const [held] = await store.list();
+
+    h.getIssueState.mockImplementation(async (_o: string, _r: string, n: number) => (n === 5 ? "closed" : "open"));
+    h.submitEvent.mockResolvedValueOnce({ kind: "failed", error: "orchestrator down" });
+    kick(h);
+    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
+    // Same record: its place in line holds.
+    expect((await store.list())[0]).toMatchObject({ id: held!.id, createdAt: held!.createdAt });
+    expect(h.logs.some((l) => l.includes("held again for the next sweep"))).toBe(true);
+
+    h.submitEvent.mockResolvedValue({ kind: "ignored" });
+    kick(h);
+    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(2));
+    expect(runEvents(h)[1]?.body).toMatchObject({ trigger: "factory-park", params: { waitFor: "5" } });
+    await vi.waitFor(async () => expect(await store.list()).toHaveLength(0));
+  });
+
+  it("drops a held event the orchestrator delivered but did not accept", async () => {
+    const store = new InMemoryDeferredEventStore();
+    const h = await start({ deferredEventStore: store });
+    chain(h, PARK);
+    await postGithub(h);
+    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
+    h.getIssueState.mockImplementation(async (_o: string, _r: string, n: number) => (n === 5 ? "closed" : "open"));
+    h.submitEvent.mockResolvedValue({ kind: "rejected", error: "bad params" });
+    kick(h);
+    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    await settle();
+    expect(await store.list()).toHaveLength(0);
+  });
+
   it("restarts the chain depth when the wait really blocked (counts are kept)", async () => {
     const store = new InMemoryDeferredEventStore();
     const FIRST: AcceptedTrigger = { ...PARK, name: "factory-coordinate", onComplete: { emitTo: "runs" } };
