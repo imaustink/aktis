@@ -14,7 +14,7 @@ patches:
   # Removed: the coordination intake (docs/adr/0055) outranks github-issue-
   # triage on the same `ai-triage` delivery, and the event-trigger specs drive
   # that delivery to github-issue-triage itself. Coordination routing is
-  # covered by orchestrator/packages/event-triggers/src/examples.test.ts and
+  # covered by orchestrator/engines/temporal/internal/catalog/examples_test.go and
   # the gateway's held-event tests.
   - target: { kind: EventTrigger, name: factory-intake }
     patch: |
@@ -92,6 +92,14 @@ patches:
       # other GitHub trigger is still exercised as shipped.
       - op: add
         path: /spec/reply/github/sessionPage
+        value: true
+  # github-pr-review ships without `reply.github.result` (the review itself is
+  # its output), but the readOnly spec reads the run's flags from the stub's
+  # reply, which only a result comment carries. Re-enabled here only.
+  - target: { kind: EventTrigger, name: github-pr-review }
+    patch: |
+      - op: add
+        path: /spec/reply/github/result
         value: true
   # A fixture Skill, not cluster-debug-skill: that one's audience needs
   # kubectl-readonly + signoz-query, which this profile neither builds nor
