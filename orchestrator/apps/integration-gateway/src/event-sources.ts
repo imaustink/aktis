@@ -29,9 +29,10 @@ export interface CompiledSender {
   provider: "github";
   /**
    * The CEL, as written. Evaluated per delivery by the orchestrator
-   * (`/events/prefilter`), the one CEL runtime; core-controller's Ready
-   * condition reports an expression that doesn't compile (InvalidCEL), and
-   * such an expression drops every delivery here, never runs without a gate.
+   * (`/events/prefilter`), the one CEL runtime. One that doesn't compile
+   * (asked of `/events/compile` by the server) makes the source 404, as an
+   * unknown one does; core-controller's Ready condition reports it too
+   * (InvalidCEL).
    */
   expressions: SenderExpressions;
   /** Default true: bot-authored events are dropped (self-trigger guard). */

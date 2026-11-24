@@ -129,6 +129,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleSessionLive(w, r)
 	case r.Method == http.MethodPost && path == "/events/prefilter":
 		s.handlePrefilter(w, r)
+	case r.Method == http.MethodPost && path == "/events/compile":
+		s.handleCompile(w, r)
 	case r.Method == http.MethodGet && path == "/healthz":
 		w.WriteHeader(http.StatusOK)
 	default:
@@ -231,6 +233,31 @@ func (s *Server) handlePrefilter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleCompile reports which of a set of CEL expressions do not compile.
+// integration-gateway asks before serving an EventSource whose sender block
+// carries them, so a source with a broken expression 404s exactly as it did
+// when the gateway compiled CEL itself (docs/event-triggers.md §8).
+func (s *Server) handleCompile(w http.ResponseWriter, r *http.Request) {
+	body, err := readBody(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "could not read body"})
+		return
+	}
+	if !s.admitCaller(w, r, "/events/compile", "") {
+		return
+	}
+	var req CompileRequest
+	if err := json.Unmarshal(body, &req); err != nil || req.Expressions == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": `body must be JSON: {"expressions": [<cel>, ...]}`})
+		return
+	}
+	if len(req.Expressions) > maxCompileExpressions {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("at most %d expressions per request", maxCompileExpressions)})
+		return
+	}
+	writeJSON(w, http.StatusOK, Compile(req))
 }
 
 // ── /invoke ────────────────────────────────────────────────────────────────

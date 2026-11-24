@@ -17,6 +17,7 @@ import type {
   OrchestratorInvokeResult,
   PollHooks,
   PrefilterResult,
+  CompileResult,
   SenderExpressions,
 } from "./orchestrator-client.js";
 import { GatewayServer, type GatewayServerOptions } from "./server.js";
@@ -175,6 +176,7 @@ interface Harness {
   logs: string[];
   submitEvent: ReturnType<typeof vi.fn>;
   prefilter: ReturnType<typeof vi.fn>;
+  compile: ReturnType<typeof vi.fn>;
   poll: ReturnType<typeof vi.fn>;
   invoke: ReturnType<typeof vi.fn>;
   postIssueComment: ReturnType<typeof vi.fn>;
@@ -211,6 +213,8 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
   const resolve = vi.spyOn(identityResolver, "resolve");
   const submitEvent = vi.fn(async (): Promise<EventSubmitResult> => ({ kind: "accepted", id: "inv-1", trigger: DEFAULT_TRIGGER }));
   const prefilter = vi.fn(async (envelope: Envelope, sender?: SenderExpressions): Promise<PrefilterResult> => fakePrefilter(envelope, sender));
+  // Everything SOURCES uses compiles unless a test says otherwise.
+  const compile = vi.fn(async (_expressions: string[]): Promise<CompileResult> => ({ kind: "ok", errors: {} }));
   const poll = vi.fn(async (_id: string, _hooks?: PollHooks): Promise<OrchestratorInvokeResult> => {
     order.push("poll");
     return { status: "succeeded", result: "Looks good." };
@@ -257,7 +261,7 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
     tickAuthenticator: { authenticate: async (token: string) => TICK_IDENTITIES[token] },
     tickNamespace: "agents",
     identityResolver,
-    orchestratorClient: { submitEvent, prefilter, poll, invoke, checkLive: vi.fn().mockResolvedValue({ live: false }) } as unknown as OrchestratorClient,
+    orchestratorClient: { submitEvent, prefilter, compile, poll, invoke, checkLive: vi.fn().mockResolvedValue({ live: false }) } as unknown as OrchestratorClient,
     githubReplyClient: {
       postIssueComment,
       updateIssueComment,
@@ -291,6 +295,7 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
     logs,
     submitEvent,
     prefilter,
+    compile,
     poll,
     invoke,
     postIssueComment,
@@ -643,6 +648,53 @@ describe("sender lookups are skipped for deliveries no trigger could match", () 
     });
     await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
     expect(h.prefilter).not.toHaveBeenCalled();
+  });
+});
+
+describe("a source whose sender CEL does not compile is served as unknown (404)", () => {
+  // Compiling is the orchestrator's (POST /events/compile, tested in Go); the
+  // gateway's job is to ask before serving, cache the answer, and fail open
+  // only to the per-delivery prefilter, which itself fails closed.
+
+  it("404s before reading the body, and never prefilters or relays", async () => {
+    const h = await start();
+    h.compile.mockResolvedValueOnce({ kind: "ok", errors: { "body.sender.login": "Syntax error" } });
+    expect((await postGithub(h)).status).toBe(404);
+    await settle();
+    expect(h.prefilter).not.toHaveBeenCalled();
+    expect(h.submitEvent).not.toHaveBeenCalled();
+    expect(h.logs.join("\n")).toMatch(/webhook github: sender expression does not compile, routes 404 \(Syntax error\)/);
+  });
+
+  it("asks once per distinct expression, then answers from cache", async () => {
+    const h = await start();
+    await postGithub(h);
+    await postGithub(h);
+    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(2));
+    expect(h.compile).toHaveBeenCalledTimes(1);
+    expect(h.compile.mock.calls[0]?.[0]).toEqual(["body.sender.login", 'body.sender.type == "Bot"', "body.repository.full_name"]);
+  });
+
+  it("an orchestrator that cannot answer leaves the source served (the prefilter still gates each delivery), and is asked again next time", async () => {
+    const h = await start();
+    h.compile.mockResolvedValueOnce({ kind: "failed", error: "/events/compile unreachable: ECONNREFUSED" });
+    expect((await postGithub(h)).status).toBe(202);
+    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
+    expect(h.prefilter).toHaveBeenCalled();
+    await postGithub(h);
+    expect(h.compile).toHaveBeenCalledTimes(2);
+  });
+
+  it("a source without `sender` is never compiled", async () => {
+    const h = await start();
+    const body = JSON.stringify(GITHUB_PAYLOAD);
+    await fetch(`http://localhost:${h.port}/webhooks/plain`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-sig": hmacHex("gh-secret", body) },
+      body,
+    });
+    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
+    expect(h.compile).not.toHaveBeenCalled();
   });
 });
 

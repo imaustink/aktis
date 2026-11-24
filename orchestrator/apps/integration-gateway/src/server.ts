@@ -31,6 +31,7 @@ import type {
   OrchestratorInvokeResult,
   PollHooks,
   CelResult,
+  SenderExpressions,
 } from "./orchestrator-client.js";
 import { parseAcceptedTrigger } from "./orchestrator-client.js";
 import type { SenderClaims } from "./sender-assertion.js";
@@ -90,6 +91,8 @@ const SOURCE_NAME = /^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$/;
  * unauthenticated sender can't make the gateway buffer more than this.
  */
 const MAX_WEBHOOK_BODY_BYTES = 25 * 1024 * 1024;
+/** Bound on the sender-CEL compile cache; real deployments have a handful of distinct expressions. */
+const MAX_CACHED_SENDER_EXPRESSIONS = 1000;
 /** A bearer that could be a Kubernetes JWT; anything else is refused without being verified. */
 const BEARER_JWT = /^Bearer ([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$/;
 /** Header carrying `sha256=<hex hmac(body)>` on a signed `reply.http` POST. */
@@ -390,6 +393,8 @@ export class GatewayServer {
   /** Runs this process is finishing, counted per session -- the label reconciler's "still going" signal. */
   private readonly runningSessions = new Map<string, number>();
   private readonly eventSources: EventSourceLookup;
+  /** Sender CEL the orchestrator has compiled: null when it compiles, else the compiler's message. */
+  private readonly compiledSenderExpressions = new Map<string, string | null>();
   private readonly log: (line: string) => void;
   private readonly now: () => Date;
   private readonly report: (error: unknown) => void;
@@ -636,6 +641,40 @@ export class GatewayServer {
     res.writeHead(404).end();
   }
 
+  /**
+   * Whether every sender expression of `sourceName` compiles, asked of the
+   * orchestrator (the one CEL compiler) once per distinct expression and then
+   * cached: compiling is deterministic, so an answer never goes stale, and an
+   * edited expression is a new cache key. A source with a broken expression
+   * 404s, as it did when this process compiled CEL itself.
+   *
+   * When the orchestrator can't answer, the source is served: each delivery's
+   * `/events/prefilter` then evaluates (and fails closed on) the same
+   * expressions, so serving it never lets an unevaluated sender through.
+   */
+  private async senderCompiles(sourceName: string, expressions: SenderExpressions): Promise<boolean> {
+    const all = [expressions.loginFrom, expressions.isBotFrom, expressions.repositoryFrom, expressions.accountIdFrom].filter(
+      (e): e is string => typeof e === "string" && e !== "",
+    );
+    const unknown = all.filter((e) => !this.compiledSenderExpressions.has(e));
+    if (unknown.length > 0) {
+      const result = await this.options.orchestratorClient.compile(unknown);
+      if (result.kind === "failed") {
+        this.log(`webhook ${sourceName}: could not check its sender CEL (${result.error}); serving it, each delivery is still evaluated`);
+        return true;
+      }
+      if (this.compiledSenderExpressions.size + unknown.length > MAX_CACHED_SENDER_EXPRESSIONS) {
+        this.compiledSenderExpressions.clear();
+      }
+      for (const expr of unknown) {
+        const error = result.errors[expr];
+        this.compiledSenderExpressions.set(expr, error ?? null);
+        if (error !== undefined) this.log(`webhook ${sourceName}: sender expression does not compile, routes 404 (${error})`);
+      }
+    }
+    return all.every((e) => this.compiledSenderExpressions.get(e) == null);
+  }
+
   /** The source a route names, or undefined (-> 404) for an unknown, unusable or wrongly-kinded one. */
   private lookupSource(rawName: string, kind: CompiledEventSource["kind"]): CompiledEventSource | undefined {
     let name: string;
@@ -663,6 +702,12 @@ export class GatewayServer {
   private async handleWebhook(req: IncomingMessage, res: ServerResponse, rawName: string): Promise<void> {
     const source = this.lookupSource(rawName, "webhook");
     if (!source || source.kind !== "webhook") {
+      res.writeHead(404).end();
+      return;
+    }
+    if (source.sender && !(await this.senderCompiles(source.name, source.sender.expressions))) {
+      // An unusable source, exactly like an unknown one: its sender CEL can
+      // never be evaluated, so no delivery to it could ever be relayed.
       res.writeHead(404).end();
       return;
     }

@@ -201,3 +201,30 @@ func evaluate(expr string, envelope catalog.Envelope) EvalResult {
 	}
 	return result
 }
+
+// maxCompileExpressions bounds one /events/compile request. A sender block
+// has at most four expressions; the gateway sends one source's at a time.
+const maxCompileExpressions = 64
+
+// CompileRequest is POST /events/compile's body.
+type CompileRequest struct {
+	Expressions []string `json:"expressions"`
+}
+
+// CompileResponse maps each expression that does NOT compile to the
+// compiler's message. An expression absent from Errors compiled.
+type CompileResponse struct {
+	Errors map[string]string `json:"errors"`
+}
+
+// Compile checks expressions with the same compiler Prefilter evaluates them
+// with, so "compiles" here and "can be evaluated over a delivery" agree.
+func Compile(req CompileRequest) CompileResponse {
+	resp := CompileResponse{Errors: map[string]string{}}
+	for _, expr := range req.Expressions {
+		if _, err := catalog.CompileEventExpr(expr); err != nil {
+			resp.Errors[expr] = err.Error()
+		}
+	}
+	return resp
+}

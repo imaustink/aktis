@@ -133,6 +133,9 @@ export type PrefilterResult =
   | { kind: "ok"; couldMatch: boolean; sender: Record<string, CelResult> }
   | { kind: "failed"; error: string };
 
+/** `POST /events/compile`: each expression that does not compile, mapped to the compiler's message. */
+export type CompileResult = { kind: "ok"; errors: Record<string, string> } | { kind: "failed"; error: string };
+
 export type EventSubmitResult =
   /** 200 `{"status":"ignored"}` -- no trigger matched; no turn ran. */
   | { kind: "ignored" }
@@ -410,37 +413,15 @@ export class OrchestratorClient {
    * there, by the same Go evaluator that matches triggers -- this process has
    * no CEL runtime of its own.
    *
-   * Retried past a connection failure like `/invoke`; any other failure
-   * (non-2xx, bad body) is returned as `failed`, which the caller treats as a
-   * drop: what comes out of here decides whose credentials a run gets, so
-   * "couldn't tell" never means "let it through".
+   * Retried past a connection failure or a 5xx (see {@link postRead}); any
+   * other failure (4xx, bad body, retries exhausted) is returned as `failed`,
+   * which the caller treats as a drop: what comes out of here decides whose
+   * credentials a run gets, so "couldn't tell" never means "let it through".
    */
   async prefilter(envelope: Envelope, sender: SenderExpressions | undefined): Promise<PrefilterResult> {
-    const post = async (): Promise<Response> =>
-      this.fetchImpl(`${this.baseUrl()}/events/prefilter`, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${await this.resolveToken()}` },
-        body: JSON.stringify({ envelope, ...(sender ? { sender } : {}) }),
-      });
-    let res: Response | undefined;
-    let networkError: unknown;
-    for (let attempt = 1; attempt <= ACCEPT_RETRY_ATTEMPTS && !res; attempt++) {
-      try {
-        res = await post();
-      } catch (err) {
-        networkError = err;
-        if (attempt < ACCEPT_RETRY_ATTEMPTS) await this.sleep(ACCEPT_RETRY_DELAY_MS);
-      }
-    }
-    if (!res) return { kind: "failed", error: `/events/prefilter unreachable: ${errorText(networkError)}` };
-    const text = await res.text();
-    if (!res.ok) return { kind: "failed", error: `/events/prefilter failed: ${res.status} ${text}` };
-    let body: unknown;
-    try {
-      body = JSON.parse(text);
-    } catch {
-      return { kind: "failed", error: `/events/prefilter returned non-JSON: ${text}` };
-    }
+    const read = await this.postRead("/events/prefilter", { envelope, ...(sender ? { sender } : {}) });
+    if (read.kind === "failed") return read;
+    const body = read.body;
     if (!isPlainObject(body) || typeof body.couldMatch !== "boolean") {
       return { kind: "failed", error: "/events/prefilter returned an unexpected body" };
     }
@@ -455,6 +436,63 @@ export class OrchestratorClient {
       }
     }
     return { kind: "ok", couldMatch: body.couldMatch, sender: results };
+  }
+
+  /**
+   * Which of `expressions` do not compile (`POST /events/compile`), each
+   * mapped to the compiler's message; an expression absent from `errors`
+   * compiled. Same compiler {@link prefilter} evaluates with, so the gateway
+   * can refuse to serve a source whose sender block could never be evaluated.
+   */
+  async compile(expressions: string[]): Promise<CompileResult> {
+    const read = await this.postRead("/events/compile", { expressions });
+    if (read.kind === "failed") return read;
+    const body = read.body;
+    if (!isPlainObject(body) || !isPlainObject(body.errors)) {
+      return { kind: "failed", error: "/events/compile returned an unexpected body" };
+    }
+    const errors: Record<string, string> = {};
+    for (const [expr, message] of Object.entries(body.errors)) {
+      errors[expr] = typeof message === "string" ? message : "does not compile";
+    }
+    return { kind: "ok", errors };
+  }
+
+  /**
+   * POSTs to a side-effect-free orchestrator endpoint and parses its JSON.
+   * Because nothing is written, a 5xx is retried as well as a connection
+   * failure -- unlike `/invoke`, where a retried 5xx could start a turn twice.
+   * That covers the window in which a draining orchestrator pod still receives
+   * traffic during a rollout.
+   */
+  private async postRead(path: string, payload: unknown): Promise<{ kind: "ok"; body: unknown } | { kind: "failed"; error: string }> {
+    let lastError = "";
+    for (let attempt = 1; attempt <= ACCEPT_RETRY_ATTEMPTS; attempt++) {
+      if (attempt > 1) await this.sleep(ACCEPT_RETRY_DELAY_MS);
+      let res: Response;
+      try {
+        res = await this.fetchImpl(`${this.baseUrl()}${path}`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${await this.resolveToken()}` },
+          body: JSON.stringify(payload),
+        });
+      } catch (err) {
+        lastError = `${path} unreachable: ${errorText(err)}`;
+        continue;
+      }
+      const text = await res.text();
+      if (res.status >= 500) {
+        lastError = `${path} failed: ${res.status} ${text}`;
+        continue;
+      }
+      if (!res.ok) return { kind: "failed", error: `${path} failed: ${res.status} ${text}` };
+      try {
+        return { kind: "ok", body: JSON.parse(text) };
+      } catch {
+        return { kind: "failed", error: `${path} returned non-JSON: ${text}` };
+      }
+    }
+    return { kind: "failed", error: lastError };
   }
 
   /**

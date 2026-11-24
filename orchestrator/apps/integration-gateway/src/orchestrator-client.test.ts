@@ -667,3 +667,55 @@ describe("run outcomes and accepted-trigger chaining fields (docs/adr/0052)", ()
     expect(junk.onComplete).toEqual({ emitTo: "runs" });
   });
 });
+
+describe("OrchestratorClient side-effect-free reads (/events/prefilter, /events/compile)", () => {
+  const envelope = {
+    source: "github",
+    kind: "webhook",
+    id: "d1",
+    time: "2026-01-01T00:00:00Z",
+    headers: {},
+    body: {},
+    sender: {},
+    repository: "",
+  } as Parameters<OrchestratorClient["prefilter"]>[0];
+  const client = (fetchImpl: ReturnType<typeof vi.fn>) =>
+    new OrchestratorClient({ baseUrl: "http://orchestrator:8081", token: "tok", sleep: noopSleep, fetchImpl: fetchImpl as unknown as typeof fetch });
+  const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status });
+
+  it("retries a 5xx (a draining pod mid-rollout) and a connection failure, then returns the answer", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(json(503, { error: "orchestrator is shutting down; retry" }))
+      .mockRejectedValueOnce(new Error("ECONNRESET"))
+      .mockResolvedValueOnce(json(200, { couldMatch: true, sender: { loginFrom: { ok: true, type: "string", value: "alice" } } }));
+    const result = await client(fetchImpl).prefilter(envelope, { loginFrom: "body.sender.login" });
+    expect(result).toEqual({ kind: "ok", couldMatch: true, sender: { loginFrom: { ok: true, type: "string", value: "alice" } } });
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it("fails after the retries run out, naming the last error", async () => {
+    const fetchImpl = vi.fn().mockImplementation(async () => json(500, { error: "boom" }));
+    const result = await client(fetchImpl).prefilter(envelope, undefined);
+    expect(result).toEqual({ kind: "failed", error: '/events/prefilter failed: 500 {"error":"boom"}' });
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not retry a 4xx: the request itself is wrong", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(json(401, { error: "unauthorized" }));
+    expect((await client(fetchImpl).prefilter(envelope, undefined)).kind).toBe("failed");
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("compile returns the expressions that do not compile", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(json(200, { errors: { "body.(": "Syntax error" } }));
+    expect(await client(fetchImpl).compile(["body.a", "body.("])).toEqual({ kind: "ok", errors: { "body.(": "Syntax error" } });
+    expect(fetchImpl.mock.calls[0]?.[0]).toBe("http://orchestrator:8081/events/compile");
+    expect(JSON.parse((fetchImpl.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({ expressions: ["body.a", "body.("] });
+  });
+
+  it("compile rejects an unexpected body", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(json(200, { nope: true }));
+    expect(await client(fetchImpl).compile(["body.a"])).toEqual({ kind: "failed", error: "/events/compile returned an unexpected body" });
+  });
+});

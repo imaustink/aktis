@@ -335,9 +335,14 @@ opencode-swe-agent) act on one by name:
 
 ## 7. Gateway endpoints
 
-- `POST /webhooks/:source` — `404` unknown or non-webhook source; `401` failed
-  verification; `202` otherwise (relay continues in the background). Dropped
-  events (bot, unresolved sender) are `202` + a log line, so senders don't retry.
+- `POST /webhooks/:source` — `404` unknown or non-webhook source, or one whose
+  `sender.*From` expressions don't compile; `401` failed verification; `202`
+  otherwise (relay continues in the background). Dropped events (bot,
+  unresolved sender) are `202` + a log line, so senders don't retry.
+  Compilation is asked of agent-orchestrator's `POST /events/compile`
+  (`{expressions} → {errors: {<expr>: <message>}}`) once per distinct
+  expression and cached; if it can't answer, the source is served and each
+  delivery's prefilter (below) still fails closed.
   Before resolving a source's `sender` (live GitHub API calls), the gateway
   sends the preliminary envelope (`sender {}`, `repository ""`) and the
   source's `sender.*From` expressions to agent-orchestrator's
@@ -348,9 +353,10 @@ opencode-swe-agent) act on one by name:
   cost no API calls. A trigger whose `match.cel` references `sender` or
   `repository` can't be decided before resolution and counts as a possible
   match. The sender results (an `int` as its decimal string) are then checked
-  for type exactly as before; an expression that doesn't compile is an
-  `ok:false` result and drops the delivery, as does a prefilter that cannot be
-  reached after a few retries. This only ever drops early; matching stays the
+  for type exactly as before; an evaluation error is an `ok:false` result and
+  drops the delivery, as does a prefilter that still fails after a few retries
+  (connection errors and `5xx` are retried — the call has no side effects).
+  This only ever drops early; matching stays the
   orchestrator's, and an event that survives is still sender-verified.
 - `POST /events/:source/tick` — `Authorization: Bearer <projected SA token>`.
   The gateway verifies it against the cluster's ServiceAccount issuer keys
