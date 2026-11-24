@@ -1,9 +1,5 @@
-import { readFileSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-import { spawn, type ChildProcess } from "node:child_process";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { startFake, type FakeProvider } from "../support/fake-provider.js";
 
 import { ConfluenceDriver } from "../../orchestrator/apps/connection-broker/src/drivers/confluence.js";
 import { PermissionDeniedError } from "../../orchestrator/apps/connection-broker/src/drivers/types.js";
@@ -29,61 +25,23 @@ import { PermissionDeniedError } from "../../orchestrator/apps/connection-broker
  * for — expressible at all.
  */
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const MANIFEST = join(HERE, "..", "manifests", "fake-confluence.yaml");
-
 const SERVICE = "e2e-service-token";
 const USER_FULL = "e2e-user-full";
 const USER_LIMITED = "e2e-user-limited";
 const CLOUD_ID = "e2e-cloud-id";
 
-let child: ChildProcess;
+let fake: FakeProvider;
 let origin: string;
 
-/**
- * Runs the manifest's own `server.js`, not a copy.
- *
- * A copy is the drift this spec exists to prevent, one level up.
- */
-function extractServer(): string {
-  const yaml = readFileSync(MANIFEST, "utf8");
-  const start = yaml.indexOf("  server.js: |");
-  expect(start, "manifest no longer contains a server.js key").toBeGreaterThan(-1);
-
-  const lines = yaml.slice(start).split("\n").slice(1);
-  const body: string[] = [];
-  for (const line of lines) {
-    // The block ends at the first line that is neither blank nor indented
-    // past the key — the document separator, in practice.
-    if (line.trim() !== "" && !line.startsWith("    ")) break;
-    body.push(line.slice(4));
-  }
-  return body.join("\n");
-}
-
+// Runs the manifest's own `server.js`, not a copy (support/fake-provider.ts),
+// on a free port: it used to take 8080, where any local port-forward answered
+// its health check instead.
 beforeAll(async () => {
-  const dir = mkdtempSync(join(tmpdir(), "fake-confluence-"));
-  const script = join(dir, "server.js");
-  writeFileSync(script, extractServer());
-
-  child = spawn(process.execPath, [script], { stdio: ["ignore", "pipe", "pipe"] });
-  origin = "http://127.0.0.1:8080";
-
-  // Wait for the listener rather than sleeping a guessed interval.
-  const deadline = Date.now() + 15_000;
-  for (;;) {
-    try {
-      const res = await fetch(`${origin}/healthz`);
-      if (res.ok) break;
-    } catch {
-      /* not up yet */
-    }
-    if (Date.now() > deadline) throw new Error("fake-confluence did not start");
-    await new Promise((r) => setTimeout(r, 100));
-  }
+  fake = await startFake("fake-confluence.yaml");
+  origin = fake.origin;
 });
 
-afterAll(() => child?.kill());
+afterAll(() => fake?.stop());
 
 const driver = () =>
   new ConfluenceDriver({

@@ -37,7 +37,7 @@ const LEADS = { channel: "CLEADS" };
 let fake: FakeProvider;
 
 beforeAll(async () => {
-  fake = await startFake("fake-slack.yaml", 18091);
+  fake = await startFake("fake-slack.yaml");
 });
 
 afterAll(() => fake?.stop());

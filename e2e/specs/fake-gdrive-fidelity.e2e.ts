@@ -30,7 +30,7 @@ const SCOPE = { folderID: "FROOT" };
 let fake: FakeProvider;
 
 beforeAll(async () => {
-  fake = await startFake("fake-gdrive.yaml", 18092);
+  fake = await startFake("fake-gdrive.yaml");
 });
 
 afterAll(() => fake?.stop());

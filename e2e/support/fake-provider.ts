@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, type ChildProcess } from "node:child_process";
+import { createServer, type AddressInfo } from "node:net";
 
 /**
  * Runs a fake provider's server OUT OF THE MANIFEST THE CLUSTER DEPLOYS.
@@ -43,13 +44,27 @@ function extractServer(manifest: string): string {
 }
 
 /**
- * Starts the fake and waits for it to listen.
+ * A port nothing on this host is listening on. A fixed one collides with
+ * whatever the developer happens to run: a port-forward on 8080 answered the
+ * confluence fake's health check with a 404 until the spec gave up.
+ */
+async function freePort(): Promise<number> {
+  const probe = createServer();
+  await new Promise<void>((resolve, reject) => probe.once("error", reject).listen(0, "127.0.0.1", () => resolve()));
+  const { port } = probe.address() as AddressInfo;
+  await new Promise<void>((resolve) => probe.close(() => resolve()));
+  return port;
+}
+
+/**
+ * Starts the fake and waits for it to listen. With no port, on a free one.
  *
  * Waits on the health endpoint rather than sleeping a guessed interval: a
  * fixed sleep is either slower than it needs to be or flaky, and usually both
  * on a loaded machine.
  */
-export async function startFake(manifest: string, port: number): Promise<FakeProvider> {
+export async function startFake(manifest: string, requestedPort?: number): Promise<FakeProvider> {
+  const port = requestedPort ?? (await freePort());
   const dir = mkdtempSync(join(tmpdir(), "fake-provider-"));
   const script = join(dir, "server.js");
   writeFileSync(script, extractServer(manifest));
