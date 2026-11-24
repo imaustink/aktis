@@ -64,24 +64,34 @@ mcp-broker (ADR 0045) is a small service that only the Go engines call.
 ## Consequences
 
 - **A webhook with a `sender` block costs one extra in-cluster round trip**
-  before sender resolution. A prefilter that cannot be reached (after the
-  same short retry the `/invoke` relay uses) drops the delivery: what it
-  computes selects whose credentials a run gets, so "couldn't evaluate" never
-  means "let it through". A delivery the relay could not have handed to the
-  orchestrator anyway is lost either way.
-- **A sender expression that does not compile no longer makes its source's
-  routes 404.** The gateway has no compiler, so the source is served and each
-  delivery's evaluation fails, which drops it (`202` + log line). Both are
-  fail-closed; core-controller's `Ready=False / InvalidCEL` is how an operator
-  finds out, as it already was for triggers.
+  before sender resolution. The call is side-effect free, so connection
+  errors and `5xx` (a draining pod mid-rollout) are retried; one that still
+  fails drops the delivery: what it computes selects whose credentials a run
+  gets, so "couldn't evaluate" never means "let it through". A delivery the
+  relay could not have handed to the orchestrator anyway is lost either way.
+- **A sender expression that does not compile still makes its source's routes
+  404.** The gateway asks `POST /events/compile` once per distinct expression
+  and caches the answer (compiling is deterministic). Only while the
+  orchestrator cannot answer is such a source served, and then each
+  delivery's prefilter fails on the same expression and drops it.
 - **The caller-tool store speaks Qdrant's gRPC API** (the engine's client)
   rather than REST. The host comes from `AGENT_QDRANT_URL`; the port is
   `AGENT_QDRANT_GRPC_PORT` (default 6334, the Qdrant default). It reuses the
   existing collection, but derives point ids differently and stores
-  `lastSeenAt` in seconds where the TS store used milliseconds. So each
-  definition is embedded once more on first sight after the rollout, and
-  `Prune` also ages out millisecond timestamps, so the TS-written points
-  are swept on the normal TTL instead of living forever.
+  `lastSeenAt` in seconds where the TS store used milliseconds. A definition
+  the TS store already embedded is not re-embedded: on first sight `Index`
+  finds the TS point (same content hash, the TS id derivation), copies its
+  vector to the new id and deletes the old point. `Prune` also ages out
+  millisecond timestamps, so TS-written points never seen again are swept on
+  the normal TTL instead of living forever.
+- **mcp-broker** keeps its contract. Where the TS process behaved badly, the Go
+  one does not: it serves while the first discovery sweep runs (invocation
+  never depended on discovery, only on the bound MCPServers, which load
+  first), gives up on a Kubernetes listing after 60s instead of hanging, exits
+  on a non-numeric `DISCOVERY_INTERVAL_MS` instead of spinning, and re-reads
+  Secrets on resync.
+- **The cluster e2e suite needs a Go toolchain** on PATH: three specs run Go
+  tests against the live cluster.
 - The TS orchestrator's unit tests are ported to Go beside the code; the e2e
   suite, which is black-box over HTTP and Kubernetes, stays TypeScript and is
   the compatibility check for the swap.

@@ -92,6 +92,12 @@ nothing asserting it is just a claim.
 npm run e2e -w e2e                  # or: npx vitest run --config e2e/vitest.config.ts
 ```
 
+Needs `node`, `kubectl` and a Go toolchain (`go`, the version in
+`orchestrator/engines/temporal/go.mod`) on PATH. Three specs --
+`chat-harness`, `caller-tools` and `mcp-broker-contract` -- drive Go tests
+against the live cluster (`support/go-test.ts`), because the code they check
+is Go (docs/adr/0055).
+
 Tests are **serial** (`fileParallelism: false`, `maxConcurrency: 1`): they
 share one cluster, and several assert on global state (Redis keys, AgentRun
 lists) that concurrent runs would race on.
