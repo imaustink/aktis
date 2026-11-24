@@ -77,10 +77,19 @@ Modelling tools and agents as custom resources flips this:
 
 ## System architecture
 
+Two separate things touch the Tool / Skill / Agent catalog. **Indexing**
+watches the custom resources continuously and embeds them into Qdrant
+([ADR 0020](docs/adr/0020-crd-catalog-hot-reload-via-k8s-watch.md)). **Lookup** happens on
+every turn, inside the agent loop, and chooses which skill, tool or sub-agent
+(if any) handles the request.
+
 ```mermaid
 graph TD
     User([User / Chat client])
-    Orchestrator[agent-orchestrator\nDeployment]
+    Orchestrator[agent-orchestrator\nfacade · identity · event triggers]
+    Gateway[Temporal engine gateway\nHMAC callback → signal bridge]
+    Worker[Temporal worker\nConversationWorkflow = per-turn agent loop]
+    CatalogSync[catalog-sync\nwatches CRs live]
     Controller[core-controller\nDeployment]
 
     subgraph CRDs["Custom Resources (core.aktis.ai/v1alpha1)"]
@@ -91,24 +100,102 @@ graph TD
         AgentRunCR[AgentRun CR\nagentRef · goal · callback]
     end
 
+    subgraph Qdrant["Qdrant (vector store)"]
+        SkillsCol[(skills collection\n+ derived audience roles)]
+        ToolsCol[(tools + agents collections\nallowedRoles per record)]
+    end
+
     subgraph Jobs["Kubernetes Jobs (one-shot)"]
         ToolJob[Tool Job pod]
         AgentJob[Agent Job pod]
     end
 
-    CallbackSrv[CallbackReceiver\nport 8080]
-    Qdrant[(Qdrant\nvector store)]
+    %% Indexing: continuous, not per turn
+    ToolCR & SkillCR & AgentCR -.->|watch, ADR 0020| CatalogSync
+    CatalogSync -.->|embed skills; audience = ∩ of tools' allowedRoles, ADR 0011| SkillsCol
+    CatalogSync -.->|upsert tools / agents| ToolsCol
 
-    User -->|POST /v1/chat/completions| Orchestrator
-    Orchestrator -->|RAG skill + tool selection| Qdrant
-    Orchestrator -->|reads CRs at startup| ToolCR & SkillCR
-    Orchestrator -->|kubectl create| ToolRunCR & AgentRunCR
+    %% Per turn
+    User -->|POST /v1/chat/completions · /invoke| Orchestrator
+    Orchestrator -->|signed caller identity + turn| Gateway
+    Gateway -->|update-with-start| Worker
+    Worker -->|RAG over skills, filtered to caller's roles| SkillsCol
+    Worker -->|RAG over agents + tools, ADR 0037;\ngetByIds on the chosen skill's toolIds, RBAC re-check| ToolsCol
+    Worker -->|create, only if the plan calls one| ToolRunCR & AgentRunCR
     Controller -->|watches + reconciles| ToolRunCR & AgentRunCR & ToolCR & SkillCR & AgentCR
     Controller -->|creates Job with secret injection| ToolJob & AgentJob
-    ToolJob & AgentJob -->|HMAC POST /callback/:id| CallbackSrv
-    CallbackSrv -->|resolves pending promise| Orchestrator
+    ToolJob & AgentJob -->|HMAC POST /callback/:id| Gateway
+    Gateway -->|signal| Worker
+    Worker -->|reply| Orchestrator
     Orchestrator -->|final SSE chunk| User
 ```
+
+Dotted edges are indexing, which runs all the time. Solid edges are one turn.
+
+### How a turn finds its skill, tool or agent
+
+The loop runs as a durable Temporal workflow
+([ADR 0036](docs/adr/0036-temporal-execution-engine.md)). Every LLM,
+Qdrant and Kubernetes call in it is an activity. The steps match the agent
+core in [docs/orchestrator.md](docs/orchestrator.md#1-agent-core), which also
+has a step-by-step [sequence diagram](docs/orchestrator.md#high-level-flow).
+
+```mermaid
+flowchart TD
+    Start([Turn arrives]) --> Identity[resolve identity → subject + roles\nfail closed]
+    Identity --> Active{Conversation has an\nactive skill? ADR 0012}
+    Active -->|yes| Fit[re-fetch skill under the caller's current roles\n+ cheap fit check]
+    Fit -->|fits| Load
+    Fit -->|miss, not an error| Gate
+    Active -->|no| Gate{Capability gate:\nconversational turn?}
+    Gate -->|yes| Done
+    Gate -->|needs capabilities| Retrieve[retrieve, each filtered to the caller's roles:\nskills · agents · bare tools\ntools fit-gated, ADR 0008 / 0011 / 0037]
+    Retrieve -->|nothing matched| Fallback([noMatchFallback])
+    Retrieve -->|only skills matched| SelectSkill[select-skill]
+    Retrieve -->|agents or tools matched| Delegate{SelectDelegate\nskill · agent · tool}
+    Delegate -->|skill| Load
+    Delegate -->|agent| DelegateAgent([delegateToAgent\nwhole turn goes to the agent])
+    Delegate -->|tool| RunTool([runSelectedTool\nplan the call, run that one tool])
+    Delegate -->|no choice| Fallback
+    SelectSkill -->|skill| Load
+    SelectSkill -->|none| Fallback
+    Load[load-skill-tools\nresolve skill.toolIds + agentRefs directly with getByIds,\nno second semantic search; RBAC re-checked]
+    Load --> Plan{plan-action\nskill markdown as system prompt}
+    Plan -->|respond| Done([Reply: no Job launched])
+    Plan -->|call a tool| Kind{What does the chosen\ncandidate point at?}
+    Kind -->|container tool| ToolRun[ToolRun CR → Tool Job]
+    Kind -->|agent-backed tool or skill agentRef| Child[child agent workflow:\ndeclarative loop, step Jobs,\nor AgentRun CR → Agent Job]
+    Kind -->|LocalTool, ADR 0014| Local[executor sidecar activity\nno Job]
+    Kind -->|knowledge-base tool, ADR 0039| KB[in-worker search / lookup / read\nno Job]
+    Kind -->|MCP tool, ADR 0045| MCP[mcp-broker activity\nno Job]
+    Kind -->|caller tool, ADR 0035| CallerTool([turn ends: client runs the tool\nno Job])
+    ToolRun --> Await[await result\nHMAC callback → workflow signal]
+    Child --> Await
+    Await --> Fold[fold result into state]
+    Local --> Fold
+    KB --> Fold
+    MCP --> Fold
+    Fold -->|up to 8 plan steps| Plan
+```
+
+Things that are easy to miss:
+
+- **Retrieval is mostly skill-mediated.** Skills, agents and (fit-gated)
+  bare tools are each retrieved, and one combined selector picks among them
+  ([ADR 0037](docs/adr/0037-tools-compete-directly-in-delegate-selection.md)).
+  Once a skill is chosen, its tools are looked up by id, with no second search.
+- **RBAC applies before anything reaches the LLM.** Skills have no
+  `allowedRoles` of their own. A skill's audience is the intersection of its
+  tools' `allowedRoles`, computed at index time. The Qdrant filter uses it,
+  and tool ids are checked again when they are resolved.
+- **Many turns end at `plan-action` and launch no Job.** Not every tool call
+  launches one either: LocalTools, knowledge-base tools and MCP tools run as
+  activities, and a caller tool ends the turn for the client to run.
+- **Sub-agents reach a turn two ways.** The combined selector can delegate
+  the whole turn to a retrieved agent directly. Inside a skill, an
+  agent-backed tool or one of the skill's own `agentRefs` (ADR 0021) is a
+  plan candidate like any tool and runs as a child workflow under the same
+  plan/await step.
 
 > The diagram shows the original five CRDs. The full custom-resource reference —
 > all 14 kinds across tools, agents, knowledge bases, MCP, events and identity —
