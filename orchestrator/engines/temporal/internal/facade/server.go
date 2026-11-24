@@ -265,13 +265,13 @@ func (s *Server) handleCompile(w http.ResponseWriter, r *http.Request) {
 // triggerResponse is the 202's `trigger` object for an event turn
 // (docs/event-triggers.md §5, docs/adr/0052 §1/§3).
 type triggerResponse struct {
-	Name       string                 `json:"name"`
-	SessionID  string                 `json:"sessionId"`
-	Reply      *catalog.RenderedReply `json:"reply"`
-	Params     map[string]string      `json:"params"`
-	OnComplete *struct {
-		EmitTo string `json:"emitTo"`
-	} `json:"onComplete,omitempty"`
+	Name      string                 `json:"name"`
+	SessionID string                 `json:"sessionId"`
+	Reply     *catalog.RenderedReply `json:"reply"`
+	Params    map[string]string      `json:"params"`
+	// OnComplete is present only when the trigger sets onComplete.emitTo, with
+	// its waitUntilClosed / serialize holds (docs/adr/0055) passed through.
+	OnComplete *catalog.EventTriggerOnComplete `json:"onComplete,omitempty"`
 }
 
 func newTriggerResponse(m *catalog.TriggerMatch) *triggerResponse {
@@ -280,9 +280,8 @@ func newTriggerResponse(m *catalog.TriggerMatch) *triggerResponse {
 		t.Params = map[string]string{}
 	}
 	if oc := m.Trigger.Spec.OnComplete; oc != nil && oc.EmitTo != "" {
-		t.OnComplete = &struct {
-			EmitTo string `json:"emitTo"`
-		}{EmitTo: oc.EmitTo}
+		echo := *oc
+		t.OnComplete = &echo
 	}
 	return t
 }
@@ -434,6 +433,7 @@ func (s *Server) handleInvokeTraced(w http.ResponseWriter, r *http.Request, span
 			ForcedSkillID:    target.SkillRef,
 			ForcedAgentID:    target.AgentRef,
 			ReadOnly:         target.ReadOnly,
+			Outcome:          target.Outcome,
 			Params:           match.StringParams,
 			IdentityOverride: target.Identity,
 		}
@@ -713,6 +713,7 @@ func (s *Server) buildTurnInput(ctx context.Context, t turnRequest) TurnInput {
 		input.ForcedToolID = t.trigger.ForcedToolID
 		input.ToolInput = t.trigger.ToolInput
 		input.ReadOnly = t.trigger.ReadOnly
+		input.Outcome = t.trigger.Outcome
 		if len(t.trigger.Params) > 0 {
 			input.Params = t.trigger.Params
 		}

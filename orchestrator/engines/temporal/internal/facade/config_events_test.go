@@ -122,7 +122,7 @@ func TestParseEnvelopeRejects(t *testing.T) {
 	}{
 		"not an object":         {"github", "event must be an object"},
 		"no kind":               {base(map[string]any{"kind": nil}), "event.kind"},
-		"unknown kind":          {base(map[string]any{"kind": "push"}), `event.kind must be "webhook", "cron" or "run"`},
+		"unknown kind":          {base(map[string]any{"kind": "push"}), `event.kind must be "webhook", "cron", "run" or "conflict"`},
 		"no source":             {base(map[string]any{"source": nil}), "event.source"},
 		"empty source":          {base(map[string]any{"source": ""}), "event.source"},
 		"no id":                 {base(map[string]any{"id": nil}), "event.id"},

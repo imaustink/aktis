@@ -48,12 +48,16 @@ type TurnInput struct {
 	// read gate.
 	TargetRepository string
 	// The EventTrigger-resolved dispatch, when there is one.
-	TriggerName      string
-	ForcedSkillID    string
-	ForcedAgentID    string
-	ForcedToolID     string
-	ToolInput        string
-	ReadOnly         bool
+	TriggerName   string
+	ForcedSkillID string
+	ForcedAgentID string
+	ForcedToolID  string
+	ToolInput     string
+	ReadOnly      bool
+	// Outcome is the trigger's target.outcome (docs/adr/0055): the structured
+	// outcome the forced agent's run reports. Trigger turns only, never
+	// sticky, and forwarded only inside the signed dispatch assertion.
+	Outcome          string
 	Params           map[string]string
 	IdentityOverride string
 	Traceparent      string
@@ -461,6 +465,7 @@ func (e *TemporalEngine) invokeRequest(input TurnInput, caller *forwardedCaller,
 			ForcedSkillID: input.ForcedSkillID,
 			ForcedAgentID: input.ForcedAgentID,
 			ReadOnly:      input.ReadOnly,
+			Outcome:       input.Outcome,
 			Identity:      input.IdentityOverride,
 		}
 		if input.ForcedToolID != "" {

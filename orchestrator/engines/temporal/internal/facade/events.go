@@ -27,8 +27,8 @@ func ParseEnvelope(raw any) (catalog.Envelope, error) {
 		return catalog.Envelope{}, fmt.Errorf("event.source must be a non-empty string")
 	}
 	kind, _ := obj["kind"].(string)
-	if kind != "webhook" && kind != "cron" && kind != "run" {
-		return catalog.Envelope{}, fmt.Errorf(`event.kind must be "webhook", "cron" or "run"`)
+	if kind != "webhook" && kind != "cron" && kind != "run" && kind != "conflict" {
+		return catalog.Envelope{}, fmt.Errorf(`event.kind must be "webhook", "cron", "run" or "conflict"`)
 	}
 	id, ok := str("id")
 	if !ok {
