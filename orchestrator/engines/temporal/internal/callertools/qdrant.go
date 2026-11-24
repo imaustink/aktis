@@ -272,7 +272,12 @@ func (s *QdrantStore) Search(ctx context.Context, text string, tools []Descripto
 	// is what makes cross-caller leakage structurally impossible, and it is why
 	// this collection needs no RBAC payload filter — retrieval can never range
 	// over definitions the request did not itself supply.
-	limit := uint64(k)
+	// A hash can be held by two points while pre-0056 TypeScript points exist
+	// (this store's pointID and the TS store's legacyPointID): adoption deletes
+	// the legacy point best effort, and a TS pod still running mid-rollout can
+	// write it again. Fetch twice k so that, after de-duplicating by hash
+	// below, a duplicate never costs a distinct tool its top-k slot.
+	limit := uint64(2 * k)
 	points, err := s.client.Query(ctx, &qdrant.QueryPoints{
 		CollectionName: s.collection,
 		Query:          qdrant.NewQuery(vectors[0]...),
@@ -287,17 +292,37 @@ func (s *QdrantStore) Search(ctx context.Context, text string, tools []Descripto
 	// Resolve back to the REQUEST's own descriptors rather than trusting the
 	// stored payload. Belt and braces on the filter above: a point that somehow
 	// matched without being in this request cannot make it into the result.
+	hits := make([]string, len(points))
+	for i, p := range points {
+		hits[i] = p.GetPayload()["hash"].GetStringValue()
+	}
+	return resolveHits(hits, tools, k), nil
+}
+
+// resolveHits maps ranked hit hashes back to the request's own descriptors,
+// dropping any hash not in the request and every repeat of a hash already
+// returned (the first, highest-scoring hit wins), and keeps at most k. A
+// repeated tool would offer the model two tools with the same name, which LLM
+// APIs reject.
+func resolveHits(hits []string, tools []Descriptor, k int) []Descriptor {
 	byHash := make(map[string]Descriptor, len(tools))
 	for _, tool := range tools {
 		byHash[tool.Hash] = tool
 	}
-	out := make([]Descriptor, 0, len(points))
-	for _, p := range points {
-		if tool, ok := byHash[p.GetPayload()["hash"].GetStringValue()]; ok {
-			out = append(out, tool)
+	seen := make(map[string]bool, len(hits))
+	out := make([]Descriptor, 0, min(len(hits), k))
+	for _, hash := range hits {
+		if len(out) == k {
+			break
 		}
+		tool, ok := byHash[hash]
+		if !ok || seen[hash] {
+			continue
+		}
+		seen[hash] = true
+		out = append(out, tool)
 	}
-	return out, nil
+	return out
 }
 
 // Prune reclaims abandoned definitions. Qdrant has no native TTL, so without
