@@ -75,9 +75,10 @@ The stack already runs Temporal for the engine.
   was lost.
 - A gateway rollout costs a run nothing: the worker cancels its activities on
   shutdown, and their retries start on the new pods at once.
-- **Temporal is required** for the gateway (the chart refuses to render
-  without `integration-gateway.temporal.address`). It already was for the
-  engine (0053). The gateway image carries the Temporal worker's native core
+- **Temporal is required** for the gateway, as it already was for the engine
+  (0053). `integration-gateway.temporal.namespace` must name a namespace that
+  already exists, normally the engine's: it defaults to `default`, and the
+  gateway does not register namespaces. The gateway image carries the Temporal worker's native core
   (prebuilt for glibc; the image is Debian), and the workflow code is bundled
   at build time (`npm run build`), so a pod never runs webpack.
 - One worker activity slot per live run (a poll in flight), so the worker
