@@ -2056,6 +2056,32 @@ describe("held run events and conflict events (docs/adr/0055)", () => {
       expect(h.logs.some((l) => l.includes("ended without an answer"))).toBe(true);
     });
 
+    it("keeps its marks when a scan fails, rather than ending and emitting them again", async () => {
+      let failing = false;
+      const h = await start({ eventSources: fastConflicts() }, SECRETS, {}, (a) => ({
+        ...a,
+        findConflicts: async (...args) => {
+          if (failing) throw new Error("GitHub too slow");
+          return a.findConflicts(...args);
+        },
+      }));
+      appAssigned(h, "alice");
+      h.submitEvent.mockResolvedValue({ kind: "ignored" });
+      h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
+      h.getPullRequest.mockResolvedValue(DIRTY);
+      await h.temporal.runs.ensureConflictSweeps(["pr-conflicts"]);
+      await waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(1));
+      failing = true;
+      await waitFor(() => expect(h.logs.some((l) => l.includes("conflicts pr-conflicts: scan failed (GitHub too slow)"))).toBe(true));
+      failing = false;
+      const sweeps = h.searchOpenPullRequests.mock.calls.length;
+      await waitFor(() => expect(h.searchOpenPullRequests.mock.calls.length).toBeGreaterThanOrEqual(sweeps + 2));
+      // The same workflow kept its mark for (PR 12, base1): no second event.
+      expect(h.submitEvent).toHaveBeenCalledTimes(1);
+      const desc = await h.temporal.runs.client.workflow.getHandle(`${h.temporal.taskQueue}/conflict-sweep:pr-conflicts`).describe();
+      expect(desc.status.name).toBe("RUNNING");
+    });
+
     it("one sweep per source, however often it is ensured", async () => {
       const h = await sweeping((h) => h.searchOpenPullRequests.mockResolvedValue([]));
       await h.temporal.runs.ensureConflictSweeps(["pr-conflicts"]);

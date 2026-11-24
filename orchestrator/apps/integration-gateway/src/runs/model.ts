@@ -209,6 +209,10 @@ export const DEFAULT_RUN_SETTINGS: RunSettings = {
 export const PUBLISH_RETRY_MAX_MS = 15 * 60 * 1000;
 /** How long one publish (an emit activity) may take; it is never retried (workflows.ts). */
 export const EMIT_TIMEOUT_MS = 10 * 60 * 1000;
+
+/** A conflict mark outlives any plausible gap between a conflict and the next base move. */
+export const CONFLICT_MARK_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
 /** Attempts at polling one turn, each up to `turnTimeoutMs`. */
 export const TURN_ATTEMPTS = 10;
 /** Attempts at one identity-link wait, each up to `linkWaitTimeoutMs`. */

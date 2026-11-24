@@ -633,6 +633,7 @@ started the chain),
 never the bot or whoever merged the other PR; it starts a new chain. Each
 source is one `conflictSweep` workflow (docs/adr/0057), started by the gateway
 when it sees the source and ending when the source goes away; the (PR, base
-commit) marks are its own state, kept for 30 days. `factory-resync` (examples, production) merges the
+commit) marks are its own state, kept for 30 days (a failed scan skips one sweep
+and keeps them). `factory-resync` (examples, production) merges the
 base into the branch as that person, and its completion goes to review or
 handoff like a fix's.

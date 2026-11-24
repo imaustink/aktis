@@ -4,6 +4,7 @@ import {
   continueAsNew,
   defineSignal,
   getExternalWorkflowHandle,
+  isCancellation,
   makeContinueAsNewFunc,
   ParentClosePolicy,
   proxyActivities,
@@ -15,6 +16,7 @@ import {
 import type { RunActivities } from "./contract.js";
 import {
   githubReplyTarget,
+  CONFLICT_MARK_TTL_MS,
   EMIT_TIMEOUT_MS,
   LABEL_RETRY_MS,
   LINK_ATTEMPTS,
@@ -406,24 +408,32 @@ export async function runQueue(input: { queue: string; waiting?: string[]; holdT
   }
 }
 
-/** A conflict mark outlives any plausible gap between a conflict and the next base move. */
-const MARK_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-
 /**
  * The `conflicts` EventSource kind (docs/adr/0055 §1): every `intervalMs`,
  * emit one `conflict` event per open PR that conflicts with its base -- once
  * per (PR, base commit), remembered in this workflow's own state. One
  * workflow per source, so replicas never sweep twice; it ends when its
- * source is gone.
+ * source is gone. A scan that fails is skipped, not fatal: the marks live
+ * only here. `marks` seeds a new sweep (the pre-0057 Redis marks, see
+ * TemporalRuns.ensureConflictSweeps).
  */
 export async function conflictSweep(input: { source: string; marks?: Record<string, number> }): Promise<void> {
   const marks: Record<string, number> = { ...(input.marks ?? {}) };
   for (let i = 0; i < ITERATIONS_PER_RUN; i++) {
     const conflicts = await effects.conflictsSource(input.source);
     if (!conflicts) return;
-    for (const [key, at] of Object.entries(marks)) if (Date.now() - at > MARK_TTL_MS) delete marks[key];
+    for (const [key, at] of Object.entries(marks)) if (Date.now() - at > CONFLICT_MARK_TTL_MS) delete marks[key];
 
-    for (const candidate of await effects.findConflicts(input.source, conflicts)) {
+    let candidates: Awaited<ReturnType<RunActivities["findConflicts"]>> = [];
+    try {
+      candidates = await effects.findConflicts(input.source, conflicts);
+    } catch (error) {
+      if (isCancellation(error)) throw error;
+      // A slow or failing scan skips this sweep. Failing the workflow would
+      // drop every mark, and its restart would emit them all again.
+      await effects.log(`conflicts ${input.source}: scan failed (${messageOf(error)}); trying again next sweep`);
+    }
+    for (const candidate of candidates) {
       if (marks[candidate.markKey] !== undefined) continue;
       let delivered: boolean;
       try {

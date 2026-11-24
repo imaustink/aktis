@@ -57,7 +57,10 @@ The stack already runs Temporal for the engine.
    turn is passed over after `queueClaimGraceMs` (15 minutes by default).
 4. **A conflicts source is a `conflictSweep` workflow**: one per source,
    started (if not running) by every replica, ending when the source goes
-   away. Its once-per-(PR, base commit) marks are workflow state.
+   away. Its once-per-(PR, base commit) marks are workflow state, carried
+   across continue-as-new. A scan that fails (a slow GitHub, say) skips that
+   sweep instead of failing the workflow, since a restarted sweep would have
+   no marks and emit every conflict again.
 5. **Workflow ids are prefixed with the task queue** (`<queue>/event-run:<id>`,
    ...), so two releases sharing a namespace never share a queue or a sweep.
 6. **The workflows are TypeScript, in integration-gateway**, not Go in the
