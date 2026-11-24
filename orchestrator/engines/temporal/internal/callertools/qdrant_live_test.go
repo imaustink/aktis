@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -127,6 +128,53 @@ func TestLiveQdrantIndexSearchAndCache(t *testing.T) {
 	one, err := store.Search(ctx, "anything at all", []Descriptor{alpha, beta, gamma}, 1)
 	require.NoError(t, err)
 	require.Len(t, one, 1)
+}
+
+// The TypeScript store's toQdrantPointId("a"*64), computed by that function.
+func TestLegacyPointIDMatchesTheTypeScriptStore(t *testing.T) {
+	require.Equal(t, "d554f00d-7ae5-544b-9061-f5b186ebffac", legacyPointID(strings.Repeat("a", 64)))
+}
+
+func TestLiveQdrantReusesAPre0055VectorInsteadOfEmbedding(t *testing.T) {
+	store, client, embedder := liveStore(t)
+	ctx := context.Background()
+	migrated := mustTool(t, "migrated_tool", "Embedded by the TypeScript store")
+	brandNew := mustTool(t, "brand_new_tool", "Never seen before")
+
+	// The point the TS store left: its id derivation, ms lastSeenAt, a vector
+	// the fake embedder could never produce (so reuse is observable).
+	tsVector := make([]float32, 64)
+	tsVector[7] = 42
+	wait := true
+	_, err := client.Upsert(ctx, &qdrant.UpsertPoints{
+		CollectionName: store.collection,
+		Wait:           &wait,
+		Points: []*qdrant.PointStruct{{
+			Id:      qdrant.NewIDUUID(legacyPointID(migrated.Hash)),
+			Vectors: qdrant.NewVectors(tsVector...),
+			Payload: qdrant.NewValueMap(map[string]any{"hash": migrated.Hash, "name": migrated.Name, "lastSeenAt": time.Now().UnixMilli()}),
+		}},
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, store.Index(ctx, []Descriptor{migrated, brandNew}))
+	require.Equal(t, int64(1), embedder.calls.Load(), "only the definition the TS store never saw is embedded")
+	require.Equal(t, []string{"brand_new_tool", "migrated_tool"}, storedNames(t, client, store.collection), "the TS point is replaced, not duplicated")
+
+	points, err := client.Get(ctx, &qdrant.GetPoints{
+		CollectionName: store.collection,
+		Ids:            []*qdrant.PointId{qdrant.NewIDUUID(store.pointID(migrated.Hash))},
+		WithVectors:    qdrant.NewWithVectors(true),
+	})
+	require.NoError(t, err)
+	require.Len(t, points, 1)
+	got := points[0].GetVectors().GetVector()
+	data := got.GetDense().GetData()
+	if len(data) == 0 {
+		data = got.GetData() //nolint:staticcheck
+	}
+	// Cosine collections normalize on write, so compare direction, not values.
+	require.InDelta(t, 1.0, data[7], 1e-6, "the TS vector was carried over")
 }
 
 func TestLiveQdrantPruneDropsOnlyStaleDefinitionsIncludingLegacyMillis(t *testing.T) {

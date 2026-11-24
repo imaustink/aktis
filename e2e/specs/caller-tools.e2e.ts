@@ -108,8 +108,9 @@ describe("caller-supplied tools: the store's queries against a real Qdrant", () 
   // Qdrant accepts the hash keyword filter (the isolation boundary -- a gamma
   // indexed but not supplied must never come back), the payload-only
   // lastSeenAt touch (re-indexing adds no points and embeds NOTHING, against a
-  // counting embedder), `limit`, and the delete-by-range prune, including the
-  // millisecond timestamps the TypeScript store left behind.
+  // counting embedder), `limit`, the delete-by-range prune (including the
+  // millisecond timestamps the TypeScript store left behind), and adopting a
+  // TypeScript-written vector instead of re-embedding it.
   it("indexes, caches, filters, limits and prunes against a real Qdrant", async () => {
     const forward = await openQdrantGrpc();
     try {
@@ -117,7 +118,11 @@ describe("caller-supplied tools: the store's queries against a real Qdrant", () 
         module: "orchestrator/engines/temporal",
         pkg: "./internal/callertools",
         pattern: "^TestLiveQdrant",
-        mustPass: ["TestLiveQdrantIndexSearchAndCache", "TestLiveQdrantPruneDropsOnlyStaleDefinitionsIncludingLegacyMillis"],
+        mustPass: [
+          "TestLiveQdrantIndexSearchAndCache",
+          "TestLiveQdrantReusesAPre0055VectorInsteadOfEmbedding",
+          "TestLiveQdrantPruneDropsOnlyStaleDefinitionsIncludingLegacyMillis",
+        ],
         env: { CALLERTOOLS_QDRANT_ADDR: forward.address },
       });
     } finally {

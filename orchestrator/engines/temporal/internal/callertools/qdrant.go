@@ -122,13 +122,33 @@ func (s *QdrantStore) Index(ctx context.Context, tools []Descriptor) error {
 		return nil
 	}
 
-	texts := make([]string, len(misses))
-	for i, tool := range misses {
-		texts[i] = embeddingText(tool)
-	}
-	vectors, err := s.embedder.Embed(ctx, texts)
+	// A definition the TypeScript store already embedded is reused, not
+	// re-embedded: same hash, same embedding text, only the point id differs.
+	legacy, err := s.legacyVectors(ctx, misses)
 	if err != nil {
-		return fmt.Errorf("embed %d caller tools: %w", len(misses), err)
+		return err
+	}
+	vectors := make([][]float32, len(misses))
+	var toEmbed []int
+	for i, tool := range misses {
+		if v, ok := legacy[tool.Hash]; ok {
+			vectors[i] = v
+			continue
+		}
+		toEmbed = append(toEmbed, i)
+	}
+	if len(toEmbed) > 0 {
+		texts := make([]string, len(toEmbed))
+		for j, i := range toEmbed {
+			texts[j] = embeddingText(misses[i])
+		}
+		embedded, err := s.embedder.Embed(ctx, texts)
+		if err != nil {
+			return fmt.Errorf("embed %d caller tools: %w", len(toEmbed), err)
+		}
+		for j, i := range toEmbed {
+			vectors[i] = embedded[j]
+		}
 	}
 
 	points := make([]*qdrant.PointStruct, len(misses))
@@ -159,7 +179,62 @@ func (s *QdrantStore) Index(ctx context.Context, tools []Descriptor) error {
 	}); err != nil {
 		return fmt.Errorf("upsert %d caller tools: %w", len(points), err)
 	}
+	if len(legacy) > 0 {
+		// Migrated: the TS point is now a duplicate. Best effort -- one left
+		// behind is harmless and Prune ages it out on the normal TTL.
+		ids := make([]*qdrant.PointId, 0, len(legacy))
+		for hash := range legacy {
+			ids = append(ids, qdrant.NewIDUUID(legacyPointID(hash)))
+		}
+		_, _ = s.client.Delete(ctx, &qdrant.DeletePoints{
+			CollectionName: s.collection,
+			Points:         qdrant.NewPointsSelector(ids...),
+		})
+	}
 	return nil
+}
+
+// legacyVectors returns, by hash, the vectors the TypeScript agent-orchestrator
+// (before docs/adr/0055) stored for any of tools. Its points live in the same
+// collection under legacyPointID; a payload whose hash disagrees is ignored.
+func (s *QdrantStore) legacyVectors(ctx context.Context, tools []Descriptor) (map[string][]float32, error) {
+	ids := make([]*qdrant.PointId, len(tools))
+	for i, tool := range tools {
+		ids[i] = qdrant.NewIDUUID(legacyPointID(tool.Hash))
+	}
+	points, err := s.client.Get(ctx, &qdrant.GetPoints{
+		CollectionName: s.collection,
+		Ids:            ids,
+		WithPayload:    qdrant.NewWithPayload(true),
+		WithVectors:    qdrant.NewWithVectors(true),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("look up %d pre-0055 caller tools: %w", len(ids), err)
+	}
+	out := map[string][]float32{}
+	for _, p := range points {
+		hash := p.GetPayload()["hash"].GetStringValue()
+		vector := p.GetVectors().GetVector()
+		data := vector.GetDense().GetData()
+		if len(data) == 0 {
+			data = vector.GetData() //nolint:staticcheck // older servers fill only the deprecated field
+		}
+		if hash != "" && legacyPointID(hash) == p.GetId().GetUuid() && uint64(len(data)) == s.dims {
+			out[hash] = data
+		}
+	}
+	return out, nil
+}
+
+// legacyNamespace is the UUIDv5 namespace the TypeScript store derived point
+// ids in (vector-store/qdrant-id.ts: toQdrantPointId).
+var legacyNamespace = uuid.Must(uuid.FromBytes([]byte{
+	0x7b, 0x6f, 0x1e, 0x1a, 0x6e, 0x6a, 0x4f, 0x0e, 0x9b, 0x7a, 0x9f, 0x2e, 0x6b, 0x8a, 0x2f, 0x1a,
+}))
+
+// legacyPointID is the point id the TypeScript store wrote a definition under.
+func legacyPointID(hash string) string {
+	return uuid.NewSHA1(legacyNamespace, []byte(hash)).String()
 }
 
 func (s *QdrantStore) existing(ctx context.Context, tools []Descriptor) (map[string]bool, error) {
