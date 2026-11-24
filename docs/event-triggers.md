@@ -466,12 +466,14 @@ bot-drop guard (§1) is untouched.
   have replied to. No trigger config can exceed it.
 
 **Durability.** A run survives a rollout of the gateway or the orchestrator.
-The gateway records each accepted run in Redis under a renewed lease, and a
-replacement gateway takes over any run whose lease lapsed (within about two
-and a half minutes), finishing it from the poll on without repeating steps
-already done. The orchestrator re-attaches to a turn whose process died by the
-engine id it recorded. Without Redis (`AGENT_REDIS_URL` / the session-page
-Redis), a gateway restart still drops runs in flight.
+Each accepted event's run is a Temporal workflow (`eventRun`, docs/adr/0057)
+that the gateway's own worker runs, on the engine's Temporal: ack, poll,
+result, label removal and the completion event are its steps. A gateway that
+dies mid-run costs a retried activity on another replica -- at once on a
+rollout (the worker cancels its activities on shutdown), within a minute on a
+crash (the poll's heartbeat timeout) -- and no step that finished runs again.
+The orchestrator re-attaches to a turn whose process died by the engine id it
+recorded.
 
 ### The factory recipe
 
@@ -539,8 +541,8 @@ anyway.
 ### Held completions (`onComplete.waitUntilClosed`, `onComplete.serialize`)
 
 Two gateway primitives, both on a trigger with `onComplete.emitTo`. Instead of
-publishing the completion at once, the gateway records it (in Redis, beside the
-in-flight runs) and a sweep publishes it once every hold is released:
+publishing the completion at once, the run hands it to a `heldRunEvent`
+workflow (docs/adr/0057), which publishes it once every hold is released:
 
 - `waitUntilClosed: {repositoryParam, numberParam}`: until the issue or PR
   named by those params is closed (a PR closes when it merges; an issue when
@@ -554,19 +556,19 @@ in-flight runs) and a sweep publishes it once every hold is released:
 - `serialize: {group, keyParam}`: at most one completion per
   `<group>:<params[keyParam]>` queue is in flight. The queue is taken when the
   completion is published and held until **the run it started** finishes (its
-  completion, and that run's status labels, already out), renewed alongside the
-  run's in-flight lease, so a dead gateway frees it within minutes. Oldest
-  first. A completion nobody accepted frees the queue at once.
+  completion, and that run's status labels, already out). Each queue is a
+  `runQueue` workflow handing out turns oldest first; a holder that never
+  releases (its workflow was terminated) is passed over after 9 hours. A
+  completion nobody accepted frees the queue at once.
 
-Both together hold until both are released. The sweep runs every 30s and
-immediately after a hold or a queue release; a held wait re-reads its issues
-from GitHub at most once per `GATEWAY_HELD_EVENT_STATE_CHECK_INTERVAL_MS`
-(default 5 minutes) across all replicas. Of several gateway replicas, exactly
-one publishes each completion (it is claimed before it is sent). A completion
-whose publish fails (orchestrator unreachable, an error status, or an error
-re-verifying the chain's origin) is saved back in its place and retried on
-the next sweep, for up to 24 hours after the first failure; then it is
-dropped, logged, and a comment on the held run's issue says it needs a human.
+Both together hold until both are released: the wait first, then the queue.
+A held wait re-reads its issues from GitHub once per
+`GATEWAY_HELD_EVENT_STATE_CHECK_INTERVAL_MS` (default 5 minutes). Every
+completion is published by exactly one workflow. One whose publish fails
+(orchestrator unreachable, an error status, or an error re-verifying the
+chain's origin) is retried with backoff for up to 24 hours after the first
+failure -- held or not -- then dropped, logged, and a comment on the run's
+issue says it needs a human.
 
 ### The coordinator
 
@@ -619,7 +621,9 @@ the App itself (the latest `assigned` timeline event for that login has
 `author` as its actor; an assignment a person made is never trusted). The
 event's sender is that assignee (the factory's handoff assigns the human who
 started the chain),
-never the bot or whoever merged the other PR; it starts a new chain. One gateway
-replica sweeps each interval. `factory-resync` (examples, production) merges the
+never the bot or whoever merged the other PR; it starts a new chain. Each
+source is one `conflictSweep` workflow (docs/adr/0057), started by the gateway
+when it sees the source and ending when the source goes away; the (PR, base
+commit) marks are its own state, kept for 30 days. `factory-resync` (examples, production) merges the
 base into the branch as that person, and its completion goes to review or
 handoff like a fix's.

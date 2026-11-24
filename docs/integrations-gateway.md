@@ -400,8 +400,8 @@ hardcoded in the gateway any more.
   `reply`, and the gateway runs it: `reply.github` posts an `ack` comment
   (+ a session-page link when `GATEWAY_PUBLIC_URL` is set), the turn's
   `result`, and removes `removeLabel` when the run ends on every outcome —
-  through the durable pending-action store, so a crash mid-run still clears the
-  label (`label-reconciler.ts`). `reply.http` POSTs the outcome to a literal,
+  each a step of the run's Temporal workflow (`src/runs/`, docs/adr/0057), so a
+  crash mid-run still clears the label. `reply.http` POSTs the outcome to a literal,
   never-templated URL, optionally HMAC-signed.
 - **The `ai-triage` / `ai-review` flows are four example CRs** in
   `examples/event-triggers/` (`eventtrigger-github-{issue,pr}-{triage,review}.yaml`;
