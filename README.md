@@ -102,7 +102,7 @@ graph TD
 
     subgraph Qdrant["Qdrant (vector store)"]
         SkillsCol[(skills collection\n+ derived audience roles)]
-        ToolsCol[(tool / agent records\nby id + allowedRoles)]
+        ToolsCol[(tools + agents collections\nallowedRoles per record)]
     end
 
     subgraph Jobs["Kubernetes Jobs (one-shot)"]
@@ -119,8 +119,8 @@ graph TD
     User -->|POST /v1/chat/completions · /invoke| Orchestrator
     Orchestrator -->|signed caller identity + turn| Gateway
     Gateway -->|update-with-start| Worker
-    Worker -->|RAG, filtered to caller's roles| SkillsCol
-    Worker -->|getByIds on the chosen skill's toolIds, RBAC re-check| ToolsCol
+    Worker -->|RAG over skills, filtered to caller's roles| SkillsCol
+    Worker -->|RAG over agents + tools, ADR 0037;\ngetByIds on the chosen skill's toolIds, RBAC re-check| ToolsCol
     Worker -->|create, only if the plan calls one| ToolRunCR & AgentRunCR
     Controller -->|watches + reconciles| ToolRunCR & AgentRunCR & ToolCR & SkillCR & AgentCR
     Controller -->|creates Job with secret injection| ToolJob & AgentJob
@@ -149,32 +149,43 @@ flowchart TD
     Fit -->|miss, not an error| Gate
     Active -->|no| Gate{Capability gate:\nconversational turn?}
     Gate -->|yes| Done
-    Gate -->|needs capabilities| Retrieve[retrieve-skills\nRAG over the skills collection,\nonly skills whose derived audience\nincludes the caller, ADR 0008 / 0011]
-    Retrieve --> Select[select-skill]
-    Select --> Load[load-skill-tools\nresolve skill.toolIds directly with getByIds,\nno second semantic search; RBAC re-checked]
+    Gate -->|needs capabilities| Retrieve[retrieve, each filtered to the caller's roles:\nskills · agents · bare tools\ntools fit-gated, ADR 0008 / 0011 / 0037]
+    Retrieve -->|nothing matched| Fallback([noMatchFallback])
+    Retrieve -->|only skills matched| SelectSkill[select-skill]
+    Retrieve -->|agents or tools matched| Delegate{SelectDelegate\nskill · agent · tool}
+    Delegate -->|skill| Load
+    Delegate -->|agent| DelegateAgent([delegateToAgent\nwhole turn goes to the agent])
+    Delegate -->|tool| RunTool([runSelectedTool\nplan the call, run that one tool])
+    Delegate -->|no choice| Fallback
+    SelectSkill -->|skill| Load
+    SelectSkill -->|none| Fallback
+    Load[load-skill-tools\nresolve skill.toolIds + agentRefs directly with getByIds,\nno second semantic search; RBAC re-checked]
     Load --> Plan{plan-action\nskill markdown as system prompt}
     Plan -->|respond| Done([Reply: no Job launched])
-    Plan -->|call a tool| Kind{What does the chosen\ntool id point at?}
+    Plan -->|call a tool| Kind{What does the chosen\ncandidate point at?}
     Kind -->|container tool| ToolRun[ToolRun CR → Tool Job]
-    Kind -->|agent-backed tool / sub-agent| Child[child agent workflow:\ndeclarative loop, step Jobs,\nor AgentRun CR → Agent Job]
+    Kind -->|agent-backed tool or skill agentRef| Child[child agent workflow:\ndeclarative loop, step Jobs,\nor AgentRun CR → Agent Job]
     ToolRun --> Await[await result\nHMAC callback → workflow signal]
     Child --> Await
-    Await -->|fold result into state,\nup to 4 plan steps| Plan
+    Await -->|fold result into state,\nup to 8 plan steps| Plan
 ```
 
 Things that are easy to miss:
 
-- **Retrieval has two layers.** RAG runs only over *skills*. A selected
-  skill's tools are looked up by id. There is no flat search over the whole
-  tool catalog.
+- **Retrieval is mostly skill-mediated.** Skills, agents and (fit-gated)
+  bare tools are each retrieved, and one combined selector picks among them
+  ([ADR 0037](docs/adr/0037-tools-compete-directly-in-delegate-selection.md)).
+  Once a skill is chosen, its tools are looked up by id, with no second search.
 - **RBAC applies before anything reaches the LLM.** Skills have no
   `allowedRoles` of their own. A skill's audience is the intersection of its
   tools' `allowedRoles`, computed at index time. The Qdrant filter uses it,
   and tool ids are checked again when they are resolved.
 - **Many turns end at `plan-action` and launch no Job.**
-- **Sub-agents use the same step as tools.** An agent is picked the same way
-  as a tool: it is one of the selected skill's tool ids. It runs as a child
-  workflow under the same plan/await step, not through a separate code path.
+- **Sub-agents reach a turn two ways.** The combined selector can delegate
+  the whole turn to a retrieved agent directly. Inside a skill, an
+  agent-backed tool or one of the skill's own `agentRefs` (ADR 0021) is a
+  plan candidate like any tool and runs as a child workflow under the same
+  plan/await step.
 
 > The diagram shows the original five CRDs. The full custom-resource reference —
 > all 14 kinds across tools, agents, knowledge bases, MCP, events and identity —
