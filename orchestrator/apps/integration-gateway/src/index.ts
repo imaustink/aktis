@@ -27,9 +27,13 @@ import { K8sSecretPrincipalDirectory } from "./connections/principal-directory.j
 import { deriveKey } from "./connections/signed-token.js";
 import { GatewayServer, type GatewayServerOptions } from "./server.js";
 import { InMemorySessionPageStore, RedisSessionPageStore } from "./session-page-store.js";
-import { InMemoryPendingLabelStore, RedisPendingLabelStore } from "./label-reconciler.js";
+import { RedisPendingLabelStore } from "./label-reconciler.js";
 import { RedisInflightRunStore } from "./inflight-runs.js";
 import { RedisDeferredEventStore } from "./deferred-events.js";
+import { createRunActivities } from "./runs/activities.js";
+import { LegacyRunDrain } from "./runs/legacy-drain.js";
+import { connectClient, createRunWorker, TemporalRuns } from "./runs/temporal.js";
+import { DEFAULT_RUN_SETTINGS } from "./runs/model.js";
 import { CrdEventSourceRegistry, SecretKeyReader, type SecretReadApi } from "./event-sources.js";
 import { JwksTokenAuthenticator, kubeIssuerKeySource, TICK_TOKEN_AUDIENCE } from "./tick-auth.js";
 
@@ -335,33 +339,38 @@ async function main(): Promise<void> {
     console.error("WARNING: CRD_NAMESPACE is not set -- no EventSources are loaded, so every event route answers 404.");
   }
 
-  // Durable self-heal for trigger-declared label removal (the headline "only
-  // works ~3/4 of the time" bug): an outbox of owed label removals, Redis-backed so it
-  // survives the gateway pod restart/OOM that loses the in-process `finally`.
-  // Reuses the same Redis as the session-page store, and falls back to in-memory
-  // (which heals a same-process throw but not a restart) with the same
-  // "works standalone, better with Redis" posture as elsewhere here. Always on:
-  // no public URL or other feature flag is needed, since it only reconciles
-  // labels this gateway itself applied.
-  const pendingLabelRedisUrl = config.sessionPageRedisUrl ?? config.redisUrl;
-  const pendingLabelStore = pendingLabelRedisUrl
-    ? new RedisPendingLabelStore(pendingLabelRedisUrl)
-    : new InMemoryPendingLabelStore();
-  console.error(
-    `Label reconciler enabled (${pendingLabelRedisUrl ? `Redis: ${pendingLabelRedisUrl}` : "in-memory (not durable across restarts)"})`,
-  );
-  // Same Redis: accepted runs a restarted gateway takes over and finishes
-  // (result comment, label removal, run-completion event). Redis-only -- an
-  // in-memory record would die with the process it is meant to outlive.
-  const inflightRunStore = pendingLabelRedisUrl ? new RedisInflightRunStore(pendingLabelRedisUrl) : undefined;
-  console.error(
-    inflightRunStore
-      ? `In-flight run takeover enabled (Redis: ${pendingLabelRedisUrl})`
-      : "In-flight run takeover disabled (no Redis): a restart drops runs being polled",
-  );
-  // Same Redis: held run events, serialize queues and conflict-sweep marks
-  // (docs/adr/0055). Without it they live in memory and a restart forgets them.
-  const deferredEventStore = pendingLabelRedisUrl ? new RedisDeferredEventStore(pendingLabelRedisUrl) : undefined;
+  // docs/adr/0057: every accepted event's run is a Temporal workflow, on the
+  // engine's cluster. Required: without it no run would be finished.
+  if (!config.temporalAddress) {
+    console.error("TEMPORAL_ADDRESS is not set: the gateway runs each accepted event's run as a Temporal workflow (docs/adr/0057)");
+    process.exit(EXIT_STARTUP_FAILURE);
+  }
+  const temporalClient = await connectClient({ address: config.temporalAddress, namespace: config.temporalNamespace });
+  const runs = new TemporalRuns({
+    client: temporalClient,
+    taskQueue: config.temporalTaskQueue,
+    settings: {
+      ...DEFAULT_RUN_SETTINGS,
+      heldEventCheckMs: Math.max(1000, config.heldEventStateCheckIntervalMs ?? DEFAULT_RUN_SETTINGS.heldEventCheckMs),
+      // Each poll may also wait on an identity link and its resumed turn; the
+      // slack keeps Temporal from cutting off a poll the gateway still allows.
+      turnTimeoutMs: config.pollTimeoutMs + 10 * 60 * 1000,
+      linkWaitTimeoutMs: config.resumeWaitMs + 10 * 60 * 1000,
+    },
+  });
+  console.error(`Event runs on Temporal ${config.temporalAddress} (namespace ${config.temporalNamespace}, task queue ${config.temporalTaskQueue})`);
+
+  // What pre-Temporal gateways left in Redis (owed label removals, runs they
+  // were finishing, held run events) is handed to the workflows, then the
+  // stores sit empty. Removable one release after 0057.
+  const legacyRedisUrl = config.sessionPageRedisUrl ?? config.redisUrl;
+  const legacyStores = legacyRedisUrl
+    ? {
+        pendingLabelStore: new RedisPendingLabelStore(legacyRedisUrl),
+        inflightRunStore: new RedisInflightRunStore(legacyRedisUrl),
+        deferredEventStore: new RedisDeferredEventStore(legacyRedisUrl),
+      }
+    : undefined;
 
   // Claude-auth (docs/adr/0027) is opt-in and layered on top of
   // identity-link's Redis/encryption-key/bearer-token config and
@@ -460,22 +469,45 @@ async function main(): Promise<void> {
     ...(identityLinkLinker ? { identityLinkLinker, identityLinkToken: config.identityLinkToken } : {}),
     ...(identityLinkAuthCodeLinkers ? { identityLinkAuthCodeLinkers } : {}),
     ...(sessionPageStore ? { sessionPageStore, publicBaseUrl: config.publicUrl } : {}),
-    pendingLabelStore,
-    ...(inflightRunStore ? { inflightRunStore } : {}),
-    ...(deferredEventStore ? { deferredEventStore } : {}),
-    ...(config.labelReconcilerIntervalMs ? { labelReconcilerIntervalMs: config.labelReconcilerIntervalMs } : {}),
-    ...(config.labelReconcilerGraceMs !== undefined ? { labelReconcilerGraceMs: config.labelReconcilerGraceMs } : {}),
+    runs,
     ...(claudeAuthFlows && claudeTokenStore ? { claudeAuthFlows, claudeAuthStore: claudeTokenStore } : {}),
     ...(claudeLoginFlows ? { claudeLoginFlows } : {}),
     ...(connections ? { connections } : {}),
     resumeWaitMs: config.resumeWaitMs,
     runEventMaxDepth: config.runEventMaxDepth,
-    ...(config.heldEventStateCheckIntervalMs !== undefined ? { heldEventStateCheckIntervalMs: config.heldEventStateCheckIntervalMs } : {}),
     claudeCredentialRefreshEnabled: config.claudeCredentialRefreshEnabled,
     claudeCredentialRefreshMarginMs: config.claudeCredentialRefreshMarginMs,
     claudeCredentialSweepIntervalMs: config.claudeCredentialSweepIntervalMs,
     claudeCredentialSweepMarginMs: config.claudeCredentialSweepMarginMs,
   });
+
+  const worker = await createRunWorker({
+    address: config.temporalAddress,
+    namespace: config.temporalNamespace,
+    taskQueue: config.temporalTaskQueue,
+    activities: createRunActivities(server.effects, runs, (line) => console.error(line)),
+  });
+  const workerDone = worker.run().catch((error: unknown) => {
+    // A worker that stops runs no workflow: say so and let the pod restart.
+    console.error("Temporal worker stopped:", error);
+    process.exit(EXIT_STARTUP_FAILURE);
+  });
+
+  const drain = legacyStores
+    ? new LegacyRunDrain({
+        runs,
+        ...legacyStores,
+        removeLabel: (owner, repo, issueNumber, label) => githubReplyClient.removeIssueLabel(owner, repo, issueNumber, label),
+      })
+    : undefined;
+  drain?.start();
+
+  // docs/adr/0055 §1: one sweep workflow per `conflicts` source. A source that
+  // appears is picked up within a minute; one that goes away ends its own.
+  const conflictSources = (): string[] => (eventSources?.all() ?? []).flatMap((s) => (s.kind === "conflicts" ? [s.name] : []));
+  void runs.ensureConflictSweeps(conflictSources());
+  const conflictTimer = setInterval(() => void runs.ensureConflictSweeps(conflictSources()), 60_000);
+  conflictTimer.unref();
 
   await server.listen(config.httpPort);
   console.error(`integration-gateway listening on :${config.httpPort}`);
@@ -486,15 +518,22 @@ async function main(): Promise<void> {
     shuttingDown = true;
     console.error(`Received ${signal}; shutting down integration-gateway...`);
     await server.close();
+    clearInterval(conflictTimer);
+    drain?.stop();
+    // Activities in flight are abandoned to their retries: another replica's
+    // worker picks each up once its heartbeat lapses.
+    worker.shutdown();
+    await workerDone;
     eventSources?.stop();
     // The credential stores hold no long-lived connection to close: each call is
     // a request against the API server, and the only durable thing they own is
     // the Secret itself (docs/adr/0034). The Redis handles that used to need
     // draining here went with them.
     if (sessionPageStore instanceof RedisSessionPageStore) await sessionPageStore.close();
-    if (pendingLabelStore instanceof RedisPendingLabelStore) await pendingLabelStore.close();
-    await inflightRunStore?.close();
-    await deferredEventStore?.close();
+    await legacyStores?.pendingLabelStore.close();
+    await legacyStores?.inflightRunStore.close();
+    await legacyStores?.deferredEventStore.close();
+    await temporalClient.connection.close();
     await shutdownTelemetry();
     process.exit(0);
   };

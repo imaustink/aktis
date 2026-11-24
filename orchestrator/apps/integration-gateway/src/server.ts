@@ -1,5 +1,4 @@
-import { createHmac, randomUUID } from "node:crypto";
-import { hostname } from "node:os";
+import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import {
   buildCronEnvelope,
@@ -8,7 +7,6 @@ import {
   parseBody,
   type Envelope,
   type JsonValue,
-  type RenderedReply,
 } from "@aktis/event-triggers";
 import type { GithubReplyClient } from "./github-client.js";
 import type { GithubDeviceFlowLinker } from "./identity-link/device-flow-linker.js";
@@ -24,45 +22,18 @@ import type { ClaudeSetupTokenFlows } from "./claude-auth/pty-setup-token.js";
 import type { ClaudeLoginFlows } from "./claude-auth/pty-login.js";
 import type { ClaudeTokenStore } from "./claude-auth/store.js";
 import type { IdentityResolver, RepoContext } from "./identity.js";
-import type {
-  AcceptedTrigger,
-  IdentityErrorBody,
-  OrchestratorClient,
-  OrchestratorInvokeResult,
-  PollHooks,
-  CelResult,
-  SenderExpressions,
-} from "./orchestrator-client.js";
-import { parseAcceptedTrigger } from "./orchestrator-client.js";
+import type { OrchestratorClient, OrchestratorInvokeResult, CelResult, SenderExpressions } from "./orchestrator-client.js";
 import type { SenderClaims } from "./sender-assertion.js";
 import { startSpan, type TraceSpan } from "./telemetry.js";
+import { RunEffects, type RunStarter, type WebhookOutcome } from "./runs/effects.js";
+import { REPOSITORY } from "./runs/model.js";
 
-/**
- * How a webhook delivery is answered: a status (and optional JSON body) sent
- * once the relay's accept is known, plus any work that continues after the
- * response (an accepted run, an opt-in identity-error comment).
- */
-interface WebhookOutcome {
-  status: number;
-  body?: unknown;
-  after?: () => Promise<void>;
-  /** How the orchestrator answered the relay (absent when nothing was relayed). */
-  relay?: "ignored" | "rejected" | "failed" | "identity-required" | "accepted";
-}
+export { EVENT_SIGNATURE_HEADER, DEFAULT_RUN_EVENT_MAX_DEPTH } from "./runs/effects.js";
 
-/**
- * How publishing a run event ended: accepted; delivered but not accepted (or
- * stopped by a gate) -- final; or "failed", a transport failure worth retrying.
- */
-type EmitRunEventResult = "accepted" | "not-accepted" | "failed";
 import { ClaudeCredentialRefresher, ClaudeCredentialSweeper } from "./claude-auth/credential-refresher.js";
 import { renderSessionPage } from "./session-page.js";
 import type { SessionPageStore } from "./session-page-store.js";
 import { tickUsername, type TokenAuthenticator } from "./tick-auth.js";
-import { gatewayOwedRunTerminal, LabelReconciler, type PendingLabelStore } from "./label-reconciler.js";
-import { DEFAULT_LEASE_MS, InflightRunRecovery, type InflightRun, type InflightRunStore } from "./inflight-runs.js";
-import { InMemoryDeferredEventStore, type DeferredEventStore, type HeldRunEvent, type IssueRef } from "./deferred-events.js";
-import { ConflictSweeper, type ConflictCandidate } from "./conflict-sweeper.js";
 import {
   StaticEventSourceRegistry,
   type CompiledEventSource,
@@ -71,7 +42,6 @@ import {
   type SecretLookup,
 } from "./event-sources.js";
 import {
-  constantTimeEquals,
   slackUrlVerificationChallenge,
   verifyHeaderName,
   verifyWebhookRequest,
@@ -96,8 +66,6 @@ const MAX_CACHED_SENDER_EXPRESSIONS = 1000;
 /** A bearer that could be a Kubernetes JWT; anything else is refused without being verified. */
 const BEARER_JWT = /^Bearer ([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$/;
 /** Header carrying `sha256=<hex hmac(body)>` on a signed `reply.http` POST. */
-export const EVENT_SIGNATURE_HEADER = "x-event-signature";
-const HTTP_REPLY_TIMEOUT_MS = 10_000;
 
 export interface GatewayServerOptions {
   /**
@@ -216,149 +184,16 @@ export interface GatewayServerOptions {
     githubAuthCode: boolean;
   };
   /**
-   * Durable outbox of `reply.github.removeLabel` removals still owed, enabling
-   * the self-healing reconciler (label-reconciler.ts). Optional and additive:
-   * when absent, label removal works exactly the same (the in-process
-   * `finally`), just without the restart-surviving backstop.
-   */
-  pendingLabelStore?: PendingLabelStore;
-  /** How often the reconciling sweep runs; forwarded to {@link LabelReconciler}. */
-  labelReconcilerIntervalMs?: number;
-  /** How old an owed removal must be before the sweep acts on it; forwarded to {@link LabelReconciler}. */
-  labelReconcilerGraceMs?: number;
-  /**
-   * Durable record of accepted runs still owed their finish -- result comment,
-   * label removal, run-completion event (inflight-runs.ts). With it, a run
-   * whose gateway died mid-poll is taken over by another gateway; without
-   * it, a restart drops whatever was in flight, as before.
-   */
-  inflightRunStore?: InflightRunStore;
-  /** Lease on a running run; a gateway that stops renewing it for this long is presumed dead. */
-  inflightRunLeaseMs?: number;
-  /** How often to look for runs to take over. */
-  inflightRunSweepIntervalMs?: number;
-  /**
    * The global run-event chain depth cap (docs/adr/0052 §1,
-   * `RUN_EVENT_MAX_DEPTH`). Absent -> {@link DEFAULT_RUN_EVENT_MAX_DEPTH}.
+   * `RUN_EVENT_MAX_DEPTH`). Absent -> 12.
    */
   runEventMaxDepth?: number;
   /**
-   * Held run events and serialize queues (docs/adr/0055 §2), plus the conflict
-   * sweep's once-marks (§1). Absent -> in memory: holds work, but a restart
-   * forgets them.
+   * Starts the workflow each accepted event's run lives in (docs/adr/0057):
+   * runs/temporal.ts in production.
    */
-  deferredEventStore?: DeferredEventStore;
-  /** How often held run events are re-checked. */
-  deferredEventSweepIntervalMs?: number;
-  /**
-   * How often a held `waitUntilClosed` event's issues are re-read from GitHub
-   * (docs/adr/0055 §2), shared across replicas through the deferred store.
-   * Absent -> {@link DEFAULT_HELD_EVENT_STATE_CHECK_MS}; 0 checks every pass.
-   */
-  heldEventStateCheckIntervalMs?: number;
-  /** How often the conflict sweeper checks whether a `conflicts` source is due. */
-  conflictSweepTickMs?: number;
+  runs: RunStarter;
 }
-
-export const DEFAULT_RUN_EVENT_MAX_DEPTH = 12;
-const DEFAULT_DEFERRED_SWEEP_MS = 30_000;
-/** A held queue without an in-flight store to renew it: longer than any poll (8h). */
-const UNRENEWED_QUEUE_TTL_MS = 9 * 60 * 60 * 1000;
-/**
- * How long a held run event keeps being retried after its first failed
- * publish. "failed" covers an unreachable orchestrator, but also permanent
- * errors (a 400/401/404, a deterministic throw), so retrying must end: long
- * enough to ride out an orchestrator outage, short enough that a poison event
- * stops calling the orchestrator every sweep.
- */
-const HELD_EVENT_RETRY_WINDOW_MS = 24 * 60 * 60 * 1000;
-/**
- * A held `waitUntilClosed` event re-reads its issues' state at most this
- * often (across all replicas). Waiting on a human merge does not need 30s
- * latency, and two GitHub calls per parked ticket per pass per replica would
- * exhaust the App installation's rate limit with a modest backlog.
- */
-const DEFAULT_HELD_EVENT_STATE_CHECK_MS = 5 * 60 * 1000;
-
-/** A positive integer from a string param (params arrive in their §4 string form). */
-function positiveInt(value: string | undefined): number | undefined {
-  if (typeof value !== "string" || !/^[1-9][0-9]*$/.test(value.trim())) return undefined;
-  const n = Number(value.trim());
-  return Number.isSafeInteger(n) ? n : undefined;
-}
-
-const refKey = (r: IssueRef): string => `${r.owner}/${r.repo}#${r.number}`.toLowerCase();
-
-/**
- * The chain a run belongs to (docs/adr/0052 §1), carried in every run event's
- * `body.chain`. A webhook/cron delivery starts one at depth 0; each run event
- * is one deeper.
- */
-interface RunChain {
-  /** The id of the envelope that started the chain. */
-  id: string;
-  depth: number;
-  /** Completed runs per trigger name in this chain. */
-  counts: Record<string, number>;
-  /** The verified human who started it. Absent for a sourceless sender (cron, a webhook without `sender`), which cannot emit. */
-  origin?: { login: string; accountId?: string; repository: string };
-}
-
-/** How a run ended, for its completion event. */
-interface FinishedRun {
-  status: OrchestratorInvokeResult["status"];
-  outcome?: Record<string, unknown>;
-}
-
-/** The validated `reply.github` of an accepted trigger, with its repository split. */
-interface GithubReplyTarget {
-  owner: string;
-  repo: string;
-  issueNumber: number;
-  ack?: string;
-  sessionPage?: boolean;
-  result?: boolean;
-  removeLabel?: string;
-  /** Applied at acceptance (docs/adr/0052 §3); only non-empty strings survive validation. */
-  addLabels?: string[];
-  assignees?: string[];
-}
-
-/** The non-empty strings of a rendered list; anything else would only earn a 422 from GitHub. */
-function nonEmptyStrings(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string" && v.trim() !== "") : [];
-}
-
-const isCount = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
-
-/**
- * Reads back a run event's `body.chain`. The gateway wrote it, and a run
- * source has no HTTP route, but the engine round-trips it, so it is checked
- * rather than trusted: an unreadable chain stops emission (fail closed) rather
- * than restarting at depth 0, which would defeat the depth cap.
- */
-function parseChain(raw: unknown): RunChain | undefined {
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
-  const c = raw as Record<string, unknown>;
-  if (typeof c.id !== "string" || !c.id || !isCount(c.depth)) return undefined;
-  if (typeof c.counts !== "object" || c.counts === null || Array.isArray(c.counts)) return undefined;
-  const counts: Record<string, number> = {};
-  for (const [name, n] of Object.entries(c.counts)) {
-    if (!isCount(n)) return undefined;
-    counts[name] = n;
-  }
-  let origin: RunChain["origin"];
-  if (c.origin !== undefined) {
-    const o = c.origin as Record<string, unknown> | null;
-    if (typeof o !== "object" || o === null || typeof o.login !== "string" || !o.login || typeof o.repository !== "string") return undefined;
-    if (o.accountId !== undefined && typeof o.accountId !== "string") return undefined;
-    origin = { login: o.login, ...(o.accountId ? { accountId: o.accountId } : {}), repository: o.repository };
-  }
-  return { id: c.id, depth: c.depth, counts, ...(origin ? { origin } : {}) };
-}
-
-/** `owner/name`, each a GitHub-legal segment -- what lands in a REST path. */
-const REPOSITORY = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/;
 
 class BodyTooLargeError extends Error {}
 
@@ -379,19 +214,8 @@ export class GatewayServer {
   private readonly claudeAuthApi: ClaudeAuthApi | undefined;
   private readonly connectionsApi: ConnectionsApi | undefined;
   private readonly claudeCredentialSweeper: ClaudeCredentialSweeper | undefined;
-  private readonly labelReconciler: LabelReconciler | undefined;
-  private readonly inflightRecovery: InflightRunRecovery | undefined;
-  private readonly deferredStore: DeferredEventStore;
-  private readonly conflictSweeper: ConflictSweeper;
-  private deferredTimer: ReturnType<typeof setInterval> | undefined;
-  private deferredSweeping = false;
-  private deferredSweepAgain = false;
-  /** This process's lease owner id (inflight-runs.ts). */
-  private readonly instanceId = `${hostname()}-${randomUUID().slice(0, 8)}`;
-  /** Runs this process is finishing right now, by key. */
-  private readonly runningRuns = new Set<string>();
-  /** Runs this process is finishing, counted per session -- the label reconciler's "still going" signal. */
-  private readonly runningSessions = new Map<string, number>();
+  /** Every side effect of a run, shared with the run activities (runs/activities.ts). */
+  readonly effects: RunEffects;
   private readonly eventSources: EventSourceLookup;
   /** Sender CEL the orchestrator has compiled: null when it compiles, else the compiler's message. */
   private readonly compiledSenderExpressions = new Map<string, string | null>();
@@ -404,6 +228,24 @@ export class GatewayServer {
     this.log = options.log ?? ((line) => console.error(line));
     this.now = options.now ?? (() => new Date());
     this.report = options.onBackgroundError ?? ((error: unknown) => console.error(error));
+    this.effects = new RunEffects({
+      eventSources: this.eventSources,
+      ...(options.secrets ? { secrets: options.secrets } : {}),
+      identityResolver: options.identityResolver,
+      ...(options.senderSubjects ? { senderSubjects: options.senderSubjects } : {}),
+      orchestratorClient: options.orchestratorClient,
+      githubReplyClient: options.githubReplyClient,
+      ...(options.replyFetch ? { replyFetch: options.replyFetch } : {}),
+      ...(options.sessionPageStore ? { sessionPageStore: options.sessionPageStore } : {}),
+      ...(options.publicBaseUrl ? { publicBaseUrl: options.publicBaseUrl } : {}),
+      ...(options.claudeAuthStore ? { claudeAuthStore: options.claudeAuthStore } : {}),
+      ...(options.resumeWaitMs !== undefined ? { resumeWaitMs: options.resumeWaitMs } : {}),
+      ...(options.runEventMaxDepth !== undefined ? { runEventMaxDepth: options.runEventMaxDepth } : {}),
+      runs: options.runs,
+      log: this.log,
+      report: this.report,
+      now: this.now,
+    });
     this.identityLinkApi =
       options.identityLinkLinker && options.identityLinkToken
         ? new IdentityLinkApi(
@@ -480,60 +322,6 @@ export class GatewayServer {
             ...(options.claudeCredentialSweepMarginMs ? { marginMs: options.claudeCredentialSweepMarginMs } : {}),
           })
         : undefined;
-    // Durable self-heal for a trigger-declared label whose in-process `finally`
-    // was lost to a mid-turn pod restart/OOM. Only built when a pending-label
-    // store is wired; a run THIS gateway recorded and no longer owes a finish
-    // (not running here, no in-flight record left) is treated as terminal and
-    // its label removed.
-    this.labelReconciler = options.pendingLabelStore
-      ? new LabelReconciler({
-          store: options.pendingLabelStore,
-          isRunTerminal: gatewayOwedRunTerminal({
-            isRunningHere: (sessionId) => (this.runningSessions.get(sessionId) ?? 0) > 0,
-            ...(options.inflightRunStore ? { inflightRunStore: options.inflightRunStore } : {}),
-          }),
-          removeLabel: (owner, repo, issueNumber, label) =>
-            options.githubReplyClient.removeIssueLabel(owner, repo, issueNumber, label),
-          onError: this.report,
-          ...(options.labelReconcilerIntervalMs ? { intervalMs: options.labelReconcilerIntervalMs } : {}),
-          ...(options.labelReconcilerGraceMs !== undefined ? { graceMs: options.labelReconcilerGraceMs } : {}),
-        })
-      : undefined;
-    this.inflightRecovery = options.inflightRunStore
-      ? new InflightRunRecovery({
-          store: options.inflightRunStore,
-          owner: this.instanceId,
-          resume: (run) => this.finishRun(run, true),
-          isRunning: (key) => this.runningRuns.has(key),
-          onError: this.report,
-          ...(options.inflightRunLeaseMs ? { leaseMs: options.inflightRunLeaseMs } : {}),
-          ...(options.inflightRunSweepIntervalMs ? { intervalMs: options.inflightRunSweepIntervalMs } : {}),
-        })
-      : undefined;
-    this.deferredStore = options.deferredEventStore ?? new InMemoryDeferredEventStore();
-    this.conflictSweeper = new ConflictSweeper({
-      sources: () =>
-        this.eventSources.all().flatMap((s) => (s.kind === "conflicts" ? [{ name: s.name, conflicts: s.conflicts }] : [])),
-      github: options.githubReplyClient,
-      store: this.deferredStore,
-      verify: async (login, owner, repo) => {
-        try {
-          return Boolean(await options.identityResolver.resolve(login, false, { owner, repo }));
-        } catch (error) {
-          this.report(error);
-          return false;
-        }
-      },
-      emit: (source, candidate) => this.emitConflictEvent(source, candidate),
-      log: (line) => this.log(line),
-      onError: this.report,
-      ...(options.conflictSweepTickMs ? { tickMs: options.conflictSweepTickMs } : {}),
-    });
-  }
-
-  /** How long a serialize queue is held before it must be renewed (docs/adr/0055 §2). */
-  private queueTtlMs(): number {
-    return this.options.inflightRunStore ? 3 * (this.options.inflightRunLeaseMs ?? DEFAULT_LEASE_MS) : UNRENEWED_QUEUE_TTL_MS;
   }
 
   listen(port: number): Promise<void> {
@@ -546,20 +334,6 @@ export class GatewayServer {
         });
       });
       this.claudeCredentialSweeper?.start();
-      // Fires one sweep immediately -- the startup self-heal for any label
-      // stranded by the previous pod dying mid-turn -- then on its interval.
-      this.labelReconciler?.start();
-      // Likewise picks up, at once, any run a previous pod died finishing.
-      this.inflightRecovery?.start();
-      // docs/adr/0055: held run events (checked at once, then periodically)
-      // and the conflict sweep.
-      this.kickHeldEvents();
-      this.deferredTimer = setInterval(
-        () => this.kickHeldEvents(),
-        this.options.deferredEventSweepIntervalMs ?? DEFAULT_DEFERRED_SWEEP_MS,
-      );
-      this.deferredTimer.unref?.();
-      this.conflictSweeper.start();
       this.server.listen(port, resolve);
     });
   }
@@ -567,11 +341,6 @@ export class GatewayServer {
   close(): Promise<void> {
     return new Promise((resolve, reject) => {
       this.claudeCredentialSweeper?.stop();
-      this.labelReconciler?.stop();
-      this.inflightRecovery?.stop();
-      if (this.deferredTimer) clearInterval(this.deferredTimer);
-      this.deferredTimer = undefined;
-      this.conflictSweeper.stop();
       if (!this.server) return resolve();
       this.server.close((err) => (err ? reject(err) : resolve()));
     });
@@ -837,7 +606,7 @@ export class GatewayServer {
         span.set({ "aktis.event.outcome": "dropped" });
         return { status: 202 };
       }
-      senderClaims = await this.senderClaims(source.name, resolved);
+      senderClaims = await this.effects.senderClaims(source.name, resolved);
       sender = { login: resolved.login, isBot: resolved.isBot };
       repository = resolved.repository;
     }
@@ -850,36 +619,7 @@ export class GatewayServer {
       ...(repository ? { repository } : {}),
       now: input.receivedAt,
     });
-    return this.relayEvent(envelope, senderClaims, span);
-  }
-
-  /**
-   * What the gateway vouches for about a verified sender (docs/adr/0049 §5):
-   * their login, and -- when the source extracts an account id -- the one
-   * subject that account is linked under, or why there isn't one. Never
-   * throws: a lookup failure is "unavailable", which no agent acting as the
-   * sender will accept, so it fails closed.
-   */
-  private async senderClaims(sourceName: string, resolved: { login: string; accountId?: string }): Promise<SenderClaims> {
-    const claims: SenderClaims = { login: resolved.login };
-    if (!resolved.accountId) return claims;
-    claims.accountId = resolved.accountId;
-    const lookup = this.options.senderSubjects?.findSubjectsByAccount;
-    if (!lookup) return { ...claims, subjectStatus: "unavailable" };
-    try {
-      const subjects = await lookup.call(this.options.senderSubjects, "github", resolved.accountId);
-      if (subjects.length === 1) return { ...claims, subject: subjects[0]!, subjectStatus: "linked" };
-      if (subjects.length > 1) {
-        // One GitHub account linked from several chat users. The subject also
-        // keys every OTHER provider's links, so picking one would be arbitrary.
-        this.log(`webhook ${sourceName}: sender ${resolved.login} is linked under ${subjects.length} subjects (ambiguous)`);
-        return { ...claims, subjectStatus: "ambiguous" };
-      }
-      return { ...claims, subjectStatus: "unlinked" };
-    } catch (error) {
-      this.report(error);
-      return { ...claims, subjectStatus: "unavailable" };
-    }
+    return this.effects.relayEvent(envelope, senderClaims, span);
   }
 
   /**
@@ -968,7 +708,7 @@ export class GatewayServer {
       kind: "server",
       attributes: { "http.request.method": "POST", "http.route": "/events/:source/tick", "aktis.event_source": source.name },
     });
-    this.relayEvent(envelope, undefined, span)
+    this.effects.relayEvent(envelope, undefined, span)
       .catch((error: unknown) => {
         span.fail("internal_error");
         throw error;
@@ -994,924 +734,9 @@ export class GatewayServer {
     return username === tickUsername(tickNamespace, name);
   }
 
-  private async readSecret(name: string, key: string, refresh = false): Promise<string | undefined> {
-    if (!this.options.secrets) return undefined;
-    try {
-      return await this.options.secrets.get(name, key, refresh ? { refresh: true } : undefined);
-    } catch (error) {
-      this.report(error);
-      return undefined;
-    }
+  private readSecret(name: string, key: string, refresh = false): Promise<string | undefined> {
+    return this.effects.readSecret(name, key, refresh);
   }
-
-  /**
-   * Sends the envelope to `/invoke` and handles the three §5 outcomes. Only
-   * an accepted event has side effects, and only the ones its trigger's
-   * `reply` declares.
-   */
-  private async relayEvent(
-    envelope: Envelope,
-    sender: SenderClaims | undefined,
-    span: TraceSpan,
-    holdsQueue?: InflightRun["holdsQueue"],
-  ): Promise<WebhookOutcome> {
-    const submitted = await this.options.orchestratorClient.submitEvent(envelope, sender, span.traceparent);
-    this.log(`event ${envelope.source}/${envelope.id}: trace ${span.traceId}`);
-    span.set({ "aktis.event.outcome": submitted.kind });
-    switch (submitted.kind) {
-      case "ignored":
-        this.log(`event ${envelope.source}/${envelope.id}: no trigger matched (ignored)`);
-        return { status: 202, relay: "ignored" };
-      case "rejected":
-        this.log(`event ${envelope.source}/${envelope.id}: trigger matched but failed for this event (422): ${submitted.error}`);
-        return { status: 202, relay: "rejected" };
-      case "failed":
-        this.log(`event ${envelope.source}/${envelope.id}: relay failed: ${submitted.error}`);
-        span.fail("relay_failed");
-        return { status: 202, relay: "failed" };
-      case "identity-required":
-        this.log(`event ${envelope.source}/${envelope.id}: refused, ${submitted.body.error.code} for sender ${sender?.login ?? "?"}`);
-        // docs/adr/0050 §4: a refused delivery is a short trace ending in an
-        // error span that carries the code ("how often do senders hit the
-        // link wall?").
-        span.set({ "aktis.identity_error": submitted.body.error.code });
-        span.fail(submitted.body.error.code);
-        return {
-          status: 403,
-          body: submitted.body,
-          after: () => this.postIdentityError(submitted.body),
-          relay: "identity-required",
-        };
-      case "accepted":
-        span.set({ "aktis.trigger": submitted.trigger.name, "aktis.invocation_id": submitted.id });
-        return {
-          status: 202,
-          after: () => this.runAcceptedEvent(envelope, sender, submitted.id, submitted.trigger, span.traceparent, holdsQueue),
-          relay: "accepted",
-        };
-    }
-  }
-
-  /**
-   * GitHub never reads a webhook's response body, so a trigger may opt in to
-   * having the 403's printable message posted where the sender will see it
-   * (`reply.github.onIdentityError`, docs/adr/0049). The target is the
-   * trigger's own rendered reply, carried back on the 403.
-   */
-  private async postIdentityError(body: IdentityErrorBody): Promise<void> {
-    const trigger = (body.error as { trigger?: unknown }).trigger;
-    if (typeof trigger !== "object" || trigger === null) return;
-    const accepted = parseAcceptedTrigger(trigger);
-    const gh = this.githubReplyTarget(accepted);
-    if (!gh || !accepted.reply?.github?.onIdentityError) return;
-    await this.options.githubReplyClient.postIssueComment(gh.owner, gh.repo, gh.issueNumber, body.error.message);
-  }
-
-  /** Validates `reply.github` from the orchestrator; an unusable one is logged and treated as absent (it would only produce 404s against a garbage path). */
-  private githubReplyTarget(trigger: AcceptedTrigger): GithubReplyTarget | undefined {
-    const gh = trigger.reply?.github;
-    if (!gh) return undefined;
-    const repoMatch = typeof gh.repository === "string" ? REPOSITORY.exec(gh.repository) : null;
-    const issueNumber = gh.issueNumber;
-    if (!repoMatch || typeof issueNumber !== "number" || !Number.isSafeInteger(issueNumber) || issueNumber <= 0) {
-      this.log(`trigger ${trigger.name}: reply.github ignored (repository ${JSON.stringify(gh.repository)} / issueNumber ${JSON.stringify(issueNumber)} unusable)`);
-      return undefined;
-    }
-    const addLabels = nonEmptyStrings(gh.addLabels);
-    const assignees = nonEmptyStrings(gh.assignees);
-    return {
-      owner: repoMatch[1] as string,
-      repo: repoMatch[2] as string,
-      issueNumber,
-      ...(gh.ack ? { ack: gh.ack } : {}),
-      ...(gh.sessionPage ? { sessionPage: true } : {}),
-      ...(gh.result ? { result: true } : {}),
-      ...(gh.removeLabel ? { removeLabel: gh.removeLabel } : {}),
-      ...(addLabels.length ? { addLabels } : {}),
-      ...(assignees.length ? { assignees } : {}),
-    };
-  }
-
-  /**
-   * One accepted event, start to finish (docs/event-triggers.md §7):
-   *
-   *   record owed label removal -> ack (+ session page link) -> poll
-   *   -> result comment -> http reply -> remove label (always)
-   *
-   * Every side effect is best effort and reported, never thrown: a failed ack
-   * must not stop the run being tracked, and a failed comment must not keep the
-   * label on or the HTTP callback from firing.
-   */
-  private async runAcceptedEvent(
-    envelope: Envelope,
-    sender: SenderClaims | undefined,
-    invocationId: string,
-    trigger: AcceptedTrigger,
-    traceparent?: string,
-    holdsQueue?: InflightRun["holdsQueue"],
-  ): Promise<void> {
-    await this.finishRun(
-      {
-        key: invocationId,
-        invocationId,
-        envelope,
-        ...(sender ? { sender } : {}),
-        trigger,
-        ...(traceparent ? { traceparent } : {}),
-        ...(holdsQueue ? { holdsQueue } : {}),
-        recordedAt: this.now().getTime(),
-      },
-      false,
-    );
-  }
-
-  /**
-   * Runs an accepted event to its finish, recorded in the in-flight store
-   * (inflight-runs.ts) under a lease this process renews for as long as it
-   * runs, so that if this process dies another gateway takes it over.
-   * `takenOver` is that other gateway: the acceptance side effects (ack,
-   * labels, assignees, owed label removal) already happened, so it starts at
-   * the poll, and it skips whatever finishing steps the record says are done.
-   * The record is cleared when this returns, however the run ended -- only a
-   * process that died leaves one behind.
-   */
-  private async finishRun(run: InflightRun, takenOver: boolean): Promise<void> {
-    const store = this.options.inflightRunStore;
-    const leaseMs = this.options.inflightRunLeaseMs ?? DEFAULT_LEASE_MS;
-    this.runningRuns.add(run.key);
-    const sessionId = run.trigger.sessionId;
-    this.runningSessions.set(sessionId, (this.runningSessions.get(sessionId) ?? 0) + 1);
-    let renew: ReturnType<typeof setInterval> | undefined;
-    try {
-      if (store) {
-        // Lease BEFORE the record exists, so no sweep can see it unleased.
-        if (!takenOver) {
-          await store.lease(run.key, this.instanceId, leaseMs);
-          await store.save(run);
-        }
-        const held = run.holdsQueue;
-        renew = setInterval(() => {
-          void store.lease(run.key, this.instanceId, leaseMs).catch(this.report);
-          // docs/adr/0055 §2: the serialize queue lives exactly as long as the
-          // run that holds it, renewed by whoever is finishing it.
-          if (held) void this.deferredStore.acquireQueue(held.queue, held.holder, this.queueTtlMs()).catch(this.report);
-        }, Math.max(1, Math.floor(leaseMs / 3)));
-        renew.unref?.();
-      }
-      await this.runAcceptedEventSteps(run, takenOver, async () => {
-        await store?.save(run);
-      });
-    } finally {
-      if (renew) clearInterval(renew);
-      if (run.holdsQueue) {
-        // Released AFTER the run's own completion event went out (inside
-        // runAcceptedEventSteps), so the next run in the queue starts only
-        // once this one's next hop -- and its status labels -- exist.
-        await this.deferredStore.releaseQueue(run.holdsQueue.queue, run.holdsQueue.holder).catch(this.report);
-        this.kickHeldEvents();
-      }
-      await store?.clear(run.key);
-      this.runningRuns.delete(run.key);
-      const left = (this.runningSessions.get(sessionId) ?? 1) - 1;
-      if (left > 0) this.runningSessions.set(sessionId, left);
-      else this.runningSessions.delete(sessionId);
-    }
-  }
-
-  private async runAcceptedEventSteps(run: InflightRun, takenOver: boolean, persist: () => Promise<void>): Promise<void> {
-    const { envelope, sender, trigger, traceparent } = run;
-    const gh = this.githubReplyTarget(trigger);
-    const http = trigger.reply?.http;
-    const sessionId = trigger.sessionId;
-    const label = gh?.removeLabel;
-    const best = async (fn: () => Promise<unknown>): Promise<void> => {
-      try {
-        await fn();
-      } catch (error) {
-        this.report(error);
-      }
-    };
-    let httpSent = false;
-    // Set once the run has a final outcome to publish (docs/adr/0052 §1).
-    let finished: FinishedRun | undefined;
-    // The posted ack, so the Remote Control link can be edited into it
-    // rather than posted as a second comment (see remoteControlHooks).
-    let ackComment: { id: number; body: string } | undefined = run.ackComment;
-    try {
-      // Record the owed removal BEFORE polling (and before anything else that
-      // can throw or outlive the pod), so the reconciler can self-heal it if
-      // the `finally` below never runs.
-      if (!takenOver && gh && label && this.options.pendingLabelStore) {
-        const store = this.options.pendingLabelStore;
-        await best(() =>
-          store.record({ owner: gh.owner, repo: gh.repo, issueNumber: gh.issueNumber, label, sessionId, recordedAt: Date.now() }),
-        );
-      }
-
-      if (gh && !takenOver) {
-        let pageUrl: string | undefined;
-        if (gh.sessionPage && this.options.sessionPageStore && this.options.publicBaseUrl) {
-          const store = this.options.sessionPageStore;
-          await best(async () => {
-            // The issue follow-ups reply to is stored on the entry; it is
-            // never derived from the session id (an operator template).
-            const entry = await store.getOrCreate(sessionId, { owner: gh.owner, repo: gh.repo, issueNumber: gh.issueNumber });
-            pageUrl = `${this.options.publicBaseUrl!.replace(/\/+$/, "")}/sessions/${entry.token}`;
-          });
-        }
-        const ack = [gh.ack, pageUrl ? `Follow along or send follow-ups: ${pageUrl}` : undefined].filter(Boolean).join("\n\n");
-        if (ack) {
-          await best(async () => {
-            const id = await this.options.githubReplyClient.postIssueComment(gh.owner, gh.repo, gh.issueNumber, ack);
-            if (id !== undefined) ackComment = { id, body: ack };
-          });
-          if (ackComment) {
-            run.ackComment = ackComment;
-            await persist();
-          }
-        }
-        // docs/adr/0052 §3: status labels and assignees go on at acceptance,
-        // with the ack. Bot-authored, so they never re-enter routing.
-        const { addLabels, assignees } = gh;
-        if (addLabels) await best(() => this.options.githubReplyClient.addIssueLabels(gh.owner, gh.repo, gh.issueNumber, addLabels));
-        if (assignees) await best(() => this.options.githubReplyClient.addIssueAssignees(gh.owner, gh.repo, gh.issueNumber, assignees));
-      }
-
-      const turnLabel = `${envelope.source} event ${envelope.id} → ${trigger.name || "trigger"}`;
-      let tracked = await this.trackTurn(sessionId, turnLabel);
-      const hooks =
-        gh && !run.remoteControlPosted
-          ? this.remoteControlHooks(gh, () => ackComment, async () => {
-              run.remoteControlPosted = true;
-              await persist();
-            })
-          : {};
-      let outcome = await this.options.orchestratorClient.poll(run.invocationId, hooks);
-
-      // Unauthenticated turn: `result` is a "link your account" prompt, not
-      // finished work. It is posted whenever there is an issue to post to --
-      // regardless of `reply.github.result`, since it's an action a human has
-      // to take, and nobody would otherwise see it. Then, for a provider whose
-      // token store this gateway owns, wait for the link and re-submit the same
-      // event (the ack is not repeated).
-      if (outcome.status === "succeeded" && outcome.identityLinkPending && outcome.identityLink) {
-        await this.completeTurn(sessionId, tracked, outcome);
-        if (gh) await best(() => this.options.githubReplyClient.postIssueComment(gh.owner, gh.repo, gh.issueNumber, outcome.result ?? ""));
-        // The ack now sits above the prompt the human is acting on, and GitHub
-        // doesn't notify on edits: a Remote Control link that surfaces on the
-        // resumed turn is posted as its own comment instead.
-        ackComment = undefined;
-        const resumed = await this.waitAndResume(outcome.identityLink, async () => {
-          // The resumed turn stays in the delivery's trace.
-          const hop = startSpan("event resubmit", traceparent, { kind: "client", attributes: { "aktis.event_source": envelope.source } });
-          let again: Awaited<ReturnType<OrchestratorClient["submitEvent"]>>;
-          try {
-            again = await this.options.orchestratorClient.submitEvent(envelope, sender, hop.traceparent);
-            hop.set({ "aktis.event.outcome": again.kind });
-            if (again.kind === "identity-required") hop.fail(again.body.error.code);
-            else if (again.kind === "failed") hop.fail("relay_failed");
-          } finally {
-            hop.end();
-          }
-          if (again.kind !== "accepted") {
-            const why =
-              again.kind === "ignored" ? "no trigger matched" : again.kind === "identity-required" ? again.body.error.code : again.error;
-            return { status: "failed", error: `re-submitting the event after linking: ${why}` };
-          }
-          // A takeover from here on polls the re-submitted turn.
-          run.invocationId = again.id;
-          await persist();
-          return this.options.orchestratorClient.poll(again.id, hooks);
-        });
-        if (!resumed) {
-          if (http) {
-            httpSent = true;
-            await best(() => this.postHttpReply(http, trigger, { status: "failed", error: "identity link was not completed; the run did not start" }));
-          }
-          return;
-        }
-        tracked = await this.trackTurn(sessionId, turnLabel);
-        outcome = resumed;
-      }
-
-      // A turn that is still a "link your account" prompt (a provider whose
-      // store this gateway can't wait on, or a resume that parked again) did
-      // no work, so it has no completion to publish -- its `succeeded` is
-      // the prompt's, not the run's.
-      if (!outcome.identityLinkPending) {
-        finished = { status: outcome.status, ...(outcome.outcome ? { outcome: outcome.outcome } : {}) };
-      }
-      await this.completeTurn(sessionId, tracked, outcome);
-      if (!run.resultPosted) {
-        if (gh?.result) {
-          const text = outcome.status === "succeeded" ? (outcome.result ?? "") : `Something went wrong processing this: ${outcome.error ?? "unknown error"}`;
-          await best(() => this.options.githubReplyClient.postIssueComment(gh.owner, gh.repo, gh.issueNumber, text));
-        }
-        if (http) {
-          httpSent = true;
-          await best(() => this.postHttpReply(http, trigger, outcome));
-        }
-        run.resultPosted = true;
-        await persist();
-      }
-    } catch (error) {
-      // Last line of defence: the run must not end in silence where the
-      // trigger declared somewhere to report to.
-      const message = error instanceof Error ? error.message : String(error);
-      if (gh?.result) {
-        await best(() => this.options.githubReplyClient.postIssueComment(gh.owner, gh.repo, gh.issueNumber, `Something went wrong processing this: ${message}`));
-      }
-      if (http && !httpSent) await best(() => this.postHttpReply(http, trigger, { status: "failed", error: message }));
-      this.report(error);
-    } finally {
-      // Every outcome: a failed run is exactly when someone wants to
-      // re-trigger. Removal is retried internally (github-client.ts) and
-      // backstopped by the reconciler; a failure here is reported but never
-      // masks the run's own outcome.
-      if (gh && label) {
-        try {
-          await this.options.githubReplyClient.removeIssueLabel(gh.owner, gh.repo, gh.issueNumber, label);
-          // Removed for real -- drop the owed-removal record. Best effort: a
-          // stale record only costs one idempotent 404 on the next sweep.
-          await best(async () => this.options.pendingLabelStore?.clear(sessionId, label));
-        } catch (error) {
-          // Retries exhausted; the record stays so the reconciler finishes it.
-          this.report(error);
-        }
-      }
-    }
-
-    // docs/adr/0052 §1: publish the completion LAST -- after the result
-    // comment, the http reply and the label removal -- so the next hop's
-    // acceptance actions (say, re-adding a label this run just removed) land
-    // after this run's cleanup rather than being undone by it. Only a run
-    // with a final outcome publishes: not one whose identity link never
-    // completed (it returns above, inside the try), and not one that threw
-    // before polling produced an outcome (`finished` unset) -- "the
-    // gateway crashed mid-run" is not a run status a trigger should route on.
-    if (finished && trigger.onComplete?.emitTo && !run.emitted) {
-      // Marked BEFORE emitting: a gateway that dies mid-emit costs the chain
-      // its next step (a human still gets the run's result), where a
-      // takeover that re-emitted would start a second one.
-      run.emitted = true;
-      await persist();
-      try {
-        if (trigger.onComplete.waitUntilClosed || trigger.onComplete.serialize) {
-          await this.holdRunEvent(envelope, sender, trigger, finished, gh, traceparent);
-        } else {
-          await this.emitRunEvent(envelope, sender, trigger, finished, gh, traceparent);
-        }
-      } catch (error) {
-        this.report(error);
-      }
-    }
-  }
-
-  /**
-   * docs/adr/0055 §2: records a completion whose trigger holds it --
-   * `waitUntilClosed` (until an issue/PR is closed) and/or `serialize` (until
-   * no other run holds the same queue) -- for {@link processHeldEvents} to
-   * publish once every hold is released. A hold whose params are unusable is
-   * dropped with a log line, and with no hold left the event goes out now:
-   * a broken hold degrades to today's behaviour, never to a stalled chain.
-   *
-   * Two deterministic guards on `waitUntilClosed`, both of which also publish
-   * at once rather than wait:
-   *  - waiting on the run's own issue (it could never close first);
-   *  - a cycle: the issue waited on is itself held waiting -- directly or
-   *    through others -- on this run's issue. Two pieces of work that each
-   *    decided to wait for the other would otherwise wait forever.
-   */
-  private async holdRunEvent(
-    envelope: Envelope,
-    sender: SenderClaims | undefined,
-    trigger: AcceptedTrigger,
-    finished: FinishedRun,
-    gh: GithubReplyTarget | undefined,
-    traceparent: string | undefined,
-  ): Promise<void> {
-    const oc = trigger.onComplete!;
-    const params = trigger.params ?? {};
-    const tag = `run event ${trigger.name || "trigger"} -> ${oc.emitTo}`;
-    const parkedOn: IssueRef | undefined = gh ? { owner: gh.owner, repo: gh.repo, number: gh.issueNumber } : undefined;
-
-    let waitFor: IssueRef | undefined;
-    let blocked = false;
-    if (oc.waitUntilClosed) {
-      const repoMatch = REPOSITORY.exec(params[oc.waitUntilClosed.repositoryParam] ?? "");
-      const number = positiveInt(params[oc.waitUntilClosed.numberParam]);
-      const candidate = repoMatch && number ? { owner: repoMatch[1] as string, repo: repoMatch[2] as string, number } : undefined;
-      if (!candidate) {
-        this.log(`${tag}: not waiting (waitUntilClosed params ${oc.waitUntilClosed.repositoryParam}/${oc.waitUntilClosed.numberParam} are not a repository and number)`);
-      } else if (parkedOn && refKey(candidate) === refKey(parkedOn)) {
-        this.log(`${tag}: not waiting (it would wait on its own issue ${refKey(candidate)})`);
-      } else if (parkedOn && (await this.waitsOn(candidate, parkedOn))) {
-        this.log(`${tag}: not waiting (${refKey(candidate)} is already waiting on ${refKey(parkedOn)}; that would be a cycle)`);
-      } else {
-        let state: "open" | "closed" | "missing" = "open";
-        try {
-          state = await this.options.githubReplyClient.getIssueState(candidate.owner, candidate.repo, candidate.number);
-        } catch (error) {
-          // Unknown: hold it, and let the sweep find out.
-          this.report(error);
-        }
-        if (state === "open") {
-          waitFor = candidate;
-          blocked = true;
-        } else {
-          this.log(`${tag}: not waiting (${refKey(candidate)} is already ${state})`);
-        }
-      }
-    }
-
-    let queue: string | undefined;
-    if (oc.serialize) {
-      const key = params[oc.serialize.keyParam];
-      if (key) queue = `${oc.serialize.group}:${key}`;
-      else this.log(`${tag}: not serializing (param ${oc.serialize.keyParam} is empty)`);
-    }
-
-    if (!waitFor && !queue) {
-      await this.emitRunEvent(envelope, sender, trigger, finished, gh, traceparent);
-      return;
-    }
-    const held: HeldRunEvent = {
-      id: randomUUID(),
-      createdAt: this.now().getTime(),
-      envelope,
-      ...(sender ? { sender } : {}),
-      trigger,
-      finished,
-      ...(traceparent ? { traceparent } : {}),
-      ...(waitFor ? { waitFor } : {}),
-      ...(waitFor && parkedOn ? { parkedOn } : {}),
-      ...(queue ? { queue } : {}),
-      ...(blocked ? { blocked } : {}),
-    };
-    await this.deferredStore.save(held);
-    this.log(
-      `${tag}: held${waitFor ? ` until ${refKey(waitFor)} is closed` : ""}${waitFor && queue ? " and" : ""}${queue ? ` until queue ${queue} is free` : ""}`,
-    );
-    this.kickHeldEvents();
-  }
-
-  /** Whether `from` is held waiting -- directly or through other held events -- on `target`. */
-  private async waitsOn(from: IssueRef, target: IssueRef): Promise<boolean> {
-    const next = new Map<string, IssueRef>();
-    for (const e of await this.deferredStore.list()) {
-      if (e.parkedOn && e.waitFor) next.set(refKey(e.parkedOn), e.waitFor);
-    }
-    const goal = refKey(target);
-    const seen = new Set<string>();
-    let cur: IssueRef | undefined = from;
-    while (cur) {
-      const k = refKey(cur);
-      if (k === goal) return true;
-      if (seen.has(k)) return false;
-      seen.add(k);
-      cur = next.get(k);
-    }
-    return false;
-  }
-
-  /** Runs {@link processHeldEvents} now, or once more right after the pass in progress. */
-  private kickHeldEvents(): void {
-    if (this.deferredSweeping) {
-      this.deferredSweepAgain = true;
-      return;
-    }
-    this.deferredSweeping = true;
-    void (async () => {
-      try {
-        do {
-          this.deferredSweepAgain = false;
-          await this.processHeldEvents();
-        } while (this.deferredSweepAgain);
-      } catch (error) {
-        this.report(error);
-      } finally {
-        this.deferredSweeping = false;
-      }
-    })();
-  }
-
-  /**
-   * One pass over the held run events, oldest first (so a serialize queue is
-   * FIFO). An event is published when its issue to wait on is closed (or
-   * gone) and it can take its queue. It is claimed (deleted) before it is
-   * published, so of several gateway replicas exactly one publishes it; a
-   * replica that took the queue but lost the claim gives the queue back.
-   * Waiting is abandoned when the held run's own issue is closed.
-   */
-  private async processHeldEvents(): Promise<void> {
-    const events = (await this.deferredStore.list()).sort((a, b) => a.createdAt - b.createdAt);
-    for (const ev of events) {
-      try {
-        if (ev.waitFor) {
-          // At most one state check per interval for this event, shared by
-          // every replica and every kick; skipped while another pass's mark
-          // is live (or the store is unreachable -- not checking keeps it held).
-          const checkMs = this.options.heldEventStateCheckIntervalMs ?? DEFAULT_HELD_EVENT_STATE_CHECK_MS;
-          if (checkMs > 0 && !(await this.deferredStore.markOnce(`waitcheck:${ev.id}`, checkMs))) continue;
-          const gh = this.options.githubReplyClient;
-          if (ev.parkedOn && (await gh.getIssueState(ev.parkedOn.owner, ev.parkedOn.repo, ev.parkedOn.number)) !== "open") {
-            if (await this.deferredStore.claim(ev.id)) {
-              this.log(`held run event ${ev.trigger.name}: abandoned (its issue ${refKey(ev.parkedOn)} was closed while waiting)`);
-            }
-            continue;
-          }
-          if ((await gh.getIssueState(ev.waitFor.owner, ev.waitFor.repo, ev.waitFor.number)) === "open") continue;
-        }
-        const holder = `${ev.id}:${this.instanceId}`;
-        if (ev.queue && !(await this.deferredStore.acquireQueue(ev.queue, holder, this.queueTtlMs()))) continue;
-        if (!(await this.deferredStore.claim(ev.id))) {
-          if (ev.queue) await this.deferredStore.releaseQueue(ev.queue, holder);
-          continue;
-        }
-        // Stays "failed" if emitRunEvent throws: treated like a transport failure.
-        let result: EmitRunEventResult = "failed";
-        try {
-          result = await this.emitRunEvent(ev.envelope, ev.sender, ev.trigger, ev.finished, this.githubReplyTarget(ev.trigger), ev.traceparent, {
-            resetDepth: ev.blocked === true,
-            ...(ev.queue ? { holdsQueue: { queue: ev.queue, holder } } : {}),
-          });
-        } finally {
-          // Nothing started that could release it.
-          if (ev.queue && result !== "accepted") await this.deferredStore.releaseQueue(ev.queue, holder);
-          // The orchestrator was unreachable (or publishing threw): put the
-          // event back, same id and createdAt so it keeps its place in line,
-          // and the next sweep retries it -- until HELD_EVENT_RETRY_WINDOW_MS
-          // after the first failure, since "failed" may be permanent. A
-          // delivered-but-not-accepted outcome (ignored, rejected, depth,
-          // verify) is final and dropped.
-          if (result === "failed") {
-            const now = this.now().getTime();
-            const publishFailure = { firstAt: ev.publishFailure?.firstAt ?? now, attempts: (ev.publishFailure?.attempts ?? 0) + 1 };
-            if (now - publishFailure.firstAt >= HELD_EVENT_RETRY_WINDOW_MS) {
-              this.log(
-                `held run event ${ev.trigger.name}: publish failed ${publishFailure.attempts} times since ${new Date(publishFailure.firstAt).toISOString()}; dropped`,
-              );
-              // Say so where the held run replied: a parked ticket would
-              // otherwise keep looking like it is still waiting.
-              await this.commentHeldEventDropped(ev);
-            } else {
-              await this.deferredStore.save({ ...ev, publishFailure });
-              this.log(`held run event ${ev.trigger.name}: publish failed (attempt ${publishFailure.attempts}); held again for the next sweep`);
-            }
-          }
-        }
-      } catch (error) {
-        this.report(error);
-      }
-    }
-  }
-
-  /** Best-effort notice on the held run's issue that its follow-up will never be published. */
-  private async commentHeldEventDropped(ev: HeldRunEvent): Promise<void> {
-    const gh = this.githubReplyTarget(ev.trigger);
-    const target = gh ? { owner: gh.owner, repo: gh.repo, number: gh.issueNumber } : ev.parkedOn;
-    if (!target) return;
-    try {
-      await this.options.githubReplyClient.postIssueComment(
-        target.owner,
-        target.repo,
-        target.number,
-        "Stopped the automated chain here: its next step could not be delivered after retrying for 24 hours. This needs a human to pick it up.",
-      );
-    } catch (error) {
-      this.report(error);
-    }
-  }
-
-  /**
-   * One `conflict` event (docs/adr/0055 §1) for a pull request the conflict
-   * sweep found conflicting with its base, acting as its verified assignee.
-   * A fresh chain: the PR's earlier chain ended when it was handed off.
-   * True unless the orchestrator could not be reached (the sweep then retries).
-   */
-  private async emitConflictEvent(source: string, c: ConflictCandidate): Promise<boolean> {
-    const claims = await this.senderClaims(source, c.assignee);
-    const envelope: Envelope = {
-      source,
-      kind: "conflict",
-      id: randomUUID(),
-      time: this.now().toISOString(),
-      headers: {},
-      sender: { login: c.assignee.login, isBot: false },
-      repository: `${c.owner}/${c.repo}`,
-      body: {
-        pullRequest: {
-          number: c.pr.number,
-          url: c.pr.url,
-          title: c.pr.title,
-          baseRef: c.pr.baseRef,
-          baseSha: c.pr.baseSha,
-          headRef: c.pr.headRef,
-          headSha: c.pr.headSha,
-        },
-      },
-    };
-    const span = startSpan("conflict event", undefined, {
-      kind: "client",
-      attributes: { "aktis.event_source": source, "aktis.event_id": envelope.id },
-    });
-    let relayed: WebhookOutcome;
-    try {
-      relayed = await this.relayEvent(envelope, claims, span);
-    } catch (error) {
-      span.fail("internal_error");
-      this.report(error);
-      return false;
-    } finally {
-      span.end();
-    }
-    relayed.after?.().catch(this.report);
-    return relayed.relay !== "failed";
-  }
-
-  /**
-   * The chain an accepted envelope belongs to. A run event carries it in its
-   * body (the gateway built it, below); anything else starts a new one, whose
-   * origin is the delivery's VERIFIED sender -- `sender` is only ever set for
-   * a login the source's provider resolved.
-   */
-  private chainOf(envelope: Envelope, sender: SenderClaims | undefined): RunChain | undefined {
-    if (envelope.kind === "run") return parseChain((envelope.body as Record<string, JsonValue> | null)?.chain);
-    return {
-      id: envelope.id,
-      depth: 0,
-      counts: {},
-      ...(sender?.login
-        ? { origin: { login: sender.login, ...(sender.accountId ? { accountId: sender.accountId } : {}), repository: envelope.repository } }
-        : {}),
-    };
-  }
-
-  /**
-   * Publishes one run's completion to its trigger's `onComplete.emitTo` run
-   * source (docs/adr/0052 §1) through the same `relayEvent` -> `/invoke`
-   * path a webhook takes. Three deterministic gates, each of which stops the
-   * chain here (logged; the first two also commented where the run replied):
-   *
-   *  - the global depth cap (`runEventMaxDepth`), which no trigger can raise;
-   *  - the origin must re-verify NOW: a human whose access was revoked
-   *    mid-chain stops it, and every hop still acts as a verified person;
-   *  - the target must be a run source, and the chain must have a human
-   *    origin at all (a run event never carries a bot or a made-up sender).
-   */
-  private async emitRunEvent(
-    envelope: Envelope,
-    sender: SenderClaims | undefined,
-    trigger: AcceptedTrigger,
-    finished: FinishedRun,
-    gh: GithubReplyTarget | undefined,
-    traceparent: string | undefined,
-    opts: {
-      /** docs/adr/0055 §2: a hold that really blocked on a human restarts the depth count (counts are kept). */
-      resetDepth?: boolean;
-      /** The serialize queue the next hop's run will hold. */
-      holdsQueue?: InflightRun["holdsQueue"];
-    } = {},
-  ): Promise<EmitRunEventResult> {
-    const emitTo = trigger.onComplete!.emitTo;
-    const tag = `run event ${trigger.name || "trigger"} -> ${emitTo}`;
-    const target = this.eventSources.get(emitTo);
-    if (!target || target.kind !== "run") {
-      this.log(`${tag}: skipped (${target ? `source is kind ${target.kind}, not run` : "no such usable EventSource"})`);
-      return "not-accepted";
-    }
-    const chain = this.chainOf(envelope, sender);
-    if (!chain) {
-      this.log(`${tag}: skipped (the run's chain metadata is unreadable)`);
-      return "not-accepted";
-    }
-    const origin = chain.origin;
-    if (!origin) {
-      this.log(`${tag}: skipped (the chain has no verified human sender to act as)`);
-      return "not-accepted";
-    }
-    const comment = async (text: string): Promise<void> => {
-      if (!gh) return;
-      try {
-        await this.options.githubReplyClient.postIssueComment(gh.owner, gh.repo, gh.issueNumber, text);
-      } catch (error) {
-        this.report(error);
-      }
-    };
-
-    const next: RunChain = {
-      id: chain.id,
-      // A hold that waited on a human merging something is not a runaway
-      // loop: the depth restarts there. Counts are kept, so per-trigger caps
-      // (e.g. how many times a ticket may wait) still bound the chain.
-      depth: opts.resetDepth ? 1 : chain.depth + 1,
-      counts: { ...chain.counts, [trigger.name]: (chain.counts[trigger.name] ?? 0) + 1 },
-      origin,
-    };
-    const maxDepth = this.options.runEventMaxDepth ?? DEFAULT_RUN_EVENT_MAX_DEPTH;
-    if (next.depth > maxDepth) {
-      this.log(`${tag}: dropped, chain ${chain.id} would reach depth ${next.depth} (max ${maxDepth})`);
-      await comment(`Stopped the automated chain here: it exceeded ${maxDepth} steps.`);
-      return "not-accepted";
-    }
-
-    // Per-hop re-verification, exactly as resolveSender verifies a webhook's
-    // login (a run event's sender is never a bot).
-    const repoMatch = REPOSITORY.exec(origin.repository);
-    const repoContext: RepoContext | undefined = repoMatch ? { owner: repoMatch[1] as string, repo: repoMatch[2] as string } : undefined;
-    let identity: unknown;
-    try {
-      identity = await this.options.identityResolver.resolve(origin.login, false, repoContext);
-    } catch (error) {
-      // A GitHub or identity-link blip is not "no longer verifies": report it
-      // as a transport failure, so a held event is kept and retried.
-      this.report(error);
-      this.log(`${tag}: chain origin ${origin.login} could not be re-verified right now (resolver error)`);
-      return "failed";
-    }
-    if (!identity) {
-      this.log(`${tag}: dropped, chain origin ${origin.login} no longer verifies`);
-      await comment(`Stopped the automated chain here: ${origin.login} could not be re-verified for the next step.`);
-      return "not-accepted";
-    }
-    const claims = await this.senderClaims(emitTo, { login: origin.login, ...(origin.accountId ? { accountId: origin.accountId } : {}) });
-
-    const event: Envelope = {
-      source: emitTo,
-      kind: "run",
-      id: randomUUID(),
-      time: this.now().toISOString(),
-      headers: {},
-      sender: { login: origin.login, isBot: false },
-      repository: origin.repository,
-      body: {
-        trigger: trigger.name,
-        status: finished.status,
-        params: trigger.params ?? {},
-        outcome: (finished.outcome ?? {}) as JsonValue,
-        chain: next as unknown as JsonValue,
-      },
-    };
-    // Its own span, in the finished run's trace, so a chain reads as one trace.
-    const span = startSpan("run event", traceparent, {
-      kind: "client",
-      attributes: {
-        "aktis.event_source": emitTo,
-        "aktis.event_id": event.id,
-        "aktis.completed_trigger": trigger.name,
-        "aktis.chain_depth": next.depth,
-      },
-    });
-    let relayed: WebhookOutcome;
-    try {
-      relayed = await this.relayEvent(event, claims, span, opts.holdsQueue);
-    } catch (error) {
-      span.fail("internal_error");
-      throw error;
-    } finally {
-      span.end();
-    }
-    // The next hop's run is its own lifecycle; this one is done.
-    relayed.after?.().catch(this.report);
-    if (relayed.relay === "failed") return "failed";
-    return relayed.relay === "accepted" ? "accepted" : "not-accepted";
-  }
-
-  /**
-   * Surfaces the Remote Control link (at most once) on the trigger's issue
-   * when the delegated agent reports one. The agent pod takes minutes to
-   * register its session, so the ack can't wait for it: instead the link is
-   * edited INTO the already-posted ack, keeping one "starting work" comment.
-   * With no ack to edit (none declared, its post failed, no id came back)
-   * or a failed edit, it falls back to posting the link as its own comment
-   * -- the link is the one thing a human needs to take over, so it must land.
-   */
-  private remoteControlHooks(
-    gh: GithubReplyTarget,
-    ack: () => { id: number; body: string } | undefined,
-    onPosted?: () => Promise<void>,
-  ): PollHooks {
-    let posted = false;
-    return {
-      onRemoteControlUrl: async (url) => {
-        if (posted) return;
-        posted = true;
-        await onPosted?.();
-        const line = `🤖 Watch live or take over the session here: ${url}`;
-        const ackComment = ack();
-        if (ackComment) {
-          try {
-            await this.options.githubReplyClient.updateIssueComment(gh.owner, gh.repo, ackComment.id, `${ackComment.body}\n\n${line}`);
-            return;
-          } catch (error) {
-            this.report(error);
-          }
-        }
-        try {
-          await this.options.githubReplyClient.postIssueComment(gh.owner, gh.repo, gh.issueNumber, line);
-        } catch (error) {
-          this.report(error);
-        }
-      },
-    };
-  }
-
-  /**
-   * `reply.http`: POST the outcome to the trigger's LITERAL url (it comes only
-   * from the EventTrigger CR -- never from event content, so an event can't
-   * aim the gateway at an internal address). Body:
-   * `{trigger, sessionId, status: "succeeded"|"failed", result?|error?}`;
-   * with `secretRef`, `x-event-signature: sha256=<hex hmac(secret, body)>`
-   * over the exact bytes sent. A signing secret that can't be read means the
-   * reply is NOT sent -- an unsigned callback to a receiver expecting a
-   * signature would just be rejected, or worse, accepted by a lax one.
-   * Redirects are not followed.
-   */
-  private async postHttpReply(
-    http: NonNullable<RenderedReply["http"]>,
-    trigger: AcceptedTrigger,
-    outcome: Pick<OrchestratorInvokeResult, "status" | "result" | "error">,
-  ): Promise<void> {
-    let url: URL;
-    try {
-      url = new URL(http.url);
-    } catch {
-      this.log(`trigger ${trigger.name}: reply.http not sent (invalid url)`);
-      return;
-    }
-    if (url.protocol !== "http:" && url.protocol !== "https:") {
-      this.log(`trigger ${trigger.name}: reply.http not sent (unsupported scheme ${url.protocol})`);
-      return;
-    }
-    const succeeded = outcome.status === "succeeded";
-    const body = JSON.stringify({
-      trigger: trigger.name,
-      sessionId: trigger.sessionId,
-      status: succeeded ? "succeeded" : "failed",
-      ...(succeeded ? { result: outcome.result ?? "" } : { error: outcome.error ?? "unknown error" }),
-    });
-    const headers: Record<string, string> = { "content-type": "application/json" };
-    if (http.secretRef) {
-      const secret = await this.readSecret(http.secretRef.name, http.secretRef.key);
-      if (!secret) {
-        this.log(`trigger ${trigger.name}: reply.http not sent (signing secret ${http.secretRef.name}/${http.secretRef.key} unavailable)`);
-        return;
-      }
-      headers[EVENT_SIGNATURE_HEADER] = `sha256=${createHmac("sha256", secret).update(body, "utf8").digest("hex")}`;
-    }
-    const doFetch = this.options.replyFetch ?? fetch;
-    const res = await doFetch(url, {
-      method: "POST",
-      headers,
-      body,
-      redirect: "manual",
-      signal: AbortSignal.timeout(HTTP_REPLY_TIMEOUT_MS),
-    });
-    if (!res.ok) this.log(`trigger ${trigger.name}: reply.http answered ${res.status}`);
-  }
-
-  private async trackTurn(sessionId: string, request: string): Promise<{ turnIndex: number } | undefined> {
-    try {
-      return await this.options.sessionPageStore?.addTurn(sessionId, request);
-    } catch (error) {
-      this.report(error);
-      return undefined;
-    }
-  }
-
-  private async completeTurn(
-    sessionId: string,
-    tracked: { turnIndex: number } | undefined,
-    outcome: OrchestratorInvokeResult,
-  ): Promise<void> {
-    if (!tracked || !this.options.sessionPageStore) return;
-    try {
-      await this.options.sessionPageStore.completeTurn(
-        sessionId,
-        tracked.turnIndex,
-        outcome.status === "succeeded"
-          ? { status: "succeeded", result: outcome.result ?? "" }
-          : { status: "failed", error: outcome.error ?? "unknown error" },
-      );
-    } catch (error) {
-      this.report(error);
-    }
-  }
-
-  /**
-   * Default for {@link GatewayServerOptions.resumeWaitMs}: how long to hold a
-   * parked turn open waiting for the user to finish linking their account
-   * before giving up (they can always re-trigger later). Matches the link
-   * flow's own ~10-minute expiry.
-   *
-   * Was a hard-coded constant, and being unconfigurable had a cost worth
-   * recording: every parked turn holds a relay for this whole window. The e2e
-   * suite's identity-keying negative controls park deliberately, so a 10-minute
-   * hold outlived the spec that caused it and starved the next spec's trigger --
-   * surfacing as a positive keying assertion timing out with no orchestrator
-   * activity at all, which reads exactly like a keying bug.
-   */
-  private static readonly DEFAULT_RESUME_WAIT_MS = 10 * 60 * 1000;
 
   /**
    * A follow-up prompt from the session page: an ordinary conversational turn
@@ -1926,7 +751,7 @@ export class GatewayServer {
       this.options.orchestratorClient.invoke(request, sessionId, "device");
 
     const finishTurn = async (tracked: { turnIndex: number } | undefined, outcome: OrchestratorInvokeResult): Promise<void> => {
-      await this.completeTurn(sessionId, tracked, outcome);
+      await this.effects.completeTurn(sessionId, tracked, outcome);
       const reply =
         outcome.status === "succeeded"
           ? (outcome.result ?? "")
@@ -1934,7 +759,7 @@ export class GatewayServer {
       await this.options.githubReplyClient.postIssueComment(owner, repo, issueNumber, reply);
     };
 
-    const tracked = await this.trackTurn(sessionId, request);
+    const tracked = await this.effects.trackTurn(sessionId, request);
     const outcome = await invokeOnce();
 
     // Unauthenticated turn: post the link prompt, then -- for a provider whose
@@ -1942,38 +767,14 @@ export class GatewayServer {
     // request automatically.
     if (outcome.status === "succeeded" && outcome.identityLinkPending && outcome.identityLink) {
       await finishTurn(tracked, outcome);
-      const resumed = await this.waitAndResume(outcome.identityLink, invokeOnce);
-      if (resumed) await finishTurn(await this.trackTurn(sessionId, request), resumed);
+      if (await this.effects.waitForLink(outcome.identityLink)) {
+        const resumed = await invokeOnce();
+        await finishTurn(await this.effects.trackTurn(sessionId, request), resumed);
+      }
       return;
     }
 
     await finishTurn(tracked, outcome);
-  }
-
-  /**
-   * Waits for a pending identity link to complete, then re-runs the turn.
-   * Only providers whose token store this gateway itself owns can be waited
-   * on -- today, both `claude` (setup-token) and `claude-remote` (full
-   * login, docs/adr/0027's follow-up), since both live in the same
-   * `claudeAuthStore` (`ClaudeTokenStore`, keyed by `kind`). Anything else
-   * returns `undefined` and the caller leaves the link prompt standing for a
-   * manual re-trigger. Returns the resumed turn's outcome, or `undefined` if
-   * the link never landed within the wait window.
-   */
-  private async waitAndResume(
-    identityLink: { provider: string; subject: string },
-    reinvoke: () => Promise<OrchestratorInvokeResult>,
-  ): Promise<OrchestratorInvokeResult | undefined> {
-    const kind = identityLink.provider === "claude" ? "setup-token" : identityLink.provider === "claude-remote" ? "login" : undefined;
-    const store = kind ? this.options.claudeAuthStore : undefined;
-    if (!store || !kind) return undefined;
-    const record = await store.waitForCompletion(
-      identityLink.subject,
-      this.options.resumeWaitMs ?? GatewayServer.DEFAULT_RESUME_WAIT_MS,
-      kind,
-    );
-    if (!record) return undefined;
-    return reinvoke();
   }
 
   private async handleSessionPage(res: ServerResponse, token: string): Promise<void> {

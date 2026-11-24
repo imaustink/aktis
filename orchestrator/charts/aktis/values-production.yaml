@@ -314,6 +314,10 @@ core-controller:
 # relays GitHub issue/comment webhooks into agent-orchestrator's existing
 # conversational /invoke API, one session per issue.
 integration-gateway:
+  # docs/adr/0057: its run workflows, on the engine's Temporal.
+  temporal:
+    address: temporal-frontend.temporal.svc:7233
+    namespace: default
   enabled: true
 
   image:

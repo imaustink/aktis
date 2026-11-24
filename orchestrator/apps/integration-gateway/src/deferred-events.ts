@@ -4,6 +4,11 @@ import type { AcceptedTrigger, OrchestratorInvokeResult } from "./orchestrator-c
 import type { SenderClaims } from "./sender-assertion.js";
 
 /**
+ * DRAIN ONLY (docs/adr/0057): nothing records here any more; runs are Temporal
+ * workflows (src/runs/). runs/legacy-drain.ts reads what pre-0057 gateways
+ * left behind. Delete this module one release after 0057 ships.
+ */
+/**
  * Durable state for the coordination primitives of docs/adr/0055:
  *
  *  - **Held run events** (§2). A trigger whose `onComplete` sets

@@ -99,6 +99,12 @@ spec:
             - name: RUN_EVENT_MAX_DEPTH
               value: {{ .Values.config.runEventMaxDepth | quote }}
             {{- end }}
+            - name: TEMPORAL_ADDRESS
+              value: {{ required "integration-gateway.temporal.address is required (docs/adr/0057)" .Values.temporal.address | quote }}
+            - name: TEMPORAL_NAMESPACE
+              value: {{ .Values.temporal.namespace | quote }}
+            - name: TEMPORAL_TASK_QUEUE
+              value: {{ .Values.temporal.taskQueue | quote }}
             {{- if .Values.sessionPage.publicBaseUrl }}
             - name: GATEWAY_PUBLIC_URL
               value: {{ .Values.sessionPage.publicBaseUrl | quote }}
