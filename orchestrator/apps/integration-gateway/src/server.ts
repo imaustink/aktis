@@ -255,6 +255,12 @@ export interface GatewayServerOptions {
   deferredEventStore?: DeferredEventStore;
   /** How often held run events are re-checked. */
   deferredEventSweepIntervalMs?: number;
+  /**
+   * How often a held `waitUntilClosed` event's issues are re-read from GitHub
+   * (docs/adr/0055 §2), shared across replicas through the deferred store.
+   * Absent -> {@link DEFAULT_HELD_EVENT_STATE_CHECK_MS}; 0 checks every pass.
+   */
+  heldEventStateCheckIntervalMs?: number;
   /** How often the conflict sweeper checks whether a `conflicts` source is due. */
   conflictSweepTickMs?: number;
 }
@@ -271,6 +277,13 @@ const UNRENEWED_QUEUE_TTL_MS = 9 * 60 * 60 * 1000;
  * stops calling the orchestrator every sweep.
  */
 const HELD_EVENT_RETRY_WINDOW_MS = 24 * 60 * 60 * 1000;
+/**
+ * A held `waitUntilClosed` event re-reads its issues' state at most this
+ * often (across all replicas). Waiting on a human merge does not need 30s
+ * latency, and two GitHub calls per parked ticket per pass per replica would
+ * exhaust the App installation's rate limit with a modest backlog.
+ */
+const DEFAULT_HELD_EVENT_STATE_CHECK_MS = 5 * 60 * 1000;
 
 /** A positive integer from a string param (params arrive in their §4 string form). */
 function positiveInt(value: string | undefined): number | undefined {
@@ -1446,6 +1459,11 @@ export class GatewayServer {
     for (const ev of events) {
       try {
         if (ev.waitFor) {
+          // At most one state check per interval for this event, shared by
+          // every replica and every kick; skipped while another pass's mark
+          // is live (or the store is unreachable -- not checking keeps it held).
+          const checkMs = this.options.heldEventStateCheckIntervalMs ?? DEFAULT_HELD_EVENT_STATE_CHECK_MS;
+          if (checkMs > 0 && !(await this.deferredStore.markOnce(`waitcheck:${ev.id}`, checkMs))) continue;
           const gh = this.options.githubReplyClient;
           if (ev.parkedOn && (await gh.getIssueState(ev.parkedOn.owner, ev.parkedOn.repo, ev.parkedOn.number)) !== "open") {
             if (await this.deferredStore.claim(ev.id)) {
@@ -1484,6 +1502,9 @@ export class GatewayServer {
               this.log(
                 `held run event ${ev.trigger.name}: publish failed ${publishFailure.attempts} times since ${new Date(publishFailure.firstAt).toISOString()}; dropped`,
               );
+              // Say so where the held run replied: a parked ticket would
+              // otherwise keep looking like it is still waiting.
+              await this.commentHeldEventDropped(ev);
             } else {
               await this.deferredStore.save({ ...ev, publishFailure });
               this.log(`held run event ${ev.trigger.name}: publish failed (attempt ${publishFailure.attempts}); held again for the next sweep`);
@@ -1493,6 +1514,23 @@ export class GatewayServer {
       } catch (error) {
         this.report(error);
       }
+    }
+  }
+
+  /** Best-effort notice on the held run's issue that its follow-up will never be published. */
+  private async commentHeldEventDropped(ev: HeldRunEvent): Promise<void> {
+    const gh = this.githubReplyTarget(ev.trigger);
+    const target = gh ? { owner: gh.owner, repo: gh.repo, number: gh.issueNumber } : ev.parkedOn;
+    if (!target) return;
+    try {
+      await this.options.githubReplyClient.postIssueComment(
+        target.owner,
+        target.repo,
+        target.number,
+        "Stopped the automated chain here: its next step could not be delivered after retrying for 24 hours. This needs a human to pick it up.",
+      );
+    } catch (error) {
+      this.report(error);
     }
   }
 
@@ -1636,8 +1674,11 @@ export class GatewayServer {
     try {
       identity = await this.options.identityResolver.resolve(origin.login, false, repoContext);
     } catch (error) {
+      // A GitHub or identity-link blip is not "no longer verifies": report it
+      // as a transport failure, so a held event is kept and retried.
       this.report(error);
-      identity = undefined;
+      this.log(`${tag}: chain origin ${origin.login} could not be re-verified right now (resolver error)`);
+      return "failed";
     }
     if (!identity) {
       this.log(`${tag}: dropped, chain origin ${origin.login} no longer verifies`);

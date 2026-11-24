@@ -232,6 +232,9 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
     labelReconcilerGraceMs: 60 * 60 * 1000,
     sessionPageStore,
     publicBaseUrl: "https://gateway.example.com",
+    // Re-read a held event's issues on every pass, so tests can kick freely;
+    // the throttle has its own test.
+    heldEventStateCheckIntervalMs: 0,
     ...overrides,
   });
   await server.listen(0);
@@ -1582,8 +1585,59 @@ describe("held run events and conflict events (docs/adr/0055)", () => {
     kick(h);
     await vi.waitFor(() => expect(h.logs.some((l) => l.includes("publish failed 3 times") && l.includes("dropped"))).toBe(true));
     expect(await store.list()).toHaveLength(0);
+    // A human is told, where the held run replied.
+    await vi.waitFor(() =>
+      expect(h.postIssueComment).toHaveBeenCalledWith("acme", "widgets", 7, expect.stringContaining("could not be delivered after retrying")),
+    );
     // Its queue was released: another holder can take it.
     expect(await store.acquireQueue(queue, "other", 60_000)).toBe(true);
+  });
+
+  it("keeps a held event whose sender re-verification throws, and publishes it once the resolver recovers", async () => {
+    const store = new InMemoryDeferredEventStore();
+    const h = await start({ deferredEventStore: store });
+    chain(h, PARK);
+    await postGithub(h);
+    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
+    const [held] = await store.list();
+
+    h.getIssueState.mockImplementation(async (_o: string, _r: string, n: number) => (n === 5 ? "closed" : "open"));
+    h.resolve.mockRejectedValueOnce(new Error("GitHub 502"));
+    kick(h);
+    await vi.waitFor(async () => expect((await store.list())[0]?.publishFailure?.attempts).toBe(1));
+    expect((await store.list())[0]).toMatchObject({ id: held!.id, createdAt: held!.createdAt });
+    expect(runEvents(h)).toHaveLength(0);
+    expect(h.postIssueComment).not.toHaveBeenCalledWith("acme", "widgets", 7, expect.stringContaining("could not be re-verified"));
+
+    h.submitEvent.mockResolvedValue({ kind: "ignored" });
+    kick(h);
+    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    expect(runEvents(h)[0]?.body).toMatchObject({ trigger: "factory-park" });
+    await vi.waitFor(async () => expect(await store.list()).toHaveLength(0));
+  });
+
+  it("re-reads a held event's issues from GitHub at most once per check interval", async () => {
+    const store = new InMemoryDeferredEventStore();
+    const h = await start({ deferredEventStore: store, heldEventStateCheckIntervalMs: 60 * 60 * 1000 });
+    chain(h, PARK);
+    await postGithub(h);
+    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
+    kick(h);
+    await settle();
+    const calls = h.getIssueState.mock.calls.length;
+
+    kick(h);
+    await settle();
+    kick(h);
+    await settle();
+    expect(h.getIssueState.mock.calls.length).toBe(calls);
+    expect(await store.list()).toHaveLength(1);
+
+    // Once the mark lapses, the next pass checks again (and publishes).
+    await store.unmark(`waitcheck:${(await store.list())[0]!.id}`);
+    h.getIssueState.mockImplementation(async (_o: string, _r: string, n: number) => (n === 5 ? "closed" : "open"));
+    kick(h);
+    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
   });
 
   it("drops a held event the orchestrator delivered but did not accept", async () => {

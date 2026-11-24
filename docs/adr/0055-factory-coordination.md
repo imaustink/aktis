@@ -95,13 +95,17 @@ beside the in-flight runs) and publishes it once every hold is released:
 
 The record is claimed (deleted) before it is published, so of several replicas
 exactly one publishes it. If the publish then fails (the orchestrator is
-unreachable or answers an error status, or publishing throws), the replica
+unreachable or answers an error status, re-verifying the chain's origin
+errors, or publishing throws), the replica
 saves the record back, with the same id and creation time, so the next sweep
 retries it in order. Because such a failure may be permanent (a 400 or 401
 looks the same as an outage), retrying stops 24 hours after the first failed
-attempt: the record is dropped with a log line and its queue is freed. A
-delivered completion that nobody accepted is dropped. The sweep runs
-every 30s, and also immediately after a hold or a queue release.
+attempt: the record is dropped with a log line and a comment on the held
+run's issue, and its queue is freed. A delivered completion that nobody
+accepted is dropped. The sweep runs every 30s, and also immediately after a
+hold or a queue release; a held wait's issue states are re-read at most once
+per check interval (default 5 minutes, shared across replicas), so parked
+tickets do not eat into the App's rate limit.
 
 **Depth.** A wait that really blocked (its target was open when the run ended)
 restarts the chain's `depth` at 1 when it is published. Progress there was
@@ -175,7 +179,7 @@ because bot-authored label webhooks are dropped.
   coordinated serially, though triage, review and fix runs still run
   concurrently.
 - New GitHub reads per gateway: one search plus one PR read per open factory PR
-  per interval, and one issue read per held wait every 30s. These are well
+  per interval, and up to two issue reads per held wait every 5 minutes. These are well
   within App rate limits at factory scale.
 - In-memory fallback: without Redis, holds, queues and marks live in memory and
   a restart forgets them. The waiting issues stay labeled `ai-waiting` and need

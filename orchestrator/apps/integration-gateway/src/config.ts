@@ -209,6 +209,12 @@ export interface AppConfig {
    * raise -- per-trigger caps live in CEL on `body.chain.counts`.
    */
   runEventMaxDepth: number;
+  /**
+   * How often a held `waitUntilClosed` event re-reads its issues from GitHub
+   * (docs/adr/0055 §2), in ms; 0 checks every sweep. Unset -> the gateway's
+   * default (5 minutes).
+   */
+  heldEventStateCheckIntervalMs: number | undefined;
 }
 
 function num(raw: string | undefined, fallback: number): number {
@@ -282,6 +288,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     labelReconcilerIntervalMs: numOrUndefined(env.GATEWAY_LABEL_RECONCILER_INTERVAL_MS),
     labelReconcilerGraceMs: numOrUndefined(env.GATEWAY_LABEL_RECONCILER_GRACE_MS),
     runEventMaxDepth: positiveInt(env.RUN_EVENT_MAX_DEPTH, 12),
+    heldEventStateCheckIntervalMs: numOrUndefined(env.GATEWAY_HELD_EVENT_STATE_CHECK_INTERVAL_MS),
   };
 }
 

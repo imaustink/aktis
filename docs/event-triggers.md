@@ -538,11 +538,14 @@ in-flight runs) and a sweep publishes it once every hold is released:
   first. A completion nobody accepted frees the queue at once.
 
 Both together hold until both are released. The sweep runs every 30s and
-immediately after a hold or a queue release; of several gateway replicas,
-exactly one publishes each completion (it is claimed before it is sent). A
-completion whose publish fails (orchestrator unreachable or an error status)
-is saved back in its place and retried on the next sweep, for up to 24 hours
-after the first failure; then it is dropped and logged.
+immediately after a hold or a queue release; a held wait re-reads its issues
+from GitHub at most once per `GATEWAY_HELD_EVENT_STATE_CHECK_INTERVAL_MS`
+(default 5 minutes) across all replicas. Of several gateway replicas, exactly
+one publishes each completion (it is claimed before it is sent). A completion
+whose publish fails (orchestrator unreachable, an error status, or an error
+re-verifying the chain's origin) is saved back in its place and retried on
+the next sweep, for up to 24 hours after the first failure; then it is
+dropped, logged, and a comment on the held run's issue says it needs a human.
 
 ### The coordinator
 

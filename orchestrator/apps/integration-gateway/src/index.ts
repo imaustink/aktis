@@ -482,6 +482,7 @@ async function main(): Promise<void> {
     ...(connections ? { connections } : {}),
     resumeWaitMs: config.resumeWaitMs,
     runEventMaxDepth: config.runEventMaxDepth,
+    ...(config.heldEventStateCheckIntervalMs !== undefined ? { heldEventStateCheckIntervalMs: config.heldEventStateCheckIntervalMs } : {}),
     claudeCredentialRefreshEnabled: config.claudeCredentialRefreshEnabled,
     claudeCredentialRefreshMarginMs: config.claudeCredentialRefreshMarginMs,
     claudeCredentialSweepIntervalMs: config.claudeCredentialSweepIntervalMs,
