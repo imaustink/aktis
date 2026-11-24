@@ -99,7 +99,7 @@ export class TemporalRuns implements RunStarter {
     await this.o.client.workflow.signalWithStart<typeof runQueue, [string]>("runQueue", {
       taskQueue: this.o.taskQueue,
       workflowId: workflowIds.runQueue(this.o.taskQueue, hold.queue),
-      args: [{ queue: hold.queue, holdTimeoutMs: queueHoldTimeoutMs(this.o.settings) }],
+      args: [{ queue: hold.queue, holdTimeoutMs: queueHoldTimeoutMs(this.o.settings), claimGraceMs: this.o.settings.queueClaimGraceMs }],
       signal: "enqueue",
       signalArgs: [hold.holder],
     });

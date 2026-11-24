@@ -50,7 +50,11 @@ The stack already runs Temporal for the engine.
    turn started releases it when it finishes. A holder that never releases is
    passed over after a timeout computed from the run settings
    (`queueHoldTimeoutMs`) to outlast any live holder, so two runs from one
-   queue never overlap.
+   queue never overlap. A turn whose publish left no run behind does not wait
+   that long: an event accepted whose run could not be started releases it at
+   once, and a publish that ended without an answer hands the turn off; the
+   run it may have started claims the queue when it starts, and an unclaimed
+   turn is passed over after `queueClaimGraceMs` (15 minutes by default).
 4. **A conflicts source is a `conflictSweep` workflow**: one per source,
    started (if not running) by every replica, ending when the source goes
    away. Its once-per-(PR, base commit) marks are workflow state.

@@ -564,7 +564,11 @@ workflow (docs/adr/0057), which publishes it once every hold is released:
   releases (its workflow was terminated) is passed over after a timeout derived
   from the run settings to outlast any live holder (about 60 hours with the
   defaults: two 24-hour publish windows, plus a run's turns, link wait and
-  label retries). A completion nobody accepted frees the queue at once.
+  label retries). A completion nobody accepted, or accepted but whose run
+  could not be started, frees the queue at once. A publish that ended without
+  an answer (its worker died, or it timed out) hands the queue to the run it
+  may have started, which claims it when it starts; if no run claims it within
+  15 minutes, the next completion gets its turn.
 
 Both together hold until both are released: the wait first, then the queue.
 A held wait re-reads its issues from GitHub once per

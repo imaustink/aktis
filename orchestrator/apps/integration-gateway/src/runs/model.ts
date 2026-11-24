@@ -153,10 +153,13 @@ export interface FinishedRun {
 }
 
 /**
- * How publishing a run event ended: accepted; delivered but not accepted (or
- * stopped by a gate) -- final; or "failed", a transport failure worth retrying.
+ * How publishing a run event ended: accepted, and its run started; accepted,
+ * but its run could not be started ("accepted-not-started": final, since a
+ * second publish would be a second acceptance, and no run will release a
+ * queue it was to hold); delivered but not accepted (or stopped by a gate) --
+ * final; or "failed", a transport failure worth retrying.
  */
-export type EmitRunEventResult = "accepted" | "not-accepted" | "failed";
+export type EmitRunEventResult = "accepted" | "accepted-not-started" | "not-accepted" | "failed";
 
 /** A serialize queue (docs/adr/0055 §2) and who holds it. */
 export interface QueueHold {
@@ -182,6 +185,14 @@ export interface RunSettings {
   turnTimeoutMs: number;
   /** How long an identity-link wait may take: GATEWAY_RESUME_WAIT_MS, plus slack. */
   linkWaitTimeoutMs: number;
+  /**
+   * How long a serialize queue waits, after its holder's publish ended with
+   * an unknown outcome, for the run that publish may have started to claim
+   * the queue (docs/adr/0055 §2). Unclaimed by then, the queue moves on. It
+   * outlasts the emit attempt that may still be running past its timeout
+   * (EMIT_TIMEOUT_MS) plus the run's start retries.
+   */
+  queueClaimGraceMs: number;
 }
 
 export const DEFAULT_RUN_SETTINGS: RunSettings = {
@@ -190,6 +201,8 @@ export const DEFAULT_RUN_SETTINGS: RunSettings = {
   linkWaitTimeoutMs: 10 * 60 * 1000 + 10 * 60 * 1000,
   publishRetryMs: 30_000,
   publishRetryWindowMs: 24 * 60 * 60 * 1000,
+  // EMIT_TIMEOUT_MS (10 minutes) plus five.
+  queueClaimGraceMs: 15 * 60 * 1000,
 };
 
 /** The longest wait between two publishes of one completion (the backoff doubles up to this). */
@@ -212,7 +225,9 @@ export const LABEL_RETRY_MS = 60 * 60 * 1000;
  * (before and after an identity link) at every poll retry, the link wait, the
  * hour of label retries, and its own completion's publish -- plus an hour for
  * the short steps in between. Only a holder that is gone (terminated) ever
- * reaches it.
+ * reaches it: a held event whose publish started no run releases the queue
+ * itself, or -- when it cannot know -- hands it off, and the queue then
+ * waits only `queueClaimGraceMs` for a run to claim it.
  */
 export function queueHoldTimeoutMs(s: RunSettings): number {
   const publishMs = s.publishRetryWindowMs + PUBLISH_RETRY_MAX_MS + EMIT_TIMEOUT_MS;

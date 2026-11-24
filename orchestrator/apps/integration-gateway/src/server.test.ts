@@ -1880,6 +1880,76 @@ describe("held run events and conflict events (docs/adr/0055)", () => {
     await waitFor(() => expect(runEvents(h)).toHaveLength(2));
   });
 
+  it("frees the queue when the held event was accepted but its run could not be started", async () => {
+    const h = await start();
+    chain(h, INTAKE, COORDINATE, INTAKE, COORDINATE);
+    const startEventRun = h.temporal.runs.startEventRun.bind(h.temporal.runs);
+    vi.spyOn(h.temporal.runs, "startEventRun").mockImplementation(async (input) => {
+      if (input.invocationId === "inv-2") throw new Error("temporal unreachable");
+      return startEventRun(input);
+    });
+    await postGithub(h);
+    await waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    await waitFor(() => expect(h.logs.some((l) => l.includes("accepted, but its run could not be started"))).toBe(true));
+    // No run holds the queue, so the next completion in it is not kept waiting.
+    await postGithub(h);
+    await waitFor(() => expect(runEvents(h)).toHaveLength(2));
+    await waitFor(async () => expect(await held(h)).toEqual([]));
+    // Published once each: an accepted event is never published again.
+    expect(runEvents(h)).toHaveLength(2);
+  });
+
+  it("moves the queue on within the claim grace when a held publish ends without an answer and no run started", async () => {
+    let emits = 0;
+    const h = await start({}, SECRETS, { queueClaimGraceMs: 300 }, (a) => ({
+      ...a,
+      emitRunEvent: async (...args) => {
+        // The first publish dies before it reaches the orchestrator.
+        if (++emits === 1) throw new Error("worker lost before the relay");
+        return a.emitRunEvent(...args);
+      },
+    }));
+    chain(h, INTAKE, INTAKE);
+    await postGithub(h);
+    await waitFor(() => expect(h.logs.some((l) => l.includes("ended without an answer"))).toBe(true));
+    expect(runEvents(h)).toHaveLength(0);
+    await postGithub(h);
+    await waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    expect(h.logs.some((l) => l.includes("no run claimed the queue"))).toBe(true);
+  });
+
+  it("keeps the queue for a run that did start when its held publish ended without an answer", async () => {
+    let emits = 0;
+    const h = await start({}, SECRETS, { queueClaimGraceMs: 300 }, (a) => ({
+      ...a,
+      emitRunEvent: async (...args) => {
+        const result = await a.emitRunEvent(...args);
+        // The first publish dies after the orchestrator accepted it and its run started.
+        if (++emits === 1) throw new Error("worker lost after the relay");
+        return result;
+      },
+    }));
+    chain(h, INTAKE, COORDINATE, INTAKE, COORDINATE);
+    let finishFirst!: () => void;
+    const firstCoordinate = new Promise<OrchestratorInvokeResult>((resolve) => {
+      finishFirst = () => resolve({ status: "succeeded", result: "decided" });
+    });
+    h.poll.mockImplementation(async (id: string) => (id === "inv-2" ? firstCoordinate : { status: "succeeded", result: "ok" }));
+
+    await postGithub(h);
+    await waitFor(() => expect(h.logs.some((l) => l.includes("ended without an answer"))).toBe(true));
+    await waitFor(() => expect(h.poll).toHaveBeenCalledWith("inv-2", expect.anything()));
+    // The coordinate run (inv-2) claimed the queue: well past the claim grace, the next completion still waits.
+    await postGithub(h);
+    await waitFor(async () => expect(await held(h)).toHaveLength(1));
+    await settle();
+    expect(runEvents(h)).toHaveLength(1);
+
+    finishFirst();
+    await waitFor(() => expect(runEvents(h)).toHaveLength(2));
+    await waitFor(async () => expect(await held(h)).toEqual([]));
+  });
+
   it("never publishes a run event twice when its publish dies after the orchestrator accepted it", async () => {
     const EMITS: AcceptedTrigger = { ...COORDINATE, name: "factory-intake", sessionId: "event:intake", onComplete: { emitTo: "runs" } };
     // The worker "dies" after /invoke accepted and the next run started: the activity fails.

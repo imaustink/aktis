@@ -99,6 +99,19 @@ const ITERATIONS_PER_RUN = 200;
 export const enqueueSignal = defineSignal<[holder: string]>("enqueue");
 export const releaseSignal = defineSignal<[holder: string]>("release");
 export const turnSignal = defineSignal("turn");
+/** A run started by a holder's publish: it now holds the queue (sent when the run starts). */
+export const claimSignal = defineSignal<[holder: string]>("claim");
+/** A holder whose publish ended with an unknown outcome: the queue is the run's, if one claims it. */
+export const handoffSignal = defineSignal<[holder: string]>("handoff");
+
+/** Signals a serialize queue's workflow; a queue that has closed has nobody to tell. */
+async function signalQueue(hold: QueueHold, signal: typeof claimSignal | typeof handoffSignal): Promise<void> {
+  try {
+    await getExternalWorkflowHandle(workflowIds.runQueue(workflowInfo().taskQueue, hold.queue)).signal(signal, hold.holder);
+  } catch {
+    // Not running: nothing holds it to claim or hand off.
+  }
+}
 
 function messageOf(error: unknown): string {
   if (error instanceof ActivityFailure && error.cause) return error.cause.message;
@@ -121,6 +134,9 @@ export async function eventRun(input: EventRunInput): Promise<void> {
   const turns = turnsFor(input.settings);
   const links = linksFor(input.settings);
   try {
+    // Tells the queue this run holds it now, so a publish that ended without
+    // an answer does not let the queue move on under a live run.
+    if (input.holdsQueue) await signalQueue(input.holdsQueue, claimSignal);
     // Set once the run has a final outcome to publish.
     let finished: FinishedRun | undefined;
     let httpSent = false;
@@ -243,13 +259,16 @@ async function publish(
       });
     } catch (error) {
       // Unknown outcome (see `emits`): the next hop may already be running,
-      // so it is not published again. Nor is a held queue released: if that
-      // run started, it holds the queue and releases it when it finishes; if
-      // not, the queue passes over this holder at its hold timeout.
+      // so it is not published again. Nor is a held queue released: it is
+      // handed off. If that run started, it claims the queue and releases it
+      // when it finishes; if no run claims it within the claim grace, the
+      // queue moves on.
       await effects.log(`run event ${name}: publish attempt ${attempt} ended without an answer (${messageOf(error)}); not published again, so it cannot start the next hop twice`);
+      if (opts.holdsQueue) await signalQueue(opts.holdsQueue, handoffSignal);
       return;
     }
     if (result !== "failed") {
+      // "accepted-not-started" too: no run exists to release it.
       if (opts.holdsQueue && result !== "accepted") await effects.releaseQueue(opts.holdsQueue);
       return;
     }
@@ -311,14 +330,20 @@ export async function heldRunEvent(input: HeldRunEventInput): Promise<void> {
  * One serialize queue (docs/adr/0055 §2): hands turns to held events in the
  * order they joined, one at a time. A turn ends when its holder releases it --
  * the held event itself when its publish started nothing, else the run it
- * started, once that run has finished.
+ * started, once that run has finished. A held event whose publish ended
+ * without an answer hands its turn off instead: the turn then lasts only
+ * until the claim grace unless a run claims it.
  */
-export async function runQueue(input: { queue: string; waiting?: string[]; holdTimeoutMs?: number }): Promise<void> {
+export async function runQueue(input: { queue: string; waiting?: string[]; holdTimeoutMs?: number; claimGraceMs?: number }): Promise<void> {
   // A holder that never releases (its workflow was terminated) is passed over after this long -- longer than any live holder.
   const holdTimeoutMs = input.holdTimeoutMs ?? queueHoldTimeoutMs(DEFAULT_RUN_SETTINGS);
+  // A handed-off turn that no run claims is passed over after this long.
+  const claimGraceMs = input.claimGraceMs ?? DEFAULT_RUN_SETTINGS.queueClaimGraceMs;
   const waiting = [...(input.waiting ?? [])];
   let current: string | undefined;
   let released = false;
+  let claimed = false;
+  let handedOff = false;
   setHandler(enqueueSignal, (holder) => {
     if (holder !== current && !waiting.includes(holder)) waiting.push(holder);
   });
@@ -329,14 +354,22 @@ export async function runQueue(input: { queue: string; waiting?: string[]; holdT
       if (at >= 0) waiting.splice(at, 1);
     }
   });
+  setHandler(claimSignal, (holder) => {
+    if (holder === current) claimed = true;
+  });
+  setHandler(handoffSignal, (holder) => {
+    if (holder === current) handedOff = true;
+  });
 
   for (let served = 0; ; served++) {
     if (waiting.length === 0 && !(await condition(() => waiting.length > 0, QUEUE_IDLE))) return;
     if (served >= ITERATIONS_PER_RUN || workflowInfo().continueAsNewSuggested) {
-      await continueAsNew<typeof runQueue>({ queue: input.queue, waiting, holdTimeoutMs });
+      await continueAsNew<typeof runQueue>({ queue: input.queue, waiting, holdTimeoutMs, claimGraceMs });
     }
     current = waiting.shift()!;
     released = false;
+    claimed = false;
+    handedOff = false;
     try {
       await getExternalWorkflowHandle(current).signal(turnSignal);
     } catch {
@@ -344,7 +377,19 @@ export async function runQueue(input: { queue: string; waiting?: string[]; holdT
       current = undefined;
       continue;
     }
-    await condition(() => released, holdTimeoutMs);
+    const turnStarted = Date.now();
+    const left = () => holdTimeoutMs - (Date.now() - turnStarted);
+    let passedOver = !(await condition(() => released || (handedOff && !claimed), holdTimeoutMs));
+    if (!released && !passedOver) {
+      // Handed off, and no run has claimed the turn yet.
+      const graceMs = Math.min(claimGraceMs, left());
+      if (graceMs <= 0 || !(await condition(() => released || claimed, graceMs))) {
+        await effects.log(`run queue ${input.queue}: ${current}'s publish ended without an answer and no run claimed the queue within ${claimGraceMs}ms; passing it over`);
+      } else if (!released) {
+        passedOver = left() <= 0 || !(await condition(() => released, left()));
+      }
+    }
+    if (passedOver) await effects.log(`run queue ${input.queue}: ${current} did not release the queue within ${holdTimeoutMs}ms; passing it over`);
     current = undefined;
   }
 }
