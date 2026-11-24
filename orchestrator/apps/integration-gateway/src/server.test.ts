@@ -9,6 +9,7 @@ import { GithubIdentityResolver } from "./identity.js";
 import { testRuns, type TestRuns } from "./__fixtures__/temporal.js";
 import { createRunActivities } from "./runs/activities.js";
 import { LegacyRunDrain } from "./runs/legacy-drain.js";
+import type { RunActivities } from "./runs/contract.js";
 import type { RunSettings } from "./runs/model.js";
 import { InMemoryInflightRunStore, type InflightRun } from "./inflight-runs.js";
 import { InMemoryDeferredEventStore } from "./deferred-events.js";
@@ -216,6 +217,8 @@ async function start(
   overrides: Partial<GatewayServerOptions> = {},
   secrets: Record<string, string> = SECRETS,
   runOpts: Partial<RunSettings> = {},
+  /** Wraps the activities the worker runs (to make one fail, say). */
+  wrapActivities: (a: RunActivities) => RunActivities = (a) => a,
 ): Promise<Harness> {
   const temporal = await testRuns(runOpts);
   const order: string[] = [];
@@ -286,7 +289,7 @@ async function start(
     runs: temporal.runs,
     ...overrides,
   });
-  await temporal.serve(createRunActivities(server.effects, temporal.runs, (line) => logs.push(line)));
+  await temporal.serve(wrapActivities(createRunActivities(server.effects, temporal.runs, (line) => logs.push(line))));
   await server.listen(0);
   const port = (server as unknown as { server: { address: () => AddressInfo } }).server.address().port;
   current = {
@@ -674,14 +677,46 @@ describe("a source whose sender CEL does not compile is served as unknown (404)"
     expect(h.compile.mock.calls[0]?.[0]).toEqual(["body.sender.login", 'body.sender.type == "Bot"', "body.repository.full_name"]);
   });
 
-  it("an orchestrator that cannot answer leaves the source served (the prefilter still gates each delivery), and is asked again next time", async () => {
-    const h = await start();
+  it("an orchestrator that cannot answer leaves the source served (the prefilter still gates each delivery), and is asked again after the backoff", async () => {
+    let clock = Date.parse("2026-01-01T00:00:00Z");
+    const h = await start({ now: () => new Date(clock) });
     h.compile.mockResolvedValueOnce({ kind: "failed", error: "/events/compile unreachable: ECONNREFUSED" });
     expect((await postGithub(h)).status).toBe(202);
     await waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
     expect(h.prefilter).toHaveBeenCalled();
+    clock += 10_000;
     await postGithub(h);
     expect(h.compile).toHaveBeenCalledTimes(2);
+  });
+
+  it("during an orchestrator outage, repeated requests make at most one compile call per backoff window", async () => {
+    let clock = Date.parse("2026-01-01T00:00:00Z");
+    const h = await start({ now: () => new Date(clock) });
+    h.compile.mockResolvedValue({ kind: "failed", error: "/events/compile unreachable: ECONNREFUSED" });
+    for (let i = 0; i < 5; i++) {
+      expect((await postGithub(h)).status).toBe(202);
+      clock += 1_000;
+    }
+    expect(h.compile).toHaveBeenCalledTimes(1);
+    clock += 5_000;
+    expect((await postGithub(h)).status).toBe(202);
+    expect(h.compile).toHaveBeenCalledTimes(2);
+  });
+
+  it("a negative verdict is re-checked after its TTL, and the source is served once it compiles", async () => {
+    let clock = Date.parse("2026-01-01T00:00:00Z");
+    const h = await start({ now: () => new Date(clock) });
+    h.compile.mockResolvedValueOnce({ kind: "ok", errors: { "body.sender.login": "undeclared reference to 'body'" } });
+    expect((await postGithub(h)).status).toBe(404);
+    clock += 59_000;
+    expect((await postGithub(h)).status).toBe(404);
+    expect(h.compile).toHaveBeenCalledTimes(1);
+    clock += 1_000;
+    expect((await postGithub(h)).status).toBe(202);
+    expect(h.compile).toHaveBeenCalledTimes(2);
+    // Only the expression with the expired negative verdict is asked again.
+    expect(h.compile.mock.calls[1]?.[0]).toEqual(["body.sender.login"]);
+    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
   });
 
   it("a source without `sender` is never compiled", async () => {
@@ -1845,6 +1880,96 @@ describe("held run events and conflict events (docs/adr/0055)", () => {
     await waitFor(() => expect(runEvents(h)).toHaveLength(2));
   });
 
+  it("frees the queue when the held event was accepted but its run could not be started", async () => {
+    const h = await start();
+    chain(h, INTAKE, COORDINATE, INTAKE, COORDINATE);
+    const startEventRun = h.temporal.runs.startEventRun.bind(h.temporal.runs);
+    vi.spyOn(h.temporal.runs, "startEventRun").mockImplementation(async (input) => {
+      if (input.invocationId === "inv-2") throw new Error("temporal unreachable");
+      return startEventRun(input);
+    });
+    await postGithub(h);
+    await waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    await waitFor(() => expect(h.logs.some((l) => l.includes("accepted, but its run could not be started"))).toBe(true));
+    // No run holds the queue, so the next completion in it is not kept waiting.
+    await postGithub(h);
+    await waitFor(() => expect(runEvents(h)).toHaveLength(2));
+    await waitFor(async () => expect(await held(h)).toEqual([]));
+    // Published once each: an accepted event is never published again.
+    expect(runEvents(h)).toHaveLength(2);
+  });
+
+  it("moves the queue on within the claim grace when a held publish ends without an answer and no run started", async () => {
+    let emits = 0;
+    const h = await start({}, SECRETS, { queueClaimGraceMs: 300 }, (a) => ({
+      ...a,
+      emitRunEvent: async (...args) => {
+        // The first publish dies before it reaches the orchestrator.
+        if (++emits === 1) throw new Error("worker lost before the relay");
+        return a.emitRunEvent(...args);
+      },
+    }));
+    chain(h, INTAKE, INTAKE);
+    await postGithub(h);
+    await waitFor(() => expect(h.logs.some((l) => l.includes("ended without an answer"))).toBe(true));
+    expect(runEvents(h)).toHaveLength(0);
+    await postGithub(h);
+    await waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    expect(h.logs.some((l) => l.includes("no run claimed the queue"))).toBe(true);
+  });
+
+  it("keeps the queue for a run that did start when its held publish ended without an answer", async () => {
+    let emits = 0;
+    const h = await start({}, SECRETS, { queueClaimGraceMs: 300 }, (a) => ({
+      ...a,
+      emitRunEvent: async (...args) => {
+        const result = await a.emitRunEvent(...args);
+        // The first publish dies after the orchestrator accepted it and its run started.
+        if (++emits === 1) throw new Error("worker lost after the relay");
+        return result;
+      },
+    }));
+    chain(h, INTAKE, COORDINATE, INTAKE, COORDINATE);
+    let finishFirst!: () => void;
+    const firstCoordinate = new Promise<OrchestratorInvokeResult>((resolve) => {
+      finishFirst = () => resolve({ status: "succeeded", result: "decided" });
+    });
+    h.poll.mockImplementation(async (id: string) => (id === "inv-2" ? firstCoordinate : { status: "succeeded", result: "ok" }));
+
+    await postGithub(h);
+    await waitFor(() => expect(h.logs.some((l) => l.includes("ended without an answer"))).toBe(true));
+    await waitFor(() => expect(h.poll).toHaveBeenCalledWith("inv-2", expect.anything()));
+    // The coordinate run (inv-2) claimed the queue: well past the claim grace, the next completion still waits.
+    await postGithub(h);
+    await waitFor(async () => expect(await held(h)).toHaveLength(1));
+    await settle();
+    expect(runEvents(h)).toHaveLength(1);
+
+    finishFirst();
+    await waitFor(() => expect(runEvents(h)).toHaveLength(2));
+    await waitFor(async () => expect(await held(h)).toEqual([]));
+  });
+
+  it("never publishes a run event twice when its publish dies after the orchestrator accepted it", async () => {
+    const EMITS: AcceptedTrigger = { ...COORDINATE, name: "factory-intake", sessionId: "event:intake", onComplete: { emitTo: "runs" } };
+    // The worker "dies" after /invoke accepted and the next run started: the activity fails.
+    const h = await start({}, SECRETS, {}, (a) => ({
+      ...a,
+      emitRunEvent: async (...args) => {
+        await a.emitRunEvent(...args);
+        throw new Error("worker lost after the relay");
+      },
+    }));
+    chain(h, EMITS, COORDINATE);
+    await postGithub(h);
+    await waitFor(() => expect(h.logs.some((l) => l.includes("ended without an answer"))).toBe(true));
+    await waitFor(() => expect(h.poll).toHaveBeenCalledWith("inv-2", expect.anything()));
+    await settle();
+    // One acceptance, one next-hop run: the activity is not retried.
+    expect(runEvents(h)).toHaveLength(1);
+    expect(h.poll.mock.calls.filter((c) => c[0] === "inv-2")).toHaveLength(1);
+  });
+
   describe("conflict sweep", () => {
     const DIRTY = {
       number: 12,
@@ -1910,6 +2035,80 @@ describe("held run events and conflict events (docs/adr/0055)", () => {
       const sweeps = h.searchOpenPullRequests.mock.calls.length;
       await waitFor(() => expect(h.searchOpenPullRequests.mock.calls.length).toBeGreaterThanOrEqual(sweeps + 2));
       expect(h.submitEvent).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not emit a conflict event again when its publish dies after the orchestrator accepted it", async () => {
+      const h = await start({ eventSources: fastConflicts() }, SECRETS, {}, (a) => ({
+        ...a,
+        emitConflict: async (...args) => {
+          await a.emitConflict(...args);
+          throw new Error("worker lost after the relay");
+        },
+      }));
+      appAssigned(h, "alice");
+      h.submitEvent.mockResolvedValue({ kind: "ignored" });
+      h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
+      h.getPullRequest.mockResolvedValue(DIRTY);
+      await h.temporal.runs.ensureConflictSweeps(["pr-conflicts"]);
+      await waitFor(() => expect(h.searchOpenPullRequests.mock.calls.length).toBeGreaterThanOrEqual(3));
+      // The sweep kept going, and sent the event once.
+      expect(h.submitEvent).toHaveBeenCalledTimes(1);
+      expect(h.logs.some((l) => l.includes("ended without an answer"))).toBe(true);
+    });
+
+    it("keeps its marks when a scan fails, rather than ending and emitting them again", async () => {
+      let failing = false;
+      const h = await start({ eventSources: fastConflicts() }, SECRETS, {}, (a) => ({
+        ...a,
+        findConflicts: async (...args) => {
+          if (failing) throw new Error("GitHub too slow");
+          return a.findConflicts(...args);
+        },
+      }));
+      appAssigned(h, "alice");
+      h.submitEvent.mockResolvedValue({ kind: "ignored" });
+      h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
+      h.getPullRequest.mockResolvedValue(DIRTY);
+      await h.temporal.runs.ensureConflictSweeps(["pr-conflicts"]);
+      await waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(1));
+      failing = true;
+      await waitFor(() => expect(h.logs.some((l) => l.includes("conflicts pr-conflicts: scan failed (GitHub too slow)"))).toBe(true));
+      failing = false;
+      const sweeps = h.searchOpenPullRequests.mock.calls.length;
+      await waitFor(() => expect(h.searchOpenPullRequests.mock.calls.length).toBeGreaterThanOrEqual(sweeps + 2));
+      // The same workflow kept its mark for (PR 12, base1): no second event.
+      expect(h.submitEvent).toHaveBeenCalledTimes(1);
+      const desc = await h.temporal.runs.client.workflow.getHandle(`${h.temporal.taskQueue}/conflict-sweep:pr-conflicts`).describe();
+      expect(desc.status.name).toBe("RUNNING");
+    });
+
+    it("does not emit again for a PR the pre-0057 sweep already marked in Redis", async () => {
+      const deferredEventStore = new InMemoryDeferredEventStore();
+      await deferredEventStore.markOnce("conflict:pr-conflicts:acme/widgets#12@base1", 30 * 24 * 60 * 60 * 1000);
+      const h = await start({ eventSources: fastConflicts() });
+      appAssigned(h, "alice");
+      h.submitEvent.mockResolvedValue({ kind: "ignored" });
+      h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
+      h.getPullRequest.mockResolvedValue(DIRTY);
+      const drain = new LegacyRunDrain({ runs: h.temporal.runs, deferredEventStore, removeLabel: async () => {} });
+      await h.temporal.runs.ensureConflictSweeps(["pr-conflicts"], (source) => drain.conflictMarks(source));
+      await waitFor(() => expect(h.searchOpenPullRequests.mock.calls.length).toBeGreaterThanOrEqual(3));
+      expect(h.submitEvent).not.toHaveBeenCalled();
+
+      // A new base commit is a new conflict: emitted once.
+      h.getPullRequest.mockResolvedValue({ ...DIRTY, baseSha: "base2" });
+      await waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(1));
+      expect(submittedEnvelope(h)).toMatchObject({ body: { pullRequest: { baseSha: "base2" } } });
+    });
+
+    it("does not start a sweep while the pre-0057 marks can't be read", async () => {
+      const h = await sweeping((h) => h.searchOpenPullRequests.mockResolvedValue([]));
+      const id = `${h.temporal.taskQueue}/conflict-sweep:pr-conflicts`;
+      await h.temporal.runs.client.workflow.getHandle(id).terminate("test");
+      await h.temporal.runs.ensureConflictSweeps(["pr-conflicts"], async () => {
+        throw new Error("redis down");
+      });
+      expect((await h.temporal.runs.client.workflow.getHandle(id).describe()).status.name).toBe("TERMINATED");
     });
 
     it("one sweep per source, however often it is ensured", async () => {

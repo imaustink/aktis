@@ -25,13 +25,22 @@ function temporal(): Promise<TestWorkflowEnvironment> {
   return env;
 }
 
-function workflows(): Promise<WorkflowBundleWithSourceMap> {
+/** The workflow bundle every worker here runs, built once per test file (the replay test replays histories against it). */
+export function workflows(): Promise<WorkflowBundleWithSourceMap> {
   bundle ??= bundleWorkflowCode({
     workflowsPath: fileURLToPath(new URL("../runs/workflows.ts", import.meta.url)),
     logger: new DefaultLogger("WARN"),
   });
   return bundle;
 }
+
+/**
+ * The task queue the replay histories (src/runs/__histories__) are captured
+ * and replayed on -- production's. Workflow ids derive from the task queue
+ * (workflowIds), so a replay on any other queue would mismatch every child
+ * workflow id.
+ */
+export const HISTORY_TASK_QUEUE = "integration-gateway";
 
 /** Every worker a test started, so teardown can stop the ones a test left running. */
 const workers = new Set<{ stop(): Promise<void> }>();
@@ -43,16 +52,22 @@ afterAll(async () => {
 
 export interface TestRuns {
   runs: TemporalRuns;
+  /** The dev server's client, for reading back a workflow's history. */
+  client: TestWorkflowEnvironment["client"];
   taskQueue: string;
   /** Starts the worker; call once the activities exist. */
   serve(activities: RunActivities): Promise<void>;
   stop(): Promise<void>;
 }
 
-/** A {@link TemporalRuns} on its own task queue, and its worker. */
-export async function testRuns(opts: Partial<RunSettings> = {}): Promise<TestRuns> {
+/**
+ * A {@link TemporalRuns} on its own task queue, and its worker. `taskQueue`
+ * names the queue instead (capture-histories.test.ts records on the one
+ * production uses).
+ */
+export async function testRuns(opts: Partial<RunSettings> = {}, queue: { taskQueue?: string } = {}): Promise<TestRuns> {
   const e = await temporal();
-  const taskQueue = `test-${randomUUID()}`;
+  const taskQueue = queue.taskQueue ?? `test-${randomUUID()}`;
   const runs = new TemporalRuns({
     client: e.client,
     taskQueue,
@@ -65,6 +80,7 @@ export async function testRuns(opts: Partial<RunSettings> = {}): Promise<TestRun
   let running: Promise<void> | undefined;
   const handle: TestRuns = {
     runs,
+    client: e.client,
     taskQueue,
     async serve(activities) {
       worker = await createRunWorker({

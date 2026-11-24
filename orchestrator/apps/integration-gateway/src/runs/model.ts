@@ -153,10 +153,13 @@ export interface FinishedRun {
 }
 
 /**
- * How publishing a run event ended: accepted; delivered but not accepted (or
- * stopped by a gate) -- final; or "failed", a transport failure worth retrying.
+ * How publishing a run event ended: accepted, and its run started; accepted,
+ * but its run could not be started ("accepted-not-started": final, since a
+ * second publish would be a second acceptance, and no run will release a
+ * queue it was to hold); delivered but not accepted (or stopped by a gate) --
+ * final; or "failed", a transport failure worth retrying.
  */
-export type EmitRunEventResult = "accepted" | "not-accepted" | "failed";
+export type EmitRunEventResult = "accepted" | "accepted-not-started" | "not-accepted" | "failed";
 
 /** A serialize queue (docs/adr/0055 §2) and who holds it. */
 export interface QueueHold {
@@ -182,6 +185,14 @@ export interface RunSettings {
   turnTimeoutMs: number;
   /** How long an identity-link wait may take: GATEWAY_RESUME_WAIT_MS, plus slack. */
   linkWaitTimeoutMs: number;
+  /**
+   * How long a serialize queue waits, after its holder's publish ended with
+   * an unknown outcome, for the run that publish may have started to claim
+   * the queue (docs/adr/0055 §2). Unclaimed by then, the queue moves on. It
+   * outlasts the emit attempt that may still be running past its timeout
+   * (EMIT_TIMEOUT_MS) plus the run's start retries.
+   */
+  queueClaimGraceMs: number;
 }
 
 export const DEFAULT_RUN_SETTINGS: RunSettings = {
@@ -190,7 +201,43 @@ export const DEFAULT_RUN_SETTINGS: RunSettings = {
   linkWaitTimeoutMs: 10 * 60 * 1000 + 10 * 60 * 1000,
   publishRetryMs: 30_000,
   publishRetryWindowMs: 24 * 60 * 60 * 1000,
+  // EMIT_TIMEOUT_MS (10 minutes) plus five.
+  queueClaimGraceMs: 15 * 60 * 1000,
 };
+
+/** The longest wait between two publishes of one completion (the backoff doubles up to this). */
+export const PUBLISH_RETRY_MAX_MS = 15 * 60 * 1000;
+/** How long one publish (an emit activity) may take; it is never retried (workflows.ts). */
+export const EMIT_TIMEOUT_MS = 10 * 60 * 1000;
+
+/** A conflict mark outlives any plausible gap between a conflict and the next base move. */
+export const CONFLICT_MARK_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Attempts at polling one turn, each up to `turnTimeoutMs`. */
+export const TURN_ATTEMPTS = 10;
+/** Attempts at one identity-link wait, each up to `linkWaitTimeoutMs`. */
+export const LINK_ATTEMPTS = 3;
+/** How long a run keeps retrying its label removal. */
+export const LABEL_RETRY_MS = 60 * 60 * 1000;
+
+/**
+ * How long a serialize queue waits for its holder to release before passing
+ * it over (docs/adr/0055 §2). It must outlast any holder that is still alive,
+ * or two runs from one queue overlap, so it is the worst case of both holders
+ * back to back -- the held event publishing (retried for
+ * `publishRetryWindowMs`), then the run that publish started: two turns
+ * (before and after an identity link) at every poll retry, the link wait, the
+ * hour of label retries, and its own completion's publish -- plus an hour for
+ * the short steps in between. Only a holder that is gone (terminated) ever
+ * reaches it: a held event whose publish started no run releases the queue
+ * itself, or -- when it cannot know -- hands it off, and the queue then
+ * waits only `queueClaimGraceMs` for a run to claim it.
+ */
+export function queueHoldTimeoutMs(s: RunSettings): number {
+  const publishMs = s.publishRetryWindowMs + PUBLISH_RETRY_MAX_MS + EMIT_TIMEOUT_MS;
+  const runMs = 2 * TURN_ATTEMPTS * s.turnTimeoutMs + LINK_ATTEMPTS * s.linkWaitTimeoutMs + LABEL_RETRY_MS;
+  return 2 * publishMs + runMs + 60 * 60 * 1000;
+}
 
 /** One accepted event, as `eventRun` receives it. */
 export interface EventRunInput {

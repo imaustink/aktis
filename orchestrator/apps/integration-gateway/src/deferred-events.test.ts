@@ -43,4 +43,20 @@ describe("InMemoryDeferredEventStore (docs/adr/0055)", () => {
     now = 200;
     expect(await store.markOnce("k", 100)).toBe(true);
   });
+
+  it("listMarks returns the live marks under a prefix, with the time each has left", async () => {
+    let now = 0;
+    const store = new InMemoryDeferredEventStore(() => now);
+    await store.markOnce("conflict:a:x", 100);
+    await store.markOnce("conflict:ab:y", 100);
+    await store.markOnce("sweep:a:1", 100);
+    now = 40;
+    await store.markOnce("conflict:a:z", 10);
+    expect(await store.listMarks("conflict:a:")).toEqual([
+      { key: "conflict:a:x", expiresInMs: 60 },
+      { key: "conflict:a:z", expiresInMs: 10 },
+    ]);
+    now = 55;
+    expect(await store.listMarks("conflict:a:")).toEqual([{ key: "conflict:a:x", expiresInMs: 45 }]);
+  });
 });

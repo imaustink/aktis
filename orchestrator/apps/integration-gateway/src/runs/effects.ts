@@ -618,8 +618,15 @@ export class RunEffects {
       // The next hop's run is its own workflow. A start that fails even
       // after the starter's own retries is reported, not "failed": the
       // orchestrator already accepted the event, so publishing it again
-      // would start a second run.
-      await relayed.after?.().catch(this.o.report);
+      // would start a second run. Nor is it "accepted": no run exists to
+      // release a queue this publish held.
+      try {
+        await relayed.after?.();
+      } catch (error) {
+        this.o.report(error);
+        this.o.log(`${tag}: accepted, but its run could not be started`);
+        return "accepted-not-started";
+      }
       return "accepted";
     }
     relayed.after?.().catch(this.o.report);

@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { DeferredEventStore } from "../deferred-events.js";
 import { InflightRunRecovery, type InflightRunStore } from "../inflight-runs.js";
 import { gatewayOwedRunTerminal, LabelReconciler, type PendingLabelStore } from "../label-reconciler.js";
+import { CONFLICT_MARK_TTL_MS } from "./model.js";
 import type { TemporalRuns } from "./temporal.js";
 
 /**
@@ -20,6 +21,9 @@ import type { TemporalRuns } from "./temporal.js";
  *    pods' sweep does before publishing, so exactly one side takes it.
  *  - Owed label removals keep the old reconciler: a record whose run is in
  *    neither store is finished, and its label comes off.
+ *  - The old conflict sweep's once-marks (`mark:conflict:<markKey>`) seed a
+ *    new `conflictSweep`'s marks ({@link LegacyRunDrain.conflictMarks}), so a
+ *    PR already sent a conflict event at its base commit is not sent another.
  */
 export interface LegacyRunDrainOptions {
   runs: TemporalRuns;
@@ -33,6 +37,9 @@ export interface LegacyRunDrainOptions {
 }
 
 const DEFAULT_INTERVAL_MS = 60_000;
+
+/** The old sweep's mark key was `conflict:` plus what conflictSweep now calls its markKey. */
+const LEGACY_CONFLICT_MARK = "conflict:";
 
 export class LegacyRunDrain {
   private readonly recovery: InflightRunRecovery | undefined;
@@ -81,6 +88,23 @@ export class LegacyRunDrain {
           intervalMs: o.intervalMs ?? DEFAULT_INTERVAL_MS,
         })
       : undefined;
+  }
+
+  /**
+   * The pre-0057 conflict sweep's marks for `source`, keyed as
+   * `conflictSweep` keys them and dated so each still lapses when its Redis
+   * key would have. Throws when the store can't be read, so a sweep is not
+   * started without them.
+   */
+  async conflictMarks(source: string, now = Date.now()): Promise<Record<string, number>> {
+    const store = this.o.deferredEventStore;
+    if (!store) return {};
+    const marks: Record<string, number> = {};
+    for (const { key, expiresInMs } of await store.listMarks(`${LEGACY_CONFLICT_MARK}${source}:`)) {
+      const left = Math.min(expiresInMs, CONFLICT_MARK_TTL_MS);
+      marks[key.slice(LEGACY_CONFLICT_MARK.length)] = now - (CONFLICT_MARK_TTL_MS - left);
+    }
+    return marks;
   }
 
   /** One pass over the held events. Never throws. */

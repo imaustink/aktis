@@ -4,6 +4,7 @@ import {
   continueAsNew,
   defineSignal,
   getExternalWorkflowHandle,
+  isCancellation,
   makeContinueAsNewFunc,
   ParentClosePolicy,
   proxyActivities,
@@ -15,8 +16,16 @@ import {
 import type { RunActivities } from "./contract.js";
 import {
   githubReplyTarget,
+  CONFLICT_MARK_TTL_MS,
+  EMIT_TIMEOUT_MS,
+  LABEL_RETRY_MS,
+  LINK_ATTEMPTS,
+  PUBLISH_RETRY_MAX_MS,
+  queueHoldTimeoutMs,
   refKey,
+  TURN_ATTEMPTS,
   workflowIds,
+  DEFAULT_RUN_SETTINGS,
   type CompletedRun,
   type EventRunInput,
   type FinishedRun,
@@ -36,6 +45,18 @@ import {
  *
  * Workflow code is deterministic: every side effect is an activity
  * (activities.ts), and time is workflow time.
+ *
+ * CHANGING A WORKFLOW (docs/adr/0057 §7): these workflows outlive a release
+ * (heldRunEvent for weeks), and a new pod replays each from its history. Any
+ * change to the commands one issues -- an activity, timer, signal or child
+ * added, removed or reordered -- must keep the old path for running
+ * workflows, behind `patched()`:
+ *
+ *   if (patched("claim-queue-on-start")) await signalQueue(hold, claimSignal);
+ *
+ * then `deprecatePatch()` a release later. src/runs/replay.test.ts replays
+ * committed histories (src/runs/__histories__) against this file and fails
+ * on a change that is not gated; fix the change, don't re-capture them.
  */
 
 /** Short side effects: comments, labels, relays. Each is best effort inside, so a retry only covers a crashed worker. */
@@ -44,12 +65,26 @@ const effects = proxyActivities<RunActivities>({
   retry: { maximumAttempts: 3 },
 });
 
+/**
+ * Publishing a run or conflict event: never retried. Each attempt submits its
+ * own envelope, and the orchestrator accepts every envelope it is sent as a
+ * new run -- so an attempt that dies after `/invoke` accepted (a worker crash,
+ * this timeout) is not repeated: a second attempt would start the next hop
+ * twice. An attempt that fails this way has an unknown outcome; the workflow
+ * logs it and does not publish again. An orchestrator that answers "failed"
+ * (unreachable, a 5xx) is still retried, by `publish`'s own loop.
+ */
+const emits = proxyActivities<Pick<RunActivities, "emitRunEvent" | "emitConflict">>({
+  startToCloseTimeout: EMIT_TIMEOUT_MS,
+  retry: { maximumAttempts: 1 },
+});
+
 /** Polls a turn for as long as it may run: the gateway's poll budget bounds it (settings.turnTimeoutMs). */
 function turnsFor(settings: RunSettings) {
   return proxyActivities<Pick<RunActivities, "awaitTurn">>({
     startToCloseTimeout: settings.turnTimeoutMs,
     heartbeatTimeout: "1 minute",
-    retry: { maximumAttempts: 10 },
+    retry: { maximumAttempts: TURN_ATTEMPTS },
   });
 }
 
@@ -58,21 +93,17 @@ function linksFor(settings: RunSettings) {
   return proxyActivities<Pick<RunActivities, "waitForLink">>({
     startToCloseTimeout: settings.linkWaitTimeoutMs,
     heartbeatTimeout: "1 minute",
-    retry: { maximumAttempts: 3 },
+    retry: { maximumAttempts: LINK_ATTEMPTS },
   });
 }
 
 /** Label removal is retried for an hour: a stranded label means a human can never re-trigger by hand. */
 const labels = proxyActivities<Pick<RunActivities, "removeLabel">>({
   startToCloseTimeout: "1 minute",
-  scheduleToCloseTimeout: "1 hour",
+  scheduleToCloseTimeout: LABEL_RETRY_MS,
   retry: { initialInterval: "2 seconds", backoffCoefficient: 2, maximumInterval: "5 minutes" },
 });
 
-const PUBLISH_RETRY_MAX_MS = 15 * 60 * 1000;
-
-/** A queue's holder that never releases (it was terminated) is passed over after this long -- longer than any run. */
-export const QUEUE_HOLD_TIMEOUT = "9 hours";
 /** A queue with nobody waiting closes after this long; the next enqueue starts it again. */
 const QUEUE_IDLE = "1 hour";
 
@@ -82,6 +113,19 @@ const ITERATIONS_PER_RUN = 200;
 export const enqueueSignal = defineSignal<[holder: string]>("enqueue");
 export const releaseSignal = defineSignal<[holder: string]>("release");
 export const turnSignal = defineSignal("turn");
+/** A run started by a holder's publish: it now holds the queue (sent when the run starts). */
+export const claimSignal = defineSignal<[holder: string]>("claim");
+/** A holder whose publish ended with an unknown outcome: the queue is the run's, if one claims it. */
+export const handoffSignal = defineSignal<[holder: string]>("handoff");
+
+/** Signals a serialize queue's workflow; a queue that has closed has nobody to tell. */
+async function signalQueue(hold: QueueHold, signal: typeof claimSignal | typeof handoffSignal): Promise<void> {
+  try {
+    await getExternalWorkflowHandle(workflowIds.runQueue(workflowInfo().taskQueue, hold.queue)).signal(signal, hold.holder);
+  } catch {
+    // Not running: nothing holds it to claim or hand off.
+  }
+}
 
 function messageOf(error: unknown): string {
   if (error instanceof ActivityFailure && error.cause) return error.cause.message;
@@ -104,6 +148,9 @@ export async function eventRun(input: EventRunInput): Promise<void> {
   const turns = turnsFor(input.settings);
   const links = linksFor(input.settings);
   try {
+    // Tells the queue this run holds it now, so a publish that ended without
+    // an answer does not let the queue move on under a live run.
+    if (input.holdsQueue) await signalQueue(input.holdsQueue, claimSignal);
     // Set once the run has a final outcome to publish.
     let finished: FinishedRun | undefined;
     let httpSent = false;
@@ -218,11 +265,24 @@ async function publish(
   const name = completed.trigger.name || "trigger";
   let firstFailure: number | undefined;
   for (let attempt = 1; ; attempt++) {
-    const result = await effects.emitRunEvent(completed, {
-      ...(opts.resetDepth ? { resetDepth: true } : {}),
-      ...(opts.holdsQueue ? { holdsQueue: opts.holdsQueue } : {}),
-    });
+    let result: Awaited<ReturnType<RunActivities["emitRunEvent"]>>;
+    try {
+      result = await emits.emitRunEvent(completed, {
+        ...(opts.resetDepth ? { resetDepth: true } : {}),
+        ...(opts.holdsQueue ? { holdsQueue: opts.holdsQueue } : {}),
+      });
+    } catch (error) {
+      // Unknown outcome (see `emits`): the next hop may already be running,
+      // so it is not published again. Nor is a held queue released: it is
+      // handed off. If that run started, it claims the queue and releases it
+      // when it finishes; if no run claims it within the claim grace, the
+      // queue moves on.
+      await effects.log(`run event ${name}: publish attempt ${attempt} ended without an answer (${messageOf(error)}); not published again, so it cannot start the next hop twice`);
+      if (opts.holdsQueue) await signalQueue(opts.holdsQueue, handoffSignal);
+      return;
+    }
     if (result !== "failed") {
+      // "accepted-not-started" too: no run exists to release it.
       if (opts.holdsQueue && result !== "accepted") await effects.releaseQueue(opts.holdsQueue);
       return;
     }
@@ -284,12 +344,20 @@ export async function heldRunEvent(input: HeldRunEventInput): Promise<void> {
  * One serialize queue (docs/adr/0055 §2): hands turns to held events in the
  * order they joined, one at a time. A turn ends when its holder releases it --
  * the held event itself when its publish started nothing, else the run it
- * started, once that run has finished.
+ * started, once that run has finished. A held event whose publish ended
+ * without an answer hands its turn off instead: the turn then lasts only
+ * until the claim grace unless a run claims it.
  */
-export async function runQueue(input: { queue: string; waiting?: string[] }): Promise<void> {
+export async function runQueue(input: { queue: string; waiting?: string[]; holdTimeoutMs?: number; claimGraceMs?: number }): Promise<void> {
+  // A holder that never releases (its workflow was terminated) is passed over after this long -- longer than any live holder.
+  const holdTimeoutMs = input.holdTimeoutMs ?? queueHoldTimeoutMs(DEFAULT_RUN_SETTINGS);
+  // A handed-off turn that no run claims is passed over after this long.
+  const claimGraceMs = input.claimGraceMs ?? DEFAULT_RUN_SETTINGS.queueClaimGraceMs;
   const waiting = [...(input.waiting ?? [])];
   let current: string | undefined;
   let released = false;
+  let claimed = false;
+  let handedOff = false;
   setHandler(enqueueSignal, (holder) => {
     if (holder !== current && !waiting.includes(holder)) waiting.push(holder);
   });
@@ -300,14 +368,22 @@ export async function runQueue(input: { queue: string; waiting?: string[] }): Pr
       if (at >= 0) waiting.splice(at, 1);
     }
   });
+  setHandler(claimSignal, (holder) => {
+    if (holder === current) claimed = true;
+  });
+  setHandler(handoffSignal, (holder) => {
+    if (holder === current) handedOff = true;
+  });
 
   for (let served = 0; ; served++) {
     if (waiting.length === 0 && !(await condition(() => waiting.length > 0, QUEUE_IDLE))) return;
     if (served >= ITERATIONS_PER_RUN || workflowInfo().continueAsNewSuggested) {
-      await continueAsNew<typeof runQueue>({ queue: input.queue, waiting });
+      await continueAsNew<typeof runQueue>({ queue: input.queue, waiting, holdTimeoutMs, claimGraceMs });
     }
     current = waiting.shift()!;
     released = false;
+    claimed = false;
+    handedOff = false;
     try {
       await getExternalWorkflowHandle(current).signal(turnSignal);
     } catch {
@@ -315,32 +391,61 @@ export async function runQueue(input: { queue: string; waiting?: string[] }): Pr
       current = undefined;
       continue;
     }
-    await condition(() => released, QUEUE_HOLD_TIMEOUT);
+    const turnStarted = Date.now();
+    const left = () => holdTimeoutMs - (Date.now() - turnStarted);
+    let passedOver = !(await condition(() => released || (handedOff && !claimed), holdTimeoutMs));
+    if (!released && !passedOver) {
+      // Handed off, and no run has claimed the turn yet.
+      const graceMs = Math.min(claimGraceMs, left());
+      if (graceMs <= 0 || !(await condition(() => released || claimed, graceMs))) {
+        await effects.log(`run queue ${input.queue}: ${current}'s publish ended without an answer and no run claimed the queue within ${claimGraceMs}ms; passing it over`);
+      } else if (!released) {
+        passedOver = left() <= 0 || !(await condition(() => released, left()));
+      }
+    }
+    if (passedOver) await effects.log(`run queue ${input.queue}: ${current} did not release the queue within ${holdTimeoutMs}ms; passing it over`);
     current = undefined;
   }
 }
-
-/** A conflict mark outlives any plausible gap between a conflict and the next base move. */
-const MARK_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
  * The `conflicts` EventSource kind (docs/adr/0055 §1): every `intervalMs`,
  * emit one `conflict` event per open PR that conflicts with its base -- once
  * per (PR, base commit), remembered in this workflow's own state. One
  * workflow per source, so replicas never sweep twice; it ends when its
- * source is gone.
+ * source is gone. A scan that fails is skipped, not fatal: the marks live
+ * only here. `marks` seeds a new sweep (the pre-0057 Redis marks, see
+ * TemporalRuns.ensureConflictSweeps).
  */
 export async function conflictSweep(input: { source: string; marks?: Record<string, number> }): Promise<void> {
   const marks: Record<string, number> = { ...(input.marks ?? {}) };
   for (let i = 0; i < ITERATIONS_PER_RUN; i++) {
     const conflicts = await effects.conflictsSource(input.source);
     if (!conflicts) return;
-    for (const [key, at] of Object.entries(marks)) if (Date.now() - at > MARK_TTL_MS) delete marks[key];
+    for (const [key, at] of Object.entries(marks)) if (Date.now() - at > CONFLICT_MARK_TTL_MS) delete marks[key];
 
-    for (const candidate of await effects.findConflicts(input.source, conflicts)) {
+    let candidates: Awaited<ReturnType<RunActivities["findConflicts"]>> = [];
+    try {
+      candidates = await effects.findConflicts(input.source, conflicts);
+    } catch (error) {
+      if (isCancellation(error)) throw error;
+      // A slow or failing scan skips this sweep. Failing the workflow would
+      // drop every mark, and its restart would emit them all again.
+      await effects.log(`conflicts ${input.source}: scan failed (${messageOf(error)}); trying again next sweep`);
+    }
+    for (const candidate of candidates) {
       if (marks[candidate.markKey] !== undefined) continue;
+      let delivered: boolean;
+      try {
+        delivered = await emits.emitConflict(input.source, candidate);
+      } catch (error) {
+        // Unknown outcome (see `emits`): the event may have started a run, so
+        // it is marked rather than sent again. The PR's next base move emits anew.
+        await effects.log(`conflicts ${input.source}: emitting ${candidate.markKey} ended without an answer (${messageOf(error)}); not emitted again`);
+        delivered = true;
+      }
       // Undelivered (the orchestrator was unreachable): try again next sweep.
-      if (await effects.emitConflict(input.source, candidate)) marks[candidate.markKey] = Date.now();
+      if (delivered) marks[candidate.markKey] = Date.now();
     }
     await sleep(conflicts.intervalMs);
     if (workflowInfo().continueAsNewSuggested) break;

@@ -48,10 +48,19 @@ The stack already runs Temporal for the engine.
 3. **A serialize queue is a `runQueue` workflow** per `<group>:<key>`: held
    events join it by signal-with-start and get their turn by signal; the run a
    turn started releases it when it finishes. A holder that never releases is
-   passed over after 9 hours.
+   passed over after a timeout computed from the run settings
+   (`queueHoldTimeoutMs`) to outlast any live holder, so two runs from one
+   queue never overlap. A turn whose publish left no run behind does not wait
+   that long: an event accepted whose run could not be started releases it at
+   once, and a publish that ended without an answer hands the turn off; the
+   run it may have started claims the queue when it starts, and an unclaimed
+   turn is passed over after `queueClaimGraceMs` (15 minutes by default).
 4. **A conflicts source is a `conflictSweep` workflow**: one per source,
    started (if not running) by every replica, ending when the source goes
-   away. Its once-per-(PR, base commit) marks are workflow state.
+   away. Its once-per-(PR, base commit) marks are workflow state, carried
+   across continue-as-new. A scan that fails (a slow GitHub, say) skips that
+   sweep instead of failing the workflow, since a restarted sweep would have
+   no marks and emit every conflict again.
 5. **Workflow ids are prefixed with the task queue** (`<queue>/event-run:<id>`,
    ...), so two releases sharing a namespace never share a queue or a sweep.
 6. **The workflows are TypeScript, in integration-gateway**, not Go in the
@@ -60,19 +69,65 @@ The stack already runs Temporal for the engine.
    gateway needs a worker for the activities either way; Go workflows would
    only move GitHub-reply rules into the engine and add a cross-language
    contract on every step.
+7. **A change to a workflow's commands is gated with `patched()`.** These
+   workflows outlive a release: `heldRunEvent` waits for weeks, `runQueue`
+   holds a turn for up to `queueHoldTimeoutMs`, `eventRun` for hours, and a
+   new pod has no workflow cache, so it replays each one from its history.
+   Any change to the commands a workflow issues -- an activity, timer, signal
+   or child added, removed or reordered, or a changed activity type or child
+   workflow id -- breaks that replay with a `NonDeterminismError`, and
+   the workflow task then retries forever. So every such change keeps the old
+   path for histories that already took it:
+
+   ```ts
+   import { patched, deprecatePatch } from "@temporalio/workflow";
+
+   // Release N: new workflows take the new step; old histories replay without it.
+   if (patched("claim-queue-on-start")) await signalQueue(hold, claimSignal);
+
+   // Release N+1, once no workflow started before N can still be running
+   // (for heldRunEvent that is weeks): keep the marker, drop the old branch.
+   deprecatePatch("claim-queue-on-start");
+   await signalQueue(hold, claimSignal);
+
+   // Release N+2: remove deprecatePatch.
+   ```
+
+   Worker Versioning (build ids) is the alternative for a change too large
+   to patch; it needs the namespace's deployment settings, so it is not the
+   default here. During a rolling update a workflow task an old pod cannot
+   replay fails and is retried, and lands on a new pod once the old ones are
+   gone. Changes that only touch activity code (`effects.ts`,
+   `activities.ts`) or a log line's text need none of this.
+
+   `src/runs/replay.test.ts` enforces this: it replays the histories
+   committed in `src/runs/__histories__` (one or more per workflow type,
+   captured by `src/runs/capture-histories.test.ts`) against the current
+   workflow code and fails on any determinism error. A failure there means
+   the change needs a patch, not new histories. Re-capture only to add a
+   path worth covering, or after a patch has been fully removed.
 
 ## Consequences
 
 - `inflight-runs.ts`, `label-reconciler.ts` and `deferred-events.ts` no longer
   record anything. `src/runs/legacy-drain.ts` hands what pre-0057 gateways
   left in Redis to the workflows (lapsed in-flight runs, held events claimed
-  as the old sweep claimed them, owed label removals). **Remove the drain and
+  as the old sweep claimed them, owed label removals, and the conflict
+  sweep's once-marks, which seed a `conflictSweep` when it is started so the
+  cutover sends no conflict event twice; a sweep is not started while those
+  marks can't be read). **Remove the drain and
   those modules one release after this ships.** During the rolling update an
   old pod may still hold a Redis serialize queue while a new run takes the
   Temporal one, so two runs of one queue can overlap once.
 - A completion whose publish fails is retried for 24 hours whether or not it
   was held; before, only held ones were, and an immediate publish that failed
   was lost.
+- Publishing a run or conflict event is an activity that is **never retried**:
+  every attempt submits its own envelope and the orchestrator accepts each as
+  a new run, so repeating an attempt that died after `/invoke` accepted would
+  start the next hop twice. Such an attempt (a worker crash mid-publish) is
+  logged and not published again -- at most once, as before. A publish the
+  orchestrator answered as failed is still retried for 24 hours.
 - A gateway rollout costs a run nothing: the worker cancels its activities on
   shutdown, and their retries start on the new pods at once.
 - **Temporal is required** for the gateway, as it already was for the engine

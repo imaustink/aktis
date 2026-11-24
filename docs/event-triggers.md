@@ -341,8 +341,11 @@ opencode-swe-agent) act on one by name:
   unresolved sender) are `202` + a log line, so senders don't retry.
   Compilation is asked of agent-orchestrator's `POST /events/compile`
   (`{expressions} → {errors: {<expr>: <message>}}`) once per distinct
-  expression and cached; if it can't answer, the source is served and each
-  delivery's prefilter (below) still fails closed.
+  expression and cached (a "does not compile" answer for 60s, since it also
+  depends on the orchestrator's CEL environment). It is asked once, with no
+  retry, and times out after 3s, keeping the 202 inside providers' ~10s
+  delivery timeout. If it can't answer, the source is served for the next 10s without
+  asking again, and each delivery's prefilter (below) still fails closed.
   Before resolving a source's `sender` (live GitHub API calls), the gateway
   sends the preliminary envelope (`sender {}`, `repository ""`) and the
   source's `sender.*From` expressions to agent-orchestrator's
@@ -558,8 +561,14 @@ workflow (docs/adr/0057), which publishes it once every hold is released:
   completion is published and held until **the run it started** finishes (its
   completion, and that run's status labels, already out). Each queue is a
   `runQueue` workflow handing out turns oldest first; a holder that never
-  releases (its workflow was terminated) is passed over after 9 hours. A
-  completion nobody accepted frees the queue at once.
+  releases (its workflow was terminated) is passed over after a timeout derived
+  from the run settings to outlast any live holder (about 60 hours with the
+  defaults: two 24-hour publish windows, plus a run's turns, link wait and
+  label retries). A completion nobody accepted, or accepted but whose run
+  could not be started, frees the queue at once. A publish that ended without
+  an answer (its worker died, or it timed out) hands the queue to the run it
+  may have started, which claims it when it starts; if no run claims it within
+  15 minutes, the next completion gets its turn.
 
 Both together hold until both are released: the wait first, then the queue.
 A held wait re-reads its issues from GitHub once per
@@ -624,6 +633,7 @@ started the chain),
 never the bot or whoever merged the other PR; it starts a new chain. Each
 source is one `conflictSweep` workflow (docs/adr/0057), started by the gateway
 when it sees the source and ending when the source goes away; the (PR, base
-commit) marks are its own state, kept for 30 days. `factory-resync` (examples, production) merges the
+commit) marks are its own state, kept for 30 days (a failed scan skips one sweep
+and keeps them). `factory-resync` (examples, production) merges the
 base into the branch as that person, and its completion goes to review or
 handoff like a fix's.
