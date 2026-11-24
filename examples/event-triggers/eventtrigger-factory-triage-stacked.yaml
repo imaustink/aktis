@@ -52,7 +52,6 @@ spec:
       repository: "{{repository}}"
       issueNumber: "{{number}}"
       ack: "🤖 Starting work on this now, stacked on #{{stackOn}}."
-      sessionPage: true
       result: true
       removeLabel: "ai-triage"
   onComplete:

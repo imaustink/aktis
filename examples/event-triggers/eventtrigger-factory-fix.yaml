@@ -89,7 +89,6 @@ spec:
       repository: "{{repository}}"
       issueNumber: "{{number}}"
       ack: "🤖 Addressing the automated review's feedback now."
-      sessionPage: true
       result: true
       addLabels: ["ai-triage"]
       removeLabel: "ai-triage"
