@@ -246,11 +246,14 @@ export class IdentityLinkApi {
   }
 
   private async handleStart(req: IncomingMessage, res: ServerResponse, provider: string): Promise<void> {
+    // Read the body before any answer, even a refusal: replying first and
+    // closing a socket the client is still writing to makes the kernel send
+    // an RST, which can discard the reply before the client reads it.
+    const body = await parseJsonBody(req);
     if (!this.supports(provider)) {
       this.unsupported(res, provider);
       return;
     }
-    const body = await parseJsonBody(req);
     if (!body || typeof (body as { subject?: unknown }).subject !== "string") {
       sendJson(res, 400, { error: "Request body must be JSON with a string `subject` field" });
       return;
@@ -296,11 +299,14 @@ export class IdentityLinkApi {
   }
 
   private async handlePoll(req: IncomingMessage, res: ServerResponse, provider: string): Promise<void> {
+    // Read the body before any answer, even a refusal: replying first and
+    // closing a socket the client is still writing to makes the kernel send
+    // an RST, which can discard the reply before the client reads it.
+    const body = await parseJsonBody(req);
     if (!this.supports(provider)) {
       this.unsupported(res, provider);
       return;
     }
-    const body = await parseJsonBody(req);
     if (
       !body ||
       typeof (body as { subject?: unknown }).subject !== "string" ||
@@ -327,11 +333,14 @@ export class IdentityLinkApi {
    * requiring the caller to send a follow-up chat message.
    */
   private async handleWait(req: IncomingMessage, res: ServerResponse, provider: string): Promise<void> {
+    // Read the body before any answer, even a refusal: replying first and
+    // closing a socket the client is still writing to makes the kernel send
+    // an RST, which can discard the reply before the client reads it.
+    const body = await parseJsonBody(req);
     if (!this.supports(provider)) {
       this.unsupported(res, provider);
       return;
     }
-    const body = await parseJsonBody(req);
     if (!body || typeof (body as { subject?: unknown }).subject !== "string") {
       sendJson(res, 400, { error: "Request body must be JSON with a string `subject` field" });
       return;
