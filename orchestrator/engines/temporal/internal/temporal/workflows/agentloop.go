@@ -46,6 +46,9 @@ const (
 	// declares no identity providers, so its identity mode is resolved and
 	// its decision is on the audit record (docs/adr/0049).
 	versionIdentityModePreflight = "identity-mode-preflight"
+	// A trigger-forced agent's failure fails the turn instead of answering
+	// with the failure as a reply (forcedAgentFailure).
+	versionForcedAgentFailFails = "forced-agent-fail-fails"
 )
 
 // TurnMeta reports what the agent loop did, for TurnResult/debugging.
@@ -129,7 +132,7 @@ func runAgentTurn(ctx workflow.Context, actx workflow.Context, state *Conversati
 			agentID := state.ActiveAgentID
 			reply, outcome, preempted, failed := handleAgentUp(ctx, state, agentID, state.ActiveAgentWorkflowID, gen, note)
 			meta.Outcome = outcome
-			if err := forcedAgentFailure(in, agentID, failed, reply); err != nil {
+			if err := forcedAgentFailure(ctx, in, agentID, failed, reply); err != nil {
 				return "", meta, nil, err
 			}
 			if preempted {

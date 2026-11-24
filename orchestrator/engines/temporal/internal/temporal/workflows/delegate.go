@@ -160,7 +160,7 @@ func delegateToAgent(ctx workflow.Context, actx workflow.Context, state *Convers
 	gen := state.beginAgentListen(ctx)
 	reply, outcome, preempted, failed := handleAgentUp(ctx, state, agent.ID, childID, gen, note)
 	meta.Outcome = outcome
-	if err := forcedAgentFailure(in, agent.ID, failed, reply); err != nil {
+	if err := forcedAgentFailure(ctx, in, agent.ID, failed, reply); err != nil {
 		return "", *meta, err
 	}
 	if preempted {
@@ -268,8 +268,16 @@ func handleAgentUp(ctx workflow.Context, state *ConversationState, agentID, chil
 // reply.http, a GitHub result comment -- must see failed, not a reply that
 // merely describes the failure. Chat and planner delegation keep answering
 // with the failure as text.
-func forcedAgentFailure(in TurnInput, agentID string, failed bool, reply string) error {
+//
+// Guarded by versionForcedAgentFailFails: a turn recorded before the change
+// answered with the reply (and counted toward Turns), so its replay must too.
+// The version is only consulted on that path, so no other turn records a
+// marker.
+func forcedAgentFailure(ctx workflow.Context, in TurnInput, agentID string, failed bool, reply string) error {
 	if !failed || in.ForcedAgentID == "" || in.ForcedAgentID != agentID {
+		return nil
+	}
+	if workflow.GetVersion(ctx, versionForcedAgentFailFails, workflow.DefaultVersion, 1) == workflow.DefaultVersion {
 		return nil
 	}
 	return errors.New(reply)

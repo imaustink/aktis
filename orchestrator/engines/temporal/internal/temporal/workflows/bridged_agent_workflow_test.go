@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.temporal.io/sdk/workflow"
 
 	"github.com/aktisai/orchestrator/engines/temporal/internal/agentrun"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/catalog"
@@ -568,4 +569,30 @@ func TestForcedBridgedAgentFailureFailsTheTurn(t *testing.T) {
 	require.NoError(t, le.env.GetWorkflowError())
 	require.Error(t, failure)
 	require.Contains(t, failure.Error(), "it broke")
+}
+
+// A conversation that recorded such a turn before the change replays it as it
+// ran: the failure is the turn's reply, not its error.
+func TestForcedBridgedAgentFailureBeforeTheChangeIsAReply(t *testing.T) {
+	le := newLoopEnv(t)
+	le.env.OnGetVersion("forced-agent-fail-fails", workflow.DefaultVersion, 1).Return(workflow.DefaultVersion)
+	agent := bridgedAgent()
+	le.agents = []catalog.AgentDescriptor{agent}
+	le.resolvedAgent = &agent
+
+	in := workflows.TurnInput{
+		Message:       "Review acme/widgets#42",
+		Caller:        activities.Caller{Subject: "svc:gw", Roles: []string{"agent"}},
+		ForcedAgentID: agent.ID,
+		TriggerName:   "factory-review",
+	}
+	var result workflows.TurnResult
+	le.sendTurnInput(t, "turn-1", in, &result, time.Millisecond)
+	le.deliverUp(agentrun.UpMessage{Seq: 1, Type: agentrun.UpReady}, time.Second)
+	le.deliverUp(agentrun.UpMessage{Seq: 2, Type: agentrun.UpFailed, Code: "boom", Message: "it broke"}, 2*time.Second)
+
+	le.env.ExecuteWorkflow(workflows.ConversationWorkflowName, (*workflows.ConversationState)(nil))
+	require.True(t, le.env.IsWorkflowCompleted())
+	require.NoError(t, le.env.GetWorkflowError())
+	require.Contains(t, result.Reply, "it broke")
 }
