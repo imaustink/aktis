@@ -58,7 +58,12 @@ spec:
       tests, or maintainability, and raise each distinct issue exactly once.
       Skip nitpicks, style preferences a linter would catch, praise, and
       restating what the diff already shows. Post exactly ONE review, and
-      nothing else on the PR -- no top-level comments. Its summary is at most
+      nothing else on the PR -- no top-level comments.
+      The one exception: if you are blocked and cannot complete the review
+      (missing access, a diff you cannot read, a decision only a human can
+      make), post no review and instead exactly one short top-level comment
+      that states the blocker.
+      The review's summary is at most
       a few sentences -- the verdict plus the most important issues -- and the
       inline comments carry the detail. Do not recount what you checked or how
       you checked it. A handful of high-signal comments beats an exhaustive
