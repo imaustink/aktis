@@ -233,6 +233,16 @@ spec:
                 x-kubernetes-validations:
                 - message: launch is immutable
                   rule: self == oldSelf
+              outcome:
+                description: |-
+                  outcome names the structured outcome a read-only run reports, handed
+                  to the agent as AGENT_OUTCOME (docs/adr/0055). Set from an
+                  EventTrigger's target.outcome. Unset: a read-only run reports a
+                  verdict.
+                enum:
+                - verdict
+                - coordination
+                type: string
               params:
                 additionalProperties:
                   type: string

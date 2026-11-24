@@ -114,7 +114,7 @@ didn't block (closed target, cycle) does not reset depth.
 
 ```
 ai-triage ─► factory-intake (none; serialize factory-coordinate:<repo>)
-              └─► factory-coordinate (readOnly SWE agent; aktis-coordinate)
+              └─► factory-coordinate (readOnly SWE agent; outcome: coordination)
                     ├─ proceed / none / failed ─► factory-triage ─► factory-review …
                     ├─ stack <N>                ─► factory-triage-stacked ─► factory-review …
                     └─ wait <N>                 ─► factory-park (none; waitUntilClosed #N + serialize)
@@ -129,10 +129,17 @@ ai-triage ─► factory-intake (none; serialize factory-coordinate:<repo>)
   together would each see an empty board and both proceed: the collision this
   ADR exists to prevent.
 - **The decision is recorded like a verdict.** The runner installs
-  `aktis-coordinate proceed | wait <N> | stack <N>`. On a `readOnly` run whose
-  prompt names that command, the runner reports
-  `outcome.coordination: {decision, number?}` instead of a review verdict, and
-  does not append the verdict section. A missing or invalid decision is `none`,
+  `aktis-coordinate proceed | wait <N> | stack <N>`. Which outcome a run
+  reports is a structured trigger field, `target.outcome: verdict |
+  coordination` (read-only `agentRef` only; unset means `verdict`). It travels
+  like `readOnly`: in the signed dispatch, onto `AgentRun.spec.outcome`, into
+  the pod as `AGENT_OUTCOME`, and to the runner as `session.outcome`. On a
+  `coordination` run the runner appends the coordination prompt section
+  instead of the verdict one, and reports
+  `outcome.coordination: {decision, number?}` instead of a verdict. The runner
+  never reads the prompt to decide this: review prompts embed issue and pull
+  request bodies, and text there must not be able to switch a review into a
+  run that reports no verdict. A missing or invalid decision is `none`,
   which proceeds, so a confused coordinator costs nothing over having none.
 - **Routing is CEL over that enum.** `factory-triage` is the exact complement
   of `factory-park` and `factory-triage-stacked`, so every coordinated issue is
@@ -180,6 +187,13 @@ because bot-authored label webhooks are dropped.
   held-event and sweep tests.
 
 ## Alternatives considered
+
+- **Detect coordination runs from the prompt** (the runner checks whether the
+  instruction names `aktis-coordinate`). This needs no new field, but review
+  prompts embed user-written issue and pull request bodies, so any body that
+  mentions the command (including every PR about this feature) silently turns
+  a review into a run with no verdict. Rejected for the structured
+  `target.outcome`, the same reason 0048 made `readOnly` a field.
 
 - **Serialize by `sessionKey` in the engine.** Each session is one
   conversation workflow, but concurrent turns in one conversation are not

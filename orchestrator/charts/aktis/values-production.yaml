@@ -839,7 +839,8 @@ extraManifests:
           keyParam: repository
   # eventtrigger-factory-coordinate
   # A read-only coordinator compares the issue with the open PRs and in-flight
-  # issues and records proceed / wait <N> / stack <N> with aktis-coordinate.
+  # issues and records proceed / wait <N> / stack <N> with aktis-coordinate
+  # (target.outcome: coordination, a structured field, never the prompt).
   # Routing on that enum is deterministic (factory-triage, factory-park,
   # factory-triage-stacked). It re-adds ai-triage (an issue returning from a
   # wait is in flight again) and clears ai-waiting when it ends.
@@ -862,6 +863,7 @@ extraManifests:
       target:
         agentRef: "claude-code-swe-agent"
         readOnly: true
+        outcome: coordination
         promptTemplate: |
           You are the coordinator of an automated software factory working in
           {{`{{repository}}`}}. Issue {{`{{repository}}`}}#{{`{{number}}`}} ("{{`{{title}}`}}") is about to

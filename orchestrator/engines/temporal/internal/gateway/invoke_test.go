@@ -686,6 +686,29 @@ func TestShapeInvokeTurnCarriesTheTriggersIdentityOverride(t *testing.T) {
 	require.Equal(t, "agent", matched.turn.IdentityOverride)
 }
 
+// docs/adr/0055: the trigger's outcome reaches the turn from a signed
+// dispatch and from a trigger matched here, and from nowhere else.
+func TestShapeInvokeTurnCarriesTheTriggersOutcome(t *testing.T) {
+	now := time.Now()
+	d := rbac.Dispatch{TriggerName: "factory-coordinate", ForcedAgentID: "claude-code-swe-agent", ReadOnly: true, Outcome: "coordination"}
+	shaped, err := shapeInvokeTurn(invokeRequest{Request: "coordinate #5", SessionID: "s"},
+		"", signedDispatch(d, "s", "coordinate #5", now), assertionSecret, reviewTriggers(t), testCaller, now)
+	require.NoError(t, err)
+	require.Equal(t, "coordination", shaped.turn.Outcome)
+
+	plain, err := shapeInvokeTurn(invokeRequest{Request: "coordinate #5", SessionID: "s"}, "", "", assertionSecret, reviewTriggers(t), testCaller, now)
+	require.NoError(t, err)
+	require.Empty(t, plain.turn.Outcome)
+
+	reg := catalog.NewEventTriggerRegistry()
+	reg.Upsert(catalog.NewEventTriggerDescriptor("coordinate", catalog.EventTriggerSpec{
+		Target: catalog.EventTriggerTarget{AgentRef: "claude-code-swe-agent", PromptTemplate: "coordinate", ReadOnly: true, Outcome: "coordination"},
+	}, true))
+	matched, err := shapeInvokeTurn(invokeRequest{Event: prEnvelope("ai-review")}, "", "", "", reg, testCaller, now)
+	require.NoError(t, err)
+	require.Equal(t, "coordination", matched.turn.Outcome)
+}
+
 // --- docs/adr/0052 ---
 
 // runEnvelope is a run-completion event as integration-gateway builds it.

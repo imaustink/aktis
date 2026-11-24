@@ -8,8 +8,10 @@ import type {
   EventTriggerReplySpec,
   EventTriggerResource,
   RenderedReply,
+  RunOutcome,
   TriggerTarget,
 } from "./types.js";
+import { RUN_OUTCOMES } from "./types.js";
 import {
   canonicalJson,
   paramToString,
@@ -104,6 +106,7 @@ function resolveTarget(resource: EventTriggerResource): TriggerTarget | string {
     if (t.promptTemplate) return "spec.target.promptTemplate cannot be set with none";
     if (t.readOnly) return "spec.target.readOnly cannot be set with none";
     if (t.identity) return "spec.target.identity cannot be set with none";
+    if (t.outcome) return "spec.target.outcome cannot be set with none";
     return { kind, readOnly: false };
   }
   if (kind !== "tool" && !t.promptTemplate) {
@@ -115,6 +118,13 @@ function resolveTarget(resource: EventTriggerResource): TriggerTarget | string {
   if (t.identity) {
     if (kind === "tool") return "spec.target.identity cannot be set with toolRef";
     target.identity = t.identity;
+  }
+  if (t.outcome !== undefined && t.outcome !== "") {
+    if (!(RUN_OUTCOMES as readonly string[]).includes(t.outcome)) {
+      return `spec.target.outcome must be one of ${RUN_OUTCOMES.join(", ")}`;
+    }
+    if (kind !== "agent" || !target.readOnly) return "spec.target.outcome requires agentRef and readOnly";
+    target.outcome = t.outcome as RunOutcome;
   }
   return target;
 }

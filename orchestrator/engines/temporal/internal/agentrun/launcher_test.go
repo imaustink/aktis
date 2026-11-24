@@ -52,6 +52,25 @@ func TestLaunchCarriesReadOnlyAndParams(t *testing.T) {
 	}
 }
 
+// docs/adr/0055: spec.outcome is written only when set.
+func TestLaunchCarriesOutcome(t *testing.T) {
+	for _, outcome := range []string{"coordination", ""} {
+		client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
+			map[schema.GroupVersionResource]string{agentrun.GVR: "AgentRunList"})
+		launcher := agentrun.NewK8sLauncher(client, "ns", toolrun.SecretRef{Name: "cb", Key: "k"})
+		require.NoError(t, launcher.Launch(context.Background(), agentrun.LaunchSpec{
+			Name: "agentrun-swe-1", AgentRef: "swe", Goal: "Coordinate acme/widgets#5",
+			CallbackURL: "http://gw/callback/w/agentrun-swe-1",
+			ReadOnly:    true, Outcome: outcome,
+		}))
+		obj, err := client.Resource(agentrun.GVR).Namespace("ns").Get(context.Background(), "agentrun-swe-1", metav1.GetOptions{})
+		require.NoError(t, err)
+		got, found, _ := unstructured.NestedString(obj.Object, "spec", "outcome")
+		require.Equal(t, outcome != "", found)
+		require.Equal(t, outcome, got)
+	}
+}
+
 // The pre-flight's decision becomes spec.identityMode (AGENT_IDENTITY_MODE)
 // and the immutable spec.launch record (docs/adr/0049). A launch no decision
 // covered writes neither, byte-identical to before.

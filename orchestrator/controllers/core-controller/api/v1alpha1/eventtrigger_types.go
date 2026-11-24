@@ -45,6 +45,7 @@ type NoneTarget struct{}
 // +kubebuilder:validation:XValidation:rule="!has(self.none) || !has(self.readOnly) || !self.readOnly",message="readOnly cannot be set with none: nothing runs to restrict"
 // +kubebuilder:validation:XValidation:rule="!has(self.none) || !has(self.identity)",message="identity cannot be set with none: nothing runs to authorize"
 // +kubebuilder:validation:XValidation:rule="!has(self.identity) || !has(self.toolRef)",message="identity applies to agent runs; it cannot be set with toolRef"
+// +kubebuilder:validation:XValidation:rule="!has(self.outcome) || (has(self.agentRef) && has(self.readOnly) && self.readOnly)",message="outcome requires agentRef and readOnly"
 type EventTriggerTarget struct {
 	// orchestrator runs a conversational turn on the rendered prompt.
 	// +optional
@@ -77,6 +78,13 @@ type EventTriggerTarget struct {
 	// suppresses write credentials. It can only restrict.
 	// +optional
 	ReadOnly bool `json:"readOnly,omitempty"`
+
+	// outcome names the structured outcome the read-only agent run reports
+	// (docs/adr/0055): verdict (the default) or coordination. It reaches the
+	// agent as AgentRun.spec.outcome, never through the prompt, so nothing in
+	// an event body can switch it.
+	// +optional
+	Outcome RunOutcome `json:"outcome,omitempty"`
 
 	// identity overrides the identity mode of every agent this turn
 	// authorizes (docs/adr/0049): agent, delegated or hybrid, in place of the

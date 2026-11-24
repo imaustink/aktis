@@ -106,6 +106,10 @@ func TestEventTriggerInvalidTargetsNeverMatch(t *testing.T) {
 		"two targets":         {SkillRef: "s", AgentRef: "a", PromptTemplate: "x"},
 		"no target":           {PromptTemplate: "x"},
 		"no prompt for skill": {SkillRef: "s"},
+		// docs/adr/0055
+		"unknown outcome":         {AgentRef: "a", PromptTemplate: "x", ReadOnly: true, Outcome: "approve"},
+		"outcome on writable run": {AgentRef: "a", PromptTemplate: "x", Outcome: "coordination"},
+		"outcome on a skill":      {SkillRef: "s", PromptTemplate: "x", ReadOnly: true, Outcome: "verdict"},
 	} {
 		d := catalog.NewEventTriggerDescriptor(name, catalog.EventTriggerSpec{Target: target}, true)
 		require.Error(t, d.Invalid(), name)
@@ -347,4 +351,12 @@ func TestEventTriggerMatchesConflictKind(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, m)
 	require.Equal(t, "12", m.StringParams["number"])
+}
+
+// docs/adr/0055: a read-only agent target may name its outcome.
+func TestEventTriggerOutcomeOnAReadOnlyAgent(t *testing.T) {
+	d := catalog.NewEventTriggerDescriptor("c", catalog.EventTriggerSpec{Target: catalog.EventTriggerTarget{
+		AgentRef: "a", PromptTemplate: "x", ReadOnly: true, Outcome: catalog.OutcomeCoordination,
+	}}, true)
+	require.NoError(t, d.Invalid())
 }

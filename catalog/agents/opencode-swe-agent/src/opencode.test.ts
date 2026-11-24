@@ -9,7 +9,7 @@ import {
   isReadOnly,
   READ_ONLY_DENY_BASH_PATTERNS,
 } from "./opencode.js";
-import { VERDICT_PROMPT_SECTION } from "./outcome.js";
+import { COORDINATE_PROMPT_SECTION, VERDICT_PROMPT_SECTION } from "./outcome.js";
 
 describe("buildOpencodeConfig", () => {
   it("pins the model and bakes in bash deny rules alongside a blanket allow", () => {
@@ -111,22 +111,26 @@ describe("buildPrompt", () => {
 
   // docs/adr/0052 §2: a review records its decision with aktis-verdict.
   it("ends a read-only prompt with the verdict instruction", () => {
-    const prompt = buildPrompt("review PR #7", null, true);
+    const prompt = buildPrompt("review PR #7", null, "verdict");
     expect(prompt.endsWith(`\n\n${VERDICT_PROMPT_SECTION}`)).toBe(true);
     expect(prompt).toContain("aktis-verdict changes-requested");
     expect(prompt).toContain("aktis-verdict ready");
   });
 
   // docs/adr/0055: a coordination run records a decision, not a review verdict.
-  it("omits the verdict instruction from a read-only coordination prompt", () => {
-    const prompt = buildPrompt("Decide, then run `aktis-coordinate proceed`.", null, true);
-    expect(prompt).not.toContain(VERDICT_PROMPT_SECTION);
+  it("ends a coordination prompt with the coordination instruction instead", () => {
+    const prompt = buildPrompt("Check issue #5 against in-flight work.", null, "coordination");
+    expect(prompt.endsWith(`\n\n${COORDINATE_PROMPT_SECTION}`)).toBe(true);
     expect(prompt).not.toContain("aktis-verdict");
-    expect(prompt).toContain("aktis-coordinate proceed");
+  });
+
+  it("follows the report, not the instruction text", () => {
+    const prompt = buildPrompt("Review PR #7; its body mentions `aktis-coordinate wait 3`.", null, "verdict");
+    expect(prompt.endsWith(`\n\n${VERDICT_PROMPT_SECTION}`)).toBe(true);
   });
 
   it("leaves a write run's prompt unchanged", () => {
-    const prompt = buildPrompt("fix the bug", null, false);
+    const prompt = buildPrompt("fix the bug", null, null);
     expect(prompt).not.toContain("aktis-verdict");
     expect(prompt).toBe(buildPrompt("fix the bug", null));
   });

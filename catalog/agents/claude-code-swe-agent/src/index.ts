@@ -41,6 +41,7 @@ import {
   clearCoordination,
   clearVerdict,
   collectOutcome,
+  reportedOutcome,
   COORDINATE_FILE_ENV,
   installVerdictCommand,
   VERDICT_FILE_ENV,
@@ -140,6 +141,9 @@ async function handler(session: AgentSession): Promise<AgentReply> {
   // (buildClaudeSettings), a read-only GitHub token (the readOnly arg to the
   // token resolvers), and skipping the runner-owned push/PR creation.
   const readOnly = isReadOnly(session);
+  // Which structured outcome this run reports (docs/adr/0055): from
+  // AgentRun.spec.readOnly / spec.outcome alone, never from the goal text.
+  const report = reportedOutcome({ readOnly, ...(session.outcome ? { outcome: session.outcome } : {}) });
   if (readOnly) {
     console.error("[claude-code-swe-agent] read-only run: enforcing (deny push/PR create/merge, read-only token)");
   }
@@ -211,8 +215,8 @@ async function handler(session: AgentSession): Promise<AgentReply> {
   childEnv.PATH = `${verdict.binDir}:${childEnv.PATH ?? ""}`;
   childEnv[VERDICT_FILE_ENV] = verdict.verdictFile;
   // `aktis-coordinate` (docs/adr/0055): the factory coordinator's decision,
-  // installed and reported the same way -- only on a read-only run whose
-  // instruction names the command.
+  // installed and reported the same way -- prompted for and reported only
+  // when AgentRun.spec.outcome is "coordination" (outcome.ts reportedOutcome).
   childEnv[COORDINATE_FILE_ENV] = verdict.coordinateFile;
   if (delegating) {
     const shim = await installGhShim({ homeDir: toolConfig.homeDir });
@@ -293,7 +297,7 @@ async function handler(session: AgentSession): Promise<AgentReply> {
   }
 
   await session.progress("Running Claude Code…", { stage: "agent" });
-  const prompt = buildPrompt(instruction, marker, skill, awsProfiles.profiles, toolConfig.kubeInCluster, readOnly);
+  const prompt = buildPrompt(instruction, marker, skill, awsProfiles.profiles, toolConfig.kubeInCluster, report);
   const runOpts = {
     cwd: toolConfig.workdir,
     env: childEnv,
@@ -393,9 +397,8 @@ async function handler(session: AgentSession): Promise<AgentReply> {
       outcome: await collectOutcome({
         discovered: null,
         madeNewCommits: false,
-        readOnly,
+        report,
         verdictFile: verdict.verdictFile,
-        instruction,
         coordinateFile: verdict.coordinateFile,
       }),
     };
@@ -543,9 +546,8 @@ async function handler(session: AgentSession): Promise<AgentReply> {
     outcome: await collectOutcome({
       discovered,
       madeNewCommits: pushedNewCommits,
-      readOnly,
+      report,
       verdictFile: verdict.verdictFile,
-      instruction,
       coordinateFile: verdict.coordinateFile,
     }),
   };

@@ -152,6 +152,8 @@ export interface LocalAgentOptions extends Omit<InProcessChannelOptions, "autoAc
   readOnly?: boolean;
   /** Structured run parameters, as `AgentRun.spec.params` would pass them (default `{}`). */
   params?: Record<string, string>;
+  /** Structured outcome, as `AgentRun.spec.outcome` would pass it (docs/adr/0055). */
+  outcome?: string;
 }
 
 export type LocalAgentOutcome =
@@ -191,7 +193,7 @@ export function startLocalAgent(
 
   const outcome = runAgent(handler, {
     channel,
-    config: { runId, goal: opts.goal, subjectPrefix: "agent", readOnly: opts.readOnly ?? false, params: opts.params ?? {} },
+    config: { runId, goal: opts.goal, subjectPrefix: "agent", readOnly: opts.readOnly ?? false, params: opts.params ?? {}, ...(opts.outcome ? { outcome: opts.outcome } : {}) },
   }).then((): LocalAgentOutcome => {
     for (let i = peer.up.length - 1; i >= 0; i--) {
       const msg = peer.up[i]!;

@@ -70,6 +70,13 @@ type AgentRunSpec struct {
 	// +optional
 	Params map[string]string `json:"params,omitempty"`
 
+	// outcome names the structured outcome a read-only run reports, handed
+	// to the agent as AGENT_OUTCOME (docs/adr/0055). Set from an
+	// EventTrigger's target.outcome. Unset: a read-only run reports a
+	// verdict.
+	// +optional
+	Outcome RunOutcome `json:"outcome,omitempty"`
+
 	// identityMode is the identity this run acts as, decided once by the
 	// launching engine's authorization pre-flight (docs/adr/0049) and handed
 	// to the agent as AGENT_IDENTITY_MODE. It describes the credentials this
@@ -272,3 +279,16 @@ type AgentRunList struct {
 func init() {
 	SchemeBuilder.Register(&AgentRun{}, &AgentRunList{})
 }
+
+// RunOutcome is the structured outcome a read-only agent run reports
+// (docs/adr/0055).
+// +kubebuilder:validation:Enum=verdict;coordination
+type RunOutcome string
+
+const (
+	// RunOutcomeVerdict records a review verdict (aktis-verdict).
+	RunOutcomeVerdict RunOutcome = "verdict"
+	// RunOutcomeCoordination records a factory coordination decision
+	// (aktis-coordinate).
+	RunOutcomeCoordination RunOutcome = "coordination"
+)

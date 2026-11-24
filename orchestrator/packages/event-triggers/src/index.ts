@@ -27,6 +27,7 @@ export type {
   HttpReplySpec,
   ObjectMeta,
   RenderedReply,
+  RunOutcome,
   RunSource,
   SecretKeySelector,
   TriggerTarget,
@@ -35,6 +36,8 @@ export type {
   WebhookVerify,
   WebhookVerifyScheme,
 } from "./types.js";
+
+export { RUN_OUTCOMES } from "./types.js";
 
 export {
   canonicalJson,

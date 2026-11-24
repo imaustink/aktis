@@ -399,6 +399,7 @@ func shapeInvokeTurn(
 			// The trigger's mode, plus any restriction the caller adds.
 			turn.ReadOnly = d.ReadOnly || req.ReadOnly
 			turn.Params = d.Params
+			turn.Outcome = d.Outcome
 			turn.TriggerName = d.TriggerName
 			turn.IdentityOverride = d.Identity
 		}
@@ -446,6 +447,7 @@ func shapeInvokeTurn(
 	// A caller may add read-only on top of the trigger's; never remove it.
 	turn.ReadOnly = target.ReadOnly || req.ReadOnly
 	turn.Params = m.StringParams
+	turn.Outcome = target.Outcome
 	turn.TriggerName = m.Trigger.Name
 	turn.IdentityOverride = target.Identity
 	// The repository the source's sender was verified on (§2 repositoryFrom)

@@ -7,7 +7,9 @@ import {
   buildOutcome,
   clearCoordination,
   clearVerdict,
-  coordinationRequested,
+  COORDINATE_PROMPT_SECTION,
+  outcomePromptSection,
+  reportedOutcome,
   COORDINATE_COMMAND,
   COORDINATE_FILE_ENV,
   readCoordination,
@@ -106,15 +108,16 @@ describe("verdict file", () => {
 describe("collectOutcome", () => {
   let home: string;
   let file: string;
+  let coordinateFile: string;
   beforeEach(async () => {
     home = mkdtempSync(join(tmpdir(), "collect-test-"));
-    ({ verdictFile: file } = await installVerdictCommand({ homeDir: home }));
+    ({ verdictFile: file, coordinateFile } = await installVerdictCommand({ homeDir: home }));
   });
   afterEach(() => rmSync(home, { recursive: true, force: true }));
 
   it("reports the recorded verdict on a read-only run", async () => {
     writeFileSync(file, "changes-requested\n");
-    expect(await collectOutcome({ discovered: pr, madeNewCommits: false, readOnly: true, verdictFile: file })).toEqual({
+    expect(await collectOutcome({ discovered: pr, madeNewCommits: false, report: "verdict", verdictFile: file, coordinateFile })).toEqual({
       pullRequest: { number: 42, url: pr.prUrl },
       madeNewCommits: false,
       verdict: "changes-requested",
@@ -122,14 +125,14 @@ describe("collectOutcome", () => {
   });
 
   it("reports none on a read-only run that recorded nothing", async () => {
-    expect((await collectOutcome({ discovered: pr, madeNewCommits: false, readOnly: true, verdictFile: file })).verdict).toBe(
+    expect((await collectOutcome({ discovered: pr, madeNewCommits: false, report: "verdict", verdictFile: file, coordinateFile })).verdict).toBe(
       "none",
     );
   });
 
   it("never reports a verdict on a write run, even if one was recorded", async () => {
     writeFileSync(file, "ready\n");
-    const outcome = await collectOutcome({ discovered: pr, madeNewCommits: true, readOnly: false, verdictFile: file });
+    const outcome = await collectOutcome({ discovered: pr, madeNewCommits: true, report: null, verdictFile: file, coordinateFile });
     expect("verdict" in outcome).toBe(false);
   });
 });
@@ -298,10 +301,20 @@ describe("coordination file", () => {
   });
 });
 
-describe("coordinationRequested", () => {
-  it("is true only when the instruction names the command", () => {
-    expect(coordinationRequested(`Record it with \`${COORDINATE_COMMAND} proceed\`.`)).toBe(true);
-    expect(coordinationRequested("Review pull request #4.")).toBe(false);
+describe("reportedOutcome", () => {
+  it("comes from the structured fields alone", () => {
+    expect(reportedOutcome({ readOnly: false })).toBeNull();
+    expect(reportedOutcome({ readOnly: false, outcome: "coordination" })).toBeNull();
+    expect(reportedOutcome({ readOnly: true })).toBe("verdict");
+    expect(reportedOutcome({ readOnly: true, outcome: "verdict" })).toBe("verdict");
+    expect(reportedOutcome({ readOnly: true, outcome: "coordination" })).toBe("coordination");
+  });
+
+  it("maps to the matching prompt section", () => {
+    expect(outcomePromptSection("verdict")).toBe(VERDICT_PROMPT_SECTION);
+    expect(outcomePromptSection("coordination")).toBe(COORDINATE_PROMPT_SECTION);
+    expect(outcomePromptSection(null)).toBeNull();
+    expect(COORDINATE_PROMPT_SECTION).toContain(`${COORDINATE_COMMAND} wait <number>`);
   });
 });
 
@@ -309,22 +322,20 @@ describe("collectOutcome with coordination", () => {
   let home: string;
   let verdictFile: string;
   let coordinateFile: string;
-  const asking = `Decide, then run \`${COORDINATE_COMMAND} proceed\`.`;
   beforeEach(async () => {
     home = mkdtempSync(join(tmpdir(), "collect-coord-"));
     ({ verdictFile, coordinateFile } = await installVerdictCommand({ homeDir: home }));
   });
   afterEach(() => rmSync(home, { recursive: true, force: true }));
 
-  it("reports coordination instead of a verdict on a read-only run that asked for it", async () => {
+  it("reports coordination instead of a verdict on a coordination run", async () => {
     writeFileSync(coordinateFile, "stack 9\n");
     writeFileSync(verdictFile, "ready\n");
     const outcome = await collectOutcome({
       discovered: null,
       madeNewCommits: false,
-      readOnly: true,
+      report: "coordination",
       verdictFile,
-      instruction: asking,
       coordinateFile,
     });
     expect(outcome).toEqual({ madeNewCommits: false, coordination: { decision: "stack", number: 9 } });
@@ -334,38 +345,36 @@ describe("collectOutcome with coordination", () => {
     const outcome = await collectOutcome({
       discovered: null,
       madeNewCommits: false,
-      readOnly: true,
+      report: "coordination",
       verdictFile,
-      instruction: asking,
       coordinateFile,
     });
     expect(outcome.coordination).toEqual({ decision: "none" });
     expect("verdict" in outcome).toBe(false);
   });
 
-  it("never reports coordination on a review, even if the file exists", async () => {
+  it("never reports coordination on a verdict run, even if the file exists", async () => {
     writeFileSync(coordinateFile, "proceed\n");
     writeFileSync(verdictFile, "ready\n");
     const outcome = await collectOutcome({
       discovered: pr,
       madeNewCommits: false,
-      readOnly: true,
+      report: "verdict",
       verdictFile,
-      instruction: "Review pull request #42.",
       coordinateFile,
     });
     expect(outcome.verdict).toBe("ready");
     expect("coordination" in outcome).toBe(false);
   });
 
-  it("never reports coordination on a write run, even when the instruction names the command", async () => {
+  it("never reports either on a write run", async () => {
     writeFileSync(coordinateFile, "proceed\n");
+    writeFileSync(verdictFile, "ready\n");
     const outcome = await collectOutcome({
       discovered: pr,
       madeNewCommits: true,
-      readOnly: false,
+      report: null,
       verdictFile,
-      instruction: asking,
       coordinateFile,
     });
     expect("coordination" in outcome).toBe(false);

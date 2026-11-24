@@ -1,5 +1,6 @@
 import type { CallerToolDescriptor, PendingToolCall } from "../caller-tools/types.js";
 import type { SenderClaims } from "../rbac/sender-assertion.js";
+import type { RunOutcome } from "@aktis/event-triggers";
 
 /**
  * A tool call the CLIENT already executed for the exchange in flight
@@ -74,6 +75,12 @@ export interface TurnInput {
   toolInput?: string;
   /** Read-only turn: the trigger's `target.readOnly`, else the session's sticky flag. */
   readOnly?: boolean;
+  /**
+   * The trigger's `target.outcome` (docs/adr/0055): the structured outcome
+   * the forced agent's run reports. Trigger turns only (never sticky), and
+   * forwarded only inside the signed dispatch assertion.
+   */
+  outcome?: RunOutcome;
   /** The trigger's `target.identity` (docs/adr/0049), forwarded inside the signed dispatch assertion. */
   identityOverride?: string;
   /** Everything integration-gateway vouched for about a webhook sender (docs/adr/0049 §5). */

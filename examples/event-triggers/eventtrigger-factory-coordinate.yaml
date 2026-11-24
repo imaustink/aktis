@@ -1,8 +1,10 @@
 # Software factory, step 1 (docs/adr/0055 §3): before any work starts, a
 # read-only coordinator compares the issue against the work already in flight
-# in the repository and records ONE decision with `aktis-coordinate` (the
-# runner installs it; because this prompt names it, the runner reports
-# `outcome.coordination` instead of a review verdict):
+# in the repository and records ONE decision with `aktis-coordinate`.
+# `target.outcome: coordination` is what makes the run report
+# `outcome.coordination` instead of a review verdict: it reaches the runner as
+# AgentRun.spec.outcome, never through the prompt, so nothing in an issue or
+# pull request body can switch a run's mode:
 #
 #   proceed     -> factory-triage (work from the default branch)
 #   stack <N>   -> factory-triage-stacked (branch from open PR #N)
@@ -35,6 +37,7 @@ spec:
   target:
     agentRef: "opencode-swe-agent"
     readOnly: true
+    outcome: coordination
     promptTemplate: |
       You are the coordinator of an automated software factory working in
       {{repository}}. Issue {{repository}}#{{number}} ("{{title}}") is about to

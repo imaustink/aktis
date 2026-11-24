@@ -106,6 +106,11 @@ type AgentWorkflowInput struct {
 	ReadOnly bool              `json:"readOnly,omitempty"`
 	Params   map[string]string `json:"params,omitempty"`
 
+	// Outcome is the trigger's target.outcome (docs/adr/0055), set only on
+	// the episode a trigger forced; it becomes AgentRun.spec.outcome. Not
+	// inherited by sub-agents: the outcome is the forced agent's to report.
+	Outcome string `json:"outcome,omitempty"`
+
 	// Launch is the parent pre-flight's audit view of this launch (docs/adr/
 	// 0049 §3): the identity mode the run was given and who launched it. A
 	// pod-backed episode stamps it on its AgentRun. Empty for a nested

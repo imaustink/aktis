@@ -149,6 +149,8 @@ export interface EventTriggerTargetSpec {
   toolRef?: string;
   promptTemplate?: string;
   readOnly?: boolean;
+  /** Structured outcome a read-only agent run reports (docs/adr/0055). */
+  outcome?: string;
   /** Identity-mode override for the agents this turn launches (docs/adr/0049). */
   identity?: string;
 }
@@ -235,6 +237,10 @@ export interface EventTriggerResource {
 // Resolved dispatch (§4-§5)
 // ---------------------------------------------------------------------------
 
+/** Structured outcomes a read-only agent run can report (docs/adr/0055). */
+export const RUN_OUTCOMES = ["verdict", "coordination"] as const;
+export type RunOutcome = (typeof RUN_OUTCOMES)[number];
+
 export type TriggerTargetKind = "orchestrator" | "skill" | "agent" | "tool" | "none";
 
 export interface TriggerTarget {
@@ -243,6 +249,12 @@ export interface TriggerTarget {
   ref?: string;
   readOnly: boolean;
   promptTemplate?: string;
+  /**
+   * `target.outcome` (docs/adr/0055): the structured outcome the forced
+   * read-only agent run reports. Forwarded inside the signed dispatch
+   * assertion and handed to the run as `AgentRun.spec.outcome`.
+   */
+  outcome?: RunOutcome;
   /**
    * `target.identity` (docs/adr/0049): the identity mode every agent the turn
    * authorizes runs in. Can widen what a run reaches, so it is forwarded only

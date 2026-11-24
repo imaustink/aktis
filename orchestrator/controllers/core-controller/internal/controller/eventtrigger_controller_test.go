@@ -311,6 +311,32 @@ var _ = Describe("EventTrigger Controller", func() {
 		Expect(err.Error()).To(ContainSubstring("cannot be set with toolRef"))
 	})
 
+	// docs/adr/0055
+	It("is Ready with outcome on a read-only agent target", func() {
+		trigger := validTrigger("outcome-coordination")
+		trigger.Spec.Target.ReadOnly = true
+		trigger.Spec.Target.Outcome = corev1alpha1.RunOutcomeCoordination
+		Expect(readyAfterReconcile(trigger).Status).To(Equal(metav1.ConditionTrue))
+	})
+
+	It("rejects outcome on a writable target at admission", func() {
+		trigger := validTrigger("outcome-writable")
+		trigger.Spec.Target.ReadOnly = false
+		trigger.Spec.Target.Outcome = corev1alpha1.RunOutcomeCoordination
+		err := k8sClient.Create(ctx, trigger)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("outcome requires agentRef and readOnly"))
+	})
+
+	It("rejects an unknown outcome at admission", func() {
+		trigger := validTrigger("outcome-unknown")
+		trigger.Spec.Target.ReadOnly = true
+		trigger.Spec.Target.Outcome = "approve"
+		err := k8sClient.Create(ctx, trigger)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("outcome"))
+	})
+
 	It("maps a referenced resource back to the triggers naming it", func() {
 		r := &EventTriggerReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 		named := validTrigger("maps-named")

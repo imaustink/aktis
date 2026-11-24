@@ -114,6 +114,7 @@ spec:
   target:                           # exactly one of orchestrator/skillRef/agentRef/toolRef/none
     agentRef: claude-code-swe-agent
     readOnly: true                  # deterministic write-gate for every run in the turn
+    outcome: verdict                # optional: verdict | coordination (read-only agentRef only; §9, §10)
     promptTemplate: |               # required unless toolRef; {{param}} substitution
       Review pull request {{repo}}#{{number}} ...
   reply:                            # optional, executed by integration-gateway
@@ -159,12 +160,19 @@ Rules:
   `allowedIdentities` (the trigger is not `Ready` otherwise), it is invalid with
   `toolRef`, and it is honoured only by the Temporal engine. A turn that parks
   on an account link resumes under the same override. It is not a session mode.
+- `outcome: verdict | coordination` names the structured outcome the forced
+  agent's run reports (§9, §10). Valid only with `agentRef` and
+  `readOnly: true`; unset means `verdict`. It reaches the run as
+  `AgentRun.spec.outcome` inside the signed dispatch, never through the
+  prompt, so no text in an event body can switch it. It applies to the
+  trigger's own turn only: the forced agent's launch (and an account-link
+  resume of it), not sub-agents and not later turns in the session.
 - `none: {}` runs nothing: no AgentRun, skill, tool, LLM call or identity /
   credential check (so never an identity `403`). The event is matched and
   accepted (`202` + invocation id) and polling returns
   `{status:"succeeded", result:""}` at once; only the `reply` side effects run.
-  Admission rejects `none` together with `promptTemplate`, `readOnly` or
-  `identity` (nothing runs to receive them). It is how a handoff such as
+  Admission rejects `none` together with `promptTemplate`, `readOnly`,
+  `outcome` or `identity` (nothing runs to receive them). It is how a handoff such as
   "assign the PR to a human" is expressed.
 - `reply.github.addLabels` / `assignees` are rendered like `removeLabel`
   (`{{param}}`), and an entry that renders to `""` is dropped; when nothing is
@@ -290,7 +298,7 @@ envelope. Body: `request` (rendered prompt), `sessionId`, `readOnly` (only
 travels in the signed `x-orchestrator-dispatch-assertion` header, an
 HMAC-SHA256 `<payload>.<signature>` under the sender-assertion secret with
 payload `{typ:"dispatch", triggerName, forcedSkillId | forcedAgentId |
-forcedToolId, toolInput, readOnly, params, identity, sessionId, requestSha256, exp}`.
+forcedToolId, toolInput, readOnly, outcome, params, identity, sessionId, requestSha256, exp}`.
 It is bound to the turn's session and prompt and expires after 300 s. The
 gateway refuses (`400`) an invalid, expired or mis-bound assertion and one sent
 with an `event`. Without the secret, agent-orchestrator fails a Temporal-mode
@@ -302,10 +310,11 @@ trigger turn instead of sending it unsigned.
 | --- | --- |
 | `AgentRun.spec.readOnly` | `AGENT_READ_ONLY=true` |
 | `AgentRun.spec.params` (map<string,string>) | `AGENT_PARAMS=<json object>` |
+| `AgentRun.spec.outcome` (`verdict` \| `coordination`) | `AGENT_OUTCOME=<value>` |
 | `ToolRun.spec.readOnly` | `TOOL_READ_ONLY=true` |
 
 `@aktis/agent-runtime` exposes them as `session.readOnly` /
-`session.params`. The SWE agents enforce read-only (deny `git push`, `gh pr
+`session.params` / `session.outcome`. The SWE agents enforce read-only (deny `git push`, `gh pr
 create|merge|close|reopen|ready|edit`, mint a `contents:read` token) from
 `session.readOnly` alone.
 
@@ -414,7 +423,8 @@ from the runner, not the model:
 when the turn ended with an open PR. `madeNewCommits` is true only when a
 non-`readOnly` turn moved HEAD **and** the new HEAD reached a remote (some
 remote-tracking branch contains it), so a commit whose push failed counts as no
-new work. `verdict` is set only on `readOnly` runs:
+new work. `verdict` is set only on `readOnly` runs (unless the trigger's
+`target.outcome` is `coordination`, §10):
 the runner tells the model to run `aktis-verdict changes-requested` or
 `aktis-verdict ready` once after posting its review, validates what it recorded,
 and reports `"none"` for a missing or invalid one.
@@ -539,16 +549,20 @@ after the first failure; then it is dropped and logged.
 | Trigger | Matches | Target | Reply / onComplete |
 | --- | --- | --- | --- |
 | `factory-intake` | `ai-triage` applied to an issue (priority 10, so it wins over `github-issue-triage`); in production also a new issue on the auto-triage repos | `none` | `serialize: {group: factory-coordinate, keyParam: repository}` |
-| `factory-coordinate` | `body.trigger in ["factory-intake", "factory-park"]` | SWE agent, `readOnly`; the prompt names `aktis-coordinate` | ack, result, `addLabels: [ai-triage]`, `removeLabel: ai-waiting`; `emitTo: runs` |
+| `factory-coordinate` | `body.trigger in ["factory-intake", "factory-park"]` | SWE agent, `readOnly`, `outcome: coordination` | ack, result, `addLabels: [ai-triage]`, `removeLabel: ai-waiting`; `emitTo: runs` |
 | `factory-park` | coordinate `succeeded`, `decision == "wait"`, a number other than the issue's own, `counts["factory-park"] < 5` | `none` | ack, `addLabels: [ai-waiting]`, `removeLabel: ai-triage`; `waitUntilClosed` on `waitFor` + the same `serialize` |
 | `factory-triage-stacked` | coordinate `succeeded`, `decision == "stack"`, a number other than the issue's own | SWE agent (branch from PR #N, `--base` its branch) | ack, result, `removeLabel: ai-triage`; `emitTo: runs` |
 | `factory-triage` | every other coordinate completion: `proceed`, `none`, a failed coordinator, an unroutable wait (its own number, or 5 waits already) | SWE agent | ack, result, `removeLabel: ai-triage`; `emitTo: runs` |
 
 The coordinator records its decision like a review verdict: the runner
 installs `aktis-coordinate` (`proceed` | `wait <N>` | `stack <N>`), and on a
-`readOnly` run whose prompt names that command it reports
+run whose `AgentRun.spec.outcome` is `coordination` (the trigger's
+`target.outcome`) it appends the coordination prompt section in place of the
+verdict one and reports
 `outcome.coordination: {decision: "proceed" | "wait" | "stack" | "none", number?}`
-(no review verdict, and no verdict prompt section). A missing or invalid
+instead of a verdict. The mode comes from that structured field alone, never
+from the prompt, so a review of a pull request whose description mentions
+`aktis-coordinate` still reports its verdict. A missing or invalid
 decision is `none`, which proceeds: a confused coordinator costs nothing over
 running without one.
 

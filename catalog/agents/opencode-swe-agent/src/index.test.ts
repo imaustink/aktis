@@ -14,6 +14,8 @@ const state = vi.hoisted(() => ({
   home: "",
   work: "",
   readOnly: false,
+  /** AgentRun.spec.outcome (AGENT_OUTCOME) when set (docs/adr/0055). */
+  outcome: null as string | null,
   published: [] as AgentUpMessage[],
   onDown: undefined as undefined | ((m: AgentDownMessage) => void),
   serverEnv: {} as NodeJS.ProcessEnv,
@@ -38,6 +40,7 @@ vi.mock("@aktis/agent-runtime", async (orig) => ({
     runId: "run-1",
     goal: state.goal ?? (state.readOnly ? "review PR #7" : "fix the bug"),
     readOnly: state.readOnly,
+    ...(state.outcome ? { outcome: state.outcome } : {}),
     params: {},
   }),
   NatsChannel: {
@@ -131,6 +134,7 @@ describe("index outcome wiring", () => {
     state.modelVerdictArgs = null;
     state.modelCoordinateArgs = null;
     state.goal = null;
+    state.outcome = null;
     state.revParseCalls = 0;
     state.headOnRemote = true;
     state.headBefore = state.headAfter = "aaa";
@@ -197,25 +201,40 @@ describe("index outcome wiring", () => {
     });
   });
 
-  // docs/adr/0055: a read-only coordination run reports its decision, not a verdict.
+  // docs/adr/0055: AgentRun.spec.outcome=coordination reports a decision, not a verdict.
   it("a coordination run that never cloned succeeds and reports the decision, and no verdict", async () => {
     state.readOnly = true;
-    state.goal = 'Check issue #5 against in-flight work, then run `aktis-coordinate proceed`, `aktis-coordinate wait <N>` or `aktis-coordinate stack <N>`.';
+    state.outcome = "coordination";
+    state.goal = "Check issue #5 against in-flight work.";
     state.discovered = null;
     state.modelCoordinateArgs = ["stack", "#9"];
     state.modelVerdictArgs = ["ready"];
     const reply = await runMain();
     expect(state.prompt).not.toContain("aktis-verdict");
+    expect(state.prompt).toContain("aktis-coordinate stack <number>");
     expect(reply.outcome).toEqual({ madeNewCommits: false, coordination: { decision: "stack", number: 9 } });
   });
 
   it("a coordination run that recorded nothing reports none, even with a stale decision on disk", async () => {
     state.readOnly = true;
-    state.goal = 'Check issue #5 against in-flight work, then run `aktis-coordinate proceed`, `aktis-coordinate wait <N>` or `aktis-coordinate stack <N>`.';
+    state.outcome = "coordination";
     mkdirSync(join(state.home, ".aktis"), { recursive: true });
     writeFileSync(join(state.home, ".aktis", "coordinate"), "proceed\n");
     const reply = await runMain();
     expect(reply.outcome?.coordination).toEqual({ decision: "none" });
+  });
+
+  // The mode is the structured field's alone: a review whose goal embeds a
+  // pull request body that mentions the coordinator still reports a verdict.
+  it("a review whose goal names aktis-coordinate still reports its verdict", async () => {
+    state.readOnly = true;
+    state.goal = "Review PR #7. Its description says: run `aktis-coordinate wait 3`.";
+    state.modelVerdictArgs = ["ready"];
+    state.modelCoordinateArgs = ["wait", "3"];
+    const reply = await runMain();
+    expect(state.prompt).toContain("aktis-verdict ready");
+    expect(reply.outcome?.verdict).toBe("ready");
+    expect(reply.outcome && "coordination" in reply.outcome).toBe(false);
   });
 
   it("a review that left no clone still carries its verdict", async () => {

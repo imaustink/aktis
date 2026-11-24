@@ -572,6 +572,30 @@ describe("InvokeServer /invoke with an event envelope (ADR 0048, docs/event-trig
     await server.close();
   });
 
+  // docs/adr/0055
+  it("forwards a trigger's target.outcome on the turn, and only on trigger turns", async () => {
+    const coordTrigger: EventTriggerResource = {
+      metadata: { name: "factory-coordinate" },
+      spec: { target: { agentRef: "swe", readOnly: true, outcome: "coordination", promptTemplate: "Coordinate" } },
+    };
+    const engine = fakeEngine();
+    const sessions = new InMemorySessionStore({ ttlMs: 60_000, maxEntries: 10 });
+    const server = new InvokeServer(engine, sessions, undefined, await triggerRegistry([coordTrigger]));
+    const port = await listenOn(server);
+
+    await invoke(port, { event: envelope() });
+    await tick();
+    expect(engine.invoke.mock.calls[0]![0]).toMatchObject({ forcedAgentId: "swe", readOnly: true, outcome: "coordination" });
+
+    // A follow-up in the same session inherits read-only, not the outcome.
+    const sessionId = engine.invoke.mock.calls[0]![0].sessionId as string;
+    await invoke(port, { request: "and then?", session_id: sessionId });
+    await tick();
+    expect(engine.invoke.mock.calls[1]![0]).toMatchObject({ readOnly: true });
+    expect(engine.invoke.mock.calls[1]![0].outcome).toBeUndefined();
+    await server.close();
+  });
+
   it("forces a skill for a skillRef target", async () => {
     const skillTrigger: EventTriggerResource = {
       metadata: { name: "ci-failed" },

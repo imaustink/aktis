@@ -13,10 +13,13 @@
  * route to a human rather than back into a fix loop.
  *
  * The factory coordinator (docs/adr/0055) records its decision the same way:
- * a read-only run whose instruction names `aktis-coordinate` gets that command
- * instead of the review verdict, and reports `coordination` -- `proceed`,
- * `wait <N>` or `stack <N>`, validated against a strict pattern, or `none` when
- * nothing valid was recorded (triggers treat that like proceed).
+ * a read-only run whose structured `AgentRun.spec.outcome` is `coordination`
+ * (AGENT_OUTCOME, from the trigger's `target.outcome`) is told to record it
+ * with `aktis-coordinate` instead of a verdict, and reports `coordination` --
+ * `proceed`, `wait <N>` or `stack <N>`, validated against a strict pattern, or
+ * `none` when nothing valid was recorded (triggers treat that like proceed).
+ * Which outcome a run reports comes from that field alone, never from the
+ * prompt, so no text in an issue or pull request can switch it.
  *
  * Kept identical between claude-code-swe-agent and opencode-swe-agent.
  */
@@ -55,12 +58,36 @@ export const COORDINATE_COMMAND = "aktis-coordinate";
 export type OutcomeCoordination = { decision: CoordinateDecision | "none"; number?: number };
 
 /**
- * Whether this turn is a coordination run: its instruction names
- * {@link COORDINATE_COMMAND}. The trigger author writes the instruction, so
- * this is config, not something the model decides.
+ * Appended to a coordination run's prompt in place of
+ * {@link VERDICT_PROMPT_SECTION}. Fixed text, so it always matches the
+ * command's grammar.
  */
-export function coordinationRequested(instruction: string): boolean {
-  return instruction.includes(COORDINATE_COMMAND);
+export const COORDINATE_PROMPT_SECTION = [
+  `## Coordination decision`,
+  `When you have decided, record it exactly once by running one of:`,
+  `- \`${COORDINATE_COMMAND} proceed\` -- start the work now.`,
+  `- \`${COORDINATE_COMMAND} wait <number>\` -- hold it until that open pull request or issue is merged or closed.`,
+  `- \`${COORDINATE_COMMAND} stack <number>\` -- build it on top of that open pull request's branch.`,
+].join("\n");
+
+/** Which structured outcome a run reports (docs/adr/0055). */
+export type ReportedOutcome = "verdict" | "coordination";
+
+/**
+ * The outcome this run reports, from its structured fields alone
+ * (AgentRun.spec.readOnly / spec.outcome): none for a write run; for a
+ * read-only run, `coordination` when spec.outcome says so, else a verdict.
+ */
+export function reportedOutcome(run: { readOnly: boolean; outcome?: string }): ReportedOutcome | null {
+  if (!run.readOnly) return null;
+  return run.outcome === "coordination" ? "coordination" : "verdict";
+}
+
+/** The prompt section that tells the model how to record `report`; none for a write run. */
+export function outcomePromptSection(report: ReportedOutcome | null): string | null {
+  if (report === "verdict") return VERDICT_PROMPT_SECTION;
+  if (report === "coordination") return COORDINATE_PROMPT_SECTION;
+  return null;
 }
 
 /** Type alias (not an interface) so it is assignable to AgentReply.outcome's Record. */
@@ -224,26 +251,22 @@ export function buildOutcome(opts: {
 }
 
 /**
- * The end-of-turn outcome: reads the verdict file only on a read-only run. A
- * write run never reports a verdict, even if the model ran the command. A
- * read-only run whose instruction asked for coordination
- * ({@link coordinationRequested}) reports `coordination` INSTEAD of a verdict;
- * no other run reports coordination, even if the file exists.
+ * The end-of-turn outcome. `report` ({@link reportedOutcome}) decides which
+ * runner-owned file is read: a verdict run reports only `verdict`, a
+ * coordination run only `coordination`, and a write run neither -- whatever
+ * command the model actually ran.
  */
 export async function collectOutcome(opts: {
   discovered: { pr: string | null; prUrl: string | null } | null;
   madeNewCommits: boolean;
-  readOnly: boolean;
+  report: ReportedOutcome | null;
   verdictFile: string;
-  /** The turn's instruction, which tells a coordination run from a review. */
-  instruction?: string;
-  coordinateFile?: string;
+  coordinateFile: string;
 }): Promise<SweOutcome> {
-  const coordinating = opts.readOnly && opts.instruction !== undefined && coordinationRequested(opts.instruction);
   let extra: { verdict?: OutcomeVerdict; coordination?: OutcomeCoordination } = {};
-  if (coordinating) {
-    extra = { coordination: opts.coordinateFile ? await readCoordination(opts.coordinateFile) : { decision: "none" } };
-  } else if (opts.readOnly) {
+  if (opts.report === "coordination") {
+    extra = { coordination: await readCoordination(opts.coordinateFile) };
+  } else if (opts.report === "verdict") {
     extra = { verdict: await readVerdict(opts.verdictFile) };
   }
   return buildOutcome({ discovered: opts.discovered, madeNewCommits: opts.madeNewCommits, ...extra });

@@ -30,6 +30,8 @@ import {
   clearCoordination,
   clearVerdict,
   collectOutcome,
+  reportedOutcome,
+  type ReportedOutcome,
   COORDINATE_FILE_ENV,
   installVerdictCommand,
   VERDICT_FILE_ENV,
@@ -74,6 +76,8 @@ interface TurnContext {
   attribution: { githubLogin: string; githubId?: number } | null;
   turnStartedAt: number;
   readOnly: boolean;
+  /** Which structured outcome the run reports (outcome.ts reportedOutcome; docs/adr/0055). */
+  report: ReportedOutcome | null;
   /** The run's structured params (AgentRun.spec.params; ADR 0048). */
   params: Readonly<Record<string, string>>;
   /** Runner-owned file `aktis-verdict` writes to (outcome.ts). */
@@ -117,7 +121,7 @@ async function runTurn(ctx: TurnContext, instruction: string, marker: SweMarker 
   // Only the FIRST turn gets the full framing prompt (workflow rules,
   // environment description, continuation context) -- opencode already has
   // that context in the session's own history for every turn after.
-  const promptText = isFirstTurn ? buildPrompt(instruction, marker, ctx.readOnly) : instruction;
+  const promptText = isFirstTurn ? buildPrompt(instruction, marker, ctx.report) : instruction;
   // Whatever is in the verdict file after the turn was written during THIS
   // turn, never left over from an earlier one.
   await clearVerdict(ctx.verdictFile);
@@ -150,9 +154,8 @@ async function runTurn(ctx: TurnContext, instruction: string, marker: SweMarker 
         outcome: await collectOutcome({
           discovered: null,
           madeNewCommits: false,
-          readOnly: true,
+          report: ctx.report,
           verdictFile: ctx.verdictFile,
-          instruction,
           coordinateFile: ctx.coordinateFile,
         }),
       };
@@ -271,9 +274,8 @@ async function runTurn(ctx: TurnContext, instruction: string, marker: SweMarker 
     outcome: await collectOutcome({
       discovered,
       madeNewCommits: pushedNewCommits,
-      readOnly: ctx.readOnly,
+      report: ctx.report,
       verdictFile: ctx.verdictFile,
-      instruction,
       coordinateFile: ctx.coordinateFile,
     }),
   };
@@ -392,6 +394,9 @@ async function main(): Promise<void> {
     // a read-only GitHub token (the token resolvers), so the run cannot push
     // or open a PR.
     const readOnly = isReadOnly(runtimeConfig);
+    // Which structured outcome this run reports (docs/adr/0055): from
+    // AgentRun.spec.readOnly / spec.outcome alone, never from the goal text.
+    const report = reportedOutcome({ readOnly, ...(runtimeConfig.outcome ? { outcome: runtimeConfig.outcome } : {}) });
     if (readOnly) {
       await publishUp({ type: "progress", message: "Read-only run: enforcing (no push / PR create / merge)", stage: "authenticate" });
     }
@@ -474,8 +479,8 @@ async function main(): Promise<void> {
     childEnv.PATH = `${verdict.binDir}:${childEnv.PATH ?? ""}`;
     childEnv[VERDICT_FILE_ENV] = verdict.verdictFile;
     // `aktis-coordinate` (docs/adr/0055): the factory coordinator's decision,
-    // installed and reported the same way -- only on a read-only run whose
-    // instruction names the command.
+    // installed and reported the same way -- prompted for and reported only
+    // when AgentRun.spec.outcome is "coordination" (outcome.ts reportedOutcome).
     childEnv[COORDINATE_FILE_ENV] = verdict.coordinateFile;
 
     const opencodeConfigDir = join(xdgConfigHome, "opencode");
@@ -540,6 +545,7 @@ async function main(): Promise<void> {
         attribution,
         turnStartedAt,
         readOnly,
+        report,
         params: runtimeConfig.params,
         verdictFile: verdict.verdictFile,
         coordinateFile: verdict.coordinateFile,

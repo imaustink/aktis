@@ -461,6 +461,7 @@ export class TemporalEngine implements TurnEngine {
           ...(input.forcedAgentId ? { forcedAgentId: input.forcedAgentId } : {}),
           ...(input.forcedToolId ? { forcedToolId: input.forcedToolId, toolInput: input.toolInput ?? "" } : {}),
           ...(input.readOnly ? { readOnly: true } : {}),
+          ...(input.outcome ? { outcome: input.outcome } : {}),
           ...(input.params && Object.keys(input.params).length > 0 ? { params: input.params } : {}),
           // docs/adr/0049: can widen a run's reach, so signed or not at all.
           ...(input.identityOverride ? { identity: input.identityOverride } : {}),

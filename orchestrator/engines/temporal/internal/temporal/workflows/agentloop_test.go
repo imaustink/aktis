@@ -1790,6 +1790,30 @@ func TestReadOnlyAndParamsReachTheAgentRun(t *testing.T) {
 	require.True(t, le.authorizeInputs[0].ReadOnly, "the pre-flight must know, to withhold write credentials")
 }
 
+// docs/adr/0055: the trigger's outcome reaches the forced agent's AgentRun as
+// a structured field -- the only thing the runner switches its outcome on.
+func TestForcedAgentOutcomeReachesTheAgentRun(t *testing.T) {
+	le := newLoopEnv(t)
+	agent := bridgedAgent()
+	agent.IdentityProviders = []string{"claude"}
+	le.resolvedAgent = &agent
+
+	var result workflows.TurnResult
+	le.sendTurnInput(t, "turn-1", workflows.TurnInput{
+		Message: "Coordinate acme/widgets#5", Caller: activities.Caller{Subject: "svc:gw", Roles: []string{"agent"}},
+		ForcedAgentID: agent.ID, ReadOnly: true, Outcome: "coordination",
+	}, &result, time.Millisecond)
+	le.deliverUp(agentrun.UpMessage{Seq: 1, Type: agentrun.UpReady}, time.Second)
+	le.deliverUp(agentrun.UpMessage{Seq: 2, Type: agentrun.UpReply, Final: true, Message: "Proceed."}, 2*time.Second)
+
+	le.env.ExecuteWorkflow(workflows.ConversationWorkflowName, (*workflows.ConversationState)(nil))
+	require.True(t, le.env.IsWorkflowCompleted())
+	require.NoError(t, le.env.GetWorkflowError())
+
+	require.Len(t, le.agentRunLaunches, 1)
+	require.Equal(t, "coordination", le.agentRunLaunches[0].Outcome)
+}
+
 // A read-only turn must not be fed into a WRITABLE episode already running in
 // the conversation: the episode's pod holds write credentials, so the
 // trigger's readOnly would be a dead letter.

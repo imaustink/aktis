@@ -112,6 +112,7 @@ func BridgedAgentWorkflow(ctx workflow.Context, in AgentWorkflowInput) error {
 		CredentialEnvVars:    in.Credentials.EnvVars,
 		ReadOnly:             in.ReadOnly,
 		Params:               in.Params,
+		Outcome:              in.Outcome,
 		Launch:               in.Launch,
 		ContentEligible:      contentEligible(in.Agent, in.Launch.IdentityMode, declared),
 	}).Get(ctx, nil); err != nil {

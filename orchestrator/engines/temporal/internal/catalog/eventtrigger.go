@@ -53,6 +53,10 @@ type EventTriggerTarget struct {
 	ToolRef        string    `json:"toolRef,omitempty"`
 	PromptTemplate string    `json:"promptTemplate,omitempty"`
 	ReadOnly       bool      `json:"readOnly,omitempty"`
+	// Outcome names the structured outcome a read-only agent run reports
+	// (docs/adr/0055): "verdict" (the default) or "coordination". It reaches
+	// the runner as AgentRun.spec.outcome, never through the prompt.
+	Outcome string `json:"outcome,omitempty"`
 	// Identity overrides the identity mode of every agent the turn
 	// authorizes (docs/adr/0049); see authz.ResolveMode.
 	Identity string `json:"identity,omitempty"`
@@ -65,6 +69,12 @@ const (
 	TargetSkill        = "skill"
 	TargetAgent        = "agent"
 	TargetTool         = "tool"
+)
+
+// Outcome kinds a read-only agent run can report (target.outcome).
+const (
+	OutcomeVerdict      = "verdict"
+	OutcomeCoordination = "coordination"
 )
 
 // Kind names which of the (mutually exclusive) targets is set. A descriptor
@@ -586,6 +596,16 @@ func (d *EventTriggerDescriptor) compile() error {
 		}
 	} else if d.Spec.Target.ToolRef == "" && strings.TrimSpace(d.Spec.Target.PromptTemplate) == "" {
 		return fmt.Errorf("promptTemplate is required unless toolRef or none is set")
+	}
+	// The runner reports a structured outcome only for a read-only agent run
+	// (docs/adr/0055).
+	if o := d.Spec.Target.Outcome; o != "" {
+		if o != OutcomeVerdict && o != OutcomeCoordination {
+			return fmt.Errorf("outcome must be %q or %q, got %q", OutcomeVerdict, OutcomeCoordination, o)
+		}
+		if d.Spec.Target.AgentRef == "" || !d.Spec.Target.ReadOnly {
+			return fmt.Errorf("outcome requires agentRef and readOnly")
+		}
 	}
 	// Identity modes apply to agent runs; a tool has none (docs/adr/0049).
 	if d.Spec.Target.ToolRef != "" && d.Spec.Target.Identity != "" {

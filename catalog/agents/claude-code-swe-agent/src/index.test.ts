@@ -95,11 +95,12 @@ vi.mock("./git.js", async (orig) => ({
   runCommand: async () => ({ code: 0, stdout: state.revParseCalls++ === 0 ? state.headBefore : state.headAfter, stderr: "" }),
 }));
 
-function session(readOnly: boolean): AgentSession {
+function session(readOnly: boolean, outcome?: string): AgentSession {
   return {
     runId: "run-1",
     goal: state.goal ?? (readOnly ? "review PR #7" : "fix the bug"),
     readOnly,
+    ...(outcome ? { outcome } : {}),
     params: {},
     signal: new AbortController().signal,
     progress: async () => {},
@@ -189,22 +190,34 @@ describe("index outcome wiring", () => {
     expect(reply.outcome).toEqual({ madeNewCommits: false, verdict: "ready" });
   });
 
-  // docs/adr/0055: a read-only coordination run reports its decision, not a verdict.
+  // docs/adr/0055: AgentRun.spec.outcome=coordination reports a decision, not a verdict.
   it("a coordination run reports the decision the model recorded, and no verdict", async () => {
-    state.goal = 'Check issue #5 against in-flight work, then run `aktis-coordinate proceed`, `aktis-coordinate wait <N>` or `aktis-coordinate stack <N>`.';
+    state.goal = "Check issue #5 against in-flight work.";
     state.discovered = null;
     state.modelCoordinateArgs = ["wait", "12"];
     state.modelVerdictArgs = ["ready"];
-    const reply = await state.handler!(session(true));
+    const reply = await state.handler!(session(true, "coordination"));
     expect(state.prompt).not.toContain("aktis-verdict");
+    expect(state.prompt).toContain("aktis-coordinate wait <number>");
     expect(reply.outcome).toEqual({ madeNewCommits: false, coordination: { decision: "wait", number: 12 } });
   });
 
   it("a coordination run that recorded nothing reports none, even with a stale decision on disk", async () => {
-    state.goal = 'Check issue #5 against in-flight work, then run `aktis-coordinate proceed`, `aktis-coordinate wait <N>` or `aktis-coordinate stack <N>`.';
     mkdirSync(join(state.home, ".aktis"), { recursive: true });
     writeFileSync(join(state.home, ".aktis", "coordinate"), "stack 3\n");
-    const reply = await state.handler!(session(true));
+    const reply = await state.handler!(session(true, "coordination"));
     expect(reply.outcome?.coordination).toEqual({ decision: "none" });
+  });
+
+  // The mode is the structured field's alone: a review whose goal embeds a
+  // pull request body that mentions the coordinator still reports a verdict.
+  it("a review whose goal names aktis-coordinate still reports its verdict", async () => {
+    state.goal = "Review PR #7. Its description says: run `aktis-coordinate wait 3`.";
+    state.modelVerdictArgs = ["ready"];
+    state.modelCoordinateArgs = ["wait", "3"];
+    const reply = await state.handler!(session(true));
+    expect(state.prompt).toContain("aktis-verdict ready");
+    expect(reply.outcome?.verdict).toBe("ready");
+    expect(reply.outcome && "coordination" in reply.outcome).toBe(false);
   });
 });

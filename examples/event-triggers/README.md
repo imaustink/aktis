@@ -44,7 +44,7 @@ installs production's GitHub triggers. `extraManifests` runs each entry through
 | `eventtrigger-factory-fix.yaml` | runs | agent | factory: a `changes-requested` verdict (from `factory-review` or `github-pr-review`) sends the PR to a fix run, which loops back to review (max 2 fix rounds); a `github-pr-review` verdict only for a same-repo branch |
 | `eventtrigger-factory-handoff.yaml` | runs | `none` | factory: any other review outcome (or a fix/resync that failed or pushed nothing) assigns the PR to the human who started the chain |
 | `eventtrigger-factory-intake.yaml` | github | `none` | coordination: `ai-triage` on an issue (priority 10, beats `github-issue-triage`) queues it; `onComplete.serialize` coordinates a repository's issues one at a time |
-| `eventtrigger-factory-coordinate.yaml` | runs | agent, `readOnly` | coordination: compares the issue with in-flight PRs/issues and records `aktis-coordinate proceed \| wait <N> \| stack <N>` |
+| `eventtrigger-factory-coordinate.yaml` | runs | agent, `readOnly`, `outcome: coordination` | coordination: compares the issue with in-flight PRs/issues and records `aktis-coordinate proceed \| wait <N> \| stack <N>` |
 | `eventtrigger-factory-park.yaml` | runs | `none` | coordination: `wait <N>` holds the issue (`onComplete.waitUntilClosed`) until #N merges or closes, then coordinates it again (max 5 waits) |
 | `eventtrigger-factory-triage.yaml` | runs | agent | coordination: `proceed` (or no decision) works the issue from the default branch |
 | `eventtrigger-factory-triage-stacked.yaml` | runs | agent | coordination: `stack <N>` branches from open PR #N and targets its branch |

@@ -36,6 +36,9 @@ type Dispatch struct {
 	ToolInput     string            `json:"toolInput,omitempty"`
 	ReadOnly      bool              `json:"readOnly,omitempty"`
 	Params        map[string]string `json:"params,omitempty"`
+	// Outcome is the trigger's target.outcome (docs/adr/0055): which
+	// structured outcome the agent run reports. Trigger-owned, so signed.
+	Outcome string `json:"outcome,omitempty"`
 	// Identity is the trigger's target.identity override (docs/adr/0049).
 	// Unlike ReadOnly it can widen what a run reaches, which is why it only
 	// ever arrives here, signed, and never as a body field.

@@ -257,6 +257,16 @@ spec:
                     description: orchestrator runs a conversational turn on the rendered
                       prompt.
                     type: object
+                  outcome:
+                    description: |-
+                      outcome names the structured outcome the read-only agent run reports
+                      (docs/adr/0055): verdict (the default) or coordination. It reaches the
+                      agent as AgentRun.spec.outcome, never through the prompt, so nothing in
+                      an event body can switch it.
+                    enum:
+                    - verdict
+                    - coordination
+                    type: string
                   promptTemplate:
                     description: promptTemplate is the request, with {{param}} placeholders.
                     type: string
@@ -291,6 +301,9 @@ spec:
                   rule: '!has(self.none) || !has(self.identity)'
                 - message: identity applies to agent runs; it cannot be set with toolRef
                   rule: '!has(self.identity) || !has(self.toolRef)'
+                - message: outcome requires agentRef and readOnly
+                  rule: '!has(self.outcome) || (has(self.agentRef) && has(self.readOnly)
+                    && self.readOnly)'
             required:
             - target
             type: object
