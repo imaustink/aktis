@@ -33,6 +33,16 @@ func runPod(name, jobName, phase string) *unstructured.Unstructured {
 	}}
 }
 
+// stuckPod is a Pending pod whose container (or init container) is waiting
+// for reason, e.g. ImagePullBackOff.
+func stuckPod(name, jobName, field, reason string) *unstructured.Unstructured {
+	pod := runPod(name, jobName, "Pending")
+	pod.Object["status"].(map[string]any)[field] = []any{
+		map[string]any{"name": "c", "state": map[string]any{"waiting": map[string]any{"reason": reason}}},
+	}
+	return pod
+}
+
 func statusClient(objs ...runtime.Object) *dynamicfake.FakeDynamicClient {
 	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
 		map[schema.GroupVersionResource]string{
@@ -57,6 +67,12 @@ func TestGetStatusReportsAPodStillStarting(t *testing.T) {
 		{"a retry pending after a pod that ran", "Running", []*unstructured.Unstructured{runPod("p1", "job-1", "Failed"), runPod("p2", "job-1", "Pending")}, false},
 		{"another job's running pod", "Running", []*unstructured.Unstructured{runPod("p1", "job-1", "Pending"), runPod("p9", "job-9", "Running")}, true},
 		{"finished run", "Succeeded", nil, false},
+		{"image still pulling", "Running", []*unstructured.Unstructured{stuckPod("p1", "job-1", "containerStatuses", "ContainerCreating")}, true},
+		{"image pull backing off", "Running", []*unstructured.Unstructured{stuckPod("p1", "job-1", "containerStatuses", "ImagePullBackOff")}, false},
+		{"bad image name", "Running", []*unstructured.Unstructured{stuckPod("p1", "job-1", "containerStatuses", "InvalidImageName")}, false},
+		{"missing credential Secret", "Running", []*unstructured.Unstructured{stuckPod("p1", "job-1", "containerStatuses", "CreateContainerConfigError")}, false},
+		{"container create error", "Running", []*unstructured.Unstructured{stuckPod("p1", "job-1", "containerStatuses", "CreateContainerError")}, false},
+		{"init container crash-looping", "Running", []*unstructured.Unstructured{stuckPod("p1", "job-1", "initContainerStatuses", "CrashLoopBackOff")}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			objs := []runtime.Object{agentRunWithJob(tc.phase, "job-1")}

@@ -193,7 +193,8 @@ func (l *K8sLauncher) GetStatus(ctx context.Context, name string) (toolrun.Statu
 }
 
 // podStarting reports whether the run has no pod yet, or only pods in phase
-// Pending (scheduling, image pulls and init containers all count). A Job's
+// Pending (scheduling, image pulls and init containers all count) -- unless a
+// container is stuck waiting (podStuck). A Job's
 // phase reads Running the moment its pod exists, so the CR alone cannot say
 // this: on a fresh node a 5-minute image pull looked exactly like an agent
 // that started and never spoke.
@@ -216,8 +217,31 @@ func (l *K8sLauncher) podStarting(ctx context.Context, jobName string) bool {
 		if phase, _, _ := unstructured.NestedString(pod.Object, "status", "phase"); phase != "Pending" {
 			return false
 		}
+		if podStuck(pod.Object) {
+			return false
+		}
 	}
 	return true
+}
+
+// podStuck reports whether a Pending pod is waiting on something that will not
+// resolve by itself: a failed pull, a bad image name, a missing credential
+// Secret, or a crash-looping init container. Such a pod is not "starting" --
+// it must still fail on the agent's ready window rather than wait out the
+// startup cap.
+func podStuck(pod map[string]any) bool {
+	for _, field := range []string{"initContainerStatuses", "containerStatuses"} {
+		statuses, _, _ := unstructured.NestedSlice(pod, "status", field)
+		for _, s := range statuses {
+			cs, _ := s.(map[string]any)
+			reason, _, _ := unstructured.NestedString(cs, "state", "waiting", "reason")
+			switch reason {
+			case "ImagePullBackOff", "InvalidImageName", "CreateContainerConfigError", "CreateContainerError", "CrashLoopBackOff":
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func terminalPhase(phase string) bool {
