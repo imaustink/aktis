@@ -66,6 +66,10 @@ type loopEnv struct {
 	// activity surface (A9).
 	agentRunLaunches  []activities.LaunchAgentRunInput
 	agentDownMessages []activities.AgentDownInput
+	// agentRunStops records StopAgentRun calls; agentRunStatus, when set,
+	// answers GetAgentRunPhase (default: a started, running pod).
+	agentRunStops  []string
+	agentRunStatus func() toolrun.Status
 	// agentTools is what ResolveAgentTools returns for a child agent's own
 	// declared toolRefs (ADR 0028).
 	agentTools []catalog.ToolDescriptor

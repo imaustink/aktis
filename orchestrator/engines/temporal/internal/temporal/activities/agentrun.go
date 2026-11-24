@@ -17,6 +17,7 @@ const (
 	GetAgentRunPhaseActivityName = "GetAgentRunPhase"
 	SendAgentDownActivityName    = "SendAgentDown"
 	DetachAgentRunActivityName   = "DetachAgentRun"
+	StopAgentRunActivityName     = "StopAgentRun"
 )
 
 type LaunchAgentRunInput struct {
@@ -175,6 +176,11 @@ func (a *AgentRunActivities) SendAgentDown(ctx context.Context, in AgentDownInpu
 	default:
 		return fmt.Errorf("unsupported down-message type %q", in.Type)
 	}
+}
+
+// StopAgentRun deletes a run the workflow gave up on, pod included.
+func (a *AgentRunActivities) StopAgentRun(ctx context.Context, runID string) error {
+	return a.Launcher.Stop(ctx, runID)
 }
 
 // DetachAgentRun releases a finished run's subscription. Best-effort: a leaked

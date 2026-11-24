@@ -3,6 +3,7 @@ package agentrun
 import (
 	"context"
 	"fmt"
+	"log"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -64,8 +65,20 @@ type LaunchSpec struct {
 // upstream orchestrator does, which is what lets an unmodified agent image run.
 type Launcher interface {
 	Launch(ctx context.Context, spec LaunchSpec) error
+	// GetStatus reads the CR's mirrored status, plus Starting: whether the
+	// run's pod is positively seen not to have started its containers yet
+	// (unscheduled, pulling images, running init containers).
 	GetStatus(ctx context.Context, name string) (toolrun.Status, error)
+	// Stop deletes the AgentRun, and with it (owner references) its Job and
+	// pod. For a run the workflow has given up on: an agent that starts late,
+	// after its cancel was published to nobody, would otherwise do the whole
+	// task unobserved. Idempotent: a run already gone is stopped.
+	Stop(ctx context.Context, name string) error
 }
+
+// podGVR lists a run's pods (by the Job controller's job-name label) to tell
+// a pod still starting from an agent that started and stayed silent.
+var podGVR = schema.GroupVersionResource{Version: "v1", Resource: "pods"}
 
 type K8sLauncher struct {
 	client    dynamic.Interface
@@ -172,7 +185,52 @@ func (l *K8sLauncher) GetStatus(ctx context.Context, name string) (toolrun.Statu
 	phase, _, _ := unstructured.NestedString(obj.Object, "status", "phase")
 	message, _, _ := unstructured.NestedString(obj.Object, "status", "message")
 	jobName, _, _ := unstructured.NestedString(obj.Object, "status", "jobName")
-	return toolrun.Status{Phase: phase, Message: message, JobName: jobName}, nil
+	status := toolrun.Status{Phase: phase, Message: message, JobName: jobName}
+	if !terminalPhase(phase) {
+		status.Starting = l.podStarting(ctx, jobName)
+	}
+	return status, nil
+}
+
+// podStarting reports whether the run has no pod yet, or only pods in phase
+// Pending (scheduling, image pulls and init containers all count). A Job's
+// phase reads Running the moment its pod exists, so the CR alone cannot say
+// this: on a fresh node a 5-minute image pull looked exactly like an agent
+// that started and never spoke.
+//
+// Any doubt answers false, which keeps the caller's old behaviour: an unread
+// pod list (RBAC, API error) or a Job not created yet is not evidence that the
+// pod is still starting.
+func (l *K8sLauncher) podStarting(ctx context.Context, jobName string) bool {
+	if jobName == "" {
+		return false
+	}
+	pods, err := l.client.Resource(podGVR).Namespace(l.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "job-name=" + jobName,
+	})
+	if err != nil {
+		log.Printf("[agentrun] list pods of job %s: %v (treating the run as started)", jobName, err)
+		return false
+	}
+	for _, pod := range pods.Items {
+		if phase, _, _ := unstructured.NestedString(pod.Object, "status", "phase"); phase != "Pending" {
+			return false
+		}
+	}
+	return true
+}
+
+func terminalPhase(phase string) bool {
+	return phase == "Succeeded" || phase == "Failed"
+}
+
+func (l *K8sLauncher) Stop(ctx context.Context, name string) error {
+	background := metav1.DeletePropagationBackground
+	err := l.client.Resource(GVR).Namespace(l.namespace).Delete(ctx, name, metav1.DeleteOptions{PropagationPolicy: &background})
+	if err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("delete AgentRun %s: %w", name, err)
+	}
+	return nil
 }
 
 // launchSpec renders AgentRun.spec.launch (docs/adr/0049 §3) from the

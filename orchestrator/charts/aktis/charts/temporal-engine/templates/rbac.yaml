@@ -8,7 +8,8 @@ metadata:
     {{- include "temporal-engine.labels" . | nindent 4 }}
 ---
 # The worker creates ToolRun and AgentRun CRs and reads their mirrored status —
-# never Jobs directly, which the core-controller owns. Same shape as
+# never Jobs directly, which the core-controller owns (it reads an agent run's
+# pods, and deletes an AgentRun it gave up on). Same shape as
 # agent-orchestrator's own grants, so enabling this engine does not widen the
 # release's blast radius; it moves an equivalent one to a second workload.
 apiVersion: rbac.authorization.k8s.io/v1
@@ -25,9 +26,17 @@ rules:
   {{- if .Values.nats.url }}
   # Bridged pod agents (docs/pod-agents.md) launch the ordinary AgentRun an
   # unmodified upstream agent expects. Only granted when the bridge is enabled.
+  # delete: a run the workflow gave up on is deleted, so a pod that starts
+  # after its cancel went out cannot do the task unobserved.
   - apiGroups: ["core.aktis.ai"]
     resources: ["agentruns"]
-    verbs: ["create", "get"]
+    verbs: ["create", "get", "delete"]
+  # Read-only: whether a run's pod is still starting (image pull, scheduling),
+  # which the Job-mirrored phase cannot say, so pod startup is not charged
+  # against the agent's ready window.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
   {{- end }}
   # Per-run credential Secrets (docs/adr/0030 §3, orchestrator/engines/temporal internal/authz).
   #
