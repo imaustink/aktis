@@ -71,9 +71,14 @@ mcp-broker (ADR 0045) is a small service that only the Go engines call.
   relay could not have handed to the orchestrator anyway is lost either way.
 - **A sender expression that does not compile still makes its source's routes
   404.** The gateway asks `POST /events/compile` once per distinct expression
-  and caches the answer (compiling is deterministic). Only while the
-  orchestrator cannot answer is such a source served, and then each
-  delivery's prefilter fails on the same expression and drops it.
+  and caches the answer. A "does not compile" answer expires after 60s: it
+  depends on the orchestrator's CEL environment as well as the expression,
+  which can differ between versions mid-rollout. The call is made once, with
+  no retry, and times out after 3s, because it sits in the webhook request
+  before the 202 and a failed call already serves the source. Only while
+  the orchestrator cannot answer is such a source served, without asking
+  again for 10s, and then each delivery's prefilter fails on the same
+  expression and drops it.
 - **The caller-tool store speaks Qdrant's gRPC API** (the engine's client)
   rather than REST. The host comes from `AGENT_QDRANT_URL`; the port is
   `AGENT_QDRANT_GRPC_PORT` (default 6334, the Qdrant default). It reuses the

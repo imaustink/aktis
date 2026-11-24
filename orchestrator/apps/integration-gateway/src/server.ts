@@ -63,6 +63,19 @@ const SOURCE_NAME = /^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$/;
 const MAX_WEBHOOK_BODY_BYTES = 25 * 1024 * 1024;
 /** Bound on the sender-CEL compile cache; real deployments have a handful of distinct expressions. */
 const MAX_CACHED_SENDER_EXPRESSIONS = 1000;
+/**
+ * How long a "does not compile" verdict is trusted before the orchestrator is
+ * asked again. A verdict depends on the orchestrator's CEL environment, not
+ * only on the expression, so during a rollout across versions with different
+ * functions or variables a negative answer may stop being true.
+ */
+const SENDER_COMPILE_NEGATIVE_TTL_MS = 60_000;
+/**
+ * After `/events/compile` could not be answered, how long the source is served
+ * without asking again. Bounds the orchestrator round trips (and their retry
+ * sleeps) that unauthenticated POSTs can cause before signature verification.
+ */
+const SENDER_COMPILE_FAILURE_BACKOFF_MS = 10_000;
 /** A bearer that could be a Kubernetes JWT; anything else is refused without being verified. */
 const BEARER_JWT = /^Bearer ([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$/;
 /** Header carrying `sha256=<hex hmac(body)>` on a signed `reply.http` POST. */
@@ -217,8 +230,14 @@ export class GatewayServer {
   /** Every side effect of a run, shared with the run activities (runs/activities.ts). */
   readonly effects: RunEffects;
   private readonly eventSources: EventSourceLookup;
-  /** Sender CEL the orchestrator has compiled: null when it compiles, else the compiler's message. */
-  private readonly compiledSenderExpressions = new Map<string, string | null>();
+  /**
+   * Sender CEL the orchestrator has compiled: `error` null when it compiles,
+   * else the compiler's message; `at` (epoch ms) is when a negative verdict
+   * was recorded, so it can expire.
+   */
+  private readonly compiledSenderExpressions = new Map<string, { error: string | null; at: number }>();
+  /** Expression sets whose `/events/compile` call failed, to the epoch ms until which they are not asked again. */
+  private readonly senderCompileBackoff = new Map<string, number>();
   private readonly log: (line: string) => void;
   private readonly now: () => Date;
   private readonly report: (error: unknown) => void;
@@ -413,35 +432,52 @@ export class GatewayServer {
   /**
    * Whether every sender expression of `sourceName` compiles, asked of the
    * orchestrator (the one CEL compiler) once per distinct expression and then
-   * cached: compiling is deterministic, so an answer never goes stale, and an
-   * edited expression is a new cache key. A source with a broken expression
-   * 404s, as it did when this process compiled CEL itself.
+   * cached. A positive verdict is kept (an edited expression is a new cache
+   * key); a negative one is re-asked after {@link SENDER_COMPILE_NEGATIVE_TTL_MS},
+   * because it depends on the orchestrator's CEL environment too, which can
+   * differ across versions mid-rollout. A source with a broken expression 404s,
+   * as it did when this process compiled CEL itself.
    *
    * When the orchestrator can't answer, the source is served: each delivery's
    * `/events/prefilter` then evaluates (and fails closed on) the same
-   * expressions, so serving it never lets an unevaluated sender through.
+   * expressions, so serving it never lets an unevaluated sender through. That
+   * failure is remembered for {@link SENDER_COMPILE_FAILURE_BACKOFF_MS}, so
+   * repeated (possibly unauthenticated) POSTs during an outage don't each make
+   * orchestrator round trips before signature verification.
    */
   private async senderCompiles(sourceName: string, expressions: SenderExpressions): Promise<boolean> {
     const all = [expressions.loginFrom, expressions.isBotFrom, expressions.repositoryFrom, expressions.accountIdFrom].filter(
       (e): e is string => typeof e === "string" && e !== "",
     );
-    const unknown = all.filter((e) => !this.compiledSenderExpressions.has(e));
+    const now = this.now().getTime();
+    const unknown = all.filter((e) => {
+      const verdict = this.compiledSenderExpressions.get(e);
+      return verdict === undefined || (verdict.error !== null && now - verdict.at >= SENDER_COMPILE_NEGATIVE_TTL_MS);
+    });
     if (unknown.length > 0) {
+      const backoffKey = unknown.join("\n");
+      const backoffUntil = this.senderCompileBackoff.get(backoffKey);
+      if (backoffUntil !== undefined && now < backoffUntil) return true;
       const result = await this.options.orchestratorClient.compile(unknown);
       if (result.kind === "failed") {
         this.log(`webhook ${sourceName}: could not check its sender CEL (${result.error}); serving it, each delivery is still evaluated`);
+        if (this.senderCompileBackoff.size >= MAX_CACHED_SENDER_EXPRESSIONS) this.senderCompileBackoff.clear();
+        this.senderCompileBackoff.set(backoffKey, now + SENDER_COMPILE_FAILURE_BACKOFF_MS);
         return true;
       }
+      this.senderCompileBackoff.delete(backoffKey);
       if (this.compiledSenderExpressions.size + unknown.length > MAX_CACHED_SENDER_EXPRESSIONS) {
         this.compiledSenderExpressions.clear();
       }
       for (const expr of unknown) {
         const error = result.errors[expr];
-        this.compiledSenderExpressions.set(expr, error ?? null);
+        this.compiledSenderExpressions.set(expr, { error: error ?? null, at: now });
         if (error !== undefined) this.log(`webhook ${sourceName}: sender expression does not compile, routes 404 (${error})`);
       }
     }
-    return all.every((e) => this.compiledSenderExpressions.get(e) == null);
+    // A stale negative verdict was re-asked above; when that call failed the
+    // source is served, so only a fresh or just-confirmed negative 404s here.
+    return all.every((e) => this.compiledSenderExpressions.get(e)?.error == null);
   }
 
   /** The source a route names, or undefined (-> 404) for an unknown, unusable or wrongly-kinded one. */
