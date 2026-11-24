@@ -263,6 +263,14 @@ export const DEFAULT_RUN_EVENT_MAX_DEPTH = 12;
 const DEFAULT_DEFERRED_SWEEP_MS = 30_000;
 /** A held queue without an in-flight store to renew it: longer than any poll (8h). */
 const UNRENEWED_QUEUE_TTL_MS = 9 * 60 * 60 * 1000;
+/**
+ * How long a held run event keeps being retried after its first failed
+ * publish. "failed" covers an unreachable orchestrator, but also permanent
+ * errors (a 400/401/404, a deterministic throw), so retrying must end: long
+ * enough to ride out an orchestrator outage, short enough that a poison event
+ * stops calling the orchestrator every sweep.
+ */
+const HELD_EVENT_RETRY_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /** A positive integer from a string param (params arrive in their §4 string form). */
 function positiveInt(value: string | undefined): number | undefined {
@@ -1465,11 +1473,21 @@ export class GatewayServer {
           if (ev.queue && result !== "accepted") await this.deferredStore.releaseQueue(ev.queue, holder);
           // The orchestrator was unreachable (or publishing threw): put the
           // event back, same id and createdAt so it keeps its place in line,
-          // and the next sweep retries it. A delivered-but-not-accepted
-          // outcome (ignored, rejected, depth, verify) is final and dropped.
+          // and the next sweep retries it -- until HELD_EVENT_RETRY_WINDOW_MS
+          // after the first failure, since "failed" may be permanent. A
+          // delivered-but-not-accepted outcome (ignored, rejected, depth,
+          // verify) is final and dropped.
           if (result === "failed") {
-            await this.deferredStore.save(ev);
-            this.log(`held run event ${ev.trigger.name}: publish failed; held again for the next sweep`);
+            const now = this.now().getTime();
+            const publishFailure = { firstAt: ev.publishFailure?.firstAt ?? now, attempts: (ev.publishFailure?.attempts ?? 0) + 1 };
+            if (now - publishFailure.firstAt >= HELD_EVENT_RETRY_WINDOW_MS) {
+              this.log(
+                `held run event ${ev.trigger.name}: publish failed ${publishFailure.attempts} times since ${new Date(publishFailure.firstAt).toISOString()}; dropped`,
+              );
+            } else {
+              await this.deferredStore.save({ ...ev, publishFailure });
+              this.log(`held run event ${ev.trigger.name}: publish failed (attempt ${publishFailure.attempts}); held again for the next sweep`);
+            }
           }
         }
       } catch (error) {

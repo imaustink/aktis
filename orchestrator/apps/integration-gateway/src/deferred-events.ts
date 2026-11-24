@@ -46,6 +46,13 @@ export interface HeldRunEvent {
    * re-saves a record another replica may be claiming.
    */
   blocked?: boolean;
+  /**
+   * Set when a publish attempt failed and the event was held again: epoch ms
+   * of the first such failure, and how many attempts have failed since. The
+   * retries are bounded by time since the first failure, not by this record's
+   * TTL (which every re-save renews).
+   */
+  publishFailure?: { firstAt: number; attempts: number };
 }
 
 export interface IssueRef {

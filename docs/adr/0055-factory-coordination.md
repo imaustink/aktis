@@ -94,10 +94,13 @@ beside the in-flight runs) and publishes it once every hold is released:
   - **Not accepted:** a completion nobody accepted frees the queue at once.
 
 The record is claimed (deleted) before it is published, so of several replicas
-exactly one publishes it. If the publish then fails in transport (the
-orchestrator is unreachable or answers 5xx), the replica saves the record
-back, with the same id and creation time, so the next sweep retries it in
-order. A delivered completion that nobody accepted is dropped. The sweep runs
+exactly one publishes it. If the publish then fails (the orchestrator is
+unreachable or answers an error status, or publishing throws), the replica
+saves the record back, with the same id and creation time, so the next sweep
+retries it in order. Because such a failure may be permanent (a 400 or 401
+looks the same as an outage), retrying stops 24 hours after the first failed
+attempt: the record is dropped with a log line and its queue is freed. A
+delivered completion that nobody accepted is dropped. The sweep runs
 every 30s, and also immediately after a hold or a queue release.
 
 **Depth.** A wait that really blocked (its target was open when the run ended)

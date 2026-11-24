@@ -1560,6 +1560,32 @@ describe("held run events and conflict events (docs/adr/0055)", () => {
     await vi.waitFor(async () => expect(await store.list()).toHaveLength(0));
   });
 
+  it("stops retrying a held event whose publish keeps failing, and frees its queue", async () => {
+    const store = new InMemoryDeferredEventStore();
+    let clock = Date.parse("2026-01-01T00:00:00Z");
+    const h = await start({ deferredEventStore: store, now: () => new Date(clock) });
+    chain(h, INTAKE);
+    h.submitEvent.mockResolvedValue({ kind: "failed", error: "404 not found" });
+    h.submitEvent.mockResolvedValueOnce({ kind: "accepted", id: "inv-1", trigger: INTAKE });
+    await postGithub(h);
+    // Held for its queue, published at once, and the publish fails.
+    await vi.waitFor(async () => expect((await store.list())[0]?.publishFailure).toEqual({ firstAt: clock, attempts: 1 }));
+    const [held] = await store.list();
+    const queue = held!.queue!;
+    const firstAt = clock;
+    clock += 60 * 60 * 1000;
+    kick(h);
+    await vi.waitFor(async () => expect((await store.list())[0]?.publishFailure).toEqual({ firstAt, attempts: 2 }));
+    expect((await store.list())[0]).toMatchObject({ id: held!.id, createdAt: held!.createdAt });
+
+    clock = firstAt + 24 * 60 * 60 * 1000;
+    kick(h);
+    await vi.waitFor(() => expect(h.logs.some((l) => l.includes("publish failed 3 times") && l.includes("dropped"))).toBe(true));
+    expect(await store.list()).toHaveLength(0);
+    // Its queue was released: another holder can take it.
+    expect(await store.acquireQueue(queue, "other", 60_000)).toBe(true);
+  });
+
   it("drops a held event the orchestrator delivered but did not accept", async () => {
     const store = new InMemoryDeferredEventStore();
     const h = await start({ deferredEventStore: store });
