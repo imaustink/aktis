@@ -28,8 +28,7 @@ function temporal(): Promise<TestWorkflowEnvironment> {
 /** The workflow bundle every worker here runs, built once per test file (the replay test replays histories against it). */
 export function workflows(): Promise<WorkflowBundleWithSourceMap> {
   bundle ??= bundleWorkflowCode({
-    workflowsPath: fileURLToPath(new URL("../../dist/runs/workflows.js", import.meta.url)),
-    webpackConfigHook: (c: any) => { c.module.rules = []; return c; },
+    workflowsPath: fileURLToPath(new URL("../runs/workflows.ts", import.meta.url)),
     logger: new DefaultLogger("WARN"),
   });
   return bundle;
