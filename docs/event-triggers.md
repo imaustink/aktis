@@ -342,8 +342,9 @@ opencode-swe-agent) act on one by name:
   Compilation is asked of agent-orchestrator's `POST /events/compile`
   (`{expressions} → {errors: {<expr>: <message>}}`) once per distinct
   expression and cached (a "does not compile" answer for 60s, since it also
-  depends on the orchestrator's CEL environment); each attempt times out
-  after 3s. If it can't answer, the source is served for the next 10s without
+  depends on the orchestrator's CEL environment). It is asked once, with no
+  retry, and times out after 3s, keeping the 202 inside providers' ~10s
+  delivery timeout. If it can't answer, the source is served for the next 10s without
   asking again, and each delivery's prefilter (below) still fails closed.
   Before resolving a source's `sender` (live GitHub API calls), the gateway
   sends the preliminary envelope (`sender {}`, `repository ""`) and the

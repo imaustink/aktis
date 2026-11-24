@@ -714,27 +714,48 @@ describe("OrchestratorClient side-effect-free reads (/events/prefilter, /events/
     expect(JSON.parse((fetchImpl.mock.calls[0]?.[1] as RequestInit).body as string)).toEqual({ expressions: ["body.a", "body.("] });
   });
 
-  it("bounds each attempt: an orchestrator that never answers times out and is retried", async () => {
-    // Resolves only when the request's signal aborts, like a stuck pod that accepted the connection.
-    const fetchImpl = vi.fn(
+  // Resolves only when the request's signal aborts, like a stuck pod that accepted the connection.
+  const hanging = () =>
+    vi.fn(
       (_url: string, init: RequestInit) =>
         new Promise<Response>((_resolve, reject) => {
           init.signal?.addEventListener("abort", () => reject(init.signal?.reason));
         }),
     );
-    const stuck = new OrchestratorClient({
+  const stuckClient = (fetchImpl: ReturnType<typeof hanging>, sleep: (ms: number) => Promise<void>) =>
+    new OrchestratorClient({
       baseUrl: "http://orchestrator:8081",
       token: "tok",
       pollIntervalMs: 1,
       pollTimeoutMs: 1,
-      sleep: noopSleep,
+      sleep,
       readTimeoutMs: 10,
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
-    const result = await stuck.compile(["body.a"]);
+
+  it("bounds each prefilter attempt: an orchestrator that never answers times out and is retried", async () => {
+    const fetchImpl = hanging();
+    const result = await stuckClient(fetchImpl, noopSleep).prefilter(envelope, undefined);
+    expect(result.kind).toBe("failed");
+    expect(result.kind === "failed" && result.error).toMatch(/^\/events\/prefilter unreachable: /);
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it("compile against an orchestrator that never answers fails after one timeout, with no retry or back-off", async () => {
+    // compile runs before a webhook's 202; a retry would push the worst case past the provider's ~10s timeout.
+    const fetchImpl = hanging();
+    const sleep = vi.fn(noopSleep);
+    const result = await stuckClient(fetchImpl, sleep).compile(["body.a"]);
     expect(result.kind).toBe("failed");
     expect(result.kind === "failed" && result.error).toMatch(/^\/events\/compile unreachable: /);
-    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it("compile does not retry a 5xx either", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(json(503, { error: "orchestrator is shutting down; retry" }));
+    expect((await client(fetchImpl).compile(["body.a"])).kind).toBe("failed");
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it("compile rejects an unexpected body", async () => {

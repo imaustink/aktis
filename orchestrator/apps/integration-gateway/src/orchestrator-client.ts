@@ -456,7 +456,10 @@ export class OrchestratorClient {
    * can refuse to serve a source whose sender block could never be evaluated.
    */
   async compile(expressions: string[]): Promise<CompileResult> {
-    const read = await this.postRead("/events/compile", { expressions });
+    // One attempt, no retry: the gateway awaits this before a webhook's 202,
+    // and a failed compile already means "serve the source", so a retry would
+    // only push the worst case past the provider's ~10s delivery timeout.
+    const read = await this.postRead("/events/compile", { expressions }, 1);
     if (read.kind === "failed") return read;
     const body = read.body;
     if (!isPlainObject(body) || !isPlainObject(body.errors)) {
@@ -475,11 +478,16 @@ export class OrchestratorClient {
    * failure -- unlike `/invoke`, where a retried 5xx could start a turn twice.
    * That covers the window in which a draining orchestrator pod still receives
    * traffic during a rollout. Each attempt is bounded by `readTimeoutMs`; a
-   * timed-out attempt counts as a connection failure and is retried.
+   * timed-out attempt counts as a connection failure and is retried, up to
+   * `attempts` attempts in all.
    */
-  private async postRead(path: string, payload: unknown): Promise<{ kind: "ok"; body: unknown } | { kind: "failed"; error: string }> {
+  private async postRead(
+    path: string,
+    payload: unknown,
+    attempts = ACCEPT_RETRY_ATTEMPTS,
+  ): Promise<{ kind: "ok"; body: unknown } | { kind: "failed"; error: string }> {
     let lastError = "";
-    for (let attempt = 1; attempt <= ACCEPT_RETRY_ATTEMPTS; attempt++) {
+    for (let attempt = 1; attempt <= attempts; attempt++) {
       if (attempt > 1) await this.sleep(ACCEPT_RETRY_DELAY_MS);
       let res: Response;
       let text: string;
