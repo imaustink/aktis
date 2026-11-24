@@ -11,6 +11,7 @@ import (
 	"github.com/aktisai/orchestrator/engines/temporal/internal/agentrun"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/catalog"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/temporal/activities"
+	"github.com/aktisai/orchestrator/engines/temporal/internal/toolrun"
 )
 
 // BridgedAgentWorkflow drives an UNMODIFIED Aktis pod agent
@@ -36,7 +37,17 @@ const (
 	// A pod that never becomes ready is an infrastructure problem, not a slow
 	// agent: image pull failure, a crash loop, a missing credential. Bounding it
 	// separately means those surface in a minute rather than an hour.
+	//
+	// It is the agent's window, not the pod's: while the pod is still starting
+	// (scheduling, image pulls, init containers) the wait goes on, up to
+	// bridgedStartupTimeout, and the agent still gets a full window once its
+	// pod has started. On a fresh node the agent image alone took 5m23s to
+	// pull, and the run was given up on 47s before its container started.
 	bridgedReadyTimeout = 5 * time.Minute
+
+	// bridgedStartupTimeout bounds the whole wait for `ready`, pod start
+	// included.
+	bridgedStartupTimeout = 20 * time.Minute
 
 	// defaultBridgedIdleTimeout is BridgedIdleTimeout's value until overridden.
 	// Matches agent-orchestrator's own AGENT_IDLE_TIMEOUT_SECONDS default
@@ -136,6 +147,11 @@ func BridgedAgentWorkflow(ctx workflow.Context, in AgentWorkflowInput) error {
 	}
 
 	ready := false
+	launchedAt := workflow.Now(ctx)
+	// Whether the previous ready check found the pod still starting. Set, it
+	// buys one more window even if the pod has started since, so an agent
+	// whose pod started just before a check is not judged on seconds.
+	wasStarting := false
 	// Concluding messages can arrive more than once on the wire (ADR 0033's
 	// re-offers reuse their seq). The bridge dedupes, but a workflow that
 	// replays or re-attaches may still see one twice, so the terminal decision
@@ -175,12 +191,25 @@ func BridgedAgentWorkflow(ctx workflow.Context, in AgentWorkflowInput) error {
 			// The CR's mirrored Job phase is the crash backstop, exactly as for
 			// a tool: silence plus a terminal phase means the pod is gone, not
 			// that the agent is thinking.
-			var status any
+			var status toolrun.Status
 			_ = workflow.ExecuteActivity(actx, activities.GetAgentRunPhaseActivityName, runID).Get(ctx, &status)
+			if !ready && (status.Starting || wasStarting) && workflow.Now(ctx).Sub(launchedAt) < bridgedStartupTimeout {
+				wasStarting = status.Starting
+				continue
+			}
 			_ = send(activities.AgentDownInput{Type: agentrun.DownCancel, Reason: "timed out"})
+			// The cancel only reaches an agent already listening. One whose pod
+			// starts after this would do its whole task with nobody attached,
+			// so a run still going is deleted too.
+			if workflow.GetVersion(ctx, "bridged-stop-on-give-up", workflow.DefaultVersion, 1) == 1 &&
+				status.Phase != "Succeeded" && status.Phase != "Failed" {
+				if err := workflow.ExecuteActivity(actx, activities.StopAgentRunActivityName, runID).Get(ctx, nil); err != nil {
+					logger.Warn("could not stop the agent run", "runId", runID, "error", err)
+				}
+			}
 			if !ready {
 				return fail("not_ready", fmt.Sprintf("agent %s never became ready within %s (AgentRun: %v)",
-					in.Agent.ID, bridgedReadyTimeout, status))
+					in.Agent.ID, workflow.Now(ctx).Sub(launchedAt).Round(time.Second), statusText(status)))
 			}
 			// Milliseconds, matching the retired TS engine's wording
 			// exactly ("went silent for <N>ms") — the comment a human reads is
@@ -188,7 +217,7 @@ func BridgedAgentWorkflow(ctx workflow.Context, in AgentWorkflowInput) error {
 			// the workflow returns), so the wording is load-bearing, not
 			// cosmetic.
 			return fail("timeout", fmt.Sprintf("agent %s went silent for %dms (AgentRun: %v)",
-				in.Agent.ID, BridgedIdleTimeout.Milliseconds(), status))
+				in.Agent.ID, BridgedIdleTimeout.Milliseconds(), statusText(status)))
 		}
 		if !received {
 			continue
@@ -356,4 +385,21 @@ func handleBridgedToolCall(
 	default:
 		answer(false, "", outcome.ErrorCode+": "+outcome.ErrorMessage)
 	}
+}
+
+// statusText renders a run's status for a failure message in the same form
+// the untyped map printed before (map[jobName:... phase:...]), which humans
+// read on GitHub and the e2e specs match on.
+func statusText(s toolrun.Status) map[string]any {
+	out := map[string]any{}
+	if s.Phase != "" {
+		out["phase"] = s.Phase
+	}
+	if s.Message != "" {
+		out["message"] = s.Message
+	}
+	if s.JobName != "" {
+		out["jobName"] = s.JobName
+	}
+	return out
 }

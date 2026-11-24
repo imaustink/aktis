@@ -186,6 +186,42 @@ describe("EventSource / EventTrigger status", () => {
     });
   });
 
+  describe("EventSource sender CEL", () => {
+    const SOURCE = `e2e-st-sender-${ID}`;
+    const SECRET = `e2e-st-sender-secret-${ID}`;
+    const spec = (loginFrom: string) => ({
+      webhook: { verify: { scheme: "hmacSha256", header: "x-signature-256", prefix: "sha256=", secretRef: { name: SECRET, key: "secret" } } },
+      sender: { provider: "github", loginFrom },
+    });
+    const post = () => withGateway((f) => postHmacWebhook(f, SOURCE, { sender: { login: "e2e-user" } }, `e2e-${ID}`));
+    const statusBecomes = async (want: (status: number) => boolean, what: string) => {
+      const deadline = Date.now() + 60_000;
+      let last = 0;
+      while (Date.now() < deadline) {
+        last = (await post()).status;
+        if (want(last)) return last;
+        await new Promise((r) => setTimeout(r, 2_000));
+      }
+      throw new Error(`e2e: ${SOURCE} never ${what} (last status ${last})`);
+    };
+
+    // The gateway has no CEL compiler (docs/adr/0056); it asks the
+    // orchestrator's /events/compile, and must still 404 such a source exactly
+    // as an unknown one. Proven against a control: the same source with a
+    // valid expression is served, before and after.
+    it("a source whose loginFrom does not compile 404s; fixed, it is served again", async () => {
+      await upsertSecret(SECRET, "secret", `e2e-${ID}`, { [FIXTURE_LABEL]: FIXTURE });
+      await applyEventSource(SOURCE, spec("body.sender.login"), FIXTURE);
+      expect(await statusBecomes((s) => s === 202, "was served")).toBe(202);
+
+      await applyEventSource(SOURCE, spec("body.sender.("), FIXTURE);
+      expect(await statusBecomes((s) => s === 404, "404d with a broken loginFrom")).toBe(404);
+
+      await applyEventSource(SOURCE, spec("body.sender.login"), FIXTURE);
+      expect(await statusBecomes((s) => s === 202, "was served again")).toBe(202);
+    });
+  });
+
   describe("admission", () => {
     it("rejects an EventSource that is both webhook and cron, and a trigger with two targets", async () => {
       await expect(

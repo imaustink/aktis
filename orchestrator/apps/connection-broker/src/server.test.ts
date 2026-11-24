@@ -27,7 +27,19 @@ describe("broker server", () => {
   let base: string;
   let driver: Driver;
 
+  // Tears a server down completely: close() alone leaves keep-alive sockets
+  // serving the OLD handler, and fetch's pool reuses them when a later server
+  // lands on the same port -- a search then hits a driver without one (404).
+  const stop = (s: Server | undefined): Promise<void> => {
+    if (!s) return Promise.resolve();
+    s.closeAllConnections();
+    return new Promise((resolve) => s.close(() => resolve()));
+  };
+
   const start = (d: Driver = fakeDriver()): void => {
+    // Tests that need a different driver call start() again; the server
+    // beforeEach made must not outlive them.
+    void stop(server);
     driver = d;
     server = createBrokerServer({
       auth: {
@@ -43,7 +55,10 @@ describe("broker server", () => {
   };
 
   beforeEach(() => start());
-  afterEach(() => server.close());
+  afterEach(async () => {
+    await stop(server);
+    server = undefined as unknown as Server;
+  });
 
   const call = (path: string, init: RequestInit = {}) => fetch(`${base}${path}`, init);
 
@@ -118,7 +133,6 @@ describe("broker server", () => {
   });
 
   it("maps a denial to 403 and a transient failure to 503, never the reverse", async () => {
-    server.close();
     start(
       fakeDriver({
         probe: vi.fn().mockRejectedValue(new PermissionDeniedError("403 from source")),
@@ -131,7 +145,6 @@ describe("broker server", () => {
     });
     expect(denied.status).toBe(403);
 
-    server.close();
     start(fakeDriver({ probe: vi.fn().mockRejectedValue(new TransientError("429")) }));
     const busy = await call("/corpora/globex-confluence/probe", {
       method: "POST",

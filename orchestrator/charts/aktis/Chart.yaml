@@ -38,7 +38,7 @@ keywords:
 maintainers:
   - name: controller-agent
 dependencies:
-  # The long-lived parent orchestrator (orchestrator/apps/agent-orchestrator). Bundles its
+  # The long-lived parent orchestrator (orchestrator/engines/temporal/cmd/agent-orchestrator). Bundles its
   # own optional Qdrant instance as a transitive dependency (see the
   # subchart's own Chart.yaml / values `qdrant.enabled`).
   - name: agent-orchestrator

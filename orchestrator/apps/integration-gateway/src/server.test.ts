@@ -3,14 +3,27 @@ import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseBody, type Envelope, type EventSourceResource } from "@aktis/event-triggers";
 import type { ClaudeTokenStore } from "./claude-auth/store.js";
-import { StaticEventSourceRegistry, type SecretLookup } from "./event-sources.js";
-import { StaticEventTriggerTable } from "./event-triggers.js";
+import { StaticEventSourceRegistry, type EventSourceLookup, type SecretLookup } from "./event-sources.js";
 import type { GithubReplyClient } from "./github-client.js";
 import { GithubIdentityResolver } from "./identity.js";
-import { InMemoryPendingLabelStore } from "./label-reconciler.js";
+import { testRuns, type TestRuns } from "./__fixtures__/temporal.js";
+import { createRunActivities } from "./runs/activities.js";
+import { LegacyRunDrain } from "./runs/legacy-drain.js";
+import type { RunActivities } from "./runs/contract.js";
+import type { RunSettings } from "./runs/model.js";
 import { InMemoryInflightRunStore, type InflightRun } from "./inflight-runs.js";
 import { InMemoryDeferredEventStore } from "./deferred-events.js";
-import type { AcceptedTrigger, EventSubmitResult, OrchestratorClient, OrchestratorInvokeResult, PollHooks } from "./orchestrator-client.js";
+import type {
+  AcceptedTrigger,
+  CelResult,
+  EventSubmitResult,
+  OrchestratorClient,
+  OrchestratorInvokeResult,
+  PollHooks,
+  PrefilterResult,
+  CompileResult,
+  SenderExpressions,
+} from "./orchestrator-client.js";
 import { GatewayServer, type GatewayServerOptions } from "./server.js";
 import { InMemorySessionPageStore } from "./session-page-store.js";
 import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
@@ -109,6 +122,41 @@ const SOURCES: EventSourceResource[] = [
   { metadata: { name: "pr-conflicts" }, spec: { conflicts: { author: "app/k5s-bot", skipLabels: ["ai-triage"] } } },
 ];
 
+/**
+ * Stands in for the orchestrator's CEL (`/events/prefilter`), which is Go and
+ * tested there (internal/catalog, internal/facade). Understands exactly the
+ * expression shapes SOURCES uses -- a body path, or a body path == "literal"
+ * -- with CEL's semantics for them: a missing key is an evaluation error, and
+ * a JSON integer is an `int`, sent as its decimal string.
+ */
+function fakeCel(expr: string, envelope: Envelope): CelResult {
+  const read = (path: string): unknown =>
+    path.split(".").reduce<unknown>((value, key) => {
+      if (value === undefined || typeof value !== "object" || value === null || !(key in value)) return undefined;
+      return (value as Record<string, unknown>)[key];
+    }, { body: envelope.body });
+  const missing = (path: string): CelResult => ({ ok: false, error: `no such key: ${path}` });
+  const eq = /^(body(?:\.\w+)+) == "(.*)"$/.exec(expr);
+  if (eq) {
+    const value = read(eq[1]!);
+    return value === undefined ? missing(eq[1]!) : { ok: true, type: "bool", value: value === eq[2] };
+  }
+  const bare = /^(body(?:\.\w+)+)$/.exec(expr);
+  if (!bare) throw new Error(`fakeCel does not understand ${expr}`);
+  const value = read(bare[1]!);
+  if (value === undefined) return missing(bare[1]!);
+  if (typeof value === "string") return { ok: true, type: "string", value };
+  if (typeof value === "boolean") return { ok: true, type: "bool", value };
+  if (typeof value === "number" && Number.isInteger(value)) return { ok: true, type: "int", value: String(value) };
+  return { ok: true, type: "dyn", value };
+}
+
+function fakePrefilter(envelope: Envelope, sender: SenderExpressions | undefined): PrefilterResult {
+  const results: Record<string, CelResult> = {};
+  for (const [field, expr] of Object.entries(sender ?? {})) if (expr) results[field] = fakeCel(expr, envelope);
+  return { kind: "ok", couldMatch: true, sender: results };
+}
+
 const DEFAULT_TRIGGER: AcceptedTrigger = {
   name: "github-review",
   sessionId: "github:acme/widgets#7",
@@ -131,6 +179,8 @@ interface Harness {
   order: string[];
   logs: string[];
   submitEvent: ReturnType<typeof vi.fn>;
+  prefilter: ReturnType<typeof vi.fn>;
+  compile: ReturnType<typeof vi.fn>;
   poll: ReturnType<typeof vi.fn>;
   invoke: ReturnType<typeof vi.fn>;
   postIssueComment: ReturnType<typeof vi.fn>;
@@ -145,10 +195,9 @@ interface Harness {
   replyFetch: ReturnType<typeof vi.fn>;
   secretsGet: ReturnType<typeof vi.fn>;
   resolve: ReturnType<typeof vi.spyOn>;
-  pendingLabelStore: InMemoryPendingLabelStore;
-  record: ReturnType<typeof vi.spyOn>;
-  clear: ReturnType<typeof vi.spyOn>;
   sessionPageStore: InMemorySessionPageStore;
+  /** The Temporal task queue this harness's runs live on (docs/adr/0057). */
+  temporal: TestRuns;
   onBackgroundError: ReturnType<typeof vi.fn>;
 }
 
@@ -156,16 +205,30 @@ let current: Harness | undefined;
 
 afterEach(async () => {
   await current?.server.close();
+  await current?.temporal.stop();
   current = undefined;
   vi.mocked(parseBody).mockClear();
 });
 
-async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Record<string, string> = SECRETS): Promise<Harness> {
+/** `vi.waitFor` with room for a run's activities to go through Temporal. */
+const waitFor = <T>(fn: () => T | Promise<T>): Promise<T> => vi.waitFor(fn, { timeout: 15_000, interval: 20 });
+
+async function start(
+  overrides: Partial<GatewayServerOptions> = {},
+  secrets: Record<string, string> = SECRETS,
+  runOpts: Partial<RunSettings> = {},
+  /** Wraps the activities the worker runs (to make one fail, say). */
+  wrapActivities: (a: RunActivities) => RunActivities = (a) => a,
+): Promise<Harness> {
+  const temporal = await testRuns(runOpts);
   const order: string[] = [];
   const logs: string[] = [];
   const identityResolver = new GithubIdentityResolver(new Map([["alice", { subject: "alice", roles: ["reporter"] }]]), "agent-controller[bot]");
   const resolve = vi.spyOn(identityResolver, "resolve");
   const submitEvent = vi.fn(async (): Promise<EventSubmitResult> => ({ kind: "accepted", id: "inv-1", trigger: DEFAULT_TRIGGER }));
+  const prefilter = vi.fn(async (envelope: Envelope, sender?: SenderExpressions): Promise<PrefilterResult> => fakePrefilter(envelope, sender));
+  // Everything SOURCES uses compiles unless a test says otherwise.
+  const compile = vi.fn(async (_expressions: string[]): Promise<CompileResult> => ({ kind: "ok", errors: {} }));
   const poll = vi.fn(async (_id: string, _hooks?: PollHooks): Promise<OrchestratorInvokeResult> => {
     order.push("poll");
     return { status: "succeeded", result: "Looks good." };
@@ -197,12 +260,6 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
     return new Response(null, { status: 204 });
   });
   const secretsGet = vi.fn(async (name: string, key: string) => secrets[`${name}/${key}`]);
-  const pendingLabelStore = new InMemoryPendingLabelStore();
-  const record = vi.spyOn(pendingLabelStore, "record").mockImplementation(async function (this: InMemoryPendingLabelStore, entry) {
-    order.push("record");
-    return InMemoryPendingLabelStore.prototype.record.call(pendingLabelStore, entry);
-  });
-  const clear = vi.spyOn(pendingLabelStore, "clear");
   const sessionPageStore = new InMemorySessionPageStore();
   const onBackgroundError = vi.fn();
 
@@ -212,7 +269,7 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
     tickAuthenticator: { authenticate: async (token: string) => TICK_IDENTITIES[token] },
     tickNamespace: "agents",
     identityResolver,
-    orchestratorClient: { submitEvent, poll, invoke, checkLive: vi.fn().mockResolvedValue({ live: false }) } as unknown as OrchestratorClient,
+    orchestratorClient: { submitEvent, prefilter, compile, poll, invoke, checkLive: vi.fn().mockResolvedValue({ live: false }) } as unknown as OrchestratorClient,
     githubReplyClient: {
       postIssueComment,
       updateIssueComment,
@@ -227,16 +284,12 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
     replyFetch: replyFetch as unknown as typeof fetch,
     log: (line) => logs.push(line),
     onBackgroundError,
-    pendingLabelStore,
-    // The reconciler's startup sweep must not race these tests' own removals.
-    labelReconcilerGraceMs: 60 * 60 * 1000,
     sessionPageStore,
     publicBaseUrl: "https://gateway.example.com",
-    // Re-read a held event's issues on every pass, so tests can kick freely;
-    // the throttle has its own test.
-    heldEventStateCheckIntervalMs: 0,
+    runs: temporal.runs,
     ...overrides,
   });
+  await temporal.serve(wrapActivities(createRunActivities(server.effects, temporal.runs, (line) => logs.push(line))));
   await server.listen(0);
   const port = (server as unknown as { server: { address: () => AddressInfo } }).server.address().port;
   current = {
@@ -245,6 +298,8 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
     order,
     logs,
     submitEvent,
+    prefilter,
+    compile,
     poll,
     invoke,
     postIssueComment,
@@ -259,10 +314,8 @@ async function start(overrides: Partial<GatewayServerOptions> = {}, secrets: Rec
     replyFetch,
     secretsGet,
     resolve,
-    pendingLabelStore,
-    record,
-    clear,
     sessionPageStore,
+    temporal,
     onBackgroundError,
   };
   return current;
@@ -294,9 +347,9 @@ function postGithub(
   return fetch(`http://localhost:${h.port}/webhooks/github`, { method: "POST", headers, body });
 }
 
-/** Lets the background relay run; used where the assertion is that something did NOT happen. */
+/** Lets the background relay -- and the run's workflow -- run; used where the assertion is that something did NOT happen. */
 function settle(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 30));
+  return new Promise((resolve) => setTimeout(resolve, 750));
 }
 
 function submittedEnvelope(h: Harness, call = 0): Envelope {
@@ -374,7 +427,7 @@ describe("webhook verification (hmacSha256)", () => {
       extraHeaders: { authorization: "Bearer leak", cookie: "session=leak", "X-Custom": "kept" },
     });
     expect(res.status).toBe(202);
-    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
+    await waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
     const envelope = submittedEnvelope(h);
     expect(envelope).toMatchObject({ source: "github", kind: "webhook", id: "delivery-123", body: GITHUB_PAYLOAD });
     expect(envelope.time).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
@@ -428,7 +481,7 @@ describe("webhook verification (slackV0)", () => {
   it("relays a verified event without the signature header", async () => {
     const h = await start();
     expect((await slackPost(h, { type: "event_callback", event: { text: "hi" } })).status).toBe(202);
-    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
+    await waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
     const envelope = submittedEnvelope(h);
     expect(envelope.body).toEqual({ type: "event_callback", event: { text: "hi" } });
     expect(envelope.headers).not.toHaveProperty("x-slack-signature");
@@ -446,7 +499,7 @@ describe("webhook verification (bearer)", () => {
     expect((await post("Bearer wrong")).status).toBe(401);
     expect((await post("ci-token")).status).toBe(401);
     expect((await post("Bearer ci-token")).status).toBe(202);
-    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(1));
     const envelope = submittedEnvelope(h);
     expect(envelope.body).toEqual({ text: "build ok" });
     expect(envelope.headers).not.toHaveProperty("authorization");
@@ -460,7 +513,7 @@ describe("webhook verification (bearer)", () => {
       body: "status=green",
     });
     expect(res.status).toBe(202);
-    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
+    await waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
     const envelope = submittedEnvelope(h);
     expect(envelope.body).toEqual({ status: "green" });
     expect(envelope.headers).not.toHaveProperty("x-ci-token");
@@ -471,7 +524,7 @@ describe("sender verification", () => {
   it("forwards a VERIFIED login with the signed-assertion path, in envelope.sender, with repo context", async () => {
     const h = await start();
     await postGithub(h);
-    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
+    await waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
     expect(h.resolve).toHaveBeenCalledWith("alice", false, { owner: "acme", repo: "widgets" });
     expect(h.submitEvent.mock.calls[0]?.[1]).toEqual({ login: "alice" });
     const envelope = submittedEnvelope(h);
@@ -515,7 +568,7 @@ describe("sender verification", () => {
       headers: { "content-type": "application/json", "x-sig": hmacHex("gh-secret", body) },
       body,
     });
-    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
+    await waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
     expect(h.resolve).not.toHaveBeenCalled();
     expect(h.submitEvent.mock.calls[0]?.[1]).toBeUndefined();
     expect(submittedEnvelope(h).sender).toEqual({});
@@ -524,17 +577,28 @@ describe("sender verification", () => {
 });
 
 describe("sender lookups are skipped for deliveries no trigger could match", () => {
-  const reviewTrigger = {
-    metadata: { name: "github-pr-review" },
-    spec: {
-      sourceRef: "github",
-      match: { cel: 'headers["x-github-event"] == "pull_request" && body.action == "labeled" && body.label.name == "ai-review"' },
-      target: { agentRef: "swe", promptTemplate: "go" },
-    },
-  };
+  // WHETHER a trigger could match is the orchestrator's CEL, tested in Go
+  // (internal/catalog CouldMatchBeforeSender). What is tested here is what the
+  // gateway does with each answer.
 
-  it("a push no trigger matches never reaches the identity resolver (no GitHub API call) or the orchestrator", async () => {
-    const h = await start({ eventTriggers: new StaticEventTriggerTable([reviewTrigger]) });
+  it("asks the orchestrator with the PRELIMINARY envelope and the source's sender expressions", async () => {
+    const h = await start();
+    await postGithub(h);
+    await waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
+    const [envelope, sender] = h.prefilter.mock.calls[0] as [Envelope, SenderExpressions];
+    expect(envelope.sender).toEqual({});
+    expect(envelope.repository).toBe("");
+    expect(envelope.source).toBe("github");
+    expect(sender).toEqual({
+      loginFrom: "body.sender.login",
+      isBotFrom: 'body.sender.type == "Bot"',
+      repositoryFrom: "body.repository.full_name",
+    });
+  });
+
+  it("couldMatch false: never reaches the identity resolver (no GitHub API call) or the orchestrator's /invoke", async () => {
+    const h = await start();
+    h.prefilter.mockResolvedValueOnce({ kind: "ok", couldMatch: false, sender: {} });
     const res = await postGithub(h, { ref: "refs/heads/main", repository: { full_name: "acme/widgets" }, sender: { login: "alice", type: "User" } }, {
       extraHeaders: { "x-github-event": "push" },
     });
@@ -545,36 +609,126 @@ describe("sender lookups are skipped for deliveries no trigger could match", () 
     expect(h.logs.join("\n")).toMatch(/webhook github event delivery-123: no trigger could match \(ignored before sender lookup\)/);
   });
 
-  it("a delivery a trigger matches is still sender-verified before it is relayed", async () => {
-    const h = await start({ eventTriggers: new StaticEventTriggerTable([reviewTrigger]) });
+  it("couldMatch true: the sender is still verified before the event is relayed", async () => {
+    const h = await start();
     await postGithub(h);
-    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
+    await waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
     expect(h.resolve).toHaveBeenCalledWith("alice", false, { owner: "acme", repo: "widgets" });
     expect(h.submitEvent.mock.calls[0]?.[1]).toEqual({ login: "alice" });
   });
 
-  it("a trigger that reads `sender` can't be decided early, so the sender is resolved", async () => {
-    const senderTrigger = { metadata: { name: "by-alice" }, spec: { sourceRef: "github", match: { cel: 'sender.login == "alice"' }, target: { agentRef: "swe", promptTemplate: "go" } } };
-    const h = await start({ eventTriggers: new StaticEventTriggerTable([senderTrigger]) });
-    await postGithub(h, { ...GITHUB_PAYLOAD, action: "opened" });
-    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
-    expect(h.resolve).toHaveBeenCalled();
-  });
-
-  it("triggers for OTHER sources don't count", async () => {
-    const slackOnly = { ...reviewTrigger, metadata: { name: "slack-only" }, spec: { ...reviewTrigger.spec, sourceRef: "slack" } };
-    const h = await start({ eventTriggers: new StaticEventTriggerTable([slackOnly]) });
-    await postGithub(h);
+  it("a prefilter that fails (orchestrator down, bad answer) drops the delivery: no sender is trusted unevaluated", async () => {
+    const h = await start();
+    h.prefilter.mockResolvedValueOnce({ kind: "failed", error: "/events/prefilter unreachable: ECONNREFUSED" });
+    expect((await postGithub(h)).status).toBe(202);
     await settle();
     expect(h.resolve).not.toHaveBeenCalled();
     expect(h.submitEvent).not.toHaveBeenCalled();
+    expect(h.logs.join("\n")).toMatch(/dropped \(\/events\/prefilter unreachable: ECONNREFUSED\)/);
   });
 
-  it("an unloaded trigger table resolves every sender, as before", async () => {
-    const h = await start({ eventTriggers: { all: () => undefined } });
-    await postGithub(h, { ...GITHUB_PAYLOAD, action: "opened" });
+  it("a sender expression of the wrong CEL type drops the delivery", async () => {
+    const h = await start();
+    h.prefilter.mockResolvedValueOnce({
+      kind: "ok",
+      couldMatch: true,
+      sender: { loginFrom: { ok: true, type: "int", value: "42" }, isBotFrom: { ok: true, type: "bool", value: false } },
+    });
+    await postGithub(h);
+    await settle();
+    expect(h.resolve).not.toHaveBeenCalled();
+    expect(h.logs.join("\n")).toMatch(/dropped \(sender.loginFrom is not a non-empty string\)/);
+  });
+
+  it("a source without `sender` is never prefiltered: every delivery goes to the orchestrator", async () => {
+    const h = await start();
+    const body = JSON.stringify(GITHUB_PAYLOAD);
+    await fetch(`http://localhost:${h.port}/webhooks/plain`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-sig": hmacHex("gh-secret", body) },
+      body,
+    });
+    await waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
+    expect(h.prefilter).not.toHaveBeenCalled();
+  });
+});
+
+describe("a source whose sender CEL does not compile is served as unknown (404)", () => {
+  // Compiling is the orchestrator's (POST /events/compile, tested in Go); the
+  // gateway's job is to ask before serving, cache the answer, and fail open
+  // only to the per-delivery prefilter, which itself fails closed.
+
+  it("404s before reading the body, and never prefilters or relays", async () => {
+    const h = await start();
+    h.compile.mockResolvedValueOnce({ kind: "ok", errors: { "body.sender.login": "Syntax error" } });
+    expect((await postGithub(h)).status).toBe(404);
+    await settle();
+    expect(h.prefilter).not.toHaveBeenCalled();
+    expect(h.submitEvent).not.toHaveBeenCalled();
+    expect(h.logs.join("\n")).toMatch(/webhook github: sender expression does not compile, routes 404 \(Syntax error\)/);
+  });
+
+  it("asks once per distinct expression, then answers from cache", async () => {
+    const h = await start();
+    await postGithub(h);
+    await postGithub(h);
+    await waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(2));
+    expect(h.compile).toHaveBeenCalledTimes(1);
+    expect(h.compile.mock.calls[0]?.[0]).toEqual(["body.sender.login", 'body.sender.type == "Bot"', "body.repository.full_name"]);
+  });
+
+  it("an orchestrator that cannot answer leaves the source served (the prefilter still gates each delivery), and is asked again after the backoff", async () => {
+    let clock = Date.parse("2026-01-01T00:00:00Z");
+    const h = await start({ now: () => new Date(clock) });
+    h.compile.mockResolvedValueOnce({ kind: "failed", error: "/events/compile unreachable: ECONNREFUSED" });
+    expect((await postGithub(h)).status).toBe(202);
+    await waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
+    expect(h.prefilter).toHaveBeenCalled();
+    clock += 10_000;
+    await postGithub(h);
+    expect(h.compile).toHaveBeenCalledTimes(2);
+  });
+
+  it("during an orchestrator outage, repeated requests make at most one compile call per backoff window", async () => {
+    let clock = Date.parse("2026-01-01T00:00:00Z");
+    const h = await start({ now: () => new Date(clock) });
+    h.compile.mockResolvedValue({ kind: "failed", error: "/events/compile unreachable: ECONNREFUSED" });
+    for (let i = 0; i < 5; i++) {
+      expect((await postGithub(h)).status).toBe(202);
+      clock += 1_000;
+    }
+    expect(h.compile).toHaveBeenCalledTimes(1);
+    clock += 5_000;
+    expect((await postGithub(h)).status).toBe(202);
+    expect(h.compile).toHaveBeenCalledTimes(2);
+  });
+
+  it("a negative verdict is re-checked after its TTL, and the source is served once it compiles", async () => {
+    let clock = Date.parse("2026-01-01T00:00:00Z");
+    const h = await start({ now: () => new Date(clock) });
+    h.compile.mockResolvedValueOnce({ kind: "ok", errors: { "body.sender.login": "undeclared reference to 'body'" } });
+    expect((await postGithub(h)).status).toBe(404);
+    clock += 59_000;
+    expect((await postGithub(h)).status).toBe(404);
+    expect(h.compile).toHaveBeenCalledTimes(1);
+    clock += 1_000;
+    expect((await postGithub(h)).status).toBe(202);
+    expect(h.compile).toHaveBeenCalledTimes(2);
+    // Only the expression with the expired negative verdict is asked again.
+    expect(h.compile.mock.calls[1]?.[0]).toEqual(["body.sender.login"]);
     await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
-    expect(h.resolve).toHaveBeenCalled();
+  });
+
+  it("a source without `sender` is never compiled", async () => {
+    const h = await start();
+    const body = JSON.stringify(GITHUB_PAYLOAD);
+    await fetch(`http://localhost:${h.port}/webhooks/plain`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-sig": hmacHex("gh-secret", body) },
+      body,
+    });
+    await waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
+    expect(h.compile).not.toHaveBeenCalled();
   });
 });
 
@@ -583,11 +737,10 @@ describe("/invoke outcomes drive exactly the declared side effects", () => {
     const h = await start();
     h.submitEvent.mockResolvedValueOnce({ kind: "ignored" });
     await postGithub(h);
-    await vi.waitFor(() => expect(h.logs.join("\n")).toMatch(/no trigger matched \(ignored\)/));
+    await waitFor(() => expect(h.logs.join("\n")).toMatch(/no trigger matched \(ignored\)/));
     await settle();
     expect(h.poll).not.toHaveBeenCalled();
     expect(h.postIssueComment).not.toHaveBeenCalled();
-    expect(h.record).not.toHaveBeenCalled();
     expect(h.removeIssueLabel).not.toHaveBeenCalled();
     expect(h.replyFetch).not.toHaveBeenCalled();
   });
@@ -596,20 +749,21 @@ describe("/invoke outcomes drive exactly the declared side effects", () => {
     const h = await start();
     h.submitEvent.mockResolvedValueOnce({ kind: "rejected", error: "issueNumber did not render to a positive integer" });
     await postGithub(h);
-    await vi.waitFor(() => expect(h.logs.join("\n")).toMatch(/\(422\): issueNumber did not render/));
+    await waitFor(() => expect(h.logs.join("\n")).toMatch(/\(422\): issueNumber did not render/));
     await settle();
     expect(h.poll).not.toHaveBeenCalled();
     expect(h.postIssueComment).not.toHaveBeenCalled();
-    expect(h.record).not.toHaveBeenCalled();
     expect(h.removeIssueLabel).not.toHaveBeenCalled();
     expect(h.replyFetch).not.toHaveBeenCalled();
   });
 
-  it("202: records the owed label, acks (with session page link), polls, posts the result, calls back, removes the label -- in that order", async () => {
+  it("202: acks (with session page link), polls, posts the result, calls back, removes the label -- in that order, as one workflow", async () => {
     const h = await start();
     await postGithub(h);
-    await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
-    expect(h.order).toEqual(["record", "comment:Starting a review…", "poll", "comment:Looks good.", "http", "removeLabel"]);
+    await waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
+    expect(h.order).toEqual(["comment:Starting a review…", "poll", "comment:Looks good.", "http", "removeLabel"]);
+    // docs/adr/0057: the run is a workflow, keyed by its invocation, and it finished.
+    await h.temporal.runs.client.workflow.getHandle(`${h.temporal.taskQueue}/event-run:inv-1`).result();
 
     const ack = h.postIssueComment.mock.calls[0];
     expect(ack?.slice(0, 3)).toEqual(["acme", "widgets", 7]);
@@ -622,15 +776,12 @@ describe("/invoke outcomes drive exactly the declared side effects", () => {
 
     expect(h.poll).toHaveBeenCalledWith("inv-1", expect.anything());
     expect(h.removeIssueLabel).toHaveBeenCalledWith("acme", "widgets", 7, "ai-review");
-    expect(h.record).toHaveBeenCalledWith(expect.objectContaining({ owner: "acme", repo: "widgets", issueNumber: 7, label: "ai-review", sessionId: "github:acme/widgets#7" }));
-    expect(h.clear).toHaveBeenCalledWith("github:acme/widgets#7", "ai-review");
-    expect(await h.pendingLabelStore.list()).toEqual([]);
   });
 
   it("http reply: exact body, signature verifiable with the trigger's secret, literal url", async () => {
     const h = await start();
     await postGithub(h);
-    await vi.waitFor(() => expect(h.replyFetch).toHaveBeenCalled());
+    await waitFor(() => expect(h.replyFetch).toHaveBeenCalled());
     const [url, init] = h.replyFetch.mock.calls[0] as unknown as [URL, RequestInit];
     expect(String(url)).toBe("http://ci-bridge.tools.svc/results");
     const body = init.body as string;
@@ -644,7 +795,7 @@ describe("/invoke outcomes drive exactly the declared side effects", () => {
     const h = await start();
     h.poll.mockResolvedValueOnce({ status: "failed", error: "agent crashed" });
     await postGithub(h);
-    await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalledWith("acme", "widgets", 7, "ai-review"));
+    await waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalledWith("acme", "widgets", 7, "ai-review"));
     expect(h.postIssueComment).toHaveBeenCalledWith("acme", "widgets", 7, "Something went wrong processing this: agent crashed");
     const body = JSON.parse((h.replyFetch.mock.calls[0] as unknown as [URL, RequestInit])[1].body as string);
     expect(body).toEqual({ trigger: "github-review", sessionId: "github:acme/widgets#7", status: "failed", error: "agent crashed" });
@@ -654,7 +805,7 @@ describe("/invoke outcomes drive exactly the declared side effects", () => {
     const { "callback/secret": _omit, ...rest } = SECRETS;
     const h = await start({}, rest);
     await postGithub(h);
-    await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
+    await waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
     expect(h.replyFetch).not.toHaveBeenCalled();
     expect(h.logs.join("\n")).toMatch(/reply.http not sent \(signing secret callback\/secret unavailable\)/);
   });
@@ -663,30 +814,28 @@ describe("/invoke outcomes drive exactly the declared side effects", () => {
     const h = await start();
     h.submitEvent.mockResolvedValueOnce({ kind: "accepted", id: "inv-2", trigger: { name: "t", sessionId: "event:ci:x", reply: null } });
     await postGithub(h);
-    await vi.waitFor(() => expect(h.poll).toHaveBeenCalled());
+    await waitFor(() => expect(h.poll).toHaveBeenCalled());
     await settle();
     expect(h.postIssueComment).not.toHaveBeenCalled();
-    expect(h.record).not.toHaveBeenCalled();
     expect(h.removeIssueLabel).not.toHaveBeenCalled();
     expect(h.replyFetch).not.toHaveBeenCalled();
   });
 
-  it("keeps the pending record when label removal fails, so the reconciler heals it", async () => {
+  it("retries a label removal that fails until it goes through", async () => {
     const h = await start();
     h.removeIssueLabel.mockRejectedValueOnce(new Error("502 after retries"));
     await postGithub(h);
-    await vi.waitFor(() => expect(h.onBackgroundError).toHaveBeenCalledWith(expect.objectContaining({ message: "502 after retries" })));
-    expect(h.clear).not.toHaveBeenCalled();
-    expect(await h.pendingLabelStore.list()).toHaveLength(1);
-    // The run's own outcome was still reported.
-    expect(h.postIssueComment).toHaveBeenCalledWith("acme", "widgets", 7, "Looks good.");
+    await waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalledTimes(2));
+    expect(h.removeIssueLabel).toHaveBeenLastCalledWith("acme", "widgets", 7, "ai-review");
+    // The run's own outcome was reported before, once.
+    expect(h.postIssueComment.mock.calls.filter((c) => c[3] === "Looks good.")).toHaveLength(1);
   });
 
   it("still polls, reports and removes the label when the ack comment fails", async () => {
     const h = await start();
     h.postIssueComment.mockRejectedValueOnce(new Error("github down"));
     await postGithub(h);
-    await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
+    await waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
     expect(h.poll).toHaveBeenCalled();
     expect(h.replyFetch).toHaveBeenCalled();
   });
@@ -699,7 +848,7 @@ describe("/invoke outcomes drive exactly the declared side effects", () => {
       return { status: "succeeded", result: "Done." };
     });
     await postGithub(h);
-    await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
+    await waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
     const ackBody = h.postIssueComment.mock.calls[0]?.[3] as string;
     const ackId = await h.postIssueComment.mock.results[0]?.value;
     expect(h.updateIssueComment).toHaveBeenCalledTimes(1);
@@ -720,7 +869,7 @@ describe("/invoke outcomes drive exactly the declared side effects", () => {
       return { status: "succeeded", result: "Done." };
     });
     await postGithub(h);
-    await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
+    await waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
     expect(h.updateIssueComment).not.toHaveBeenCalled();
     const rc = h.postIssueComment.mock.calls.filter((c) => String(c[3]).includes("Watch live"));
     expect(rc).toEqual([["acme", "widgets", 7, "🤖 Watch live or take over the session here: https://claude.ai/code/session_abc"]]);
@@ -734,7 +883,7 @@ describe("/invoke outcomes drive exactly the declared side effects", () => {
       return { status: "succeeded", result: "Done." };
     });
     await postGithub(h);
-    await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
+    await waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
     expect(h.updateIssueComment).toHaveBeenCalledTimes(1);
     const rc = h.postIssueComment.mock.calls.filter((c) => String(c[3]).includes("Watch live"));
     expect(rc).toEqual([["acme", "widgets", 7, "🤖 Watch live or take over the session here: https://claude.ai/code/session_abc"]]);
@@ -757,7 +906,7 @@ describe("identity-link auto-resume on the event path", () => {
     });
     h.poll.mockResolvedValueOnce(pending);
     await postGithub(h);
-    await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
+    await waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
     expect(waitForCompletion).toHaveBeenCalledWith("client-integration-gateway", 20_000, "setup-token");
     expect(h.submitEvent).toHaveBeenCalledTimes(2);
     expect(submittedEnvelope(h, 1)).toEqual(submittedEnvelope(h, 0));
@@ -779,7 +928,7 @@ describe("identity-link auto-resume on the event path", () => {
       return { status: "succeeded", result: "Looks good." };
     });
     await postGithub(h);
-    await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
+    await waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
     expect(h.updateIssueComment).not.toHaveBeenCalled();
     const rc = h.postIssueComment.mock.calls.filter((c) => String(c[3]).includes("Watch live"));
     expect(rc).toEqual([["acme", "widgets", 7, "🤖 Watch live or take over the session here: https://claude.ai/code/session_abc"]]);
@@ -792,7 +941,7 @@ describe("identity-link auto-resume on the event path", () => {
     });
     h.poll.mockResolvedValueOnce(pending);
     await postGithub(h);
-    await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
+    await waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
     expect(h.submitEvent).toHaveBeenCalledTimes(1);
     const body = JSON.parse((h.replyFetch.mock.calls[0] as unknown as [URL, RequestInit])[1].body as string);
     expect(body.status).toBe("failed");
@@ -852,7 +1001,7 @@ describe("POST /events/:source/tick (cron)", () => {
   it("202s and relays a cron envelope whose body is the CR's payload (never the tick's)", async () => {
     const h = await start();
     expect((await tick(h, "nightly", `Bearer ${NIGHTLY_TOKEN}`)).status).toBe(202);
-    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
+    await waitFor(() => expect(h.submitEvent).toHaveBeenCalled());
     const envelope = submittedEnvelope(h);
     expect(envelope).toMatchObject({ source: "nightly", kind: "cron", headers: {}, body: { repo: "acme/widgets", n: 3 }, sender: {}, repository: "" });
     expect(envelope.id).toMatch(/^nightly-\d+-[0-9a-f]{8}$/);
@@ -874,7 +1023,7 @@ describe("session pages", () => {
     });
     expect(res.status).toBe(303);
     expect(res.headers.get("location")).toBe(`/sessions/${entry.token}`);
-    await vi.waitFor(() => expect(h.postIssueComment).toHaveBeenCalled());
+    await waitFor(() => expect(h.postIssueComment).toHaveBeenCalled());
     expect(h.invoke).toHaveBeenCalledWith("actually, target develop", "event:ci:abc", "device");
     expect(h.submitEvent).not.toHaveBeenCalled();
     expect(h.postIssueComment).toHaveBeenCalledWith("acme", "widgets", 7, "Follow-up done.");
@@ -953,7 +1102,7 @@ describe("live session tunnel (ADR 0026)", () => {
       redirect: "manual",
     });
     expect(res.status).toBe(303);
-    await vi.waitFor(() => expect(forwardOpencode).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(forwardOpencode).toHaveBeenCalledTimes(2));
     expect(forwardOpencode).toHaveBeenNthCalledWith(2, "run-42", "s1", {
       method: "POST",
       path: "/session/ses_abc123/prompt_async",
@@ -1040,7 +1189,7 @@ describe("webhook sender -> delegated subject (docs/adr/0049 §5-§6)", () => {
     const h = await start({ senderSubjects: { findSubjectsByAccount: async () => [] } });
     h.submitEvent.mockResolvedValueOnce(identityError(true));
     expect((await postIds(h)).status).toBe(403);
-    await vi.waitFor(() => expect(h.postIssueComment).toHaveBeenCalled());
+    await waitFor(() => expect(h.postIssueComment).toHaveBeenCalled());
     expect(h.postIssueComment).toHaveBeenCalledWith(
       "acme",
       "widgets",
@@ -1161,7 +1310,7 @@ describe("run-completion events (docs/adr/0052 §1)", () => {
     chain(h, TRIAGE);
     h.poll.mockResolvedValueOnce({ status: "succeeded", result: "token", outcome: PR });
     await postGithub(h);
-    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(2));
 
     const event = submittedEnvelope(h, 1);
     expect(event).toEqual({
@@ -1200,7 +1349,7 @@ describe("run-completion events (docs/adr/0052 §1)", () => {
       },
       body,
     });
-    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(2));
     expect((submittedEnvelope(h, 1).body as { chain: unknown }).chain).toEqual({
       id: "delivery-ids",
       depth: 1,
@@ -1215,7 +1364,7 @@ describe("run-completion events (docs/adr/0052 §1)", () => {
     chain(h, TRIAGE);
     h.poll.mockResolvedValueOnce({ status: "failed", error: "agent crashed" });
     await postGithub(h);
-    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(2));
     expect(submittedEnvelope(h, 1).body).toMatchObject({ status: "failed", outcome: {} });
   });
 
@@ -1224,7 +1373,7 @@ describe("run-completion events (docs/adr/0052 §1)", () => {
     const { onComplete: _omit, ...plain } = TRIAGE;
     chain(h, plain);
     await postGithub(h);
-    await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
+    await waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
     await settle();
     expect(h.submitEvent).toHaveBeenCalledTimes(1);
   });
@@ -1237,7 +1386,7 @@ describe("run-completion events (docs/adr/0052 §1)", () => {
     const h = await start();
     chain(h, { ...TRIAGE, onComplete: { emitTo } });
     await postGithub(h);
-    await vi.waitFor(() => expect(h.logs.join("\n")).toMatch(why));
+    await waitFor(() => expect(h.logs.join("\n")).toMatch(why));
     await settle();
     expect(h.submitEvent).toHaveBeenCalledTimes(1);
   });
@@ -1246,7 +1395,7 @@ describe("run-completion events (docs/adr/0052 §1)", () => {
     const h = await start();
     chain(h, TRIAGE);
     await fetch(`http://localhost:${h.port}/events/nightly/tick`, { method: "POST", headers: { authorization: `Bearer ${NIGHTLY_TOKEN}` } });
-    await vi.waitFor(() => expect(h.logs.join("\n")).toMatch(/skipped \(the chain has no verified human sender to act as\)/));
+    await waitFor(() => expect(h.logs.join("\n")).toMatch(/skipped \(the chain has no verified human sender to act as\)/));
     await settle();
     expect(h.submitEvent).toHaveBeenCalledTimes(1);
   });
@@ -1259,7 +1408,7 @@ describe("run-completion events (docs/adr/0052 §1)", () => {
     chain(h, TRIAGE);
     h.poll.mockResolvedValueOnce({ status: "succeeded", identityLinkPending: true, identityLink: { provider: "claude", subject: "s" }, result: "link" });
     await postGithub(h);
-    await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
+    await waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
     await settle();
     expect(h.submitEvent).toHaveBeenCalledTimes(1);
   });
@@ -1271,7 +1420,7 @@ describe("run-completion events (docs/adr/0052 §1)", () => {
     // (say alice's access was revoked mid-run).
     h.resolve.mockResolvedValueOnce({ subject: "alice", roles: ["reporter"] }).mockResolvedValueOnce(undefined);
     await postGithub(h);
-    await vi.waitFor(() => expect(h.logs.join("\n")).toMatch(/dropped, chain origin alice no longer verifies/));
+    await waitFor(() => expect(h.logs.join("\n")).toMatch(/dropped, chain origin alice no longer verifies/));
     await settle();
     expect(h.resolve).toHaveBeenCalledTimes(2);
     expect(h.submitEvent).toHaveBeenCalledTimes(1);
@@ -1286,7 +1435,7 @@ describe("run-completion events (docs/adr/0052 §1)", () => {
       .mockResolvedValueOnce({ status: "succeeded", result: "t2", outcome: { verdict: "changes-requested" } })
       .mockResolvedValueOnce({ status: "succeeded", result: "t3", outcome: { verdict: "ready" } });
     await postGithub(h);
-    await vi.waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(4));
+    await waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(4));
 
     const [, second, third] = runEnvelopes(h);
     expect(second?.body).toEqual({
@@ -1316,7 +1465,7 @@ describe("run-completion events (docs/adr/0052 §1)", () => {
     const h = await start({ runEventMaxDepth: 1 });
     chain(h, TRIAGE, REVIEW);
     await postGithub(h);
-    await vi.waitFor(() => expect(h.logs.join("\n")).toMatch(/dropped, chain delivery-123 would reach depth 2 \(max 1\)/));
+    await waitFor(() => expect(h.logs.join("\n")).toMatch(/dropped, chain delivery-123 would reach depth 2 \(max 1\)/));
     await settle();
     // Depth 1 went out; depth 2 did not.
     expect(runEnvelopes(h)).toHaveLength(1);
@@ -1327,7 +1476,7 @@ describe("run-completion events (docs/adr/0052 §1)", () => {
     const h = await start({ runEventMaxDepth: 2 });
     chain(h, TRIAGE, REVIEW);
     await postGithub(h);
-    await vi.waitFor(() => expect(runEnvelopes(h)).toHaveLength(2));
+    await waitFor(() => expect(runEnvelopes(h)).toHaveLength(2));
   });
 
   it("a run source is not reachable over HTTP: no webhook route, no tick route", async () => {
@@ -1350,7 +1499,7 @@ describe("reply.github addLabels / assignees (docs/adr/0052 §3)", () => {
     const h = await start();
     h.submitEvent.mockResolvedValueOnce({ kind: "accepted", id: "inv-1", trigger: HANDOFF });
     await postGithub(h);
-    await vi.waitFor(() => expect(h.poll).toHaveBeenCalled());
+    await waitFor(() => expect(h.poll).toHaveBeenCalled());
     expect(h.addIssueLabels).toHaveBeenCalledWith("acme", "widgets", 12, ["ai-reviewed"]);
     expect(h.addIssueAssignees).toHaveBeenCalledWith("acme", "widgets", 12, ["alice"]);
     expect(h.order.slice(0, 4)).toEqual(["comment:Ready for review.", "addLabels:ai-reviewed", "assign:alice", "poll"]);
@@ -1361,7 +1510,7 @@ describe("reply.github addLabels / assignees (docs/adr/0052 §3)", () => {
     h.submitEvent.mockResolvedValueOnce({ kind: "accepted", id: "inv-1", trigger: HANDOFF });
     h.addIssueLabels.mockRejectedValueOnce(new Error("422 after retries"));
     await postGithub(h);
-    await vi.waitFor(() => expect(h.poll).toHaveBeenCalled());
+    await waitFor(() => expect(h.poll).toHaveBeenCalled());
     expect(h.onBackgroundError).toHaveBeenCalledWith(expect.objectContaining({ message: "422 after retries" }));
     expect(h.addIssueAssignees).toHaveBeenCalled();
   });
@@ -1369,13 +1518,13 @@ describe("reply.github addLabels / assignees (docs/adr/0052 §3)", () => {
   it("calls neither when the reply declares none", async () => {
     const h = await start();
     await postGithub(h);
-    await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
+    await waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
     expect(h.addIssueLabels).not.toHaveBeenCalled();
     expect(h.addIssueAssignees).not.toHaveBeenCalled();
   });
 });
 
-describe("in-flight run takeover (a gateway restarted mid-run)", () => {
+describe("legacy drain: runs a pre-Temporal gateway left in Redis (docs/adr/0057)", () => {
   const REVIEW: AcceptedTrigger = {
     name: "factory-review",
     sessionId: "github:acme/widgets#12",
@@ -1410,29 +1559,23 @@ describe("in-flight run takeover (a gateway restarted mid-run)", () => {
 
   const runEvents = (h: Harness): Envelope[] => h.submitEvent.mock.calls.map((c) => c[0] as Envelope).filter((e) => e.kind === "run");
 
-  /** One recovery pass, as the periodic sweep would run it. */
-  const sweep = (h: Harness): Promise<void> =>
-    (h.server as unknown as { inflightRecovery: { sweepOnce: () => Promise<void> } }).inflightRecovery.sweepOnce();
-
-  it("records an accepted run while it runs and clears it once finished", async () => {
-    const store = new InMemoryInflightRunStore();
-    const save = vi.spyOn(store, "save");
-    const h = await start({ inflightRunStore: store });
-    await postGithub(h);
-    await vi.waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
-    expect(save.mock.calls[0]?.[0]).toMatchObject({ key: "inv-1", invocationId: "inv-1", trigger: { name: "github-review" } });
-    await vi.waitFor(async () => expect(await store.list()).toEqual([]));
-  });
+  function drain(h: Harness, stores: { inflightRunStore?: InMemoryInflightRunStore; deferredEventStore?: InMemoryDeferredEventStore }) {
+    const d = new LegacyRunDrain({ runs: h.temporal.runs, ...stores, removeLabel: async () => {}, log: (l) => h.logs.push(l) });
+    return {
+      inflight: () => (d as unknown as { recovery: { sweepOnce: () => Promise<void> } }).recovery.sweepOnce(),
+      held: () => d.drainHeldOnce(),
+    };
+  }
 
   it("finishes a run a dead gateway left: polls it, posts the result, removes the label, emits the run event -- no second ack", async () => {
     const store = new InMemoryInflightRunStore();
-    const h = await start({ inflightRunStore: store });
+    const h = await start();
     h.poll.mockResolvedValueOnce({ status: "succeeded", result: "Changes requested.", outcome: VERDICT });
     h.submitEvent.mockResolvedValue({ kind: "ignored" });
     await store.save(orphan());
-    await sweep(h);
+    await drain(h, { inflightRunStore: store }).inflight();
 
-    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    await waitFor(() => expect(runEvents(h)).toHaveLength(1));
     expect(h.poll.mock.calls[0]?.[0]).toBe("inv-dead");
     expect(h.postIssueComment.mock.calls.map((c) => c[3])).toEqual(["Changes requested."]);
     expect(h.removeIssueLabel).toHaveBeenCalledWith("acme", "widgets", 12, "ai-review");
@@ -1442,35 +1585,29 @@ describe("in-flight run takeover (a gateway restarted mid-run)", () => {
       outcome: VERDICT,
       chain: { id: "delivery-dead", depth: 1, counts: { "factory-review": 1 }, origin: { login: "alice", repository: "acme/widgets" } },
     });
-    await vi.waitFor(async () => expect(await store.list()).toEqual([]));
+    // Handed over, so the old store is empty.
+    expect(await store.list()).toEqual([]);
   });
 
-  it("leaves alone a run another gateway still holds the lease on", async () => {
+  it("leaves alone a run an old gateway still holds the lease on", async () => {
     const store = new InMemoryInflightRunStore();
     await store.save(orphan());
     await store.lease("inv-dead", "the-old-pod", 60_000);
-    const h = await start({ inflightRunStore: store });
+    const h = await start();
+    await drain(h, { inflightRunStore: store }).inflight();
     await settle();
     expect(h.poll).not.toHaveBeenCalled();
     expect(await store.list()).toHaveLength(1);
   });
 
-  it("takes it over once that lease lapses", async () => {
-    const store = new InMemoryInflightRunStore();
-    await store.save(orphan());
-    await store.lease("inv-dead", "the-old-pod", 1);
-    await new Promise((r) => setTimeout(r, 5));
-    const h = await start({ inflightRunStore: store });
-    h.submitEvent.mockResolvedValue({ kind: "ignored" });
-    await vi.waitFor(() => expect(h.poll).toHaveBeenCalledWith("inv-dead", expect.anything()));
-  });
-
   it("never repeats a result comment or run event the dead gateway already sent", async () => {
     const store = new InMemoryInflightRunStore();
     await store.save(orphan({ resultPosted: true, emitted: true }));
-    const h = await start({ inflightRunStore: store });
-    await vi.waitFor(() => expect(h.poll).toHaveBeenCalled());
-    await vi.waitFor(async () => expect(await store.list()).toEqual([]));
+    const h = await start();
+    await drain(h, { inflightRunStore: store }).inflight();
+    await waitFor(() => expect(h.removeIssueLabel).toHaveBeenCalled());
+    await settle();
+    expect(h.poll).toHaveBeenCalled();
     expect(h.postIssueComment).not.toHaveBeenCalled();
     expect(h.submitEvent).not.toHaveBeenCalled();
   });
@@ -1478,9 +1615,35 @@ describe("in-flight run takeover (a gateway restarted mid-run)", () => {
   it("polls the re-submitted turn when the run had moved on past an identity link", async () => {
     const store = new InMemoryInflightRunStore();
     await store.save(orphan({ invocationId: "inv-resubmitted" }));
-    const h = await start({ inflightRunStore: store });
+    const h = await start();
     h.submitEvent.mockResolvedValue({ kind: "ignored" });
-    await vi.waitFor(() => expect(h.poll).toHaveBeenCalledWith("inv-resubmitted", expect.anything()));
+    await drain(h, { inflightRunStore: store }).inflight();
+    await waitFor(() => expect(h.poll).toHaveBeenCalledWith("inv-resubmitted", expect.anything()));
+  });
+
+  it("hands a held run event to a held-event workflow, which publishes it once its issue closes", async () => {
+    const deferred = new InMemoryDeferredEventStore();
+    await deferred.save({
+      id: "old-held",
+      createdAt: 0,
+      envelope: orphan().envelope,
+      sender: { login: "alice" },
+      trigger: { ...REVIEW, name: "factory-park", params: { repository: "acme/widgets", number: "12", waitFor: "5" } },
+      finished: { status: "succeeded" },
+      waitFor: { owner: "acme", repo: "widgets", number: 5 },
+      parkedOn: { owner: "acme", repo: "widgets", number: 12 },
+      blocked: true,
+    });
+    const h = await start();
+    h.submitEvent.mockResolvedValue({ kind: "ignored" });
+    await drain(h, { deferredEventStore: deferred }).held();
+    expect(await deferred.list()).toEqual([]);
+    await settle();
+    expect(runEvents(h)).toHaveLength(0);
+
+    h.getIssueState.mockImplementation(async (_o: string, _r: string, n: number) => (n === 5 ? "closed" : "open"));
+    await waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    expect(runEvents(h)[0]?.body).toMatchObject({ trigger: "factory-park", chain: { depth: 1 } });
   });
 });
 
@@ -1515,157 +1678,116 @@ describe("held run events and conflict events (docs/adr/0055)", () => {
     });
   }
   const runEvents = (h: Harness): Envelope[] => h.submitEvent.mock.calls.map((c) => c[0] as Envelope).filter((e) => e.kind === "run");
-  const kick = (h: Harness): void => (h.server as unknown as { kickHeldEvents: () => void }).kickHeldEvents();
-  const settle = (): Promise<void> => new Promise((r) => setTimeout(r, 30));
+  /** The held events now waiting (running heldRunEvent workflows on this harness's queue). */
+  const held = (h: Harness) => h.temporal.runs.listHeld();
+  const issueClosed = (h: Harness, closed: number): void => {
+    h.getIssueState.mockImplementation(async (_o: string, _r: string, n: number) => (n === closed ? "closed" : "open"));
+  };
 
   it("holds a waitUntilClosed completion while the issue is open, and publishes it once it closes", async () => {
-    const store = new InMemoryDeferredEventStore();
-    const h = await start({ deferredEventStore: store });
+    const h = await start();
     chain(h, PARK);
     await postGithub(h);
-    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
+    await waitFor(async () => expect(await held(h)).toEqual([{ parkedOn: "acme/widgets#7", waitFor: "acme/widgets#5" }]));
     expect(runEvents(h)).toHaveLength(0);
     expect(h.getIssueState).toHaveBeenCalledWith("acme", "widgets", 5);
     expect(h.logs.some((l) => l.includes("held until acme/widgets#5 is closed"))).toBe(true);
 
-    kick(h);
     await settle();
     expect(runEvents(h)).toHaveLength(0);
 
-    h.getIssueState.mockImplementation(async (_o: string, _r: string, n: number) => (n === 5 ? "closed" : "open"));
-    kick(h);
-    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    issueClosed(h, 5);
+    await waitFor(() => expect(runEvents(h)).toHaveLength(1));
     expect(runEvents(h)[0]?.body).toMatchObject({ trigger: "factory-park", params: { waitFor: "5" } });
-    expect(await store.list()).toHaveLength(0);
+    await waitFor(async () => expect(await held(h)).toEqual([]));
   });
 
-  it("keeps a held event whose publish hits a failed relay, and publishes it on a later sweep", async () => {
-    const store = new InMemoryDeferredEventStore();
-    const h = await start({ deferredEventStore: store });
+  it("retries a held event whose publish hits a failed relay, and publishes it", async () => {
+    const h = await start();
     chain(h, PARK);
     await postGithub(h);
-    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
-    const [held] = await store.list();
+    await waitFor(async () => expect(await held(h)).toHaveLength(1));
 
-    h.getIssueState.mockImplementation(async (_o: string, _r: string, n: number) => (n === 5 ? "closed" : "open"));
     h.submitEvent.mockResolvedValueOnce({ kind: "failed", error: "orchestrator down" });
-    kick(h);
-    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
-    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
-    // Same record: its place in line holds.
-    expect((await store.list())[0]).toMatchObject({ id: held!.id, createdAt: held!.createdAt });
-    expect(h.logs.some((l) => l.includes("held again for the next sweep"))).toBe(true);
+    issueClosed(h, 5);
+    await waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    await waitFor(() => expect(h.logs.some((l) => l.includes("publish failed (attempt 1); retrying"))).toBe(true));
 
     h.submitEvent.mockResolvedValue({ kind: "ignored" });
-    kick(h);
-    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(2));
+    await waitFor(() => expect(runEvents(h)).toHaveLength(2));
     expect(runEvents(h)[1]?.body).toMatchObject({ trigger: "factory-park", params: { waitFor: "5" } });
-    await vi.waitFor(async () => expect(await store.list()).toHaveLength(0));
+    await waitFor(async () => expect(await held(h)).toEqual([]));
   });
 
-  it("stops retrying a held event whose publish keeps failing, and frees its queue", async () => {
-    const store = new InMemoryDeferredEventStore();
-    let clock = Date.parse("2026-01-01T00:00:00Z");
-    const h = await start({ deferredEventStore: store, now: () => new Date(clock) });
+  it("stops retrying a publish that keeps failing, says so on the issue, and frees its queue", async () => {
+    const h = await start({}, SECRETS, { publishRetryWindowMs: 300 });
     chain(h, INTAKE);
     h.submitEvent.mockResolvedValue({ kind: "failed", error: "404 not found" });
     h.submitEvent.mockResolvedValueOnce({ kind: "accepted", id: "inv-1", trigger: INTAKE });
     await postGithub(h);
-    // Held for its queue, published at once, and the publish fails.
-    await vi.waitFor(async () => expect((await store.list())[0]?.publishFailure).toEqual({ firstAt: clock, attempts: 1 }));
-    const [held] = await store.list();
-    const queue = held!.queue!;
-    const firstAt = clock;
-    clock += 60 * 60 * 1000;
-    kick(h);
-    await vi.waitFor(async () => expect((await store.list())[0]?.publishFailure).toEqual({ firstAt, attempts: 2 }));
-    expect((await store.list())[0]).toMatchObject({ id: held!.id, createdAt: held!.createdAt });
-
-    clock = firstAt + 24 * 60 * 60 * 1000;
-    kick(h);
-    await vi.waitFor(() => expect(h.logs.some((l) => l.includes("publish failed 3 times") && l.includes("dropped"))).toBe(true));
-    expect(await store.list()).toHaveLength(0);
+    await waitFor(() => expect(h.logs.some((l) => /publish failed \d+ times since .*; dropped/.test(l))).toBe(true));
     // A human is told, where the held run replied.
-    await vi.waitFor(() =>
+    await waitFor(() =>
       expect(h.postIssueComment).toHaveBeenCalledWith("acme", "widgets", 7, expect.stringContaining("could not be delivered after retrying")),
     );
-    // Its queue was released: another holder can take it.
-    expect(await store.acquireQueue(queue, "other", 60_000)).toBe(true);
+    await waitFor(async () => expect(await held(h)).toEqual([]));
+
+    // Its queue was released: the next completion in it goes straight out.
+    const before = runEvents(h).length;
+    h.submitEvent.mockResolvedValueOnce({ kind: "accepted", id: "inv-2", trigger: INTAKE }).mockResolvedValueOnce({ kind: "ignored" });
+    await postGithub(h);
+    await waitFor(() => expect(runEvents(h).length).toBe(before + 1));
   });
 
-  it("keeps a held event whose sender re-verification throws, and publishes it once the resolver recovers", async () => {
-    const store = new InMemoryDeferredEventStore();
-    const h = await start({ deferredEventStore: store });
+  it("retries a held event whose sender re-verification throws, and publishes it once the resolver recovers", async () => {
+    const h = await start();
     chain(h, PARK);
     await postGithub(h);
-    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
-    const [held] = await store.list();
+    await waitFor(async () => expect(await held(h)).toHaveLength(1));
 
-    h.getIssueState.mockImplementation(async (_o: string, _r: string, n: number) => (n === 5 ? "closed" : "open"));
     h.resolve.mockRejectedValueOnce(new Error("GitHub 502"));
-    kick(h);
-    await vi.waitFor(async () => expect((await store.list())[0]?.publishFailure?.attempts).toBe(1));
-    expect((await store.list())[0]).toMatchObject({ id: held!.id, createdAt: held!.createdAt });
-    expect(runEvents(h)).toHaveLength(0);
-    expect(h.postIssueComment).not.toHaveBeenCalledWith("acme", "widgets", 7, expect.stringContaining("could not be re-verified"));
-
     h.submitEvent.mockResolvedValue({ kind: "ignored" });
-    kick(h);
-    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    issueClosed(h, 5);
+    await waitFor(() => expect(h.logs.some((l) => l.includes("could not be re-verified right now (resolver error)"))).toBe(true));
+    expect(h.postIssueComment).not.toHaveBeenCalledWith("acme", "widgets", 7, expect.stringContaining("could not be re-verified"));
+    await waitFor(() => expect(runEvents(h)).toHaveLength(1));
     expect(runEvents(h)[0]?.body).toMatchObject({ trigger: "factory-park" });
-    await vi.waitFor(async () => expect(await store.list()).toHaveLength(0));
   });
 
-  it("re-reads a held event's issues from GitHub at most once per check interval", async () => {
-    const store = new InMemoryDeferredEventStore();
-    const h = await start({ deferredEventStore: store, heldEventStateCheckIntervalMs: 60 * 60 * 1000 });
+  it("re-reads a held event's issues from GitHub only once per check interval", async () => {
+    const h = await start({}, SECRETS, { heldEventCheckMs: 60 * 60 * 1000 });
     chain(h, PARK);
     await postGithub(h);
-    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
-    kick(h);
-    await settle();
+    await waitFor(async () => expect(await held(h)).toHaveLength(1));
     const calls = h.getIssueState.mock.calls.length;
-
-    kick(h);
     await settle();
-    kick(h);
     await settle();
     expect(h.getIssueState.mock.calls.length).toBe(calls);
-    expect(await store.list()).toHaveLength(1);
-
-    // Once the mark lapses, the next pass checks again (and publishes).
-    await store.unmark(`waitcheck:${(await store.list())[0]!.id}`);
-    h.getIssueState.mockImplementation(async (_o: string, _r: string, n: number) => (n === 5 ? "closed" : "open"));
-    kick(h);
-    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
   });
 
   it("drops a held event the orchestrator delivered but did not accept", async () => {
-    const store = new InMemoryDeferredEventStore();
-    const h = await start({ deferredEventStore: store });
+    const h = await start();
     chain(h, PARK);
     await postGithub(h);
-    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
-    h.getIssueState.mockImplementation(async (_o: string, _r: string, n: number) => (n === 5 ? "closed" : "open"));
+    await waitFor(async () => expect(await held(h)).toHaveLength(1));
     h.submitEvent.mockResolvedValue({ kind: "rejected", error: "bad params" });
-    kick(h);
-    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    issueClosed(h, 5);
+    await waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    await waitFor(async () => expect(await held(h)).toEqual([]));
     await settle();
-    expect(await store.list()).toHaveLength(0);
+    expect(runEvents(h)).toHaveLength(1);
   });
 
   it("restarts the chain depth when the wait really blocked (counts are kept)", async () => {
-    const store = new InMemoryDeferredEventStore();
     const FIRST: AcceptedTrigger = { ...PARK, name: "factory-coordinate", onComplete: { emitTo: "runs" } };
-    const h = await start({ deferredEventStore: store, runEventMaxDepth: 1 });
+    const h = await start({ runEventMaxDepth: 1 });
     chain(h, FIRST, PARK);
     await postGithub(h);
     // webhook -> coordinate (its event at depth 1) -> park, held.
-    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
-    h.getIssueState.mockImplementation(async (_o: string, _r: string, n: number) => (n === 5 ? "closed" : "open"));
-    kick(h);
+    await waitFor(async () => expect(await held(h)).toHaveLength(1));
+    issueClosed(h, 5);
     // Without the reset this would be depth 2 > max 1, and dropped.
-    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(2));
+    await waitFor(() => expect(runEvents(h)).toHaveLength(2));
     expect((runEvents(h)[1]?.body as { chain: unknown }).chain).toMatchObject({
       depth: 1,
       counts: { "factory-coordinate": 1, "factory-park": 1 },
@@ -1673,14 +1795,12 @@ describe("held run events and conflict events (docs/adr/0055)", () => {
   });
 
   it("abandons a wait when the held run's own issue is closed", async () => {
-    const store = new InMemoryDeferredEventStore();
-    const h = await start({ deferredEventStore: store });
+    const h = await start();
     chain(h, PARK);
     await postGithub(h);
-    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
-    h.getIssueState.mockImplementation(async (_o: string, _r: string, n: number) => (n === 7 ? "closed" : "open"));
-    kick(h);
-    await vi.waitFor(async () => expect(await store.list()).toHaveLength(0));
+    await waitFor(async () => expect(await held(h)).toHaveLength(1));
+    issueClosed(h, 7);
+    await waitFor(async () => expect(await held(h)).toEqual([]));
     expect(runEvents(h)).toHaveLength(0);
     expect(h.logs.some((l) => l.includes("abandoned"))).toBe(true);
   });
@@ -1689,12 +1809,11 @@ describe("held run events and conflict events (docs/adr/0055)", () => {
     ["its own issue", { waitFor: "7" }, "its own issue"],
     ["an unusable number", { waitFor: "none" }, "are not a repository and number"],
   ])("does not wait on %s -- publishes at once", async (_, params, why) => {
-    const store = new InMemoryDeferredEventStore();
-    const h = await start({ deferredEventStore: store });
+    const h = await start();
     chain(h, { ...PARK, params: { ...PARK.params!, ...params } });
     await postGithub(h);
-    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
-    expect(await store.list()).toHaveLength(0);
+    await waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    expect(await held(h)).toEqual([]);
     expect(h.logs.some((l) => l.includes(why))).toBe(true);
   });
 
@@ -1703,34 +1822,34 @@ describe("held run events and conflict events (docs/adr/0055)", () => {
     h.getIssueState.mockResolvedValue("closed");
     chain(h, PARK);
     await postGithub(h);
-    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    await waitFor(() => expect(runEvents(h)).toHaveLength(1));
     expect(h.logs.some((l) => l.includes("is already closed"))).toBe(true);
   });
 
   it("refuses a wait cycle: #7 waiting on #5 while #5 waits on #7 publishes at once", async () => {
-    const store = new InMemoryDeferredEventStore();
-    await store.save({
-      id: "other",
-      createdAt: 0,
-      envelope: { source: "runs", kind: "run", id: "e", time: "t", headers: {}, sender: {}, repository: "acme/widgets", body: {} },
-      trigger: { ...PARK, reply: { github: { repository: "acme/widgets", issueNumber: 5 } } },
-      finished: { status: "succeeded" },
+    const h = await start();
+    // #5's own completion is already held, waiting on #7.
+    await h.temporal.runs.startHeld("other", {
+      completed: {
+        envelope: { source: "runs", kind: "run", id: "e", time: "t", headers: {}, sender: {}, repository: "acme/widgets", body: {} },
+        trigger: { ...PARK, reply: { github: { repository: "acme/widgets", issueNumber: 5 } } },
+        finished: { status: "succeeded" },
+      },
       waitFor: { owner: "acme", repo: "widgets", number: 7 },
       parkedOn: { owner: "acme", repo: "widgets", number: 5 },
       blocked: true,
     });
-    const h = await start({ deferredEventStore: store });
+    await waitFor(async () => expect(await held(h)).toHaveLength(1));
     chain(h, PARK);
     await postGithub(h);
-    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    await waitFor(() => expect(runEvents(h)).toHaveLength(1));
     expect(runEvents(h)[0]?.body).toMatchObject({ trigger: "factory-park" });
     expect(h.logs.some((l) => l.includes("would be a cycle"))).toBe(true);
-    expect((await store.list()).map((e) => e.id)).toEqual(["other"]);
+    expect(await held(h)).toEqual([{ parkedOn: "acme/widgets#5", waitFor: "acme/widgets#7" }]);
   });
 
   it("serializes: a second completion in the same queue waits until the run the first one started finishes", async () => {
-    const store = new InMemoryDeferredEventStore();
-    const h = await start({ deferredEventStore: store });
+    const h = await start();
     chain(h, INTAKE, COORDINATE, INTAKE, COORDINATE);
     let finishFirst!: () => void;
     const firstCoordinate = new Promise<OrchestratorInvokeResult>((resolve) => {
@@ -1739,26 +1858,116 @@ describe("held run events and conflict events (docs/adr/0055)", () => {
     h.poll.mockImplementation(async (id: string) => (id === "inv-2" ? firstCoordinate : { status: "succeeded", result: "ok" }));
 
     await postGithub(h);
-    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    await waitFor(() => expect(runEvents(h)).toHaveLength(1));
     // The coordinate run (inv-2) now holds queue coord:acme/widgets.
     await postGithub(h);
-    await vi.waitFor(async () => expect(await store.list()).toHaveLength(1));
-    kick(h);
+    await waitFor(async () => expect(await held(h)).toHaveLength(1));
     await settle();
     expect(runEvents(h)).toHaveLength(1);
 
     finishFirst();
-    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(2));
-    expect(await store.list()).toHaveLength(0);
+    await waitFor(() => expect(runEvents(h)).toHaveLength(2));
+    await waitFor(async () => expect(await held(h)).toEqual([]));
   });
 
   it("frees the queue when the held event is not accepted", async () => {
-    const store = new InMemoryDeferredEventStore();
-    const h = await start({ deferredEventStore: store });
-    chain(h, INTAKE); // its run event is then "ignored"
+    const h = await start();
+    chain(h, INTAKE, INTAKE); // each run event is then "ignored"
     await postGithub(h);
-    await vi.waitFor(() => expect(runEvents(h)).toHaveLength(1));
-    await vi.waitFor(async () => expect(await store.acquireQueue("coord:acme/widgets", "probe", 1000)).toBe(true));
+    await waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    // The next completion in the same queue is not kept waiting.
+    await postGithub(h);
+    await waitFor(() => expect(runEvents(h)).toHaveLength(2));
+  });
+
+  it("frees the queue when the held event was accepted but its run could not be started", async () => {
+    const h = await start();
+    chain(h, INTAKE, COORDINATE, INTAKE, COORDINATE);
+    const startEventRun = h.temporal.runs.startEventRun.bind(h.temporal.runs);
+    vi.spyOn(h.temporal.runs, "startEventRun").mockImplementation(async (input) => {
+      if (input.invocationId === "inv-2") throw new Error("temporal unreachable");
+      return startEventRun(input);
+    });
+    await postGithub(h);
+    await waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    await waitFor(() => expect(h.logs.some((l) => l.includes("accepted, but its run could not be started"))).toBe(true));
+    // No run holds the queue, so the next completion in it is not kept waiting.
+    await postGithub(h);
+    await waitFor(() => expect(runEvents(h)).toHaveLength(2));
+    await waitFor(async () => expect(await held(h)).toEqual([]));
+    // Published once each: an accepted event is never published again.
+    expect(runEvents(h)).toHaveLength(2);
+  });
+
+  it("moves the queue on within the claim grace when a held publish ends without an answer and no run started", async () => {
+    let emits = 0;
+    const h = await start({}, SECRETS, { queueClaimGraceMs: 300 }, (a) => ({
+      ...a,
+      emitRunEvent: async (...args) => {
+        // The first publish dies before it reaches the orchestrator.
+        if (++emits === 1) throw new Error("worker lost before the relay");
+        return a.emitRunEvent(...args);
+      },
+    }));
+    chain(h, INTAKE, INTAKE);
+    await postGithub(h);
+    await waitFor(() => expect(h.logs.some((l) => l.includes("ended without an answer"))).toBe(true));
+    expect(runEvents(h)).toHaveLength(0);
+    await postGithub(h);
+    await waitFor(() => expect(runEvents(h)).toHaveLength(1));
+    expect(h.logs.some((l) => l.includes("no run claimed the queue"))).toBe(true);
+  });
+
+  it("keeps the queue for a run that did start when its held publish ended without an answer", async () => {
+    let emits = 0;
+    const h = await start({}, SECRETS, { queueClaimGraceMs: 300 }, (a) => ({
+      ...a,
+      emitRunEvent: async (...args) => {
+        const result = await a.emitRunEvent(...args);
+        // The first publish dies after the orchestrator accepted it and its run started.
+        if (++emits === 1) throw new Error("worker lost after the relay");
+        return result;
+      },
+    }));
+    chain(h, INTAKE, COORDINATE, INTAKE, COORDINATE);
+    let finishFirst!: () => void;
+    const firstCoordinate = new Promise<OrchestratorInvokeResult>((resolve) => {
+      finishFirst = () => resolve({ status: "succeeded", result: "decided" });
+    });
+    h.poll.mockImplementation(async (id: string) => (id === "inv-2" ? firstCoordinate : { status: "succeeded", result: "ok" }));
+
+    await postGithub(h);
+    await waitFor(() => expect(h.logs.some((l) => l.includes("ended without an answer"))).toBe(true));
+    await waitFor(() => expect(h.poll).toHaveBeenCalledWith("inv-2", expect.anything()));
+    // The coordinate run (inv-2) claimed the queue: well past the claim grace, the next completion still waits.
+    await postGithub(h);
+    await waitFor(async () => expect(await held(h)).toHaveLength(1));
+    await settle();
+    expect(runEvents(h)).toHaveLength(1);
+
+    finishFirst();
+    await waitFor(() => expect(runEvents(h)).toHaveLength(2));
+    await waitFor(async () => expect(await held(h)).toEqual([]));
+  });
+
+  it("never publishes a run event twice when its publish dies after the orchestrator accepted it", async () => {
+    const EMITS: AcceptedTrigger = { ...COORDINATE, name: "factory-intake", sessionId: "event:intake", onComplete: { emitTo: "runs" } };
+    // The worker "dies" after /invoke accepted and the next run started: the activity fails.
+    const h = await start({}, SECRETS, {}, (a) => ({
+      ...a,
+      emitRunEvent: async (...args) => {
+        await a.emitRunEvent(...args);
+        throw new Error("worker lost after the relay");
+      },
+    }));
+    chain(h, EMITS, COORDINATE);
+    await postGithub(h);
+    await waitFor(() => expect(h.logs.some((l) => l.includes("ended without an answer"))).toBe(true));
+    await waitFor(() => expect(h.poll).toHaveBeenCalledWith("inv-2", expect.anything()));
+    await settle();
+    // One acceptance, one next-hop run: the activity is not retried.
+    expect(runEvents(h)).toHaveLength(1);
+    expect(h.poll.mock.calls.filter((c) => c[0] === "inv-2")).toHaveLength(1);
   });
 
   describe("conflict sweep", () => {
@@ -1777,23 +1986,38 @@ describe("held run events and conflict events (docs/adr/0055)", () => {
       labels: [] as string[],
       assignees: [{ login: "alice", id: 42 }],
     };
-    const sweep = (h: Harness): Promise<void> =>
-      (h.server as unknown as { conflictSweeper: { sweepSource: (n: string, c: unknown) => Promise<void> } }).conflictSweeper.sweepSource(
-        "pr-conflicts",
-        { author: "app/k5s-bot", intervalMs: 300_000, skipLabels: ["ai-triage"] },
-      );
+
+    /** The SOURCES registry, with pr-conflicts sweeping every 50ms instead of the 60s minimum a CR can ask for. */
+    function fastConflicts(): EventSourceLookup {
+      const registry = new StaticEventSourceRegistry(SOURCES, () => {});
+      return {
+        get: (name) => {
+          const s = registry.get(name);
+          return s?.kind === "conflicts" ? { ...s, conflicts: { ...s.conflicts, intervalMs: 50 } } : s;
+        },
+        all: () => registry.all(),
+      };
+    }
+
+    async function sweeping(prepare: (h: Harness) => void): Promise<Harness> {
+      const h = await start({ eventSources: fastConflicts() });
+      prepare(h);
+      await h.temporal.runs.ensureConflictSweeps(["pr-conflicts"]);
+      return h;
+    }
 
     const appAssigned = (h: Harness, ...logins: string[]): void => {
       h.getAssignmentActors.mockResolvedValue(new Map(logins.map((l) => [l, "k5s-bot[bot]"])));
     };
 
     it("emits one conflict event per PR and base commit, acting as the verified assignee", async () => {
-      const h = await start();
-      appAssigned(h, "alice");
-      h.submitEvent.mockResolvedValue({ kind: "ignored" });
-      h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
-      h.getPullRequest.mockResolvedValue(DIRTY);
-      await sweep(h);
+      const h = await sweeping((h) => {
+        appAssigned(h, "alice");
+        h.submitEvent.mockResolvedValue({ kind: "ignored" });
+        h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
+        h.getPullRequest.mockResolvedValue(DIRTY);
+      });
+      await waitFor(() => expect(h.searchOpenPullRequests.mock.calls.length).toBeGreaterThanOrEqual(3));
       expect(h.searchOpenPullRequests).toHaveBeenCalledWith("app/k5s-bot");
       expect(h.submitEvent).toHaveBeenCalledTimes(1);
       expect(submittedEnvelope(h)).toMatchObject({
@@ -1805,12 +2029,99 @@ describe("held run events and conflict events (docs/adr/0055)", () => {
       });
       expect(h.submitEvent.mock.calls[0]?.[1]).toMatchObject({ login: "alice", accountId: "42" });
 
-      await sweep(h);
-      expect(h.submitEvent).toHaveBeenCalledTimes(1);
       // The base moved: once more.
       h.getPullRequest.mockResolvedValue({ ...DIRTY, baseSha: "base2" });
-      await sweep(h);
+      await waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(2));
+      const sweeps = h.searchOpenPullRequests.mock.calls.length;
+      await waitFor(() => expect(h.searchOpenPullRequests.mock.calls.length).toBeGreaterThanOrEqual(sweeps + 2));
       expect(h.submitEvent).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not emit a conflict event again when its publish dies after the orchestrator accepted it", async () => {
+      const h = await start({ eventSources: fastConflicts() }, SECRETS, {}, (a) => ({
+        ...a,
+        emitConflict: async (...args) => {
+          await a.emitConflict(...args);
+          throw new Error("worker lost after the relay");
+        },
+      }));
+      appAssigned(h, "alice");
+      h.submitEvent.mockResolvedValue({ kind: "ignored" });
+      h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
+      h.getPullRequest.mockResolvedValue(DIRTY);
+      await h.temporal.runs.ensureConflictSweeps(["pr-conflicts"]);
+      await waitFor(() => expect(h.searchOpenPullRequests.mock.calls.length).toBeGreaterThanOrEqual(3));
+      // The sweep kept going, and sent the event once.
+      expect(h.submitEvent).toHaveBeenCalledTimes(1);
+      expect(h.logs.some((l) => l.includes("ended without an answer"))).toBe(true);
+    });
+
+    it("keeps its marks when a scan fails, rather than ending and emitting them again", async () => {
+      let failing = false;
+      const h = await start({ eventSources: fastConflicts() }, SECRETS, {}, (a) => ({
+        ...a,
+        findConflicts: async (...args) => {
+          if (failing) throw new Error("GitHub too slow");
+          return a.findConflicts(...args);
+        },
+      }));
+      appAssigned(h, "alice");
+      h.submitEvent.mockResolvedValue({ kind: "ignored" });
+      h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
+      h.getPullRequest.mockResolvedValue(DIRTY);
+      await h.temporal.runs.ensureConflictSweeps(["pr-conflicts"]);
+      await waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(1));
+      failing = true;
+      await waitFor(() => expect(h.logs.some((l) => l.includes("conflicts pr-conflicts: scan failed (GitHub too slow)"))).toBe(true));
+      failing = false;
+      const sweeps = h.searchOpenPullRequests.mock.calls.length;
+      await waitFor(() => expect(h.searchOpenPullRequests.mock.calls.length).toBeGreaterThanOrEqual(sweeps + 2));
+      // The same workflow kept its mark for (PR 12, base1): no second event.
+      expect(h.submitEvent).toHaveBeenCalledTimes(1);
+      const desc = await h.temporal.runs.client.workflow.getHandle(`${h.temporal.taskQueue}/conflict-sweep:pr-conflicts`).describe();
+      expect(desc.status.name).toBe("RUNNING");
+    });
+
+    it("does not emit again for a PR the pre-0057 sweep already marked in Redis", async () => {
+      const deferredEventStore = new InMemoryDeferredEventStore();
+      await deferredEventStore.markOnce("conflict:pr-conflicts:acme/widgets#12@base1", 30 * 24 * 60 * 60 * 1000);
+      const h = await start({ eventSources: fastConflicts() });
+      appAssigned(h, "alice");
+      h.submitEvent.mockResolvedValue({ kind: "ignored" });
+      h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
+      h.getPullRequest.mockResolvedValue(DIRTY);
+      const drain = new LegacyRunDrain({ runs: h.temporal.runs, deferredEventStore, removeLabel: async () => {} });
+      await h.temporal.runs.ensureConflictSweeps(["pr-conflicts"], (source) => drain.conflictMarks(source));
+      await waitFor(() => expect(h.searchOpenPullRequests.mock.calls.length).toBeGreaterThanOrEqual(3));
+      expect(h.submitEvent).not.toHaveBeenCalled();
+
+      // A new base commit is a new conflict: emitted once.
+      h.getPullRequest.mockResolvedValue({ ...DIRTY, baseSha: "base2" });
+      await waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(1));
+      expect(submittedEnvelope(h)).toMatchObject({ body: { pullRequest: { baseSha: "base2" } } });
+    });
+
+    it("does not start a sweep while the pre-0057 marks can't be read", async () => {
+      const h = await sweeping((h) => h.searchOpenPullRequests.mockResolvedValue([]));
+      const id = `${h.temporal.taskQueue}/conflict-sweep:pr-conflicts`;
+      await h.temporal.runs.client.workflow.getHandle(id).terminate("test");
+      await h.temporal.runs.ensureConflictSweeps(["pr-conflicts"], async () => {
+        throw new Error("redis down");
+      });
+      expect((await h.temporal.runs.client.workflow.getHandle(id).describe()).status.name).toBe("TERMINATED");
+    });
+
+    it("one sweep per source, however often it is ensured", async () => {
+      const h = await sweeping((h) => h.searchOpenPullRequests.mockResolvedValue([]));
+      await h.temporal.runs.ensureConflictSweeps(["pr-conflicts"]);
+      await h.temporal.runs.ensureConflictSweeps(["pr-conflicts"]);
+      const running = [];
+      for await (const w of h.temporal.runs.client.workflow.list({
+        query: `WorkflowType = 'conflictSweep' AND ExecutionStatus = 'Running' AND TaskQueue = '${h.temporal.taskQueue}'`,
+      })) {
+        running.push(w.workflowId);
+      }
+      expect(running).toEqual([`${h.temporal.taskQueue}/conflict-sweep:pr-conflicts`]);
     });
 
     it.each([
@@ -1821,46 +2132,59 @@ describe("held run events and conflict events (docs/adr/0055)", () => {
       ["unassigned", { assignees: [] }],
       ["assigned only to someone who does not verify", { assignees: [{ login: "mallory", id: 1 }] }],
     ])("skips a PR that is %s", async (_, patch) => {
-      const h = await start();
-      appAssigned(h, "alice", "mallory");
-      h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
-      h.getPullRequest.mockResolvedValue({ ...DIRTY, ...patch });
-      await sweep(h);
+      const h = await sweeping((h) => {
+        appAssigned(h, "alice", "mallory");
+        h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
+        h.getPullRequest.mockResolvedValue({ ...DIRTY, ...patch });
+      });
+      await waitFor(() => expect(h.getPullRequest.mock.calls.length).toBeGreaterThanOrEqual(2));
       expect(h.submitEvent).not.toHaveBeenCalled();
     });
 
     it("skips an assignee a person assigned, even one who verifies", async () => {
-      const h = await start();
-      h.getAssignmentActors.mockResolvedValue(new Map([["alice", "some-triager"]]));
-      h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
-      h.getPullRequest.mockResolvedValue(DIRTY);
-      await sweep(h);
+      const h = await sweeping((h) => {
+        h.getAssignmentActors.mockResolvedValue(new Map([["alice", "some-triager"]]));
+        h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
+        h.getPullRequest.mockResolvedValue(DIRTY);
+      });
+      await waitFor(() => expect(h.logs.some((l) => l.includes("not running as assignee alice (assigned by some-triager"))).toBe(true));
       expect(h.getAssignmentActors).toHaveBeenCalledWith("acme", "widgets", 12);
       expect(h.submitEvent).not.toHaveBeenCalled();
-      expect(h.logs.some((l) => l.includes("not running as assignee alice (assigned by some-triager"))).toBe(true);
     });
 
     it("uses the App-assigned assignee and passes over one a person added", async () => {
-      const h = await start();
-      h.getAssignmentActors.mockResolvedValue(new Map([["mallory", "some-triager"], ["alice", "K5S-Bot[bot]"]]));
-      h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
-      h.getPullRequest.mockResolvedValue({ ...DIRTY, assignees: [{ login: "mallory", id: 1 }, { login: "alice", id: 42 }] });
-      h.submitEvent.mockResolvedValue({ kind: "ignored" });
-      await sweep(h);
-      expect(h.submitEvent).toHaveBeenCalledTimes(1);
+      const h = await sweeping((h) => {
+        h.getAssignmentActors.mockResolvedValue(new Map([["mallory", "some-triager"], ["alice", "K5S-Bot[bot]"]]));
+        h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
+        h.getPullRequest.mockResolvedValue({ ...DIRTY, assignees: [{ login: "mallory", id: 1 }, { login: "alice", id: 42 }] });
+        h.submitEvent.mockResolvedValue({ kind: "ignored" });
+      });
+      await waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(1));
       expect(submittedEnvelope(h)).toMatchObject({ sender: { login: "alice", isBot: false } });
     });
 
     it("retries next sweep when the orchestrator was unreachable", async () => {
-      const h = await start();
-      appAssigned(h, "alice");
-      h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
-      h.getPullRequest.mockResolvedValue(DIRTY);
-      h.submitEvent.mockResolvedValueOnce({ kind: "failed", error: "down" }).mockResolvedValue({ kind: "ignored" });
-      await sweep(h);
-      await sweep(h);
+      const h = await sweeping((h) => {
+        appAssigned(h, "alice");
+        h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
+        h.getPullRequest.mockResolvedValue(DIRTY);
+        h.submitEvent.mockResolvedValueOnce({ kind: "failed", error: "down" }).mockResolvedValue({ kind: "ignored" });
+      });
+      await waitFor(() => expect(h.submitEvent).toHaveBeenCalledTimes(2));
+      const sweeps = h.searchOpenPullRequests.mock.calls.length;
+      await waitFor(() => expect(h.searchOpenPullRequests.mock.calls.length).toBeGreaterThanOrEqual(sweeps + 2));
       expect(h.submitEvent).toHaveBeenCalledTimes(2);
+    });
+
+    it("ends its sweep once the source is gone", async () => {
+      let gone = false;
+      const fast = fastConflicts();
+      const h = await start({ eventSources: { get: (name) => (gone && name === "pr-conflicts" ? undefined : fast.get(name)), all: fast.all } });
+      await h.temporal.runs.ensureConflictSweeps(["pr-conflicts"]);
+      await waitFor(() => expect(h.searchOpenPullRequests).toHaveBeenCalled());
+      gone = true;
+      // Completes (rather than sweeping forever) at its next wake-up.
+      await h.temporal.runs.client.workflow.getHandle(`${h.temporal.taskQueue}/conflict-sweep:pr-conflicts`).result();
     });
   });
 });
-

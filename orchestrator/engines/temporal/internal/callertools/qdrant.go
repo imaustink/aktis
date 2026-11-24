@@ -122,13 +122,33 @@ func (s *QdrantStore) Index(ctx context.Context, tools []Descriptor) error {
 		return nil
 	}
 
-	texts := make([]string, len(misses))
-	for i, tool := range misses {
-		texts[i] = embeddingText(tool)
-	}
-	vectors, err := s.embedder.Embed(ctx, texts)
+	// A definition the TypeScript store already embedded is reused, not
+	// re-embedded: same hash, same embedding text, only the point id differs.
+	legacy, err := s.legacyVectors(ctx, misses)
 	if err != nil {
-		return fmt.Errorf("embed %d caller tools: %w", len(misses), err)
+		return err
+	}
+	vectors := make([][]float32, len(misses))
+	var toEmbed []int
+	for i, tool := range misses {
+		if v, ok := legacy[tool.Hash]; ok {
+			vectors[i] = v
+			continue
+		}
+		toEmbed = append(toEmbed, i)
+	}
+	if len(toEmbed) > 0 {
+		texts := make([]string, len(toEmbed))
+		for j, i := range toEmbed {
+			texts[j] = embeddingText(misses[i])
+		}
+		embedded, err := s.embedder.Embed(ctx, texts)
+		if err != nil {
+			return fmt.Errorf("embed %d caller tools: %w", len(toEmbed), err)
+		}
+		for j, i := range toEmbed {
+			vectors[i] = embedded[j]
+		}
 	}
 
 	points := make([]*qdrant.PointStruct, len(misses))
@@ -141,7 +161,11 @@ func (s *QdrantStore) Index(ctx context.Context, tools []Descriptor) error {
 			Id:      qdrant.NewIDUUID(s.pointID(tool.Hash)),
 			Vectors: qdrant.NewVectors(vectors[i]...),
 			Payload: qdrant.NewValueMap(map[string]any{
-				"hash":       tool.Hash,
+				"hash": tool.Hash,
+				// Observability only (never read back): which function a
+				// point is, for an operator or the e2e suite scrolling the
+				// collection. The TS store wrote the same field.
+				"name":       tool.Name,
 				"descriptor": string(descriptor),
 				"lastSeenAt": now,
 			}),
@@ -155,7 +179,62 @@ func (s *QdrantStore) Index(ctx context.Context, tools []Descriptor) error {
 	}); err != nil {
 		return fmt.Errorf("upsert %d caller tools: %w", len(points), err)
 	}
+	if len(legacy) > 0 {
+		// Migrated: the TS point is now a duplicate. Best effort -- one left
+		// behind is harmless and Prune ages it out on the normal TTL.
+		ids := make([]*qdrant.PointId, 0, len(legacy))
+		for hash := range legacy {
+			ids = append(ids, qdrant.NewIDUUID(legacyPointID(hash)))
+		}
+		_, _ = s.client.Delete(ctx, &qdrant.DeletePoints{
+			CollectionName: s.collection,
+			Points:         qdrant.NewPointsSelector(ids...),
+		})
+	}
 	return nil
+}
+
+// legacyVectors returns, by hash, the vectors the TypeScript agent-orchestrator
+// (before docs/adr/0056) stored for any of tools. Its points live in the same
+// collection under legacyPointID; a payload whose hash disagrees is ignored.
+func (s *QdrantStore) legacyVectors(ctx context.Context, tools []Descriptor) (map[string][]float32, error) {
+	ids := make([]*qdrant.PointId, len(tools))
+	for i, tool := range tools {
+		ids[i] = qdrant.NewIDUUID(legacyPointID(tool.Hash))
+	}
+	points, err := s.client.Get(ctx, &qdrant.GetPoints{
+		CollectionName: s.collection,
+		Ids:            ids,
+		WithPayload:    qdrant.NewWithPayload(true),
+		WithVectors:    qdrant.NewWithVectors(true),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("look up %d pre-0056 caller tools: %w", len(ids), err)
+	}
+	out := map[string][]float32{}
+	for _, p := range points {
+		hash := p.GetPayload()["hash"].GetStringValue()
+		vector := p.GetVectors().GetVector()
+		data := vector.GetDense().GetData()
+		if len(data) == 0 {
+			data = vector.GetData() //nolint:staticcheck // older servers fill only the deprecated field
+		}
+		if hash != "" && legacyPointID(hash) == p.GetId().GetUuid() && uint64(len(data)) == s.dims {
+			out[hash] = data
+		}
+	}
+	return out, nil
+}
+
+// legacyNamespace is the UUIDv5 namespace the TypeScript store derived point
+// ids in (vector-store/qdrant-id.ts: toQdrantPointId).
+var legacyNamespace = uuid.Must(uuid.FromBytes([]byte{
+	0x7b, 0x6f, 0x1e, 0x1a, 0x6e, 0x6a, 0x4f, 0x0e, 0x9b, 0x7a, 0x9f, 0x2e, 0x6b, 0x8a, 0x2f, 0x1a,
+}))
+
+// legacyPointID is the point id the TypeScript store wrote a definition under.
+func legacyPointID(hash string) string {
+	return uuid.NewSHA1(legacyNamespace, []byte(hash)).String()
 }
 
 func (s *QdrantStore) existing(ctx context.Context, tools []Descriptor) (map[string]bool, error) {
@@ -193,7 +272,12 @@ func (s *QdrantStore) Search(ctx context.Context, text string, tools []Descripto
 	// is what makes cross-caller leakage structurally impossible, and it is why
 	// this collection needs no RBAC payload filter — retrieval can never range
 	// over definitions the request did not itself supply.
-	limit := uint64(k)
+	// A hash can be held by two points while pre-0056 TypeScript points exist
+	// (this store's pointID and the TS store's legacyPointID): adoption deletes
+	// the legacy point best effort, and a TS pod still running mid-rollout can
+	// write it again. Fetch twice k so that, after de-duplicating by hash
+	// below, a duplicate never costs a distinct tool its top-k slot.
+	limit := uint64(2 * k)
 	points, err := s.client.Query(ctx, &qdrant.QueryPoints{
 		CollectionName: s.collection,
 		Query:          qdrant.NewQuery(vectors[0]...),
@@ -208,26 +292,58 @@ func (s *QdrantStore) Search(ctx context.Context, text string, tools []Descripto
 	// Resolve back to the REQUEST's own descriptors rather than trusting the
 	// stored payload. Belt and braces on the filter above: a point that somehow
 	// matched without being in this request cannot make it into the result.
+	hits := make([]string, len(points))
+	for i, p := range points {
+		hits[i] = p.GetPayload()["hash"].GetStringValue()
+	}
+	return resolveHits(hits, tools, k), nil
+}
+
+// resolveHits maps ranked hit hashes back to the request's own descriptors,
+// dropping any hash not in the request and every repeat of a hash already
+// returned (the first, highest-scoring hit wins), and keeps at most k. A
+// repeated tool would offer the model two tools with the same name, which LLM
+// APIs reject.
+func resolveHits(hits []string, tools []Descriptor, k int) []Descriptor {
 	byHash := make(map[string]Descriptor, len(tools))
 	for _, tool := range tools {
 		byHash[tool.Hash] = tool
 	}
-	out := make([]Descriptor, 0, len(points))
-	for _, p := range points {
-		if tool, ok := byHash[p.GetPayload()["hash"].GetStringValue()]; ok {
-			out = append(out, tool)
+	seen := make(map[string]bool, len(hits))
+	out := make([]Descriptor, 0, min(len(hits), k))
+	for _, hash := range hits {
+		if len(out) == k {
+			break
 		}
+		tool, ok := byHash[hash]
+		if !ok || seen[hash] {
+			continue
+		}
+		seen[hash] = true
+		out = append(out, tool)
 	}
-	return out, nil
+	return out
 }
 
 // Prune reclaims abandoned definitions. Qdrant has no native TTL, so without
 // this the collection grows forever — every definition any caller ever sent,
 // including one-off experiments and every intermediate edit of a schema.
 func (s *QdrantStore) Prune(ctx context.Context, olderThanSeconds int64) (int, error) {
-	cutoff := float64(time.Now().Unix() - olderThanSeconds)
+	now := time.Now()
+	cutoff := float64(now.Unix() - olderThanSeconds)
+	// Points written by the TypeScript agent-orchestrator (before docs/adr/
+	// 0056) carry lastSeenAt in MILLISECONDS and a different point id, so this
+	// store never touches them again. A seconds-only range would never reach
+	// them either; this second range ages them out on the same TTL. Any value
+	// at or above legacyMillisFloor is a millisecond timestamp (in seconds it
+	// would be the year ~5000).
+	legacyFloor := float64(legacyMillisFloor)
+	legacyCutoff := float64(now.UnixMilli() - olderThanSeconds*1000)
 	stale := &qdrant.Filter{
-		Must: []*qdrant.Condition{qdrant.NewRange("lastSeenAt", &qdrant.Range{Lt: &cutoff})},
+		Should: []*qdrant.Condition{
+			qdrant.NewRange("lastSeenAt", &qdrant.Range{Lt: &cutoff}),
+			qdrant.NewRange("lastSeenAt", &qdrant.Range{Gte: &legacyFloor, Lt: &legacyCutoff}),
+		},
 	}
 
 	// Counted before deleting: Delete reports an operation status, not how many
@@ -254,3 +370,7 @@ func (s *QdrantStore) Prune(ctx context.Context, olderThanSeconds int64) (int, e
 	}
 	return int(count), nil
 }
+
+// legacyMillisFloor separates millisecond lastSeenAt values (the TS store's)
+// from second ones: 10^11 seconds is ~year 5138, 10^11 ms is 1973.
+const legacyMillisFloor = int64(100_000_000_000)

@@ -92,6 +92,12 @@ nothing asserting it is just a claim.
 npm run e2e -w e2e                  # or: npx vitest run --config e2e/vitest.config.ts
 ```
 
+Needs `node`, `kubectl` and a Go toolchain (`go`, the version in
+`orchestrator/engines/temporal/go.mod`) on PATH. Three specs --
+`chat-harness`, `caller-tools` and `mcp-broker-contract` -- drive Go tests
+against the live cluster (`support/go-test.ts`), because the code they check
+is Go (docs/adr/0056).
+
 Tests are **serial** (`fileParallelism: false`, `maxConcurrency: 1`): they
 share one cluster, and several assert on global state (Redis keys, AgentRun
 lists) that concurrent runs would race on.
@@ -140,7 +146,7 @@ specs/
   rbac-parity.e2e.ts      markers -> role.yaml -> Helm chart RBAC agree (no cluster)
   rbac-installed.e2e.ts   the INSTALLED ClusterRole, and that the controller starts
   resilience.e2e.ts       what survives NATS/orchestrator moving mid-turn
-  mcp-broker-contract.e2e.ts  MCP engine client <-> broker server <-> Go activity agree (no cluster)
+  mcp-broker-contract.e2e.ts  Go broker <-> Go engine activity + catalog reader agree; runs the broker's TestContract* (no cluster, needs go)
   mcp-crd.e2e.ts          the deployed mcp-broker discovers the fake MCP server and proxies a call as the caller
 manifests/
   fake-github.yaml          in-cluster GitHub API stub (Deployment + Service + script)
@@ -207,7 +213,7 @@ vitest suites -- the cluster can only show the flag arrives.
 
 ### `caller-tools.e2e.ts` is the only thing that validates the Qdrant filter DSL
 
-`orchestrator/apps/agent-orchestrator`'s unit tests mock the Qdrant client outright, which
+Unit tests cannot show Qdrant accepting the store's queries, which
 means they prove *which method the code meant to call* and nothing about whether
 the query is valid. Caller-supplied tools (ADR 0035) added three hand-written
 filter shapes — `has_id` for the id-restricted search, a payload-only

@@ -2,6 +2,11 @@ import { Redis } from "ioredis";
 import type { InflightRunStore } from "./inflight-runs.js";
 
 /**
+ * DRAIN ONLY (docs/adr/0057): nothing records here any more; runs are Temporal
+ * workflows (src/runs/). runs/legacy-drain.ts reads what pre-0057 gateways
+ * left behind. Delete this module one release after 0057 ships.
+ */
+/**
  * The durable half of the deterministic label-removal fix.
  *
  * An EventTrigger may declare `reply.github.removeLabel` (ADR 0048): the label

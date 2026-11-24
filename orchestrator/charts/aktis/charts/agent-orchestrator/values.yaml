@@ -55,6 +55,9 @@ config:
   # Qdrant backs only the consumer-supplied tool index (docs/adr/0035); the
   # catalog index belongs to the temporal-engine.
   qdrantUrl: "http://qdrant:6333"
+  # The caller-tool store speaks Qdrant's gRPC API (docs/adr/0056) on qdrantUrl's
+  # host. Empty = 6334, Qdrant's default gRPC port.
+  qdrantGrpcPort: ""
   qdrantVectorSize: 1536
   # Consumer-supplied tools live in their own collection, keyed by content hash
   # so identical definitions are embedded once, ever.

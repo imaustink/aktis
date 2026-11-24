@@ -1,4 +1,7 @@
-import { fetchThrough, openPortForward, withPortForward, type PortForward } from "./k8s.js";
+import { execFile } from "node:child_process";
+import { connect } from "node:net";
+import { requireLocalClusterContext } from "./guard.js";
+import { fetchThrough, openPortForward, waitFor, withPortForward, type PortForward } from "./k8s.js";
 
 /**
  * Reads the orchestrator's REAL Qdrant, so a spec can assert on which
@@ -7,7 +10,7 @@ import { fetchThrough, openPortForward, withPortForward, type PortForward } from
  * This exists because caller-supplied tools (docs/adr/0035) make a claim that
  * is invisible to every unit test: a consumer's ephemeral function definitions
  * are indexed into their OWN collection and the tool/skill/agent catalogs are
- * never touched. `orchestrator/apps/agent-orchestrator`'s tests mock the Qdrant client
+ * never touched. Unit tests mock or skip the Qdrant client
  * outright, so they can only prove which method the code MEANT to call — not
  * which collection ended up with points in it, and not that Qdrant accepted the
  * filter DSL at all. Both are exactly the kind of cross-component wiring this
@@ -55,6 +58,45 @@ export async function withQdrant<T>(body: (baseUrl: string) => Promise<T>): Prom
  */
 export async function openQdrant(): Promise<PortForward> {
   return openPortForward(QDRANT_SERVICE, QDRANT_PORT, LOCAL_PORT + 1);
+}
+
+/** Qdrant's gRPC port, which the Go stores (agent-orchestrator, the engine) speak. */
+const QDRANT_GRPC_PORT = 6334;
+
+/**
+ * A port-forward to Qdrant's gRPC port, for Go tests that drive the real
+ * store (docs/adr/0056). Readiness is a TCP connect, not an HTTP request:
+ * the gRPC listener does not answer HTTP/1.1.
+ */
+export async function openQdrantGrpc(): Promise<{ address: string; close: () => void }> {
+  requireLocalClusterContext();
+  const localPort = LOCAL_PORT + 2;
+  const child = execFile("kubectl", ["-n", "controller-agent", "port-forward", `svc/${QDRANT_SERVICE}`, `${localPort}:${QDRANT_GRPC_PORT}`]);
+  let exited = false;
+  child.on("exit", () => {
+    exited = true;
+  });
+  try {
+    await waitFor(
+      `port-forward to ${QDRANT_SERVICE}:${QDRANT_GRPC_PORT} to accept connections`,
+      async () => {
+        if (exited) throw new Error(`kubectl port-forward svc/${QDRANT_SERVICE} exited`);
+        return new Promise<true | undefined>((resolve) => {
+          const socket = connect(localPort, "127.0.0.1");
+          socket.once("connect", () => {
+            socket.destroy();
+            resolve(true);
+          });
+          socket.once("error", () => resolve(undefined));
+        });
+      },
+      { timeoutMs: 30_000, intervalMs: 250 },
+    );
+  } catch (error) {
+    child.kill();
+    throw error;
+  }
+  return { address: `127.0.0.1:${localPort}`, close: () => child.kill() };
 }
 
 async function qdrantGet<T>(baseUrl: string, path: string): Promise<T> {

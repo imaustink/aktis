@@ -42,7 +42,7 @@ that map, e.g.:
 
 WARNING: agent-orchestrator.config.staticIdentities is set. StaticIdentityResolver
 is a DEV/TEST-ONLY stub with no real token verification — do not use it in
-production (see orchestrator/apps/agent-orchestrator/src/rbac/static-identity-resolver.ts).
+production (see orchestrator/engines/temporal/internal/facade/auth.go).
 Set agent-orchestrator.config.identityResolver=oidc (and the config.oidc*
 fields) for real IdP verification instead.
 {{- end }}

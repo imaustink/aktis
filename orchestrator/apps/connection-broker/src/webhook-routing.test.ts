@@ -26,7 +26,13 @@ function fakeDriver(parseWebhook?: Driver["parseWebhook"]): Driver {
 describe("webhook fan-out", () => {
   let server: Server | undefined;
 
-  afterEach(() => server?.close());
+  afterEach(async () => {
+    // closeAllConnections: a keep-alive socket outliving close() would serve
+    // the next test's request with this server's handler on a reused port.
+    server?.closeAllConnections();
+    await new Promise<void>((resolve) => (server ? server.close(() => resolve()) : resolve()));
+    server = undefined;
+  });
 
   /** Two Corpora over ONE Connection, plus a third over a different one. */
   function start(parseWebhook?: Driver["parseWebhook"]) {

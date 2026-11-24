@@ -50,7 +50,6 @@ spec:
       repository: "{{repository}}"
       issueNumber: "{{number}}"
       ack: "🤖 This pull request conflicts with {{baseRef}} after other work merged; resolving the conflicts now."
-      sessionPage: true
       result: true
       addLabels: ["ai-triage"]
       removeLabel: "ai-triage"

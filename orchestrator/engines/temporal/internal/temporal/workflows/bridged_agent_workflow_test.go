@@ -7,11 +7,13 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.temporal.io/sdk/workflow"
 
 	"github.com/aktisai/orchestrator/engines/temporal/internal/agentrun"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/catalog"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/temporal/activities"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/temporal/workflows"
+	"github.com/aktisai/orchestrator/engines/temporal/internal/toolrun"
 )
 
 func bridgedAgent() catalog.AgentDescriptor {
@@ -408,6 +410,80 @@ func TestBridgedAgentNeverReadyFailsFast(t *testing.T) {
 		}
 	}
 	require.True(t, cancelled)
+	// And deleted: a cancel reaches only an agent already listening.
+	require.Len(t, le.agentRunStops, 1)
+}
+
+// The ready window is the agent's, not the pod's: a pod still pulling its
+// image when the window ends gets more time, and once it starts the agent
+// still gets a full window. On a fresh node the agent image took 5m23s to
+// pull, and the run was given up on 47s before its container started; the
+// agent then did its review with nobody listening.
+func TestBridgedAgentReadyWaitExcludesPodStartup(t *testing.T) {
+	le := newLoopEnv(t)
+	agent := bridgedAgent()
+	le.agents = []catalog.AgentDescriptor{agent}
+	le.delegate = activities.DelegateChoice{Kind: activities.DelegateAgent, ID: agent.ID}
+
+	// The pod starts 9 minutes in: still Pending at the 5-minute check,
+	// started by the 10-minute one. The agent says ready 4 minutes after
+	// that check -- more than a window after launch, within one after start.
+	var start time.Time
+	le.agentRunStatus = func() toolrun.Status {
+		if le.env.Now().Sub(start) < 9*time.Minute {
+			return toolrun.Status{Phase: "Running", Starting: true}
+		}
+		return toolrun.Status{Phase: "Running"}
+	}
+	le.env.RegisterDelayedCallback(func() { start = le.env.Now() }, 0)
+
+	var result workflows.TurnResult
+	le.sendTurn(t, "turn-1", "do some work", &result, time.Millisecond)
+	le.deliverUp(agentrun.UpMessage{Seq: 1, Type: agentrun.UpReady}, 14*time.Minute)
+	le.deliverUp(agentrun.UpMessage{Seq: 2, Type: agentrun.UpReply, Final: true, Message: "Done."}, 14*time.Minute+time.Second)
+
+	le.env.ExecuteWorkflow(workflows.ConversationWorkflowName, (*workflows.ConversationState)(nil))
+	require.True(t, le.env.IsWorkflowCompleted())
+	require.NoError(t, le.env.GetWorkflowError())
+	require.Equal(t, "Done.", result.Reply)
+	require.Empty(t, le.agentRunStops)
+}
+
+// A pod that never starts is still bounded: the startup cap ends the wait,
+// and the run is deleted so it cannot start later and act unobserved.
+func TestBridgedAgentPodThatNeverStartsIsBounded(t *testing.T) {
+	le := newLoopEnv(t)
+	agent := bridgedAgent()
+	le.agents = []catalog.AgentDescriptor{agent}
+	le.delegate = activities.DelegateChoice{Kind: activities.DelegateAgent, ID: agent.ID}
+	le.agentRunStatus = func() toolrun.Status { return toolrun.Status{Phase: "Running", Starting: true} }
+
+	var result workflows.TurnResult
+	le.sendTurn(t, "turn-1", "do some work", &result, time.Millisecond)
+
+	le.env.ExecuteWorkflow(workflows.ConversationWorkflowName, (*workflows.ConversationState)(nil))
+	require.True(t, le.env.IsWorkflowCompleted())
+	require.NoError(t, le.env.GetWorkflowError())
+	require.Contains(t, result.Reply, "never became ready within 20m")
+	require.Len(t, le.agentRunStops, 1)
+}
+
+// A run whose pod already ended is not deleted: its CR is the record of why.
+func TestBridgedAgentDoesNotDeleteAFinishedRun(t *testing.T) {
+	le := newLoopEnv(t)
+	agent := bridgedAgent()
+	le.agents = []catalog.AgentDescriptor{agent}
+	le.delegate = activities.DelegateChoice{Kind: activities.DelegateAgent, ID: agent.ID}
+	le.agentRunStatus = func() toolrun.Status { return toolrun.Status{Phase: "Failed", Message: "BackoffLimitExceeded"} }
+
+	var result workflows.TurnResult
+	le.sendTurn(t, "turn-1", "do some work", &result, time.Millisecond)
+
+	le.env.ExecuteWorkflow(workflows.ConversationWorkflowName, (*workflows.ConversationState)(nil))
+	require.True(t, le.env.IsWorkflowCompleted())
+	require.Contains(t, result.Reply, "never became ready")
+	require.Contains(t, result.Reply, "BackoffLimitExceeded")
+	require.Empty(t, le.agentRunStops)
 }
 
 // The retired TS engine's nats-agent-channel.ts bounded silence from a bridged agent by
@@ -453,8 +529,70 @@ func registerAgentRunActivities(le *loopEnv) {
 		le.agentDownMessages = append(le.agentDownMessages, in)
 		return nil
 	})
-	reg(activities.GetAgentRunPhaseActivityName, func(context.Context, string) (any, error) {
-		return map[string]any{"phase": "Running"}, nil
+	reg(activities.GetAgentRunPhaseActivityName, func(context.Context, string) (toolrun.Status, error) {
+		if le.agentRunStatus != nil {
+			return le.agentRunStatus(), nil
+		}
+		return toolrun.Status{Phase: "Running"}, nil
 	})
 	reg(activities.DetachAgentRunActivityName, func(context.Context, string) error { return nil })
+	reg(activities.StopAgentRunActivityName, func(_ context.Context, runID string) error {
+		le.agentRunStops = append(le.agentRunStops, runID)
+		return nil
+	})
+}
+
+// A trigger-forced turn whose agent fails FAILS, like a forced tool's: the
+// run's outcome is what the factory chains on (aktis#363's review ended "the
+// reviewer did not record a verdict" when its agent had never started). A
+// chat turn that delegated still answers with the failure as text
+// (TestBridgedAgentNeverReadyFailsFast).
+func TestForcedBridgedAgentFailureFailsTheTurn(t *testing.T) {
+	le := newLoopEnv(t)
+	agent := bridgedAgent()
+	le.agents = []catalog.AgentDescriptor{agent}
+	le.resolvedAgent = &agent
+
+	in := workflows.TurnInput{
+		Message:       "Review acme/widgets#42",
+		Caller:        activities.Caller{Subject: "svc:gw", Roles: []string{"agent"}},
+		ForcedAgentID: agent.ID,
+		TriggerName:   "factory-review",
+	}
+	var failure error
+	le.sendTurnExpectingFailure(t, "turn-1", in, &failure, time.Millisecond)
+	le.deliverUp(agentrun.UpMessage{Seq: 1, Type: agentrun.UpReady}, time.Second)
+	le.deliverUp(agentrun.UpMessage{Seq: 2, Type: agentrun.UpFailed, Code: "boom", Message: "it broke"}, 2*time.Second)
+
+	le.env.ExecuteWorkflow(workflows.ConversationWorkflowName, (*workflows.ConversationState)(nil))
+	require.True(t, le.env.IsWorkflowCompleted())
+	require.NoError(t, le.env.GetWorkflowError())
+	require.Error(t, failure)
+	require.Contains(t, failure.Error(), "it broke")
+}
+
+// A conversation that recorded such a turn before the change replays it as it
+// ran: the failure is the turn's reply, not its error.
+func TestForcedBridgedAgentFailureBeforeTheChangeIsAReply(t *testing.T) {
+	le := newLoopEnv(t)
+	le.env.OnGetVersion("forced-agent-fail-fails", workflow.DefaultVersion, 1).Return(workflow.DefaultVersion)
+	agent := bridgedAgent()
+	le.agents = []catalog.AgentDescriptor{agent}
+	le.resolvedAgent = &agent
+
+	in := workflows.TurnInput{
+		Message:       "Review acme/widgets#42",
+		Caller:        activities.Caller{Subject: "svc:gw", Roles: []string{"agent"}},
+		ForcedAgentID: agent.ID,
+		TriggerName:   "factory-review",
+	}
+	var result workflows.TurnResult
+	le.sendTurnInput(t, "turn-1", in, &result, time.Millisecond)
+	le.deliverUp(agentrun.UpMessage{Seq: 1, Type: agentrun.UpReady}, time.Second)
+	le.deliverUp(agentrun.UpMessage{Seq: 2, Type: agentrun.UpFailed, Code: "boom", Message: "it broke"}, 2*time.Second)
+
+	le.env.ExecuteWorkflow(workflows.ConversationWorkflowName, (*workflows.ConversationState)(nil))
+	require.True(t, le.env.IsWorkflowCompleted())
+	require.NoError(t, le.env.GetWorkflowError())
+	require.Contains(t, result.Reply, "it broke")
 }

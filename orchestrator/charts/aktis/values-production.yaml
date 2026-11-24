@@ -314,6 +314,10 @@ core-controller:
 # relays GitHub issue/comment webhooks into agent-orchestrator's existing
 # conversational /invoke API, one session per issue.
 integration-gateway:
+  # docs/adr/0057: its run workflows, on the engine's Temporal.
+  temporal:
+    address: temporal-frontend.temporal.svc:7233
+    namespace: default
   enabled: true
 
   image:
@@ -1498,7 +1502,6 @@ extraManifests:
           repository: "{{`{{repository}}`}}"
           issueNumber: "{{`{{number}}`}}"
           ack: "🤖 Starting an automated review of this pull request."
-          sessionPage: true
           # No `result`: the review itself is the output, and factory-handoff
           # reports every outcome (including a failed run), so the agent's
           # end-of-turn summary would only be a redundant, verbose comment.
@@ -1582,7 +1585,6 @@ extraManifests:
           repository: "{{`{{repository}}`}}"
           issueNumber: "{{`{{number}}`}}"
           ack: "🤖 Addressing the automated review's feedback now."
-          sessionPage: true
           result: true
           addLabels: ["ai-triage"]
           removeLabel: "ai-triage"

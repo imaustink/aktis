@@ -1,5 +1,5 @@
 [
-  {"image": "agent-orchestrator", "filter": "agent-orchestrator", "dockerfile": "orchestrator/apps/agent-orchestrator/Dockerfile", "context": "."},
+  {"image": "agent-orchestrator", "filter": "agent-orchestrator", "dockerfile": "orchestrator/engines/temporal/Dockerfile.agent-orchestrator", "context": "orchestrator/engines/temporal"},
   {"image": "opencode-swe-agent", "filter": "opencode-swe-agent", "dockerfile": "catalog/agents/opencode-swe-agent/Dockerfile", "context": "."},
   {"image": "claude-code-swe-agent", "filter": "claude-code-swe-agent", "dockerfile": "catalog/agents/claude-code-swe-agent/Dockerfile", "context": "."},
   {"image": "integration-gateway", "filter": "integration-gateway", "dockerfile": "orchestrator/apps/integration-gateway/Dockerfile", "context": "."},

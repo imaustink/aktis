@@ -21,6 +21,15 @@ import { TRACEPARENT_HEADER } from "./traceparent.js";
 // backoff policy.
 const ACCEPT_RETRY_ATTEMPTS = 3;
 const ACCEPT_RETRY_DELAY_MS = 1000;
+/**
+ * Per-attempt bound on a side-effect-free read (`/events/compile`,
+ * `/events/prefilter`), response body included. `/events/compile` runs inside
+ * a webhook request, before the 202, and providers give up on a delivery
+ * after ~10s (GitHub); without a bound, an orchestrator that accepts the
+ * connection but never answers would hold that request open for undici's
+ * 300s header timeout per attempt.
+ */
+const READ_TIMEOUT_MS = 3000;
 // Consecutive poll failures tolerated before the turn is reported unreachable.
 // Small on purpose: the gateway holds a relay for as long as a poll runs, so
 // waiting out the whole poll budget on a dead orchestrator starves the next
@@ -74,6 +83,8 @@ export interface OrchestratorClientOptions {
   /** Injectable for tests; defaults to a real timer. */
   sleep?: (ms: number) => Promise<void>;
   fetchImpl?: typeof fetch;
+  /** Per-attempt timeout for `/events/compile` and `/events/prefilter`; defaults to {@link READ_TIMEOUT_MS}. */
+  readTimeoutMs?: number;
 }
 
 /** Optional callbacks fired while polling a turn. */
@@ -114,6 +125,28 @@ export interface AcceptedTrigger {
 }
 
 /** Outcome of {@link OrchestratorClient.submitEvent}. */
+/** An EventSource's `spec.sender` CEL expressions, as sent to `/events/prefilter`. */
+export interface SenderExpressions {
+  loginFrom: string;
+  isBotFrom?: string;
+  repositoryFrom?: string;
+  accountIdFrom?: string;
+}
+
+/**
+ * One CEL evaluation from the orchestrator. `type` is the CEL type name
+ * (`string`, `bool`, `int`, ...); an `int` arrives as its decimal string so an
+ * account id never meets a JSON number's 2^53 limit.
+ */
+export type CelResult = { ok: true; type: string; value: unknown } | { ok: false; error: string };
+
+export type PrefilterResult =
+  | { kind: "ok"; couldMatch: boolean; sender: Record<string, CelResult> }
+  | { kind: "failed"; error: string };
+
+/** `POST /events/compile`: each expression that does not compile, mapped to the compiler's message. */
+export type CompileResult = { kind: "ok"; errors: Record<string, string> } | { kind: "failed"; error: string };
+
 export type EventSubmitResult =
   /** 200 `{"status":"ignored"}` -- no trigger matched; no turn ran. */
   | { kind: "ignored" }
@@ -381,6 +414,107 @@ export class OrchestratorClient {
       }
     }
     return { networkError };
+  }
+
+  /**
+   * Asks the orchestrator, before any sender lookup, whether a webhook
+   * delivery could fire a trigger at all, and what the source's sender
+   * expressions evaluate to over the preliminary envelope
+   * (`POST /events/prefilter`, docs/event-triggers.md §8). CEL is evaluated
+   * there, by the same Go evaluator that matches triggers -- this process has
+   * no CEL runtime of its own.
+   *
+   * Retried past a connection failure or a 5xx (see {@link postRead}); any
+   * other failure (4xx, bad body, retries exhausted) is returned as `failed`,
+   * which the caller treats as a drop: what comes out of here decides whose
+   * credentials a run gets, so "couldn't tell" never means "let it through".
+   */
+  async prefilter(envelope: Envelope, sender: SenderExpressions | undefined): Promise<PrefilterResult> {
+    const read = await this.postRead("/events/prefilter", { envelope, ...(sender ? { sender } : {}) });
+    if (read.kind === "failed") return read;
+    const body = read.body;
+    if (!isPlainObject(body) || typeof body.couldMatch !== "boolean") {
+      return { kind: "failed", error: "/events/prefilter returned an unexpected body" };
+    }
+    const results: Record<string, CelResult> = {};
+    if (isPlainObject(body.sender)) {
+      for (const [field, raw] of Object.entries(body.sender)) {
+        if (!isPlainObject(raw)) continue;
+        results[field] =
+          raw.ok === true
+            ? { ok: true, type: typeof raw.type === "string" ? raw.type : "", value: raw.value }
+            : { ok: false, error: typeof raw.error === "string" ? raw.error : "evaluation failed" };
+      }
+    }
+    return { kind: "ok", couldMatch: body.couldMatch, sender: results };
+  }
+
+  /**
+   * Which of `expressions` do not compile (`POST /events/compile`), each
+   * mapped to the compiler's message; an expression absent from `errors`
+   * compiled. Same compiler {@link prefilter} evaluates with, so the gateway
+   * can refuse to serve a source whose sender block could never be evaluated.
+   */
+  async compile(expressions: string[]): Promise<CompileResult> {
+    // One attempt, no retry: the gateway awaits this before a webhook's 202,
+    // and a failed compile already means "serve the source", so a retry would
+    // only push the worst case past the provider's ~10s delivery timeout.
+    const read = await this.postRead("/events/compile", { expressions }, 1);
+    if (read.kind === "failed") return read;
+    const body = read.body;
+    if (!isPlainObject(body) || !isPlainObject(body.errors)) {
+      return { kind: "failed", error: "/events/compile returned an unexpected body" };
+    }
+    const errors: Record<string, string> = {};
+    for (const [expr, message] of Object.entries(body.errors)) {
+      errors[expr] = typeof message === "string" ? message : "does not compile";
+    }
+    return { kind: "ok", errors };
+  }
+
+  /**
+   * POSTs to a side-effect-free orchestrator endpoint and parses its JSON.
+   * Because nothing is written, a 5xx is retried as well as a connection
+   * failure -- unlike `/invoke`, where a retried 5xx could start a turn twice.
+   * That covers the window in which a draining orchestrator pod still receives
+   * traffic during a rollout. Each attempt is bounded by `readTimeoutMs`; a
+   * timed-out attempt counts as a connection failure and is retried, up to
+   * `attempts` attempts in all.
+   */
+  private async postRead(
+    path: string,
+    payload: unknown,
+    attempts = ACCEPT_RETRY_ATTEMPTS,
+  ): Promise<{ kind: "ok"; body: unknown } | { kind: "failed"; error: string }> {
+    let lastError = "";
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      if (attempt > 1) await this.sleep(ACCEPT_RETRY_DELAY_MS);
+      let res: Response;
+      let text: string;
+      try {
+        res = await this.fetchImpl(`${this.baseUrl()}${path}`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${await this.resolveToken()}` },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(this.options.readTimeoutMs ?? READ_TIMEOUT_MS),
+        });
+        text = await res.text();
+      } catch (err) {
+        lastError = `${path} unreachable: ${errorText(err)}`;
+        continue;
+      }
+      if (res.status >= 500) {
+        lastError = `${path} failed: ${res.status} ${text}`;
+        continue;
+      }
+      if (!res.ok) return { kind: "failed", error: `${path} failed: ${res.status} ${text}` };
+      try {
+        return { kind: "ok", body: JSON.parse(text) };
+      } catch {
+        return { kind: "failed", error: `${path} returned non-JSON: ${text}` };
+      }
+    }
+    return { kind: "failed", error: lastError };
   }
 
   /**

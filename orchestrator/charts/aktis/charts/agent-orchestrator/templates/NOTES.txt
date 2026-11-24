@@ -25,7 +25,7 @@ start.
 WARNING: config.staticIdentities is set and config.identityResolver is not
 "oidc". StaticIdentityResolver is a DEV/TEST-ONLY stub with no real token
 verification — do not use this in production (see
-orchestrator/apps/agent-orchestrator/src/rbac/static-identity-resolver.ts). Set
+orchestrator/engines/temporal/internal/facade/auth.go). Set
 config.identityResolver=oidc (and the config.oidc* fields) for real IdP
 verification instead. Note the facade does not enforce either resolver yet
 (docs/adr/0053).

@@ -1,0 +1,20 @@
+# agent-orchestrator: the facade in front of the Temporal engine gateway
+# (cmd/agent-orchestrator, package internal/facade). Built from this module so
+# it shares the engine's EventTrigger matching, CEL, caller-tool and assertion
+# code instead of keeping a second implementation of each.
+#
+#   docker build -f Dockerfile.agent-orchestrator -t agent-orchestrator:latest orchestrator/engines/temporal
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -o /out/agent-orchestrator ./cmd/agent-orchestrator
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/agent-orchestrator /agent-orchestrator
+# The chart pins runAsUser 10001 (the old image's user); nonroot here is the
+# default for anything that doesn't.
+USER 65532:65532
+EXPOSE 8081
+ENTRYPOINT ["/agent-orchestrator"]

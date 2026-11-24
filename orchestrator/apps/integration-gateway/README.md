@@ -51,13 +51,39 @@ POST /events/:source/tick   Authorization: Bearer <projected token of SA eventso
   the trigger CR's literal URL (never from event content); with `secretRef`,
   `x-event-signature: sha256=<hex hmac(secret, exact body)>`. Redirects are
   not followed; an unreadable signing secret means the reply is not sent.
-- **Labels** — `reply.github.removeLabel` is recorded in a durable outbox
-  before polling and removed on every outcome; `src/label-reconciler.ts`
-  heals removals lost to a pod restart.
+- **Labels** — `reply.github.removeLabel` is removed on every outcome, retried
+  for an hour if GitHub refuses.
+- **Runs are Temporal workflows** (docs/adr/0057, `src/runs/`). Each accepted
+  event is an `eventRun` workflow -- ack, poll, result, label removal,
+  completion event -- that this gateway's own worker runs on the engine's
+  Temporal, so a pod that dies mid-run costs a retried activity on another
+  replica, not the run. Held completions, serialize queues and conflict sweeps
+  (docs/adr/0055) are workflows too. `src/runs/legacy-drain.ts` hands over
+  what pre-0057 gateways left in Redis; it goes one release later.
+- **Changing a workflow** (`src/runs/workflows.ts`): running workflows are
+  replayed by the new code after a rollout, so a change to the commands a
+  workflow issues must be gated with `patched()` (docs/adr/0057 §7).
+  `src/runs/replay.test.ts` replays the histories in `src/runs/__histories__`
+  and fails on a change that isn't. To add or refresh those histories (a new
+  path worth covering, or after a patch has been fully removed -- never just
+  to make the replay test pass), run, from this directory:
+
+  ```
+  CAPTURE_WORKFLOW_HISTORIES=1 npx vitest run src/runs/capture-histories.test.ts
+  ```
+
+  It drives each workflow on a Temporal dev server with stubbed activities
+  and writes one JSON history per scenario; commit them with the change.
 
 ## Configuration
 
 See `src/config.ts` for the full list. Notable ones:
+
+- `TEMPORAL_ADDRESS` (required), `TEMPORAL_NAMESPACE` (default `default`),
+  `TEMPORAL_TASK_QUEUE` (default `integration-gateway`) — where the run
+  workflows live: the engine's Temporal cluster and namespace. Workflow ids
+  are prefixed with the task queue, so two releases sharing a namespace must
+  use different queues.
 
 - `CRD_NAMESPACE` (required for the event routes) — namespace of the
   `EventSource` CRs and the Secrets they reference. Unset: no sources, every

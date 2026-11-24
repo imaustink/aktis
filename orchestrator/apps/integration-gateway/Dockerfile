@@ -36,6 +36,7 @@ COPY framework/github-app-auth framework/github-app-auth
 COPY orchestrator/packages/event-triggers orchestrator/packages/event-triggers
 COPY orchestrator/apps/integration-gateway/tsconfig.json orchestrator/apps/integration-gateway/tsconfig.json
 COPY orchestrator/apps/integration-gateway/src         orchestrator/apps/integration-gateway/src
+COPY orchestrator/apps/integration-gateway/scripts     orchestrator/apps/integration-gateway/scripts
 
 RUN npm run build --workspace=@aktis/github-app-auth \
   && npm run build --workspace=@aktis/event-triggers \

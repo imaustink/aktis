@@ -41,7 +41,7 @@ contract) and never imports from a sibling directly — only from `framework/*`.
 - Docker builds use the **repo root** as build context (not the tool/app
   dir), because images need to COPY in `framework/messaging`:
   `docker build -f catalog/tools/recipe-scraper/Dockerfile -t recipe-scraper:latest .`
-  (same pattern for `orchestrator/apps/agent-orchestrator/Dockerfile`).
+  (agent-orchestrator is Go: `orchestrator/engines/temporal/Dockerfile.agent-orchestrator`, built from that module).
 - This repo is **not a git repository** — use `mv`/`cp`, not `git mv`, when
   restructuring files. After moving a workspace package, reinstall; if
   `package-lock.json` still references the old path afterward, do a full
@@ -68,7 +68,7 @@ contract) and never imports from a sibling directly — only from `framework/*`.
   gate on it deterministically in code (append the message, interrupt the turn)
   rather than adding guidance text and hoping the model relays it. Reserve
   prompt instructions for genuinely generative/judgment work.
-- Never invent unverified auth/identity shortcuts. `orchestrator/apps/agent-orchestrator/src/rbac/static-identity-resolver.ts`
+- Never invent unverified auth/identity shortcuts. agent-orchestrator's static resolver (`orchestrator/engines/temporal/internal/facade/auth.go`)
   is explicitly a DEV/TEST-ONLY stub (no signature verification) — treat it
   as a documented gap, not a pattern to copy for real auth.
 - k8s API access goes through `@kubernetes/client-node` in-process (object-param

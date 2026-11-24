@@ -69,6 +69,10 @@ spec:
               value: {{ include "agent-orchestrator.toolNamespace" . | quote }}
             - name: AGENT_QDRANT_URL
               value: {{ include "agent-orchestrator.qdrantUrl" . | quote }}
+            {{- if .Values.config.qdrantGrpcPort }}
+            - name: AGENT_QDRANT_GRPC_PORT
+              value: {{ .Values.config.qdrantGrpcPort | quote }}
+            {{- end }}
             - name: AGENT_QDRANT_VECTOR_SIZE
               value: {{ .Values.config.qdrantVectorSize | quote }}
             - name: AGENT_QDRANT_CALLER_TOOLS_COLLECTION

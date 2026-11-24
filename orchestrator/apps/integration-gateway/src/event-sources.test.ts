@@ -16,9 +16,24 @@ describe("compileEventSource", () => {
     if (r.ok && r.source.kind === "webhook") expect(r.source.sender?.dropBots).toBe(true);
   });
 
-  it("marks a source whose sender CEL does not compile as unusable", () => {
-    expect(compileEventSource(webhook("bad", { sender: { provider: "github", loginFrom: "body.sender.login +" } }) as never).ok).toBe(false);
-    expect(compileEventSource(webhook("bad2", { sender: { provider: "github", loginFrom: "nosuchvar.x" } }) as never).ok).toBe(false);
+  it("marks a source with an empty sender expression as unusable", () => {
+    expect(compileEventSource(webhook("bad", { sender: { provider: "github", loginFrom: "  " } }) as never).ok).toBe(false);
+    expect(
+      compileEventSource(webhook("bad2", { sender: { provider: "github", loginFrom: "body.sender.login", isBotFrom: "" } }) as never).ok,
+    ).toBe(false);
+  });
+
+  it("keeps sender CEL as written: the orchestrator compiles and evaluates it per delivery", () => {
+    // This process has no CEL runtime (docs/event-triggers.md §8). An
+    // expression that doesn't compile fails its evaluation, which drops the
+    // delivery (server.test.ts), and core-controller reports it as InvalidCEL.
+    const r = compileEventSource(
+      webhook("raw", { sender: { provider: "github", loginFrom: "body.sender.login +", accountIdFrom: "body.sender.id" } }) as never,
+    );
+    expect(r.ok && r.source.kind === "webhook" && r.source.sender?.expressions).toEqual({
+      loginFrom: "body.sender.login +",
+      accountIdFrom: "body.sender.id",
+    });
   });
 
   it("rejects neither/both of webhook and cron, sender on cron, and hmacSha256 without a header", () => {
@@ -100,7 +115,7 @@ describe("CrdEventSourceRegistry", () => {
 
     onEvent!("ADDED", webhook("c"));
     onEvent!("DELETED", webhook("a"));
-    onEvent!("MODIFIED", webhook("b", { sender: { provider: "github", loginFrom: "(" } }));
+    onEvent!("MODIFIED", webhook("b", { sender: { provider: "github", loginFrom: "" } }));
     expect(registry.get("c")).toBeDefined();
     expect(registry.get("a")).toBeUndefined();
     expect(registry.get("b")).toBeUndefined(); // broken edit -> unusable, not the last good copy

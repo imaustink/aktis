@@ -51,6 +51,7 @@ provider_up() {
     ferry up
   fi
   ferry_fix_nodepool_host_label
+  ferry_fix_nodepool_consolidation
 
   # `ferry kubeconfig --merge` backs up ~/.kube/config every time it runs, so
   # only merge when the context is missing or stale (a purged cluster comes
@@ -86,6 +87,23 @@ ferry_fix_nodepool_host_label() {
   kubectl --kubeconfig "$kc" patch nodepool default --type merge \
     -p "{\"spec\":{\"template\":{\"metadata\":{\"labels\":{\"ferry.dev/host\":\"$host\"}}}}}" >/dev/null \
     && echo "  NodePool now declares ferry.dev/host=$host, so pods with volumes can get machines (see scripts/cluster/providers/ferry.sh)"
+}
+
+# ferry's default NodePool consolidates WhenEmptyOrUnderutilized after 60s:
+# Karpenter evicts RUNNING pods to repack them onto fewer or cheaper machines.
+# On this stack that means Qdrant, the engine gateway/worker and CoreDNS are
+# killed mid-e2e-run whenever load dips, and the suite hangs on turns whose
+# pods vanished (seen 2026-11-23: "Disrupting Node: Underutilized", 11 pods
+# evicted). WhenEmpty still reclaims idle machines but never evicts a running
+# pod. Re-applied after every `ferry up`, like the label above.
+ferry_fix_nodepool_consolidation() {
+  local kc="$FERRY_STATE_DIR/admin.conf" current
+  kubectl --kubeconfig "$kc" get nodepool default >/dev/null 2>&1 || return 0   # machines off
+  current="$(kubectl --kubeconfig "$kc" get nodepool default -o jsonpath='{.spec.disruption.consolidationPolicy}' 2>/dev/null || true)"
+  [[ "$current" == "WhenEmpty" ]] && return 0
+  kubectl --kubeconfig "$kc" patch nodepool default --type merge \
+    -p '{"spec":{"disruption":{"consolidationPolicy":"WhenEmpty"}}}' >/dev/null \
+    && echo "  NodePool consolidates WhenEmpty only, so running pods are never repacked mid-run (see scripts/cluster/providers/ferry.sh)"
 }
 
 provider_down() {

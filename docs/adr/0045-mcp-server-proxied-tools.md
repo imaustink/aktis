@@ -284,6 +284,15 @@ per-server choice, never the silent default (§5).
 6. Harden: broker failure modes, a conformance test server, and docs for the
    privileged nature of `MCPServer` creation.
 
+**Implementation note (2026-11-23).** The broker was first built in TypeScript
+and has since been ported to Go (`orchestrator/apps/mcp-broker`, its own Go
+module, on the official `github.com/modelcontextprotocol/go-sdk` client) for
+consistency with the Temporal engine and core-controller. The contract this ADR
+defines is unchanged — routes, the `ORCHESTRATOR_TOKEN` gate, the
+`x-delegated-token` fail-closed rule, the `{result,isError}` reply, the
+`MCPServer` status and derived `MCPTool` shapes and names — and is held by the
+broker's `contract_test.go`, which `e2e/specs/mcp-broker-contract.e2e.ts` runs.
+
 This ADR introduces a new capability and supersedes nothing. It reuses ADR 0014's
 proxy posture, ADR 0038/0043's scoped-resource shape, ADR 0004/0008/0028's RBAC
 layers and ADR 0032/0040/0041's delegation unchanged.

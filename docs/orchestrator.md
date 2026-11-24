@@ -1,7 +1,7 @@
 # Agent Orchestrator (design)
 
 > **Status:** first implementation exists at
-> [orchestrator/apps/agent-orchestrator/](../orchestrator/apps/agent-orchestrator/) (see its README for
+> [orchestrator/engines/temporal/cmd/agent-orchestrator/](../orchestrator/engines/temporal/cmd/agent-orchestrator/) (see its README for
 > what's implemented vs. still a known gap).
 >
 > **The agent loop now runs in the Temporal engine**
@@ -361,7 +361,7 @@ existing SSRF/prompt-injection mitigations:
 
 - ~~Identity/auth mechanism: which IdP, how tokens map to roles/scopes.~~
   Resolved for the "verify a real token" half: `OidcIdentityResolver`
-  (`orchestrator/apps/agent-orchestrator/src/rbac/oidc-identity-resolver.ts`) verifies
+  (`orchestrator/engines/temporal/internal/facade/auth.go`) verifies
   caller bearer tokens as JWTs against a configurable OIDC issuer's JWKS —
   issuer/audience/JWKS URL and the roles-claim path are all config, so it
   works with any standards-compliant IdP without a vendor-specific SDK.

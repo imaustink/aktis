@@ -308,6 +308,7 @@ func main() {
 		w.RegisterActivityWithOptions(agentRuns.GetAgentRunPhase, activity.RegisterOptions{Name: activities.GetAgentRunPhaseActivityName})
 		w.RegisterActivityWithOptions(agentRuns.SendAgentDown, activity.RegisterOptions{Name: activities.SendAgentDownActivityName})
 		w.RegisterActivityWithOptions(agentRuns.DetachAgentRun, activity.RegisterOptions{Name: activities.DetachAgentRunActivityName})
+		w.RegisterActivityWithOptions(agentRuns.StopAgentRun, activity.RegisterOptions{Name: activities.StopAgentRunActivityName})
 		log.Printf("bridged pod agents enabled: nats=%s", natsURL)
 	} else {
 		log.Printf("AGENT_NATS_URL not set; bridged pod agents disabled")

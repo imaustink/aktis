@@ -1,5 +1,5 @@
 import { createServer, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
+import { connect, type AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IdentityLinkApi } from "./api.js";
 import type { GithubDeviceFlowLinker } from "./device-flow-linker.js";
@@ -223,5 +223,29 @@ describe("IdentityLinkApi with an authcode provider", () => {
   it("requires the bearer token on the orchestrator-facing routes", async () => {
     const res = await fetch(`${base}/identity-link/atlassian/token?subject=s`);
     expect(res.status).toBe(401);
+  });
+  // A refusal sent while the client is still writing its body, on a
+  // `connection: close` socket, makes the server's kernel answer the late body
+  // with an RST -- which can discard the 400 before the client reads it
+  // ("fetch failed: other side closed", bytesRead 0). So the body is read first.
+  it.each(["start", "poll", "wait"])("reads the whole %s body before refusing an unknown provider", async (action) => {
+    const body = JSON.stringify({ subject: "s" });
+    const socket = connect((server.address() as AddressInfo).port, "127.0.0.1");
+    let received = "";
+    socket.on("data", (chunk: Buffer) => (received += chunk.toString("utf8")));
+    const closed = new Promise<void>((resolve) => socket.on("close", () => resolve()));
+    await new Promise<void>((resolve) => socket.once("connect", () => resolve()));
+
+    socket.write(
+      `POST /identity-link/notion/${action} HTTP/1.1\r\nhost: x\r\nauthorization: Bearer ${TOKEN}\r\n` +
+        `content-type: application/json\r\ncontent-length: ${body.length}\r\nconnection: close\r\n\r\n`,
+    );
+    await new Promise((r) => setTimeout(r, 100));
+    expect(received, "answered before the body arrived").toBe("");
+
+    socket.end(body);
+    await closed;
+    expect(received).toMatch(/^HTTP\/1\.1 400 /);
+    expect(received).toContain("Unsupported identity provider: notion");
   });
 });

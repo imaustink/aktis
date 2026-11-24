@@ -41,7 +41,8 @@ const BROKER_SERVICE = "agent-controller-mcp-broker";
 const BROKER_TOKEN = "e2e-mcp-broker-token";
 const FAKE_URL = "http://fake-mcp-server.controller-agent.svc.cluster.local:8080/mcp";
 
-// catalogIdFor sanitizes `mcp-<server>-<remoteTool>` to a legal k8s name.
+// The broker's CatalogIDFor sanitizes `mcp-<server>-<remoteTool>` to a legal k8s name
+// (clean names like these get no hash suffix).
 const toolName = (remote: string) => `mcp-${SERVER}-${remote}`;
 
 const serverManifest = (exposure: string) => `

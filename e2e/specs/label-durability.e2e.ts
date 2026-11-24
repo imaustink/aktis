@@ -35,9 +35,9 @@ function nextIssueNumber(): number {
  * orchestrator, and a real (fake-)GitHub recording the DELETE:
  *
  *   1. the label comes off even on the UNHAPPY path (the run fails), and
- *   2. the label STILL comes off when the gateway is rolled mid-turn, healed by
- *      the replacement pod's startup + periodic reconciler
- *      (orchestrator/apps/integration-gateway/src/label-reconciler.ts).
+ *   2. the label STILL comes off when the gateway is rolled mid-turn: the run
+ *      is a Temporal workflow (docs/adr/0057), so the replacement pod's worker
+ *      picks up the cancelled poll and finishes the run, label removal included.
  *
  * Mirrors resilience.e2e.ts's posture: pace the stub so the turn is still
  * running when the disruption lands, and assert on what fake-github actually
@@ -129,11 +129,10 @@ describe("label durability: a trigger label always comes off, even on the unhapp
     // for this turn goes away mid-flight.
     await rollGateway();
 
-    // The REPLACEMENT pod heals it: it takes over the in-flight run once the
-    // old pod's lease lapses and removes the label when the run finishes; the
-    // reconciler backstops any removal still owed after that (it never strips
-    // a label while a run is still owed a finish). Generous budget: the run
-    // itself narrates for two minutes.
+    // The REPLACEMENT pod finishes it: the old pod's worker cancels the
+    // poll activity on shutdown, Temporal retries it on the new pod, and the
+    // run's workflow removes the label when the run ends. Generous budget: the
+    // run itself narrates for two minutes.
     const deleted = await labelRemoved(issueNumber, 600_000);
     expect(deleted).toBeDefined();
 

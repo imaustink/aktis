@@ -63,6 +63,10 @@ type Status struct {
 	Phase   string `json:"phase,omitempty"`
 	Message string `json:"message,omitempty"`
 	JobName string `json:"jobName,omitempty"`
+	// Starting is set only for an AgentRun whose pod is positively seen not
+	// to have started yet (agentrun.K8sLauncher.GetStatus). Never set for a
+	// ToolRun.
+	Starting bool `json:"starting,omitempty"`
 }
 
 // Launcher is the port; K8sLauncher is the real implementation, FakeLauncher

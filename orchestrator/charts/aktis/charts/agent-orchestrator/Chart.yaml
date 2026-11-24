@@ -2,7 +2,7 @@ apiVersion: v2
 name: agent-orchestrator
 description: >-
   Helm chart for agent-orchestrator: the OpenAI-compatible and /invoke facade
-  in front of the Temporal agent engine (see orchestrator/apps/agent-orchestrator).
+  in front of the Temporal agent engine (see orchestrator/engines/temporal/cmd/agent-orchestrator).
 type: application
 version: 0.2.3
 appVersion: "0.1.0"

@@ -107,6 +107,19 @@ config:
   # `body.chain.counts`; this is the backstop no trigger config can raise.
   # runEventMaxDepth: 12
 
+# docs/adr/0057: every accepted event's run -- ack, poll, result, label
+# removal, its completion event, and the factory's held events, serialize
+# queues and conflict sweeps -- is a Temporal workflow this gateway's own
+# worker runs. Same Temporal cluster and namespace as temporal-engine's.
+temporal:
+  # Matches the temporalio/temporal chart's frontend Service (and
+  # temporal-engine.temporal.address).
+  address: temporal-frontend.temporal.svc:7233
+  namespace: default
+  # Every replica polls this queue; workflow ids live under it, so two
+  # releases sharing a namespace must not share it.
+  taskQueue: integration-gateway
+
 # Automatic OIDC client_credentials token fetch/refresh for this gateway's
 # own /invoke calls to agent-orchestrator -- an opt-in alternative to
 # config's static, manually-rotated orchestratorToken. Requires a real

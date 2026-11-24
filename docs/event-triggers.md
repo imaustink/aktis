@@ -19,6 +19,11 @@ document; where code and this document disagree, one of them is a bug.
  orchestrator ─► Temporal engine: match EventTriggers (CEL) ─► params ─► target
 ```
 
+All CEL runs in Go, in one evaluator (`orchestrator/engines/temporal/internal/catalog`):
+agent-orchestrator matches triggers with it, core-controller compiles against
+the same environment for `Ready`, and integration-gateway — which has no CEL
+runtime of its own — asks agent-orchestrator over `POST /events/prefilter` (§7).
+
 ## 1. CRDs (`core.aktis.ai/v1alpha1`, namespaced)
 
 Both kinds live in the release namespace (the one agent-orchestrator,
@@ -209,9 +214,13 @@ Every source produces exactly this JSON object. It is both the `event` field of
 
 ## 3. CEL
 
-One environment, used identically by core-controller (compile-only), the TS
-orchestrator + gateway (`@aktis/event-triggers`, `@marcbachmann/cel-js`)
-and the Temporal gateway (`cel-go`):
+One environment and one runtime, `cel-go`: core-controller compiles against
+it for `Ready`; agent-orchestrator and the Temporal gateway match with it
+(`orchestrator/engines/temporal/internal/catalog`); integration-gateway's
+pre-sender checks are evaluated by agent-orchestrator on its behalf (§7).
+Until [ADR 0056](adr/0056-agent-orchestrator-in-go.md) a second, TypeScript
+runtime (`@marcbachmann/cel-js`) evaluated the same expressions, which is why
+the rules below are written to mean the same in both:
 
 - Variables: `source`, `kind`, `id`, `time`, `repository` (string), `headers`
   (map<string,string>), `body` (dyn), `sender` (map<string,dyn>).
@@ -233,10 +242,9 @@ and the Temporal gateway (`cel-go`):
   value must be JSON-representable (null/bool/int/double/string/list/map, finite
   doubles) — anything else is a `params` error. A `params` evaluation error after a
   match fails the event (`422`, §5) — never a silent empty value.
-- The shared fixture file `orchestrator/packages/event-triggers/fixtures/cel-parity.json` is the
-  executable definition of this section: every case runs in the TS package's
-  tests and in the Temporal engine's Go tests, and both must produce the listed
-  verdict / value.
+- The fixture file `orchestrator/engines/temporal/internal/catalog/testdata/cel-parity.json`
+  is the executable definition of this section: every case runs in the Go
+  tests and must produce the listed verdict / value.
 
 ## 4. Matching, params, templates
 
@@ -327,15 +335,31 @@ opencode-swe-agent) act on one by name:
 
 ## 7. Gateway endpoints
 
-- `POST /webhooks/:source` — `404` unknown or non-webhook source; `401` failed
-  verification; `202` otherwise (relay continues in the background). Dropped
-  events (bot, unresolved sender) are `202` + a log line, so senders don't retry.
+- `POST /webhooks/:source` — `404` unknown or non-webhook source, or one whose
+  `sender.*From` expressions don't compile; `401` failed verification; `202`
+  otherwise (relay continues in the background). Dropped events (bot,
+  unresolved sender) are `202` + a log line, so senders don't retry.
+  Compilation is asked of agent-orchestrator's `POST /events/compile`
+  (`{expressions} → {errors: {<expr>: <message>}}`) once per distinct
+  expression and cached (a "does not compile" answer for 60s, since it also
+  depends on the orchestrator's CEL environment). It is asked once, with no
+  retry, and times out after 3s, keeping the 202 inside providers' ~10s
+  delivery timeout. If it can't answer, the source is served for the next 10s without
+  asking again, and each delivery's prefilter (below) still fails closed.
   Before resolving a source's `sender` (live GitHub API calls), the gateway
-  checks its read-only view of the EventTriggers: a delivery no trigger for this
-  source could match is dropped there (`202` + log line), so pushes, check runs
-  and other unwatched events cost no API calls. A trigger whose `match.cel` reads
-  `sender` or `repository` can't be decided before resolution and counts as a
-  possible match. This view only ever drops early; matching stays the
+  sends the preliminary envelope (`sender {}`, `repository ""`) and the
+  source's `sender.*From` expressions to agent-orchestrator's
+  `POST /events/prefilter` (its `/invoke` bearer):
+  `{envelope, sender?} → {couldMatch, sender: {<field>: {ok, type, value} | {ok:false, error}}}`.
+  `couldMatch:false` — no Ready trigger for this source could match — drops the
+  delivery (`202` + log line), so pushes, check runs and other unwatched events
+  cost no API calls. A trigger whose `match.cel` references `sender` or
+  `repository` can't be decided before resolution and counts as a possible
+  match. The sender results (an `int` as its decimal string) are then checked
+  for type exactly as before; an evaluation error is an `ok:false` result and
+  drops the delivery, as does a prefilter that still fails after a few retries
+  (connection errors and `5xx` are retried — the call has no side effects).
+  This only ever drops early; matching stays the
   orchestrator's, and an event that survives is still sender-verified.
 - `POST /events/:source/tick` — `Authorization: Bearer <projected SA token>`.
   The gateway verifies it against the cluster's ServiceAccount issuer keys
@@ -445,12 +469,14 @@ bot-drop guard (§1) is untouched.
   have replied to. No trigger config can exceed it.
 
 **Durability.** A run survives a rollout of the gateway or the orchestrator.
-The gateway records each accepted run in Redis under a renewed lease, and a
-replacement gateway takes over any run whose lease lapsed (within about two
-and a half minutes), finishing it from the poll on without repeating steps
-already done. The orchestrator re-attaches to a turn whose process died by the
-engine id it recorded. Without Redis (`AGENT_REDIS_URL` / the session-page
-Redis), a gateway restart still drops runs in flight.
+Each accepted event's run is a Temporal workflow (`eventRun`, docs/adr/0057)
+that the gateway's own worker runs, on the engine's Temporal: ack, poll,
+result, label removal and the completion event are its steps. A gateway that
+dies mid-run costs a retried activity on another replica -- at once on a
+rollout (the worker cancels its activities on shutdown), within a minute on a
+crash (the poll's heartbeat timeout) -- and no step that finished runs again.
+The orchestrator re-attaches to a turn whose process died by the engine id it
+recorded.
 
 ### The factory recipe
 
@@ -518,8 +544,8 @@ anyway.
 ### Held completions (`onComplete.waitUntilClosed`, `onComplete.serialize`)
 
 Two gateway primitives, both on a trigger with `onComplete.emitTo`. Instead of
-publishing the completion at once, the gateway records it (in Redis, beside the
-in-flight runs) and a sweep publishes it once every hold is released:
+publishing the completion at once, the run hands it to a `heldRunEvent`
+workflow (docs/adr/0057), which publishes it once every hold is released:
 
 - `waitUntilClosed: {repositoryParam, numberParam}`: until the issue or PR
   named by those params is closed (a PR closes when it merges; an issue when
@@ -533,19 +559,25 @@ in-flight runs) and a sweep publishes it once every hold is released:
 - `serialize: {group, keyParam}`: at most one completion per
   `<group>:<params[keyParam]>` queue is in flight. The queue is taken when the
   completion is published and held until **the run it started** finishes (its
-  completion, and that run's status labels, already out), renewed alongside the
-  run's in-flight lease, so a dead gateway frees it within minutes. Oldest
-  first. A completion nobody accepted frees the queue at once.
+  completion, and that run's status labels, already out). Each queue is a
+  `runQueue` workflow handing out turns oldest first; a holder that never
+  releases (its workflow was terminated) is passed over after a timeout derived
+  from the run settings to outlast any live holder (about 60 hours with the
+  defaults: two 24-hour publish windows, plus a run's turns, link wait and
+  label retries). A completion nobody accepted, or accepted but whose run
+  could not be started, frees the queue at once. A publish that ended without
+  an answer (its worker died, or it timed out) hands the queue to the run it
+  may have started, which claims it when it starts; if no run claims it within
+  15 minutes, the next completion gets its turn.
 
-Both together hold until both are released. The sweep runs every 30s and
-immediately after a hold or a queue release; a held wait re-reads its issues
-from GitHub at most once per `GATEWAY_HELD_EVENT_STATE_CHECK_INTERVAL_MS`
-(default 5 minutes) across all replicas. Of several gateway replicas, exactly
-one publishes each completion (it is claimed before it is sent). A completion
-whose publish fails (orchestrator unreachable, an error status, or an error
-re-verifying the chain's origin) is saved back in its place and retried on
-the next sweep, for up to 24 hours after the first failure; then it is
-dropped, logged, and a comment on the held run's issue says it needs a human.
+Both together hold until both are released: the wait first, then the queue.
+A held wait re-reads its issues from GitHub once per
+`GATEWAY_HELD_EVENT_STATE_CHECK_INTERVAL_MS` (default 5 minutes). Every
+completion is published by exactly one workflow. One whose publish fails
+(orchestrator unreachable, an error status, or an error re-verifying the
+chain's origin) is retried with backoff for up to 24 hours after the first
+failure -- held or not -- then dropped, logged, and a comment on the run's
+issue says it needs a human.
 
 ### The coordinator
 
@@ -598,7 +630,10 @@ the App itself (the latest `assigned` timeline event for that login has
 `author` as its actor; an assignment a person made is never trusted). The
 event's sender is that assignee (the factory's handoff assigns the human who
 started the chain),
-never the bot or whoever merged the other PR; it starts a new chain. One gateway
-replica sweeps each interval. `factory-resync` (examples, production) merges the
+never the bot or whoever merged the other PR; it starts a new chain. Each
+source is one `conflictSweep` workflow (docs/adr/0057), started by the gateway
+when it sees the source and ending when the source goes away; the (PR, base
+commit) marks are its own state, kept for 30 days (a failed scan skips one sweep
+and keeps them). `factory-resync` (examples, production) merges the
 base into the branch as that person, and its completion goes to review or
 handoff like a fix's.

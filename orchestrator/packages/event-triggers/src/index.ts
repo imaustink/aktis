@@ -1,6 +1,11 @@
 // @aktis/event-triggers — the EventSource/EventTrigger contract
-// (ADR 0048, docs/event-triggers.md): envelope, CEL environment, matching,
-// params and templates. Pure logic; no Kubernetes client.
+// (ADR 0048, docs/event-triggers.md): the normalized event envelope and the
+// CR types. Pure logic; no Kubernetes client.
+//
+// CEL (matching, params, templates, sender extraction) is evaluated in one
+// place only: the orchestrator's Go evaluator, shared with the Temporal
+// engine and core-controller. integration-gateway asks it over
+// `POST /events/prefilter` (docs/event-triggers.md §8).
 
 export type {
   AcceptedOnComplete,
@@ -39,25 +44,7 @@ export type {
 
 export { RUN_OUTCOMES } from "./types.js";
 
-export {
-  canonicalJson,
-  celTypeOf,
-  fromTypedParam,
-  normalizeJson,
-  paramToString,
-  toJsonValue,
-  toTypedParam,
-  UnsupportedValueError,
-} from "./values.js";
-export type { CelTypeName, CelValue, JsonValue, TypedParam } from "./values.js";
-
-export { compileExpression, envelopeActivation, evaluate } from "./cel.js";
-export type { Activation, CompileResult, CompiledExpression, EvaluateResult } from "./cel.js";
-
-export { PLACEHOLDER_PATTERN, renderTemplate } from "./template.js";
-
-export { compileTrigger, selectTrigger } from "./trigger.js";
-export type { CompiledParam, CompiledTrigger, SelectOptions, SelectResult } from "./trigger.js";
+export type { JsonValue } from "./values.js";
 
 export {
   ALWAYS_DROPPED_HEADERS,

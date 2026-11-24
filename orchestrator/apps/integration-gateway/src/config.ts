@@ -190,19 +190,6 @@ export interface AppConfig {
   connectionsAllowUnverifiedEmail: boolean;
   connectionsSessionTtlSeconds: number;
   /**
-   * How often the label reconciler sweeps for owed removals whose
-   * in-process `finally` never ran (pod restart/OOM mid-turn). Undefined ->
-   * {@link LabelReconciler}'s own default. See label-reconciler.ts.
-   */
-  labelReconcilerIntervalMs: number | undefined;
-  /**
-   * How old an owed label removal must be before the reconciler acts on it --
-   * the grace that keeps a just-started run (not yet live) or a transient
-   * liveness-probe blip from stripping a label prematurely. Undefined ->
-   * {@link LabelReconciler}'s own default.
-   */
-  labelReconcilerGraceMs: number | undefined;
-  /**
    * The global cap on a run-event chain's depth (docs/adr/0052 §1): a run
    * event whose `chain.depth` would exceed it is dropped (logged, and
    * commented on the trigger's issue/PR). The backstop no trigger config can
@@ -211,10 +198,18 @@ export interface AppConfig {
   runEventMaxDepth: number;
   /**
    * How often a held `waitUntilClosed` event re-reads its issues from GitHub
-   * (docs/adr/0055 §2), in ms; 0 checks every sweep. Unset -> the gateway's
-   * default (5 minutes).
+   * (docs/adr/0055 §2), in ms. Unset -> the gateway's default (5 minutes);
+   * anything under a second is raised to one.
    */
   heldEventStateCheckIntervalMs: number | undefined;
+  /**
+   * The Temporal frontend the gateway's run workflows live on (docs/adr/0057)
+   * -- the same cluster and namespace as the engine's. Required.
+   */
+  temporalAddress: string;
+  temporalNamespace: string;
+  /** The task queue this gateway's worker polls; every gateway replica shares it. */
+  temporalTaskQueue: string;
 }
 
 function num(raw: string | undefined, fallback: number): number {
@@ -285,10 +280,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     connectionsOidcScopes: env.GATEWAY_CONNECTIONS_OIDC_SCOPES || "openid email profile",
     connectionsAllowUnverifiedEmail: env.GATEWAY_CONNECTIONS_ALLOW_UNVERIFIED_EMAIL === "true",
     connectionsSessionTtlSeconds: num(env.GATEWAY_CONNECTIONS_SESSION_TTL_SECONDS, 8 * 60 * 60),
-    labelReconcilerIntervalMs: numOrUndefined(env.GATEWAY_LABEL_RECONCILER_INTERVAL_MS),
-    labelReconcilerGraceMs: numOrUndefined(env.GATEWAY_LABEL_RECONCILER_GRACE_MS),
     runEventMaxDepth: positiveInt(env.RUN_EVENT_MAX_DEPTH, 12),
     heldEventStateCheckIntervalMs: numOrUndefined(env.GATEWAY_HELD_EVENT_STATE_CHECK_INTERVAL_MS),
+    temporalAddress: env.TEMPORAL_ADDRESS ?? "",
+    temporalNamespace: env.TEMPORAL_NAMESPACE || "default",
+    temporalTaskQueue: env.TEMPORAL_TASK_QUEUE || "integration-gateway",
   };
 }
 

@@ -65,9 +65,10 @@ func fixturePath(t *testing.T) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)
 	require.True(t, ok)
-	// orchestrator/engines/temporal/internal/catalog -> repository root.
-	return filepath.Join(filepath.Dir(file), "..", "..", "..", "..", "..",
-		"orchestrator", "packages", "event-triggers", "fixtures", "cel-parity.json")
+	// The executable definition of docs/event-triggers.md §3-§4, now that
+	// this evaluator is the only one (integration-gateway asks it over
+	// /events/prefilter instead of running its own).
+	return filepath.Join(filepath.Dir(file), "testdata", "cel-parity.json")
 }
 
 func loadParityFixture(t *testing.T) parityFixture {

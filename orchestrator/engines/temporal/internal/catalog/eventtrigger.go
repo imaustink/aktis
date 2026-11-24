@@ -281,6 +281,10 @@ const celCostLimit = 10_000_000
 // CompiledExpr is one compiled CEL expression.
 type CompiledExpr struct {
 	prg cel.Program
+	// readsResolved: the expression references the top-level `sender` or
+	// `repository` variable, which integration-gateway fills in only after
+	// resolving a webhook's sender (see CouldMatchBeforeSender).
+	readsResolved bool
 }
 
 // CompileEventExpr compiles (parses AND type-checks) expr against the
@@ -312,7 +316,14 @@ func compileEventExpr(expr string, want *cel.Type) (*CompiledExpr, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &CompiledExpr{prg: prg}, nil
+	readsResolved := false
+	for _, ref := range ast.NativeRep().ReferenceMap() {
+		if ref != nil && (ref.Name == "sender" || ref.Name == "repository") {
+			readsResolved = true
+			break
+		}
+	}
+	return &CompiledExpr{prg: prg, readsResolved: readsResolved}, nil
 }
 
 // Eval evaluates against an envelope and returns the result as a plain Go
