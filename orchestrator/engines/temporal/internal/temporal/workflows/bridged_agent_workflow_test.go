@@ -540,3 +540,32 @@ func registerAgentRunActivities(le *loopEnv) {
 		return nil
 	})
 }
+
+// A trigger-forced turn whose agent fails FAILS, like a forced tool's: the
+// run's outcome is what the factory chains on (aktis#363's review ended "the
+// reviewer did not record a verdict" when its agent had never started). A
+// chat turn that delegated still answers with the failure as text
+// (TestBridgedAgentNeverReadyFailsFast).
+func TestForcedBridgedAgentFailureFailsTheTurn(t *testing.T) {
+	le := newLoopEnv(t)
+	agent := bridgedAgent()
+	le.agents = []catalog.AgentDescriptor{agent}
+	le.resolvedAgent = &agent
+
+	in := workflows.TurnInput{
+		Message:       "Review acme/widgets#42",
+		Caller:        activities.Caller{Subject: "svc:gw", Roles: []string{"agent"}},
+		ForcedAgentID: agent.ID,
+		TriggerName:   "factory-review",
+	}
+	var failure error
+	le.sendTurnExpectingFailure(t, "turn-1", in, &failure, time.Millisecond)
+	le.deliverUp(agentrun.UpMessage{Seq: 1, Type: agentrun.UpReady}, time.Second)
+	le.deliverUp(agentrun.UpMessage{Seq: 2, Type: agentrun.UpFailed, Code: "boom", Message: "it broke"}, 2*time.Second)
+
+	le.env.ExecuteWorkflow(workflows.ConversationWorkflowName, (*workflows.ConversationState)(nil))
+	require.True(t, le.env.IsWorkflowCompleted())
+	require.NoError(t, le.env.GetWorkflowError())
+	require.Error(t, failure)
+	require.Contains(t, failure.Error(), "it broke")
+}

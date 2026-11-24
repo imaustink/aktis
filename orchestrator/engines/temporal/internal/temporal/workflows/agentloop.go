@@ -126,8 +126,12 @@ func runAgentTurn(ctx workflow.Context, actx workflow.Context, state *Conversati
 			gen := state.beginAgentListen(ctx)
 			// Carried like any other delegation's; ConversationWorkflow keeps it
 			// only when this turn itself was a forced agentRef dispatch.
-			reply, outcome, preempted := handleAgentUp(ctx, state, state.ActiveAgentID, state.ActiveAgentWorkflowID, gen, note)
+			agentID := state.ActiveAgentID
+			reply, outcome, preempted, failed := handleAgentUp(ctx, state, agentID, state.ActiveAgentWorkflowID, gen, note)
 			meta.Outcome = outcome
+			if err := forcedAgentFailure(in, agentID, failed, reply); err != nil {
+				return "", meta, nil, err
+			}
 			if preempted {
 				// A still-later turn took over listening for this episode's
 				// reply before (or while) this one was waiting — that turn
