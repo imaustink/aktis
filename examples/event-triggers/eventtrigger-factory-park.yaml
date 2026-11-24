@@ -1,0 +1,55 @@
+# Software factory, step 1b (docs/adr/0055 §3): the coordinator decided this
+# issue must wait for other in-flight work (`aktis-coordinate wait <N>`). This
+# runless trigger posts why, swaps ai-triage for ai-waiting, and completes at
+# once -- but its completion is HELD by the gateway (`onComplete`):
+#
+#   waitUntilClosed: until #N (an issue or PR) is closed. A PR closes when it
+#     is merged; an issue closes when the PR that `Closes` it merges. Closing
+#     THIS issue meanwhile abandons the wait.
+#   serialize: and until no coordination is running in the repository.
+#
+# Then the completion reaches factory-coordinate, which looks at the board
+# again (it may proceed, stack, or wait on something else).
+#
+# Deterministic guards: a wait on the issue itself, on a closed #N, or that
+# would close a cycle (#N is itself waiting on this issue) is not held -- the
+# gateway publishes it at once, and the coordinator decides again. At most 5
+# waits per chain (`counts`); past that factory-triage proceeds anyway. The
+# chain's depth restarts after a wait that really blocked, so a long wait
+# doesn't eat the review loop's depth budget.
+apiVersion: core.aktis.ai/v1alpha1
+kind: EventTrigger
+metadata:
+  name: factory-park
+spec:
+  sourceRef: runs
+  match:
+    cel: >-
+      source == "runs" && kind == "run" &&
+      body.trigger == "factory-coordinate" && body.status == "succeeded" &&
+      has(body.outcome.coordination) && body.outcome.coordination.decision == "wait" &&
+      has(body.outcome.coordination.number) &&
+      string(body.outcome.coordination.number) != body.params.number &&
+      (!("factory-park" in body.chain.counts) || body.chain.counts["factory-park"] < 5)
+  params:
+    repository: body.params.repository
+    number: body.params.number
+    title: body.params.title
+    waitFor: string(body.outcome.coordination.number)
+  target:
+    none: {}
+  reply:
+    github:
+      repository: "{{repository}}"
+      issueNumber: "{{number}}"
+      ack: "⏸️ Holding this until #{{waitFor}} is merged (or closed): the automated coordinator found that it overlaps with that work. It starts automatically afterwards; close this issue to cancel."
+      addLabels: ["ai-waiting"]
+      removeLabel: "ai-triage"
+  onComplete:
+    emitTo: runs
+    waitUntilClosed:
+      repositoryParam: repository
+      numberParam: waitFor
+    serialize:
+      group: factory-coordinate
+      keyParam: repository

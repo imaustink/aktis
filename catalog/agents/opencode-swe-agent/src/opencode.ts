@@ -1,5 +1,5 @@
 import type { SweMarker } from "./marker.js";
-import { VERDICT_PROMPT_SECTION } from "./outcome.js";
+import { coordinationRequested, VERDICT_PROMPT_SECTION } from "./outcome.js";
 
 /**
  * Guardrails baked into every invocation, as `permission.bash` deny rules in
@@ -122,7 +122,9 @@ export function buildOpencodeConfig(opts: OpencodeConfigOptions): object {
  *
  * `readOnly` (from the structured AgentRun.spec.readOnly, never the goal)
  * appends the review-verdict section at the very end, so the model records
- * its decision with `aktis-verdict` (see outcome.ts). Other runs' prompts are
+ * its decision with `aktis-verdict` (see outcome.ts) -- unless the
+ * instruction names `aktis-coordinate` (a factory coordination run, docs/adr/0055),
+ * which records a coordination decision instead. Other runs' prompts are
  * unchanged.
  */
 export function buildPrompt(instruction: string, marker: SweMarker | null, readOnly = false): string {
@@ -158,7 +160,7 @@ export function buildPrompt(instruction: string, marker: SweMarker | null, readO
     `- NEVER force-push, delete branches/repositories, run \`git reset --hard\`, or run other destructive/irreversible commands.`,
     `- You get exactly ONE turn to complete this task, and this process exits as soon as you reply -- there is no scheduler, cron, or webhook that will wake it back up later. You cannot pause partway through and wait for something external (a CI run, a build, a test job) to finish. Finish the task now with whatever information is available; if something is still pending, say so as a caveat in your final reply instead of deferring completion on it. Do NOT say you'll "resume automatically", "finalize later", or "when the check completes" -- that will never happen, and it leaves the task looking incomplete with no way for anyone to know a human needs to re-trigger you.`,
     `- When finished, print a short summary of what you changed and the pull request URL.`,
-    ...(readOnly ? [``, VERDICT_PROMPT_SECTION] : []),
+    ...(readOnly && !coordinationRequested(instruction) ? [``, VERDICT_PROMPT_SECTION] : []),
   ].join("\n");
 }
 

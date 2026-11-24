@@ -26,7 +26,15 @@ import {
   setupGitAuth,
 } from "./git.js";
 import { closingLine, ensureClosingReference, parseClosesIssue } from "./closingRef.js";
-import { clearVerdict, collectOutcome, installVerdictCommand, VERDICT_FILE_ENV, type SweOutcome } from "./outcome.js";
+import {
+  clearCoordination,
+  clearVerdict,
+  collectOutcome,
+  COORDINATE_FILE_ENV,
+  installVerdictCommand,
+  VERDICT_FILE_ENV,
+  type SweOutcome,
+} from "./outcome.js";
 import { extractContinuationToken } from "./continuation.js";
 import { decodeSweContinuation, encodeSweContinuation, type SweMarker } from "./marker.js";
 import { loadToolConfig } from "./config.js";
@@ -70,6 +78,8 @@ interface TurnContext {
   params: Readonly<Record<string, string>>;
   /** Runner-owned file `aktis-verdict` writes to (outcome.ts). */
   verdictFile: string;
+  /** Runner-owned file `aktis-coordinate` writes to (outcome.ts, docs/adr/0055). */
+  coordinateFile: string;
   signal: AbortSignal;
 }
 
@@ -111,6 +121,7 @@ async function runTurn(ctx: TurnContext, instruction: string, marker: SweMarker 
   // Whatever is in the verdict file after the turn was written during THIS
   // turn, never left over from an earlier one.
   await clearVerdict(ctx.verdictFile);
+  await clearCoordination(ctx.coordinateFile);
   const result = await sendMessage(ctx.serverBaseUrl, ctx.sessionId, promptText, ctx.auth, ctx.signal);
 
   if (result.failed) {
@@ -126,6 +137,26 @@ async function runTurn(ctx: TurnContext, instruction: string, marker: SweMarker 
   const discovered = repoDir ? await discoverResult(repoDir, ctx.childEnv, ctx.signal) : null;
 
   if (!discovered?.repo || !discovered.branch) {
+    // A read-only turn legitimately leaves no pushable branch (a coordination
+    // run, docs/adr/0055, may never clone at all), and may still have recorded
+    // a verdict or coordination decision, so it succeeds and carries its
+    // outcome -- as in claude-code-swe-agent. A change turn that produced
+    // nothing pushable failed.
+    if (ctx.readOnly) {
+      return {
+        reply: clip(summary, 1500),
+        nextMarker: marker,
+        succeeded: true,
+        outcome: await collectOutcome({
+          discovered: null,
+          madeNewCommits: false,
+          readOnly: true,
+          verdictFile: ctx.verdictFile,
+          instruction,
+          coordinateFile: ctx.coordinateFile,
+        }),
+      };
+    }
     return {
       reply: `The agent produced no pushable repository or pull request. Details: ${clip(summary, 1200)}`,
       nextMarker: marker,
@@ -242,6 +273,8 @@ async function runTurn(ctx: TurnContext, instruction: string, marker: SweMarker 
       madeNewCommits: pushedNewCommits,
       readOnly: ctx.readOnly,
       verdictFile: ctx.verdictFile,
+      instruction,
+      coordinateFile: ctx.coordinateFile,
     }),
   };
 }
@@ -440,6 +473,10 @@ async function main(): Promise<void> {
     const verdict = await installVerdictCommand({ homeDir: toolConfig.homeDir });
     childEnv.PATH = `${verdict.binDir}:${childEnv.PATH ?? ""}`;
     childEnv[VERDICT_FILE_ENV] = verdict.verdictFile;
+    // `aktis-coordinate` (docs/adr/0055): the factory coordinator's decision,
+    // installed and reported the same way -- only on a read-only run whose
+    // instruction names the command.
+    childEnv[COORDINATE_FILE_ENV] = verdict.coordinateFile;
 
     const opencodeConfigDir = join(xdgConfigHome, "opencode");
     await mkdir(opencodeConfigDir, { recursive: true });
@@ -505,6 +542,7 @@ async function main(): Promise<void> {
         readOnly,
         params: runtimeConfig.params,
         verdictFile: verdict.verdictFile,
+        coordinateFile: verdict.coordinateFile,
         signal: abort.signal,
       },
       instruction,

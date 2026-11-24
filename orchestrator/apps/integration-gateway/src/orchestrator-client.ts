@@ -12,7 +12,7 @@
  * follow-up, not built in this phase.
  */
 
-import type { Envelope, RenderedReply } from "@aktis/event-triggers";
+import type { AcceptedOnComplete, Envelope, RenderedReply } from "@aktis/event-triggers";
 import { SENDER_ASSERTION_HEADER, mintSenderAssertion, type SenderClaims } from "./sender-assertion.js";
 import { TRACEPARENT_HEADER } from "./traceparent.js";
 
@@ -106,8 +106,11 @@ export interface AcceptedTrigger {
    * §1). Non-string values are dropped when parsed.
    */
   params?: Record<string, string>;
-  /** `spec.onComplete` (docs/adr/0052 §1): the run source this run's completion is published to. */
-  onComplete?: { emitTo: string };
+  /**
+   * `spec.onComplete` (docs/adr/0052 §1): the run source this run's completion
+   * is published to, plus the ADR 0055 §2 holds on publishing it.
+   */
+  onComplete?: AcceptedOnComplete;
 }
 
 /** Outcome of {@link OrchestratorClient.submitEvent}. */
@@ -197,13 +200,34 @@ export function parseAcceptedTrigger(raw: unknown): AcceptedTrigger {
     params = {};
     for (const [key, value] of Object.entries(t.params)) if (typeof value === "string") params[key] = value;
   }
-  const emitTo = isPlainObject(t.onComplete) ? t.onComplete.emitTo : undefined;
   return {
     name: typeof t.name === "string" ? t.name : "",
     sessionId: typeof t.sessionId === "string" ? t.sessionId : "",
     reply: typeof t.reply === "object" && t.reply !== null ? (t.reply as RenderedReply) : null,
     ...(params ? { params } : {}),
-    ...(typeof emitTo === "string" && emitTo ? { onComplete: { emitTo } } : {}),
+    ...(isPlainObject(t.onComplete) ? parseOnComplete(t.onComplete) : {}),
+  };
+}
+
+/**
+ * `onComplete` as the engine echoed it. A malformed `waitUntilClosed` /
+ * `serialize` is dropped rather than half-parsed -- the gateway then emits
+ * straight away, which is the behaviour without the hold (docs/adr/0055 §2).
+ */
+function parseOnComplete(oc: Record<string, unknown>): { onComplete?: AcceptedOnComplete } {
+  const emitTo = oc.emitTo;
+  if (typeof emitTo !== "string" || !emitTo) return {};
+  const nonEmpty = (v: unknown): v is string => typeof v === "string" && v !== "";
+  const w = isPlainObject(oc.waitUntilClosed) ? oc.waitUntilClosed : undefined;
+  const s = isPlainObject(oc.serialize) ? oc.serialize : undefined;
+  return {
+    onComplete: {
+      emitTo,
+      ...(w && nonEmpty(w.repositoryParam) && nonEmpty(w.numberParam)
+        ? { waitUntilClosed: { repositoryParam: w.repositoryParam, numberParam: w.numberParam } }
+        : {}),
+      ...(s && nonEmpty(s.group) && nonEmpty(s.keyParam) ? { serialize: { group: s.group, keyParam: s.keyParam } } : {}),
+    },
   };
 }
 

@@ -641,4 +641,29 @@ describe("run outcomes and accepted-trigger chaining fields (docs/adr/0052)", ()
       reply: null,
     });
   });
+
+  it("carries onComplete.waitUntilClosed and serialize, dropping a malformed one (docs/adr/0055 §2)", () => {
+    const parsed = parseAcceptedTrigger({
+      name: "t",
+      sessionId: "s",
+      reply: null,
+      onComplete: {
+        emitTo: "runs",
+        waitUntilClosed: { repositoryParam: "repository", numberParam: "waitFor" },
+        serialize: { group: "coord", keyParam: "repository" },
+      },
+    });
+    expect(parsed.onComplete).toEqual({
+      emitTo: "runs",
+      waitUntilClosed: { repositoryParam: "repository", numberParam: "waitFor" },
+      serialize: { group: "coord", keyParam: "repository" },
+    });
+    const junk = parseAcceptedTrigger({
+      name: "t",
+      sessionId: "s",
+      reply: null,
+      onComplete: { emitTo: "runs", waitUntilClosed: { repositoryParam: "", numberParam: 3 }, serialize: "x" },
+    });
+    expect(junk.onComplete).toEqual({ emitTo: "runs" });
+  });
 });

@@ -130,6 +130,24 @@ func (r *EventTriggerReconciler) check(ctx context.Context, trigger *corev1alpha
 		}
 	}
 
+	// onComplete.waitUntilClosed / serialize read their values from the
+	// trigger's own rendered params (docs/adr/0055), so each must name one:
+	// a missing param would leave the gateway nothing to wait on or queue by.
+	if oc := trigger.Spec.OnComplete; oc != nil {
+		var refs [][2]string
+		if w := oc.WaitUntilClosed; w != nil {
+			refs = append(refs, [2]string{"waitUntilClosed.repositoryParam", w.RepositoryParam}, [2]string{"waitUntilClosed.numberParam", w.NumberParam})
+		}
+		if q := oc.Serialize; q != nil {
+			refs = append(refs, [2]string{"serialize.keyParam", q.KeyParam})
+		}
+		for _, ref := range refs {
+			if _, ok := trigger.Spec.Params[ref[1]]; !ok {
+				return "InvalidOnComplete", fmt.Sprintf("onComplete.%s %q is not a key of spec.params", ref[0], ref[1]), nil
+			}
+		}
+	}
+
 	exists := func(obj client.Object, name string) (bool, error) {
 		key := types.NamespacedName{Namespace: trigger.Namespace, Name: name}
 		if err := r.Get(ctx, key, obj); err != nil {

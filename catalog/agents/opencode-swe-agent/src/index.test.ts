@@ -19,6 +19,10 @@ const state = vi.hoisted(() => ({
   serverEnv: {} as NodeJS.ProcessEnv,
   /** What the stubbed model runs: `aktis-verdict <args>` when set. */
   modelVerdictArgs: null as string[] | null,
+  /** What the stubbed model runs: `aktis-coordinate <args>` when set (docs/adr/0055). */
+  modelCoordinateArgs: null as string[] | null,
+  /** Overrides the run goal when set. */
+  goal: null as string | null,
   prompt: "",
   headBefore: "aaa",
   headAfter: "aaa",
@@ -32,7 +36,7 @@ vi.mock("@aktis/agent-runtime", async (orig) => ({
   ...(await orig<typeof import("@aktis/agent-runtime")>()),
   loadConfig: () => ({
     runId: "run-1",
-    goal: state.readOnly ? "review PR #7" : "fix the bug",
+    goal: state.goal ?? (state.readOnly ? "review PR #7" : "fix the bug"),
     readOnly: state.readOnly,
     params: {},
   }),
@@ -80,6 +84,10 @@ vi.mock("./opencode-server.js", () => ({
       const res = spawnSync("aktis-verdict", state.modelVerdictArgs, { env: state.serverEnv, encoding: "utf8" });
       if (res.error) throw res.error;
     }
+    if (state.modelCoordinateArgs) {
+      const res = spawnSync("aktis-coordinate", state.modelCoordinateArgs, { env: state.serverEnv, encoding: "utf8" });
+      if (res.error) throw res.error;
+    }
     return { failed: false, finalMessage: "done", failureDetail: null };
   },
 }));
@@ -121,6 +129,8 @@ describe("index outcome wiring", () => {
     state.work = mkdtempSync(join(tmpdir(), "idx-work-"));
     state.published = [];
     state.modelVerdictArgs = null;
+    state.modelCoordinateArgs = null;
+    state.goal = null;
     state.revParseCalls = 0;
     state.headOnRemote = true;
     state.headBefore = state.headAfter = "aaa";
@@ -185,5 +195,34 @@ describe("index outcome wiring", () => {
       pullRequest: { number: 7, url: "https://github.com/acme/widgets/pull/7" },
       madeNewCommits: false,
     });
+  });
+
+  // docs/adr/0055: a read-only coordination run reports its decision, not a verdict.
+  it("a coordination run that never cloned succeeds and reports the decision, and no verdict", async () => {
+    state.readOnly = true;
+    state.goal = 'Check issue #5 against in-flight work, then run `aktis-coordinate proceed`, `aktis-coordinate wait <N>` or `aktis-coordinate stack <N>`.';
+    state.discovered = null;
+    state.modelCoordinateArgs = ["stack", "#9"];
+    state.modelVerdictArgs = ["ready"];
+    const reply = await runMain();
+    expect(state.prompt).not.toContain("aktis-verdict");
+    expect(reply.outcome).toEqual({ madeNewCommits: false, coordination: { decision: "stack", number: 9 } });
+  });
+
+  it("a coordination run that recorded nothing reports none, even with a stale decision on disk", async () => {
+    state.readOnly = true;
+    state.goal = 'Check issue #5 against in-flight work, then run `aktis-coordinate proceed`, `aktis-coordinate wait <N>` or `aktis-coordinate stack <N>`.';
+    mkdirSync(join(state.home, ".aktis"), { recursive: true });
+    writeFileSync(join(state.home, ".aktis", "coordinate"), "proceed\n");
+    const reply = await runMain();
+    expect(reply.outcome?.coordination).toEqual({ decision: "none" });
+  });
+
+  it("a review that left no clone still carries its verdict", async () => {
+    state.readOnly = true;
+    state.discovered = null;
+    state.modelVerdictArgs = ["ready"];
+    const reply = await runMain();
+    expect(reply.outcome).toEqual({ madeNewCommits: false, verdict: "ready" });
   });
 });

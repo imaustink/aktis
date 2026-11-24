@@ -1,0 +1,82 @@
+# Software factory, step 1 (docs/adr/0055 §3): before any work starts, a
+# read-only coordinator compares the issue against the work already in flight
+# in the repository and records ONE decision with `aktis-coordinate` (the
+# runner installs it; because this prompt names it, the runner reports
+# `outcome.coordination` instead of a review verdict):
+#
+#   proceed     -> factory-triage (work from the default branch)
+#   stack <N>   -> factory-triage-stacked (branch from open PR #N)
+#   wait <N>    -> factory-park (held until #N is merged or closed, then back here)
+#   none        -> factory-triage (no valid decision = today's behaviour)
+#
+# The decision is the model's judgment; routing it is not -- the triggers
+# above match on the recorded enum. Runs one at a time per repository: it is
+# reached only through factory-intake and factory-park, both of which hold
+# their completion in the `factory-coordinate` serialize queue, and the queue
+# is held until THIS run finishes.
+#
+# addLabels ai-triage re-marks an issue coming back from a wait as in flight;
+# removeLabel ai-waiting clears the parked marker when it ends.
+apiVersion: core.aktis.ai/v1alpha1
+kind: EventTrigger
+metadata:
+  name: factory-coordinate
+spec:
+  sourceRef: runs
+  match:
+    cel: >-
+      source == "runs" && kind == "run" &&
+      body.trigger in ["factory-intake", "factory-park"]
+  params:
+    repository: body.params.repository
+    number: body.params.number
+    title: body.params.title
+  sessionKey: "factory-coordinate:{{repository}}#{{number}}"
+  target:
+    agentRef: "opencode-swe-agent"
+    readOnly: true
+    promptTemplate: |
+      You are the coordinator of an automated software factory working in
+      {{repository}}. Issue {{repository}}#{{number}} ("{{title}}") is about to
+      be implemented by an automated agent that will open a pull request for
+      it. Other work may already be in flight in the same repository. Decide,
+      BEFORE that work starts, how it should integrate with the in-flight work
+      so the pull requests do not conflict. You do not implement anything.
+
+      1. Read the issue: `gh issue view {{number}} --repo {{repository}} --comments`.
+      2. List the work in flight in {{repository}}:
+         - every open pull request, with the files each one changes:
+           `gh pr list --repo {{repository}} --state open --json number,title,headRefName,baseRefName,labels,files`
+         - issues already being worked on automatically, other than #{{number}}:
+           `gh issue list --repo {{repository}} --state open --label ai-triage --json number,title,body`
+      3. Work out which files and behaviour this issue will most likely change.
+         You may clone the repository and read the code to do this.
+      4. Record exactly ONE decision by running one of these commands once:
+         - `aktis-coordinate proceed` -- nothing in flight is likely to change
+           the same code. This is the usual answer; choose it whenever the
+           overlap is only speculative.
+         - `aktis-coordinate wait <N>` -- open pull request or in-flight issue
+           #N is likely to change the same code, so this issue's work should
+           start only after #N is merged. It starts automatically then. N must
+           be an open pull request or issue other than #{{number}}; never wait
+           on an issue labeled ai-waiting (it is itself waiting).
+         - `aktis-coordinate stack <N>` -- this issue builds directly on open
+           pull request #N's changes (it needs that code to exist), so its
+           pull request should be based on #N's branch. N must be an open pull
+           request. Prefer `wait` when the overlap is only "touches the same
+           files"; stack only for a real dependency.
+      5. Then reply with two to four sentences explaining the decision: which
+         pull request or issue overlaps, and in which files. That reply is
+         posted on the issue.
+
+      Do not comment, label, push, or open anything yourself.
+  reply:
+    github:
+      repository: "{{repository}}"
+      issueNumber: "{{number}}"
+      ack: "🤖 Checking this against other in-flight work before starting."
+      result: true
+      addLabels: ["ai-triage"]
+      removeLabel: "ai-waiting"
+  onComplete:
+    emitTo: runs

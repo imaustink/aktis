@@ -5,7 +5,12 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   buildOutcome,
+  clearCoordination,
   clearVerdict,
+  coordinationRequested,
+  COORDINATE_COMMAND,
+  COORDINATE_FILE_ENV,
+  readCoordination,
   collectOutcome,
   installVerdictCommand,
   prNumber,
@@ -188,5 +193,182 @@ describe("VERDICT_PROMPT_SECTION", () => {
   it("names both commands", () => {
     for (const v of VERDICTS) expect(VERDICT_PROMPT_SECTION).toContain(`\`${VERDICT_COMMAND} ${v}\``);
     expect(VERDICT_PROMPT_SECTION).toContain("exactly once");
+  });
+});
+
+// docs/adr/0055: the factory coordinator records its decision with aktis-coordinate.
+describe(`the ${COORDINATE_COMMAND} command`, () => {
+  let home: string;
+  let binDir: string;
+  let file: string;
+  const run = (args: string[], env: NodeJS.ProcessEnv = { ...process.env, [COORDINATE_FILE_ENV]: file }) =>
+    spawnSync(join(binDir, COORDINATE_COMMAND), args, { env, encoding: "utf8" });
+
+  beforeEach(async () => {
+    home = mkdtempSync(join(tmpdir(), "coordinate-cli-"));
+    ({ binDir, coordinateFile: file } = await installVerdictCommand({ homeDir: home }));
+  });
+  afterEach(() => rmSync(home, { recursive: true, force: true }));
+
+  it("records each valid decision, which the runner then reads back", async () => {
+    const cases: Array<[string[], string, unknown]> = [
+      [["proceed"], "proceed", { decision: "proceed" }],
+      [["wait", "12"], "wait 12", { decision: "wait", number: 12 }],
+      [["stack", "#7"], "stack 7", { decision: "stack", number: 7 }],
+    ];
+    for (const [args, line, parsed] of cases) {
+      const res = run(args);
+      expect(res.status, JSON.stringify(args)).toBe(0);
+      expect(readFileSync(file, "utf8")).toBe(`${line}\n`);
+      expect(await readCoordination(file)).toEqual(parsed);
+    }
+  });
+
+  it("resolves by name once its directory is on PATH", () => {
+    const res = spawnSync(COORDINATE_COMMAND, ["wait", "3"], {
+      env: { ...process.env, PATH: `${binDir}:${process.env.PATH}`, [COORDINATE_FILE_ENV]: file },
+      encoding: "utf8",
+    });
+    expect(res.status).toBe(0);
+    expect(readFileSync(file, "utf8")).toBe("wait 3\n");
+  });
+
+  it("rejects anything else with a usage message and writes nothing", () => {
+    for (const args of [
+      [],
+      ["proceed", "1"],
+      ["wait"],
+      ["wait", "0"],
+      ["wait", "012"],
+      ["wait", "-3"],
+      ["wait", "1.5"],
+      ["stack", "abc"],
+      ["stack", "1", "2"],
+      ["wait", "1;touch x"],
+      ["merge", "4"],
+      ["PROCEED"],
+      [""],
+    ]) {
+      const res = run(args);
+      expect(res.status, JSON.stringify(args)).not.toBe(0);
+      expect(res.stderr).toContain(`usage: ${COORDINATE_COMMAND}`);
+      expect(existsSync(file), JSON.stringify(args)).toBe(false);
+    }
+  });
+
+  it("fails without the runner's file env rather than writing somewhere else", () => {
+    const env = { ...process.env };
+    delete env[COORDINATE_FILE_ENV];
+    const res = run(["proceed"], env);
+    expect(res.status).not.toBe(0);
+    expect(res.stderr).toContain(COORDINATE_FILE_ENV);
+  });
+});
+
+describe("coordination file", () => {
+  let home: string;
+  let file: string;
+  beforeEach(async () => {
+    home = mkdtempSync(join(tmpdir(), "coordinate-file-"));
+    ({ coordinateFile: file } = await installVerdictCommand({ homeDir: home }));
+  });
+  afterEach(() => rmSync(home, { recursive: true, force: true }));
+
+  it("is none when nothing was recorded", async () => {
+    expect(await readCoordination(file)).toEqual({ decision: "none" });
+  });
+
+  it("is none for anything outside the grammar", async () => {
+    for (const raw of ["", "wait", "wait 0", "stack x", "proceed 3", "wait 3 4", "merge 2", "wait 99999999999999999999"]) {
+      writeFileSync(file, `${raw}\n`);
+      expect(await readCoordination(file), raw).toEqual({ decision: "none" });
+    }
+  });
+
+  it("clearCoordination drops a previous turn's decision", async () => {
+    writeFileSync(file, "wait 4\n");
+    await clearCoordination(file);
+    expect(await readCoordination(file)).toEqual({ decision: "none" });
+  });
+
+  it("lives outside the working tree, under the home directory, next to the verdict", async () => {
+    const paths = await installVerdictCommand({ homeDir: home });
+    expect(paths.coordinateFile).toBe(join(home, ".aktis", "coordinate"));
+    expect(existsSync(join(paths.binDir, COORDINATE_COMMAND))).toBe(true);
+  });
+});
+
+describe("coordinationRequested", () => {
+  it("is true only when the instruction names the command", () => {
+    expect(coordinationRequested(`Record it with \`${COORDINATE_COMMAND} proceed\`.`)).toBe(true);
+    expect(coordinationRequested("Review pull request #4.")).toBe(false);
+  });
+});
+
+describe("collectOutcome with coordination", () => {
+  let home: string;
+  let verdictFile: string;
+  let coordinateFile: string;
+  const asking = `Decide, then run \`${COORDINATE_COMMAND} proceed\`.`;
+  beforeEach(async () => {
+    home = mkdtempSync(join(tmpdir(), "collect-coord-"));
+    ({ verdictFile, coordinateFile } = await installVerdictCommand({ homeDir: home }));
+  });
+  afterEach(() => rmSync(home, { recursive: true, force: true }));
+
+  it("reports coordination instead of a verdict on a read-only run that asked for it", async () => {
+    writeFileSync(coordinateFile, "stack 9\n");
+    writeFileSync(verdictFile, "ready\n");
+    const outcome = await collectOutcome({
+      discovered: null,
+      madeNewCommits: false,
+      readOnly: true,
+      verdictFile,
+      instruction: asking,
+      coordinateFile,
+    });
+    expect(outcome).toEqual({ madeNewCommits: false, coordination: { decision: "stack", number: 9 } });
+  });
+
+  it("reports coordination none when the coordinator recorded nothing", async () => {
+    const outcome = await collectOutcome({
+      discovered: null,
+      madeNewCommits: false,
+      readOnly: true,
+      verdictFile,
+      instruction: asking,
+      coordinateFile,
+    });
+    expect(outcome.coordination).toEqual({ decision: "none" });
+    expect("verdict" in outcome).toBe(false);
+  });
+
+  it("never reports coordination on a review, even if the file exists", async () => {
+    writeFileSync(coordinateFile, "proceed\n");
+    writeFileSync(verdictFile, "ready\n");
+    const outcome = await collectOutcome({
+      discovered: pr,
+      madeNewCommits: false,
+      readOnly: true,
+      verdictFile,
+      instruction: "Review pull request #42.",
+      coordinateFile,
+    });
+    expect(outcome.verdict).toBe("ready");
+    expect("coordination" in outcome).toBe(false);
+  });
+
+  it("never reports coordination on a write run, even when the instruction names the command", async () => {
+    writeFileSync(coordinateFile, "proceed\n");
+    const outcome = await collectOutcome({
+      discovered: pr,
+      madeNewCommits: true,
+      readOnly: false,
+      verdictFile,
+      instruction: asking,
+      coordinateFile,
+    });
+    expect("coordination" in outcome).toBe(false);
+    expect("verdict" in outcome).toBe(false);
   });
 });

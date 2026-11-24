@@ -3,7 +3,11 @@
 // params and templates. Pure logic; no Kubernetes client.
 
 export type {
+  AcceptedOnComplete,
   Condition,
+  ConflictsSource,
+  OnCompleteSerialize,
+  OnCompleteWaitUntilClosed,
   CronSource,
   Envelope,
   EnvelopeKind,

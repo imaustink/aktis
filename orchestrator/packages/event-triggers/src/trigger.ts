@@ -3,6 +3,7 @@
 import { compileExpression, evaluate, prepareActivation, type CompiledExpression } from "./cel.js";
 import { renderTemplate } from "./template.js";
 import type {
+  AcceptedOnComplete,
   Envelope,
   EventTriggerReplySpec,
   EventTriggerResource,
@@ -41,7 +42,7 @@ export interface CompiledTrigger {
   target?: TriggerTarget;
   reply?: EventTriggerReplySpec;
   /** spec.onComplete when it names an emitTo source (docs/adr/0052 §1). */
-  onComplete?: { emitTo: string };
+  onComplete?: AcceptedOnComplete;
   resource: EventTriggerResource;
 }
 
@@ -73,7 +74,7 @@ export type SelectResult =
        * it in the 202 and integration-gateway knows where to emit the run's
        * completion event. Absent when the trigger does not set emitTo.
        */
-      onComplete?: { emitTo: string };
+      onComplete?: AcceptedOnComplete;
     };
 
 export interface SelectOptions {
@@ -135,7 +136,14 @@ export function compileTrigger(resource: EventTriggerResource): CompiledTrigger 
   if (spec.sourceRef) compiled.sourceRef = spec.sourceRef;
   if (spec.sessionKey) compiled.sessionKey = spec.sessionKey;
   if (spec.reply) compiled.reply = spec.reply;
-  if (spec.onComplete?.emitTo) compiled.onComplete = { emitTo: spec.onComplete.emitTo };
+  if (spec.onComplete?.emitTo) {
+    const oc = spec.onComplete;
+    compiled.onComplete = {
+      emitTo: spec.onComplete.emitTo,
+      ...(oc.waitUntilClosed ? { waitUntilClosed: { ...oc.waitUntilClosed } } : {}),
+      ...(oc.serialize ? { serialize: { ...oc.serialize } } : {}),
+    };
+  }
 
   const notReady = (error: string): CompiledTrigger => {
     compiled.ready = false;

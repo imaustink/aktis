@@ -375,6 +375,35 @@ describe("target.none / onComplete / addLabels+assignees (ADR 0052)", () => {
     if (without.status !== "matched") throw new Error(JSON.stringify(without));
     expect("onComplete" in without).toBe(false);
   });
+  it("echoes onComplete.waitUntilClosed and serialize (ADR 0055)", () => {
+    const r = selectTrigger(
+      [
+        compileTrigger(
+          trigger("t", {
+            target: { none: {} },
+            onComplete: {
+              emitTo: "runs",
+              waitUntilClosed: { repositoryParam: "repository", numberParam: "waitFor" },
+              serialize: { group: "coord", keyParam: "repository" },
+            },
+          }),
+        ),
+      ],
+      env({}),
+    );
+    expect(r.status === "matched" && r.onComplete).toEqual({
+      emitTo: "runs",
+      waitUntilClosed: { repositoryParam: "repository", numberParam: "waitFor" },
+      serialize: { group: "coord", keyParam: "repository" },
+    });
+  });
+  it("matches a conflict-kind envelope", () => {
+    const r = selectTrigger(
+      [compileTrigger(trigger("t", { sourceRef: "pr-conflicts", match: { cel: 'kind == "conflict" && body.pullRequest.number == 7' }, target: { none: {} } }))],
+      env({ pullRequest: { number: 7 } }, { source: "pr-conflicts", kind: "conflict" }),
+    );
+    expect(r.status).toBe("matched");
+  });
   it("matches a run-kind envelope", () => {
     const r = selectTrigger(
       [compileTrigger(trigger("t", { sourceRef: "runs", match: { cel: 'kind == "run"' }, target: { none: {} } }))],

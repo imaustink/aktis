@@ -9,6 +9,72 @@ const baseConfig = {
   githubApiUrl: "https://api.github.com",
 };
 
+describe("GithubReplyClient conflict-sweep reads (docs/adr/0055)", () => {
+  const json = (status: number, body: unknown) => ({ ok: status < 300, status, json: async () => body, text: async () => JSON.stringify(body) });
+
+  it("searchOpenPullRequests queries by author and splits repository_url", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(
+      json(200, { items: [{ number: 12, repository_url: "https://api.github.com/repos/acme/widgets" }, { number: "x" }] }),
+    );
+    const client = new GithubReplyClient({ ...baseConfig, fetchImpl });
+    expect(await client.searchOpenPullRequests("app/k5s-bot")).toEqual([{ owner: "acme", repo: "widgets", number: 12 }]);
+    const url = decodeURIComponent(String(fetchImpl.mock.calls[0]?.[0]));
+    expect(url).toContain("/search/issues?q=is:pr is:open archived:false author:app/k5s-bot");
+    expect(fetchImpl.mock.calls[0]?.[1]).toMatchObject({ headers: { authorization: "Bearer pat_123" } });
+  });
+
+  it("getPullRequest maps merge state, refs, labels and assignees; undefined on 404", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(
+        json(200, {
+          state: "open",
+          draft: false,
+          title: "T",
+          html_url: "u",
+          mergeable: false,
+          mergeable_state: "dirty",
+          base: { ref: "main", sha: "b" },
+          head: { ref: "f", sha: "h" },
+          labels: [{ name: "ai-review" }],
+          assignees: [{ login: "alice", id: 42 }],
+        }),
+      )
+      .mockResolvedValueOnce(json(404, {}));
+    const client = new GithubReplyClient({ ...baseConfig, fetchImpl });
+    expect(await client.getPullRequest("acme", "widgets", 12)).toEqual({
+      number: 12,
+      state: "open",
+      draft: false,
+      title: "T",
+      url: "u",
+      mergeable: false,
+      mergeableState: "dirty",
+      baseRef: "main",
+      baseSha: "b",
+      headRef: "f",
+      headSha: "h",
+      labels: ["ai-review"],
+      assignees: [{ login: "alice", id: 42 }],
+    });
+    expect(await client.getPullRequest("acme", "widgets", 13)).toBeUndefined();
+  });
+
+  it("getIssueState: open / closed / missing, and throws on other failures", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(json(200, { state: "open" }))
+      .mockResolvedValueOnce(json(200, { state: "closed" }))
+      .mockResolvedValueOnce(json(404, {}))
+      .mockResolvedValueOnce(json(500, {}));
+    const client = new GithubReplyClient({ ...baseConfig, fetchImpl });
+    expect(await client.getIssueState("a", "b", 1)).toBe("open");
+    expect(await client.getIssueState("a", "b", 1)).toBe("closed");
+    expect(await client.getIssueState("a", "b", 1)).toBe("missing");
+    await expect(client.getIssueState("a", "b", 1)).rejects.toThrow(/500/);
+  });
+});
+
 describe("GithubReplyClient.postIssueComment", () => {
 
   it("posts a marker-prefixed comment using the resolved token", async () => {

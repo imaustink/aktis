@@ -134,6 +134,26 @@ type EventTriggerSpec struct {
 // it in the accepted response; integration-gateway emits the event.
 type EventTriggerOnComplete struct {
 	EmitTo string `json:"emitTo,omitempty"`
+	// WaitUntilClosed and Serialize (docs/adr/0055 §2-3) are passed through
+	// unchanged: each names params of this trigger, and integration-gateway
+	// reads their rendered values from the accepted response's params when
+	// it decides when to emit the completion event.
+	WaitUntilClosed *OnCompleteWaitUntilClosed `json:"waitUntilClosed,omitempty"`
+	Serialize       *OnCompleteSerialize       `json:"serialize,omitempty"`
+}
+
+// OnCompleteWaitUntilClosed names the params holding the GitHub issue/PR the
+// completion event waits on.
+type OnCompleteWaitUntilClosed struct {
+	RepositoryParam string `json:"repositoryParam"`
+	NumberParam     string `json:"numberParam"`
+}
+
+// OnCompleteSerialize names the queue (group + key param) completion events
+// are emitted through one at a time.
+type OnCompleteSerialize struct {
+	Group    string `json:"group"`
+	KeyParam string `json:"keyParam"`
 }
 
 // --- the envelope (docs/event-triggers.md §2) ---

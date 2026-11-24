@@ -37,7 +37,14 @@ import { clip } from "./security/redact.js";
 import { installMountedSkills, listInstalledSkills, splitSkillInvocation } from "./skills.js";
 import { parseAwsProfiles, writeAwsConfig } from "./awsConfig.js";
 import { closingLine, ensureClosingReference, parseClosesIssue } from "./closingRef.js";
-import { clearVerdict, collectOutcome, installVerdictCommand, VERDICT_FILE_ENV } from "./outcome.js";
+import {
+  clearCoordination,
+  clearVerdict,
+  collectOutcome,
+  COORDINATE_FILE_ENV,
+  installVerdictCommand,
+  VERDICT_FILE_ENV,
+} from "./outcome.js";
 
 const toolConfig = loadToolConfig();
 const awsProfiles = parseAwsProfiles(toolConfig.awsProfiles);
@@ -203,6 +210,10 @@ async function handler(session: AgentSession): Promise<AgentReply> {
   const verdict = await installVerdictCommand({ homeDir: toolConfig.homeDir });
   childEnv.PATH = `${verdict.binDir}:${childEnv.PATH ?? ""}`;
   childEnv[VERDICT_FILE_ENV] = verdict.verdictFile;
+  // `aktis-coordinate` (docs/adr/0055): the factory coordinator's decision,
+  // installed and reported the same way -- only on a read-only run whose
+  // instruction names the command.
+  childEnv[COORDINATE_FILE_ENV] = verdict.coordinateFile;
   if (delegating) {
     const shim = await installGhShim({ homeDir: toolConfig.homeDir });
     if (shim) {
@@ -307,6 +318,7 @@ async function handler(session: AgentSession): Promise<AgentReply> {
   // Cleared right before the turn, so whatever is in the file afterwards was
   // written during THIS turn, never left over from an earlier one.
   await clearVerdict(verdict.verdictFile);
+  await clearCoordination(verdict.coordinateFile);
 
   const outcome = toolConfig.remoteControlEnabled
     ? await runClaudeTurnRemoteControlled(prompt, {
@@ -378,7 +390,14 @@ async function handler(session: AgentSession): Promise<AgentReply> {
     // review and recorded a verdict, so the outcome travels with this reply.
     return {
       message: `The agent produced no pushable repository or pull request. Details: ${clip(summary, 1200)}`,
-      outcome: await collectOutcome({ discovered: null, madeNewCommits: false, readOnly, verdictFile: verdict.verdictFile }),
+      outcome: await collectOutcome({
+        discovered: null,
+        madeNewCommits: false,
+        readOnly,
+        verdictFile: verdict.verdictFile,
+        instruction,
+        coordinateFile: verdict.coordinateFile,
+      }),
     };
   }
 
@@ -526,6 +545,8 @@ async function handler(session: AgentSession): Promise<AgentReply> {
       madeNewCommits: pushedNewCommits,
       readOnly,
       verdictFile: verdict.verdictFile,
+      instruction,
+      coordinateFile: verdict.coordinateFile,
     }),
   };
 }

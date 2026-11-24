@@ -13,7 +13,7 @@ import type { SessionStore } from "./session/types.js";
 import { InMemoryInvocationStore, type InvocationStore } from "./invocation/types.js";
 import { checkOutcome } from "./invocation/outcome.js";
 import { parseEnvelope, type EventTriggerSelector } from "./routing/crd-event-trigger-registry.js";
-import type { Envelope, RenderedReply } from "@aktis/event-triggers";
+import type { AcceptedOnComplete, Envelope, RenderedReply } from "@aktis/event-triggers";
 import {
   buildAgentRequest,
   type ChatImage,
@@ -126,8 +126,8 @@ interface TriggerResponse {
   reply: RenderedReply | null;
   /** Every rendered param in §4 string form; the gateway threads these into the run-completion event. */
   params: Record<string, string>;
-  /** Present only when the trigger sets `onComplete.emitTo`. */
-  onComplete?: { emitTo: string };
+  /** Present only when the trigger sets `onComplete.emitTo` (with its ADR 0055 waitUntilClosed/serialize, when set). */
+  onComplete?: AcceptedOnComplete;
 }
 
 /** How often to emit an SSE keep-alive comment while a turn is running on the engine. */

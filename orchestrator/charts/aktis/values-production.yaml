@@ -739,9 +739,14 @@ searxng:
 # - The software factory (docs/adr/0052 §4). Every human entry point publishes
 #   its completion to the `runs` run source, so the chain runs to the end no
 #   matter how it was started:
-#     * ai-triage on an issue (github-issue-triage) or a new issue in
-#       aktis/glyph/homelab (github-issue-autotriage) -> factory-review of the
-#       PR it opened;
+#     * ai-triage on an issue, or a new issue in aktis/glyph/homelab
+#       (factory-intake) -> coordinated against the work already in flight
+#       (docs/adr/0055: factory-coordinate decides proceed / wait / stack;
+#       factory-park holds a waiting issue until the PR it waits on merges) ->
+#       factory-triage / factory-triage-stacked -> factory-review of the PR it
+#       opened;
+#     * a factory PR that conflicts with its base after other work merged
+#       (pr-conflicts sweep) -> factory-resync -> factory-review;
 #     * ai-triage on a PR (github-pr-triage) -> factory-review of that PR;
 #     * ai-review on a PR (github-pr-review), including a PR someone else
 #       opened -> its verdict routes exactly like factory-review's.
@@ -781,100 +786,201 @@ extraManifests:
       name: runs
     spec:
       run: {}
-  # eventtrigger-github-issue-triage
+  # eventsource-pr-conflicts
+  # The conflict sweep (docs/adr/0055 §1): every 5 minutes the gateway finds
+  # the open PRs the App opened that now conflict with their base, and emits
+  # one `conflict` event per PR and base commit -> factory-resync.
+  - |
+    apiVersion: core.aktis.ai/v1alpha1
+    kind: EventSource
+    metadata:
+      name: pr-conflicts
+    spec:
+      conflicts:
+        author: "app/k5s-bot"
+        intervalSeconds: 300
+        skipLabels: ["ai-triage", "ai-review", "ai-waiting"]
+  # eventtrigger-factory-intake
+  # Every new-issue entry point (docs/adr/0055 §3): ai-triage applied to an
+  # issue, or a new issue in aktis/glyph/homelab opened by the owner /
+  # collaborators / org members (aktis and glyph are public, so anyone can
+  # open one; bot-opened issues are already dropped by the github source; an
+  # issue opened WITH the label also gets a `labeled` delivery, so `opened`
+  # requires it absent). Runs nothing: its completion is held in the
+  # factory-coordinate queue, so a repository's issues are coordinated one at a
+  # time, then factory-coordinate decides how the work integrates with what is
+  # already in flight.
   - |
     apiVersion: core.aktis.ai/v1alpha1
     kind: EventTrigger
     metadata:
-      name: github-issue-triage
+      name: factory-intake
     spec:
       sourceRef: github
+      priority: 10
       match:
         cel: >-
           headers["x-github-event"] == "issues" &&
-          body.action == "labeled" &&
-          body.label.name == "ai-triage"
+          ((body.action == "labeled" && body.label.name == "ai-triage") ||
+           (body.action == "opened" &&
+            body.repository.full_name in ["imaustink/aktis", "imaustink/glyph", "imaustink/homelab"] &&
+            body.issue.author_association in ["OWNER", "MEMBER", "COLLABORATOR"] &&
+            !body.issue.labels.exists(l, l.name == "ai-triage")))
       params:
         repository: body.repository.full_name
         number: body.issue.number
-        # The SWE agent adds "Closes #<n>" to the PR it opens if the
-        # description doesn't already close this issue (docs/event-triggers.md §6).
-        closesIssue: body.issue.number
         title: body.issue.title
-        description: body.issue.body
-        label: body.label.name
-      sessionKey: "github:{{`{{repository}}`}}#{{`{{number}}`}}"
       target:
-        agentRef: "claude-code-swe-agent"
-        promptTemplate: |
-          GitHub issue {{`{{repository}}`}}#{{`{{number}}`}} was labeled "{{`{{label}}`}}": "{{`{{title}}`}}"
-
-          {{`{{description}}`}}
-
-          Triage and resolve this issue: investigate the {{`{{repository}}`}}
-          repository (the repository this issue was filed in), implement a fix or
-          feature there if the issue calls for one, and open a pull request against
-          {{`{{repository}}`}}. Do not create a new repository and do not
-          substitute any other repository, even if you lack permission to do
-          something the task seems to ask for (e.g. creating a repo) -- if you
-          cannot complete the task in {{`{{repository}}`}} as given, stop
-          and post a comment explaining exactly what's blocking you instead of
-          working around it elsewhere. If the issue is unclear or you need more
-          context before proceeding, post a comment asking a clarifying question
-          instead of guessing.
-
-          Once you open a pull request, an automated review of it starts on its
-          own, and its feedback is addressed automatically before the PR is
-          handed to a maintainer, so do not ask anyone to apply review labels.
-      reply:
-        github:
-          repository: "{{`{{repository}}`}}"
-          issueNumber: "{{`{{number}}`}}"
-          ack: "🤖 Starting work on this now."
-          result: true
-          removeLabel: "{{`{{label}}`}}"
-      # Publish the run's completion to `runs`, where factory-review picks up
-      # the PR it opened (docs/adr/0052).
+        none: {}
       onComplete:
         emitTo: runs
-  # eventtrigger-github-issue-autotriage
-  # Same run as github-issue-triage, but fired by a newly OPENED issue on the
-  # listed repos -- no label needed. Guards:
-  # - author_association: aktis and glyph are public, so anyone can open an
-  #   issue; only the owner / collaborators / org members auto-trigger (the
-  #   label path is implicitly gated the same way -- labeling needs triage
-  #   access). Bot-opened issues are already dropped by the github source.
-  # - no ai-triage label at open time: an issue opened WITH the label also
-  #   gets a `labeled` delivery, and github-issue-triage handles that one --
-  #   without this both would fire.
-  # No removeLabel: there is no triggering label to clear.
+        serialize:
+          group: factory-coordinate
+          keyParam: repository
+  # eventtrigger-factory-coordinate
+  # A read-only coordinator compares the issue with the open PRs and in-flight
+  # issues and records proceed / wait <N> / stack <N> with aktis-coordinate.
+  # Routing on that enum is deterministic (factory-triage, factory-park,
+  # factory-triage-stacked). It re-adds ai-triage (an issue returning from a
+  # wait is in flight again) and clears ai-waiting when it ends.
   - |
     apiVersion: core.aktis.ai/v1alpha1
     kind: EventTrigger
     metadata:
-      name: github-issue-autotriage
+      name: factory-coordinate
     spec:
-      sourceRef: github
+      sourceRef: runs
       match:
         cel: >-
-          headers["x-github-event"] == "issues" &&
-          body.action == "opened" &&
-          body.repository.full_name in ["imaustink/aktis", "imaustink/glyph", "imaustink/homelab"] &&
-          body.issue.author_association in ["OWNER", "MEMBER", "COLLABORATOR"] &&
-          !body.issue.labels.exists(l, l.name == "ai-triage")
+          source == "runs" && kind == "run" &&
+          body.trigger in ["factory-intake", "factory-park"]
       params:
-        repository: body.repository.full_name
-        number: body.issue.number
-        closesIssue: body.issue.number
-        title: body.issue.title
-        description: body.issue.body
+        repository: body.params.repository
+        number: body.params.number
+        title: body.params.title
+      sessionKey: "factory-coordinate:{{`{{repository}}`}}#{{`{{number}}`}}"
+      target:
+        agentRef: "claude-code-swe-agent"
+        readOnly: true
+        promptTemplate: |
+          You are the coordinator of an automated software factory working in
+          {{`{{repository}}`}}. Issue {{`{{repository}}`}}#{{`{{number}}`}} ("{{`{{title}}`}}") is about to
+          be implemented by an automated agent that will open a pull request for
+          it. Other work may already be in flight in the same repository. Decide,
+          BEFORE that work starts, how it should integrate with the in-flight work
+          so the pull requests do not conflict. You do not implement anything.
+
+          1. Read the issue: `gh issue view {{`{{number}}`}} --repo {{`{{repository}}`}} --comments`.
+          2. List the work in flight in {{`{{repository}}`}}:
+             - every open pull request, with the files each one changes:
+               `gh pr list --repo {{`{{repository}}`}} --state open --json number,title,headRefName,baseRefName,labels,files`
+             - issues already being worked on automatically, other than #{{`{{number}}`}}:
+               `gh issue list --repo {{`{{repository}}`}} --state open --label ai-triage --json number,title,body`
+          3. Work out which files and behaviour this issue will most likely change.
+             You may clone the repository and read the code to do this.
+          4. Record exactly ONE decision by running one of these commands once:
+             - `aktis-coordinate proceed` -- nothing in flight is likely to change
+               the same code. This is the usual answer; choose it whenever the
+               overlap is only speculative.
+             - `aktis-coordinate wait <N>` -- open pull request or in-flight issue
+               #N is likely to change the same code, so this issue's work should
+               start only after #N is merged. It starts automatically then. N must
+               be an open pull request or issue other than #{{`{{number}}`}}; never wait
+               on an issue labeled ai-waiting (it is itself waiting).
+             - `aktis-coordinate stack <N>` -- this issue builds directly on open
+               pull request #N's changes (it needs that code to exist), so its
+               pull request should be based on #N's branch. N must be an open pull
+               request. Prefer `wait` when the overlap is only "touches the same
+               files"; stack only for a real dependency.
+          5. Then reply with two to four sentences explaining the decision: which
+             pull request or issue overlaps, and in which files. That reply is
+             posted on the issue.
+
+          Do not comment, label, push, or open anything yourself.
+      reply:
+        github:
+          repository: "{{`{{repository}}`}}"
+          issueNumber: "{{`{{number}}`}}"
+          ack: "🤖 Checking this against other in-flight work before starting."
+          result: true
+          addLabels: ["ai-triage"]
+          removeLabel: "ai-waiting"
+      onComplete:
+        emitTo: runs
+  # eventtrigger-factory-park
+  # `wait <N>`: posts why, swaps ai-triage for ai-waiting, and its completion
+  # is held until #N is closed (merged) and the coordinate queue is free, then
+  # it is coordinated again. At most 5 waits per chain.
+  - |
+    apiVersion: core.aktis.ai/v1alpha1
+    kind: EventTrigger
+    metadata:
+      name: factory-park
+    spec:
+      sourceRef: runs
+      match:
+        cel: >-
+          source == "runs" && kind == "run" &&
+          body.trigger == "factory-coordinate" && body.status == "succeeded" &&
+          has(body.outcome.coordination) && body.outcome.coordination.decision == "wait" &&
+          has(body.outcome.coordination.number) &&
+          string(body.outcome.coordination.number) != body.params.number &&
+          (!("factory-park" in body.chain.counts) || body.chain.counts["factory-park"] < 5)
+      params:
+        repository: body.params.repository
+        number: body.params.number
+        title: body.params.title
+        waitFor: string(body.outcome.coordination.number)
+      target:
+        none: {}
+      reply:
+        github:
+          repository: "{{`{{repository}}`}}"
+          issueNumber: "{{`{{number}}`}}"
+          ack: "⏸️ Holding this until #{{`{{waitFor}}`}} is merged (or closed): the automated coordinator found that it overlaps with that work. It starts automatically afterwards; close this issue to cancel."
+          addLabels: ["ai-waiting"]
+          removeLabel: "ai-triage"
+      onComplete:
+        emitTo: runs
+        waitUntilClosed:
+          repositoryParam: repository
+          numberParam: waitFor
+        serialize:
+          group: factory-coordinate
+          keyParam: repository
+  # eventtrigger-factory-triage
+  # proceed / no decision / failed coordinator / unroutable wait: work the
+  # issue from the default branch (the complement of park and stacked).
+  - |
+    apiVersion: core.aktis.ai/v1alpha1
+    kind: EventTrigger
+    metadata:
+      name: factory-triage
+    spec:
+      sourceRef: runs
+      match:
+        cel: >-
+          source == "runs" && kind == "run" &&
+          body.trigger == "factory-coordinate" &&
+          !(body.status == "succeeded" && has(body.outcome.coordination) &&
+            has(body.outcome.coordination.number) &&
+            string(body.outcome.coordination.number) != body.params.number &&
+            ((body.outcome.coordination.decision == "wait" &&
+              (!("factory-park" in body.chain.counts) || body.chain.counts["factory-park"] < 5)) ||
+             body.outcome.coordination.decision == "stack"))
+      params:
+        repository: body.params.repository
+        number: body.params.number
+        # The SWE agent adds "Closes #<n>" to the PR it opens if the
+        # description doesn't already close this issue (docs/event-triggers.md §6).
+        closesIssue: body.params.number
+        title: body.params.title
       sessionKey: "github:{{`{{repository}}`}}#{{`{{number}}`}}"
       target:
         agentRef: "claude-code-swe-agent"
         promptTemplate: |
-          GitHub issue {{`{{repository}}`}}#{{`{{number}}`}} was just opened: "{{`{{title}}`}}"
-
-          {{`{{description}}`}}
+          Resolve GitHub issue {{`{{repository}}`}}#{{`{{number}}`}}: "{{`{{title}}`}}". Read it
+          first with `gh issue view {{`{{number}}`}} --repo {{`{{repository}}`}} --comments`.
 
           Triage and resolve this issue: investigate the {{`{{repository}}`}}
           repository (the repository this issue was filed in), implement a fix or
@@ -897,8 +1003,119 @@ extraManifests:
           issueNumber: "{{`{{number}}`}}"
           ack: "🤖 Starting work on this now."
           result: true
-      # Feeds the software factory exactly like github-issue-triage
-      # (factory-review's match lists both trigger names).
+          removeLabel: "ai-triage"
+      onComplete:
+        emitTo: runs
+  # eventtrigger-factory-triage-stacked
+  # `stack <N>`: branch from open PR #N and target its branch.
+  - |
+    apiVersion: core.aktis.ai/v1alpha1
+    kind: EventTrigger
+    metadata:
+      name: factory-triage-stacked
+    spec:
+      sourceRef: runs
+      match:
+        cel: >-
+          source == "runs" && kind == "run" &&
+          body.trigger == "factory-coordinate" && body.status == "succeeded" &&
+          has(body.outcome.coordination) && body.outcome.coordination.decision == "stack" &&
+          has(body.outcome.coordination.number) &&
+          string(body.outcome.coordination.number) != body.params.number
+      params:
+        repository: body.params.repository
+        number: body.params.number
+        closesIssue: body.params.number
+        title: body.params.title
+        stackOn: string(body.outcome.coordination.number)
+      sessionKey: "github:{{`{{repository}}`}}#{{`{{number}}`}}"
+      target:
+        agentRef: "claude-code-swe-agent"
+        promptTemplate: |
+          Resolve GitHub issue {{`{{repository}}`}}#{{`{{number}}`}}: "{{`{{title}}`}}". Read it
+          first with `gh issue view {{`{{number}}`}} --repo {{`{{repository}}`}} --comments`.
+
+          This issue builds on open pull request #{{`{{stackOn}}`}}, which is not merged
+          yet, so your work must be STACKED on it:
+          1. Find its branch: `gh pr view {{`{{stackOn}}`}} --repo {{`{{repository}}`}} --json state,headRefName`.
+          2. If #{{`{{stackOn}}`}} is still open, check out its branch and create your
+             feature branch from it. Open your pull request with
+             `--base <that branch>`, and state in its description that it is
+             stacked on #{{`{{stackOn}}`}} and must be merged after it.
+          3. If #{{`{{stackOn}}`}} is no longer open, work from the default branch
+             instead, as usual.
+
+          Investigate and implement the fix or feature in {{`{{repository}}`}}. Do not
+          create a new repository and do not substitute any other repository -- if
+          you cannot complete the task in {{`{{repository}}`}} as given, stop and post a
+          comment explaining exactly what's blocking you. If the issue is unclear,
+          post a comment asking a clarifying question instead of guessing.
+
+          Once you open a pull request, an automated review of it starts on its
+          own, so do not ask anyone to apply review labels.
+      reply:
+        github:
+          repository: "{{`{{repository}}`}}"
+          issueNumber: "{{`{{number}}`}}"
+          ack: "🤖 Starting work on this now, stacked on #{{`{{stackOn}}`}}."
+          result: true
+          removeLabel: "ai-triage"
+      onComplete:
+        emitTo: runs
+  # eventtrigger-factory-resync
+  # A conflict event from pr-conflicts: merge the base into the PR's branch
+  # and resolve the conflicts, as the PR's assignee. Re-reviewed after; a run
+  # that failed or pushed nothing is handed off.
+  - |
+    apiVersion: core.aktis.ai/v1alpha1
+    kind: EventTrigger
+    metadata:
+      name: factory-resync
+    spec:
+      sourceRef: pr-conflicts
+      match:
+        cel: >-
+          source == "pr-conflicts" && kind == "conflict"
+      params:
+        repository: repository
+        number: body.pullRequest.number
+        title: body.pullRequest.title
+        baseRef: body.pullRequest.baseRef
+      sessionKey: "github:{{`{{repository}}`}}#{{`{{number}}`}}"
+      target:
+        agentRef: "claude-code-swe-agent"
+        promptTemplate: |
+          Pull request {{`{{repository}}`}}#{{`{{number}}`}} ("{{`{{title}}`}}") now has merge
+          conflicts with its base branch {{`{{baseRef}}`}}, because other work was
+          merged into {{`{{baseRef}}`}} after it was opened. Resolve them on this PR's
+          existing branch. Work only in {{`{{repository}}`}} and only on this branch --
+          do not open a second pull request.
+
+          1. Check out the branch: `gh pr checkout {{`{{number}}`}}`.
+          2. Read what was merged into {{`{{baseRef}}`}} since this branch diverged
+             (`git fetch origin {{`{{baseRef}}`}}`, then `git log` / `git diff` against
+             the merge base) so you understand both sides.
+          3. Merge `origin/{{`{{baseRef}}`}}` into the branch (merge, do not rebase --
+             you cannot force-push) and resolve every conflict so that BOTH this
+             PR's intent and the newly merged work are preserved. Never resolve a
+             conflict by dropping the other side's change wholesale.
+          4. Build and run the tests that cover the files you touched, and fix
+             anything the merge broke.
+          5. Push to the same branch and post one comment summarizing which files
+             conflicted and how you resolved each.
+
+          If a conflict cannot be resolved safely without a decision from a human,
+          stop and post a comment saying exactly which conflict and why, instead
+          of guessing. You get exactly one turn: push and summarize now, do not
+          wait for CI. (When this run ends, an automated review starts on its own.)
+      reply:
+        github:
+          repository: "{{`{{repository}}`}}"
+          issueNumber: "{{`{{number}}`}}"
+          ack: "🤖 This pull request conflicts with {{`{{baseRef}}`}} after other work merged; resolving the conflicts now."
+          result: true
+          addLabels: ["ai-triage"]
+          removeLabel: "ai-triage"
       onComplete:
         emitTo: runs
   # eventtrigger-github-issue-review
@@ -1160,10 +1377,10 @@ extraManifests:
       match:
         cel: >-
           source == "runs" && kind == "run" &&
-          body.trigger in ["github-issue-triage", "github-issue-autotriage", "github-pr-triage", "factory-fix"] &&
+          body.trigger in ["factory-triage", "factory-triage-stacked", "github-pr-triage", "factory-fix", "factory-resync"] &&
           body.status == "succeeded" &&
-          (has(body.outcome.pullRequest) || body.trigger in ["github-pr-triage", "factory-fix"]) &&
-          (body.trigger != "factory-fix" || (has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits)) &&
+          (has(body.outcome.pullRequest) || body.trigger in ["github-pr-triage", "factory-fix", "factory-resync"]) &&
+          (!(body.trigger in ["factory-fix", "factory-resync"]) || (has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits)) &&
           (!("factory-review" in body.chain.counts) || body.chain.counts["factory-review"] < 3)
       params:
         repository: body.params.repository
@@ -1355,7 +1572,7 @@ extraManifests:
               (!("factory-fix" in body.chain.counts) || body.chain.counts["factory-fix"] < 2) &&
               (body.trigger != "github-pr-review" ||
                (has(body.params.headRepository) && body.params.headRepository == body.params.repository)))) ||
-           (body.trigger == "factory-fix" &&
+           (body.trigger in ["factory-fix", "factory-resync"] &&
             (body.status != "succeeded" || !(has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits))))
       params:
         repository: body.params.repository
@@ -1364,6 +1581,8 @@ extraManifests:
         reason: >-
           (body.trigger == "factory-fix" && body.status != "succeeded") ? "the automated fix run did not succeed" :
           body.trigger == "factory-fix" ? "the automated fix run pushed no changes" :
+          (body.trigger == "factory-resync" && body.status != "succeeded") ? "the automated conflict resolution did not succeed" :
+          body.trigger == "factory-resync" ? "the automated conflict resolution pushed no changes, so the conflicts need a human" :
           body.status != "succeeded" ? "the review run did not succeed" :
           (has(body.outcome.verdict) && body.outcome.verdict == "ready") ? "the reviewer judged it ready to merge" :
           (body.trigger == "github-pr-review" && has(body.outcome.verdict) && body.outcome.verdict == "changes-requested" &&

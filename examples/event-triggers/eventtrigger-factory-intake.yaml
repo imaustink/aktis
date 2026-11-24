@@ -1,0 +1,37 @@
+# Software factory, step 0 (docs/adr/0055 §3): `ai-triage` on an issue no
+# longer starts the work directly. It queues the issue for coordination: this
+# runless trigger (target none) completes at once, and its completion is HELD
+# by `onComplete.serialize` until no other coordination is running in the same
+# repository -- so two issues labeled together are coordinated one after the
+# other, and the second one sees the first one's work as in flight.
+#
+# priority 10: it wins over the standalone github-issue-triage example (same
+# event) whenever both are applied. Apply github-issue-triage WITHOUT this file
+# for label -> triage with no coordination.
+#
+# No reply: the coordinate run acks. The ai-triage label stays on the issue
+# while it is queued, coordinated and worked (factory-triage removes it), which
+# is how the coordinator recognises in-flight work.
+apiVersion: core.aktis.ai/v1alpha1
+kind: EventTrigger
+metadata:
+  name: factory-intake
+spec:
+  sourceRef: github
+  priority: 10
+  match:
+    cel: >-
+      headers["x-github-event"] == "issues" &&
+      body.action == "labeled" &&
+      body.label.name == "ai-triage"
+  params:
+    repository: body.repository.full_name
+    number: body.issue.number
+    title: body.issue.title
+  target:
+    none: {}
+  onComplete:
+    emitTo: runs
+    serialize:
+      group: factory-coordinate
+      keyParam: repository

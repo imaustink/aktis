@@ -26,7 +26,7 @@ integration-gateway and the Temporal gateway watch).
 
 ### `EventSource`
 
-How events arrive and how far they are trusted. Exactly one of `webhook` / `cron` / `run`.
+How events arrive and how far they are trusted. Exactly one of `webhook` / `cron` / `run` / `conflicts`.
 
 ```yaml
 apiVersion: core.aktis.ai/v1alpha1
@@ -61,6 +61,14 @@ kind: EventSource
 metadata: { name: runs }
 spec:
   run: {}                           # run-completion events (§9); no route, no Secret, no sender
+---
+kind: EventSource
+metadata: { name: pr-conflicts }
+spec:
+  conflicts:                        # conflict events from a sweep of open PRs (§10)
+    author: "app/k5s-bot"           # GitHub search author: qualifier (login, login[bot] or app/<slug>)
+    intervalSeconds: 300            # min 60, default 300
+    skipLabels: [ai-triage, ai-review, ai-waiting]
 ```
 
 Rules:
@@ -79,6 +87,8 @@ Rules:
 - Verification happens on the raw bytes **before** parsing; failure is `401`.
 - A `run` source receives nothing from outside: integration-gateway synthesizes
   its events (§9). It is always `Ready` (`RunEvents`) and owns no CronJob.
+- A `conflicts` source likewise has no route: the gateway sweeps it (§10). It
+  is always `Ready` (`ConflictSweep`); `sender` is rejected on it too.
 - Status: `conditions[type=Ready]`; cron sources also `status.cronJobName`.
 
 ### `EventTrigger`
@@ -166,6 +176,11 @@ Rules:
   namespace, else the trigger is `Ready=False` (`EmitToNotFound` /
   `EmitToNotRunSource`). core-controller re-checks it when that source appears
   or changes.
+- `onComplete.waitUntilClosed: {repositoryParam, numberParam}` and
+  `onComplete.serialize: {group, keyParam}` hold the completion event in the
+  gateway instead of publishing it at once (§10). Each `*Param` must name a key
+  of `spec.params` and `group` must be a DNS label, else the trigger is
+  `Ready=False` (`InvalidOnComplete`).
 - A trigger whose CEL fails to compile is `Ready=False` and never matches.
 
 ## 2. The envelope
@@ -435,7 +450,8 @@ Shipped as `examples/event-triggers/` (`eventsource-runs.yaml`,
 
 | Trigger | Matches | Target | Reply |
 | --- | --- | --- | --- |
-| `github-issue-triage` / `github-issue-autotriage` | `ai-triage` applied to an issue / a new issue (webhook) | SWE agent | ack, result, `removeLabel`; `onComplete.emitTo: runs` |
+| `github-issue-triage` | `ai-triage` applied to an issue (webhook), when coordination (§10) is not installed | SWE agent | ack, result, `removeLabel`; `onComplete.emitTo: runs` |
+| `factory-triage` / `factory-triage-stacked` | a coordinated issue (§10) | SWE agent | ack, result, `removeLabel: ai-triage`; `onComplete.emitTo: runs` |
 | `github-pr-triage` | `ai-triage` applied to a PR (webhook) | SWE agent (PR-triage prompt) | ack, result, `removeLabel`; `onComplete.emitTo: runs` |
 | `github-pr-review` | `ai-review` applied to any PR, whoever opened it (webhook); param `headRepository` (`body.pull_request.head.repo.full_name`, `""` for a deleted fork) | SWE agent, `readOnly` | ack, result, `removeLabel`; `onComplete.emitTo: runs` |
 | `factory-review` | `source == "runs" && kind == "run" && body.trigger in ["github-issue-triage", "github-pr-triage", "factory-fix"] && body.status == "succeeded" && (has(body.outcome.pullRequest) \|\| body.trigger in ["github-pr-triage", "factory-fix"]) && (body.trigger != "factory-fix" \|\| (has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits)) && (!("factory-review" in body.chain.counts) \|\| body.chain.counts["factory-review"] < 3)` | SWE agent, `readOnly` | on the PR: ack + session page, result, `addLabels: [ai-review]`, `removeLabel: ai-review`; `emitTo: runs` |
@@ -476,3 +492,90 @@ on a fork PR is an explicit request for writes and is not gated. Whatever
 starts a fix, one that can't push (e.g. to a fork's branch the App can't write)
 reports `madeNewCommits: false`, so `factory-handoff` assigns the PR rather than
 re-reviewing unchanged code.
+
+`factory-review` also follows `factory-triage`, `factory-triage-stacked` and
+`factory-resync` (§10); like a fix, a resync is re-reviewed only when it pushed
+(`madeNewCommits`), and one that failed or pushed nothing is handed off.
+
+## 10. Coordinating concurrent work
+
+[ADR 0055](adr/0055-factory-coordination.md). Factory tickets run
+concurrently, so two can change the same code. Two mechanisms keep them apart:
+a coordinator that decides how a new issue integrates with the work in flight
+**before** it starts, and a sweep that resolves the conflicts that slip through
+anyway.
+
+### Held completions (`onComplete.waitUntilClosed`, `onComplete.serialize`)
+
+Two gateway primitives, both on a trigger with `onComplete.emitTo`. Instead of
+publishing the completion at once, the gateway records it (in Redis, beside the
+in-flight runs) and a sweep publishes it once every hold is released:
+
+- `waitUntilClosed: {repositoryParam, numberParam}`: until the issue or PR
+  named by those params is closed (a PR closes when it merges; an issue when
+  the PR that `Closes` it merges) or no longer exists. Closing the held run's
+  own issue (its `reply.github` target) abandons the wait. Not held, published
+  at once and logged: params that aren't a repository and positive number, a
+  wait on the run's own issue, a target that is already closed, or a **cycle**
+  (the target is itself held waiting, directly or transitively, on this run's
+  issue). A wait that really blocked restarts the chain's `depth` at 1 when it
+  is published; `counts` are kept, so per-trigger caps still bound the chain.
+- `serialize: {group, keyParam}`: at most one completion per
+  `<group>:<params[keyParam]>` queue is in flight. The queue is taken when the
+  completion is published and held until **the run it started** finishes (its
+  completion, and that run's status labels, already out), renewed alongside the
+  run's in-flight lease, so a dead gateway frees it within minutes. Oldest
+  first. A completion nobody accepted frees the queue at once.
+
+Both together hold until both are released. The sweep runs every 30s and
+immediately after a hold or a queue release; of several gateway replicas,
+exactly one publishes each completion (it is claimed before it is sent).
+
+### The coordinator
+
+| Trigger | Matches | Target | Reply / onComplete |
+| --- | --- | --- | --- |
+| `factory-intake` | `ai-triage` applied to an issue (priority 10, so it wins over `github-issue-triage`); in production also a new issue on the auto-triage repos | `none` | `serialize: {group: factory-coordinate, keyParam: repository}` |
+| `factory-coordinate` | `body.trigger in ["factory-intake", "factory-park"]` | SWE agent, `readOnly`; the prompt names `aktis-coordinate` | ack, result, `addLabels: [ai-triage]`, `removeLabel: ai-waiting`; `emitTo: runs` |
+| `factory-park` | coordinate `succeeded`, `decision == "wait"`, a number other than the issue's own, `counts["factory-park"] < 5` | `none` | ack, `addLabels: [ai-waiting]`, `removeLabel: ai-triage`; `waitUntilClosed` on `waitFor` + the same `serialize` |
+| `factory-triage-stacked` | coordinate `succeeded`, `decision == "stack"`, a number other than the issue's own | SWE agent (branch from PR #N, `--base` its branch) | ack, result, `removeLabel: ai-triage`; `emitTo: runs` |
+| `factory-triage` | every other coordinate completion: `proceed`, `none`, a failed coordinator, an unroutable wait (its own number, or 5 waits already) | SWE agent | ack, result, `removeLabel: ai-triage`; `emitTo: runs` |
+
+The coordinator records its decision like a review verdict: the runner
+installs `aktis-coordinate` (`proceed` | `wait <N>` | `stack <N>`), and on a
+`readOnly` run whose prompt names that command it reports
+`outcome.coordination: {decision: "proceed" | "wait" | "stack" | "none", number?}`
+(no review verdict, and no verdict prompt section). A missing or invalid
+decision is `none`, which proceeds: a confused coordinator costs nothing over
+running without one.
+
+Because intake and park both hold their completion in one `factory-coordinate`
+queue per repository, a repository's issues are coordinated one at a time, and
+each coordinator sees the issues coordinated before it as in flight (they keep
+`ai-triage` until their triage run ends). Compare numbers in CEL as strings:
+`body.params` values are §4 string forms, so
+`string(body.outcome.coordination.number) != body.params.number`.
+
+### The conflict sweep (`kind: conflict`)
+
+A `conflicts` source makes the gateway sweep, every `intervalSeconds`, the open
+pull requests `author` opened (GitHub search, one page of 100). For each PR
+GitHub reports as conflicting (`mergeable: false`, `mergeable_state: "dirty"`)
+it emits one event, **once per (PR, base commit)**: a conflict the resync could
+not resolve is retried only after the base moves again.
+
+```
+{ source: "pr-conflicts", kind: "conflict", sender: {login: <assignee>, isBot: false},
+  repository: "o/r",
+  body: { pullRequest: { number, url, title, baseRef, baseSha, headRef, headSha } } }
+```
+
+Skipped: drafts; PRs carrying a `skipLabels` label (a factory run is already on
+them and syncs the branch itself); PRs whose mergeability GitHub hasn't computed
+yet (`null` right after the base moved; the next sweep sees it); and PRs with
+no assignee who verifies through the identity resolver. The event's sender is
+that assignee (the factory's handoff assigns the human who started the chain),
+never the bot or whoever merged the other PR; it starts a new chain. One gateway
+replica sweeps each interval. `factory-resync` (examples, production) merges the
+base into the branch as that person, and its completion goes to review or
+handoff like a fix's.

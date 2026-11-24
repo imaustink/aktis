@@ -103,6 +103,36 @@ type CronSource struct {
 // human, whom the gateway re-verifies on every hop.
 type RunSource struct{}
 
+// ConflictsSource is a merge-conflict sweep source (docs/adr/0055 §1). Like a
+// run source, nothing outside the cluster delivers to it: integration-gateway
+// periodically searches GitHub for open pull requests by `author`, and for
+// each one whose branch now conflicts with its base (GitHub's
+// mergeable_state "dirty") synthesizes one kind "conflict" event, at most
+// once per PR per base-branch commit. The event's sender is the PR's
+// assignee, re-verified like a run event's origin; a PR with no assignee that
+// verifies is skipped.
+type ConflictsSource struct {
+	// author is the GitHub search `author:` qualifier of the pull requests to
+	// watch -- the factory's own bot, e.g. "app/k5s-bot".
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=100
+	// +kubebuilder:validation:Pattern=`^(app/)?[A-Za-z0-9][A-Za-z0-9-]*(\[bot\])?$`
+	Author string `json:"author"`
+
+	// intervalSeconds between sweeps.
+	// +optional
+	// +kubebuilder:validation:Minimum=60
+	// +kubebuilder:default=300
+	IntervalSeconds *int32 `json:"intervalSeconds,omitempty"`
+
+	// skipLabels: a pull request carrying any of these labels is left alone
+	// (work already in flight on it, or a human hold).
+	// +optional
+	// +kubebuilder:validation:MaxItems=20
+	SkipLabels []string `json:"skipLabels,omitempty"`
+}
+
 // EventSenderProvider is how a sender's login is verified.
 // +kubebuilder:validation:Enum=github
 type EventSenderProvider string
@@ -147,8 +177,8 @@ type EventSender struct {
 	DropBots *bool `json:"dropBots,omitempty"`
 }
 
-// EventSourceSpec is exactly one of webhook / cron / run.
-// +kubebuilder:validation:XValidation:rule="(has(self.webhook)?1:0)+(has(self.cron)?1:0)+(has(self.run)?1:0)==1",message="exactly one of webhook, cron or run must be set"
+// EventSourceSpec is exactly one of webhook / cron / run / conflicts.
+// +kubebuilder:validation:XValidation:rule="(has(self.webhook)?1:0)+(has(self.cron)?1:0)+(has(self.run)?1:0)+(has(self.conflicts)?1:0)==1",message="exactly one of webhook, cron, run or conflicts must be set"
 // +kubebuilder:validation:XValidation:rule="!has(self.sender) || has(self.webhook)",message="sender is only valid for webhook sources"
 type EventSourceSpec struct {
 	// webhook makes this an HTTP source.
@@ -164,6 +194,12 @@ type EventSourceSpec struct {
 	// here (docs/adr/0052).
 	// +optional
 	Run *RunSource `json:"run,omitempty"`
+
+	// conflicts makes this a merge-conflict sweep source: integration-gateway
+	// emits one event per open pull request (by author) whose branch
+	// conflicts with its base (docs/adr/0055).
+	// +optional
+	Conflicts *ConflictsSource `json:"conflicts,omitempty"`
 
 	// sender identifies who caused a webhook event. Never set on a run source:
 	// a run event's sender is the chain's origin, not something to extract.

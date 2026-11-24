@@ -193,6 +193,14 @@ describe("buildPrompt", () => {
     expect(buildPrompt("review PR #7", null, "review", [], false, true)).toBe(`/review ${prompt}`);
   });
 
+  // docs/adr/0055: a coordination run records a decision, not a review verdict.
+  it("omits the verdict instruction from a read-only coordination prompt", () => {
+    const prompt = buildPrompt("Decide, then run `aktis-coordinate proceed`.", null, null, [], false, true);
+    expect(prompt).not.toContain(VERDICT_PROMPT_SECTION);
+    expect(prompt).not.toContain("aktis-verdict");
+    expect(prompt).toContain("aktis-coordinate proceed");
+  });
+
   it("leaves a write run's prompt unchanged", () => {
     const prompt = buildPrompt("fix the bug", null, null, [], false, false);
     expect(prompt).not.toContain("aktis-verdict");

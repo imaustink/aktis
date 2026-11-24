@@ -809,3 +809,35 @@ func TestInvokeTriggerOmitsAnUnsetOnComplete(t *testing.T) {
 	require.NotContains(t, string(raw), "onComplete")
 	require.Contains(t, string(raw), `"params":{"number":"42","repo":"acme/widgets"}`)
 }
+
+// docs/adr/0055 §2-3: onComplete.waitUntilClosed and serialize pass through
+// to the accepted trigger unchanged, beside the rendered params they name, so
+// integration-gateway can hold and queue the completion event.
+func TestInvokeTriggerPassesThroughWaitAndSerialize(t *testing.T) {
+	reg := catalog.NewEventTriggerRegistry()
+	d := catalog.NewEventTriggerDescriptor("factory-park", catalog.EventTriggerSpec{
+		SourceRef: "github",
+		Match:     catalog.EventTriggerMatch{CEL: `headers["x-github-event"] == "pull_request" && body.label.name == "ai-review"`},
+		Params: map[string]string{
+			"repo":    "body.repository.full_name",
+			"number":  "body.pull_request.number",
+			"waitFor": "7",
+		},
+		Target: catalog.EventTriggerTarget{None: &struct{}{}},
+		OnComplete: &catalog.EventTriggerOnComplete{
+			EmitTo:          "runs",
+			WaitUntilClosed: &catalog.OnCompleteWaitUntilClosed{RepositoryParam: "repo", NumberParam: "waitFor"},
+			Serialize:       &catalog.OnCompleteSerialize{Group: "factory-coordinate", KeyParam: "repo"},
+		},
+	}, true)
+	require.NoError(t, d.Invalid())
+	reg.Upsert(d)
+
+	shaped, err := shapeInvokeTurn(invokeRequest{Event: prEnvelope("ai-review")}, "", "", "", reg, testCaller, time.Now())
+	require.NoError(t, err)
+	raw, err := json.Marshal(newInvokeTrigger(shaped.match, shaped.sessionID))
+	require.NoError(t, err)
+	require.Contains(t, string(raw),
+		`"onComplete":{"emitTo":"runs","waitUntilClosed":{"repositoryParam":"repo","numberParam":"waitFor"},"serialize":{"group":"factory-coordinate","keyParam":"repo"}}`)
+	require.Contains(t, string(raw), `"waitFor":"7"`)
+}

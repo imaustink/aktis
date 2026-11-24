@@ -29,6 +29,7 @@ import { GatewayServer, type GatewayServerOptions } from "./server.js";
 import { InMemorySessionPageStore, RedisSessionPageStore } from "./session-page-store.js";
 import { InMemoryPendingLabelStore, RedisPendingLabelStore } from "./label-reconciler.js";
 import { RedisInflightRunStore } from "./inflight-runs.js";
+import { RedisDeferredEventStore } from "./deferred-events.js";
 import { CrdEventSourceRegistry, SecretKeyReader, type SecretReadApi } from "./event-sources.js";
 import { CrdEventTriggerRegistry } from "./event-triggers.js";
 import { JwksTokenAuthenticator, kubeIssuerKeySource, TICK_TOKEN_AUDIENCE } from "./tick-auth.js";
@@ -369,6 +370,9 @@ async function main(): Promise<void> {
       ? `In-flight run takeover enabled (Redis: ${pendingLabelRedisUrl})`
       : "In-flight run takeover disabled (no Redis): a restart drops runs being polled",
   );
+  // Same Redis: held run events, serialize queues and conflict-sweep marks
+  // (docs/adr/0055). Without it they live in memory and a restart forgets them.
+  const deferredEventStore = pendingLabelRedisUrl ? new RedisDeferredEventStore(pendingLabelRedisUrl) : undefined;
 
   // Claude-auth (docs/adr/0027) is opt-in and layered on top of
   // identity-link's Redis/encryption-key/bearer-token config and
@@ -470,6 +474,7 @@ async function main(): Promise<void> {
     ...(sessionPageStore ? { sessionPageStore, publicBaseUrl: config.publicUrl } : {}),
     pendingLabelStore,
     ...(inflightRunStore ? { inflightRunStore } : {}),
+    ...(deferredEventStore ? { deferredEventStore } : {}),
     ...(config.labelReconcilerIntervalMs ? { labelReconcilerIntervalMs: config.labelReconcilerIntervalMs } : {}),
     ...(config.labelReconcilerGraceMs !== undefined ? { labelReconcilerGraceMs: config.labelReconcilerGraceMs } : {}),
     ...(claudeAuthFlows && claudeTokenStore ? { claudeAuthFlows, claudeAuthStore: claudeTokenStore } : {}),
@@ -501,6 +506,7 @@ async function main(): Promise<void> {
     if (sessionPageStore instanceof RedisSessionPageStore) await sessionPageStore.close();
     if (pendingLabelStore instanceof RedisPendingLabelStore) await pendingLabelStore.close();
     await inflightRunStore?.close();
+    await deferredEventStore?.close();
     await shutdownTelemetry();
     process.exit(0);
   };

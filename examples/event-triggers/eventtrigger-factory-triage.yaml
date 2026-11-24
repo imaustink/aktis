@@ -1,0 +1,57 @@
+# Software factory, step 2 (docs/adr/0055 §3): the coordinated issue is worked
+# from the default branch -- the coordinator decided `proceed`, recorded no
+# valid decision, its run failed, or its wait was not routable (5 waits
+# already, or it named this issue). Exactly the complement of factory-park and
+# factory-triage-stacked among coordinate completions, so every coordinated
+# issue gets worked. Its PR enters factory-review like issue triage's did.
+apiVersion: core.aktis.ai/v1alpha1
+kind: EventTrigger
+metadata:
+  name: factory-triage
+spec:
+  sourceRef: runs
+  match:
+    cel: >-
+      source == "runs" && kind == "run" &&
+      body.trigger == "factory-coordinate" &&
+      !(body.status == "succeeded" && has(body.outcome.coordination) &&
+        has(body.outcome.coordination.number) &&
+        string(body.outcome.coordination.number) != body.params.number &&
+        ((body.outcome.coordination.decision == "wait" &&
+          (!("factory-park" in body.chain.counts) || body.chain.counts["factory-park"] < 5)) ||
+         body.outcome.coordination.decision == "stack"))
+  params:
+    repository: body.params.repository
+    number: body.params.number
+    # The SWE agent adds "Closes #<n>" to the PR it opens (docs/event-triggers.md §6).
+    closesIssue: body.params.number
+    title: body.params.title
+  sessionKey: "github:{{repository}}#{{number}}"
+  target:
+    agentRef: "opencode-swe-agent"
+    promptTemplate: |
+      Resolve GitHub issue {{repository}}#{{number}}: "{{title}}". Read it
+      first with `gh issue view {{number}} --repo {{repository}} --comments`.
+
+      Investigate the {{repository}} repository (the repository this issue was
+      filed in), implement a fix or feature there if the issue calls for one,
+      and open a pull request against {{repository}} from the default branch.
+      Do not create a new repository and do not substitute any other
+      repository -- if you cannot complete the task in {{repository}} as
+      given, stop and post a comment explaining exactly what's blocking you. If
+      the issue is unclear, post a comment asking a clarifying question instead
+      of guessing.
+
+      Once you open a pull request, an automated review of it starts on its
+      own, and its feedback is addressed automatically before the PR is handed
+      to a maintainer, so do not ask anyone to apply review labels.
+  reply:
+    github:
+      repository: "{{repository}}"
+      issueNumber: "{{number}}"
+      ack: "🤖 Starting work on this now."
+      sessionPage: true
+      result: true
+      removeLabel: "ai-triage"
+  onComplete:
+    emitTo: runs

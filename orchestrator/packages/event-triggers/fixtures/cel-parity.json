@@ -1,5 +1,5 @@
 {
-  "$comment": "Executable definition of docs/event-triggers.md §3-§4. Every case runs in BOTH the TS package (@aktis/event-triggers) and the Temporal engine (cel-go). expect.value is compared as JSON; expect.type pins int vs double where JSON cannot ('int'|'double'|'string'|'bool'|'list'|'map'|'null'). expect.error=true means evaluation must fail. In `matching`, expect.toolInput (when present) is the tool's single string input (docs/event-triggers.md §1); fields absent from expect are not asserted.",
+  "$comment": "Executable definition of docs/event-triggers.md \u00a73-\u00a74. Every case runs in BOTH the TS package (@aktis/event-triggers) and the Temporal engine (cel-go). expect.value is compared as JSON; expect.type pins int vs double where JSON cannot ('int'|'double'|'string'|'bool'|'list'|'map'|'null'). expect.error=true means evaluation must fail. In `matching`, expect.toolInput (when present) is the tool's single string input (docs/event-triggers.md \u00a71); fields absent from expect are not asserted.",
   "envelopes": {
     "gh_pr_labeled": {
       "source": "github",
@@ -62,7 +62,7 @@
         "issue": {
           "number": 7,
           "title": "Widgets explode",
-          "body": "Steps: …"
+          "body": "Steps: \u2026"
         },
         "repository": {
           "full_name": "acme/widgets"
@@ -1068,6 +1068,77 @@
           "head": {
             "ref": "feature",
             "repo": null
+          }
+        }
+      },
+      "sender": {
+        "login": "octocat",
+        "isBot": false
+      },
+      "repository": "acme/widgets"
+    },
+    "pr_conflict": {
+      "source": "pr-conflicts",
+      "kind": "conflict",
+      "id": "c-1",
+      "time": "2026-11-23T12:00:00Z",
+      "headers": {},
+      "body": {
+        "pullRequest": {
+          "number": 12,
+          "url": "https://github.com/acme/widgets/pull/12",
+          "title": "Fix the thing",
+          "baseRef": "main",
+          "baseSha": "aaaaaaa",
+          "headRef": "fix-thing",
+          "headSha": "bbbbbbb"
+        },
+        "chain": {
+          "id": "c-1",
+          "depth": 0,
+          "counts": {},
+          "origin": {
+            "login": "octocat",
+            "repository": "acme/widgets"
+          }
+        }
+      },
+      "sender": {
+        "login": "octocat",
+        "isBot": false
+      },
+      "repository": "acme/widgets"
+    },
+    "factory_coordinate_wait": {
+      "source": "runs",
+      "kind": "run",
+      "id": "r-9",
+      "time": "2026-11-23T12:00:00Z",
+      "headers": {},
+      "body": {
+        "trigger": "factory-coordinate",
+        "status": "succeeded",
+        "params": {
+          "repository": "acme/widgets",
+          "number": "7"
+        },
+        "outcome": {
+          "madeNewCommits": false,
+          "coordination": {
+            "decision": "wait",
+            "number": 12
+          }
+        },
+        "chain": {
+          "id": "d-9",
+          "depth": 2,
+          "counts": {
+            "factory-intake": 1,
+            "factory-coordinate": 1
+          },
+          "origin": {
+            "login": "octocat",
+            "repository": "acme/widgets"
           }
         }
       },
@@ -2252,6 +2323,33 @@
       "expect": {
         "value": "",
         "type": "string"
+      }
+    },
+    {
+      "name": "factory (ADR 0055): conflict-kind envelope matches by kind and PR number",
+      "envelope": "pr_conflict",
+      "expr": "kind == \"conflict\" && body.pullRequest.number == 12 && body.pullRequest.baseRef == \"main\"",
+      "expect": {
+        "value": true,
+        "type": "bool"
+      }
+    },
+    {
+      "name": "factory (ADR 0055): conflict PR number is an int",
+      "envelope": "pr_conflict",
+      "expr": "body.pullRequest.number",
+      "expect": {
+        "value": 12,
+        "type": "int"
+      }
+    },
+    {
+      "name": "factory (ADR 0055): coordinate wait gate (valid number, not self, under park cap)",
+      "envelope": "factory_coordinate_wait",
+      "expr": "body.trigger == \"factory-coordinate\" && body.status == \"succeeded\" && has(body.outcome.coordination) && body.outcome.coordination.decision == \"wait\" && has(body.outcome.coordination.number) && string(body.outcome.coordination.number) != body.params.number && (!(\"factory-park\" in body.chain.counts) || body.chain.counts[\"factory-park\"] < 5)",
+      "expect": {
+        "value": true,
+        "type": "bool"
       }
     }
   ],

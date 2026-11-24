@@ -11,6 +11,35 @@ kind: Kustomization
 resources:
   - ../../../examples/event-triggers
 patches:
+  # Removed: the coordination intake (docs/adr/0055) outranks github-issue-
+  # triage on the same `ai-triage` delivery, and the event-trigger specs drive
+  # that delivery to github-issue-triage itself. Coordination routing is
+  # covered by orchestrator/packages/event-triggers/src/examples.test.ts and
+  # the gateway's held-event tests.
+  - target: { kind: EventTrigger, name: factory-intake }
+    patch: |
+      $patch: delete
+      apiVersion: core.aktis.ai/v1alpha1
+      kind: EventTrigger
+      metadata:
+        name: factory-intake
+  # Removed: the conflict sweep would call the GitHub search API on a timer,
+  # which the hermetic cluster has no credentials for. (Its trigger goes with
+  # it, rather than sitting NotReady on a missing source.)
+  - target: { kind: EventSource, name: pr-conflicts }
+    patch: |
+      $patch: delete
+      apiVersion: core.aktis.ai/v1alpha1
+      kind: EventSource
+      metadata:
+        name: pr-conflicts
+  - target: { kind: EventTrigger, name: factory-resync }
+    patch: |
+      $patch: delete
+      apiVersion: core.aktis.ai/v1alpha1
+      kind: EventTrigger
+      metadata:
+        name: factory-resync
   # The suite signs and posts GitHub deliveries itself with the same HMAC
   # secret the gateway verifies (bootstrap-secrets.sh's
   # e2e-integration-gateway-secrets, key GITHUB_WEBHOOK_SECRET), so the

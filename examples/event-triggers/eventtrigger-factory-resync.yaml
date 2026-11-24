@@ -1,0 +1,58 @@
+# Software factory, conflict re-sync (docs/adr/0055 §1): the pr-conflicts
+# sweep found an automation-opened pull request that conflicts with its base
+# (usually because another factory PR merged first). Resolve the conflicts on
+# the PR's own branch, acting as the PR's assignee (the human the factory
+# handed it to). Its completion re-enters factory-review; a run that failed or
+# pushed nothing goes to factory-handoff.
+apiVersion: core.aktis.ai/v1alpha1
+kind: EventTrigger
+metadata:
+  name: factory-resync
+spec:
+  sourceRef: pr-conflicts
+  match:
+    cel: >-
+      source == "pr-conflicts" && kind == "conflict"
+  params:
+    repository: repository
+    number: body.pullRequest.number
+    title: body.pullRequest.title
+    baseRef: body.pullRequest.baseRef
+  sessionKey: "github:{{repository}}#{{number}}"
+  target:
+    agentRef: "opencode-swe-agent"
+    promptTemplate: |
+      Pull request {{repository}}#{{number}} ("{{title}}") now has merge
+      conflicts with its base branch {{baseRef}}, because other work was
+      merged into {{baseRef}} after it was opened. Resolve them on this PR's
+      existing branch. Work only in {{repository}} and only on this branch --
+      do not open a second pull request.
+
+      1. Check out the branch: `gh pr checkout {{number}}`.
+      2. Read what was merged into {{baseRef}} since this branch diverged
+         (`git fetch origin {{baseRef}}`, then `git log` / `git diff` against
+         the merge base) so you understand both sides.
+      3. Merge `origin/{{baseRef}}` into the branch (merge, do not rebase --
+         you cannot force-push) and resolve every conflict so that BOTH this
+         PR's intent and the newly merged work are preserved. Never resolve a
+         conflict by dropping the other side's change wholesale.
+      4. Build and run the tests that cover the files you touched, and fix
+         anything the merge broke.
+      5. Push to the same branch and post one comment summarizing which files
+         conflicted and how you resolved each.
+
+      If a conflict cannot be resolved safely without a decision from a human,
+      stop and post a comment saying exactly which conflict and why, instead
+      of guessing. You get exactly one turn: push and summarize now, do not
+      wait for CI. (When this run ends, an automated review starts on its own.)
+  reply:
+    github:
+      repository: "{{repository}}"
+      issueNumber: "{{number}}"
+      ack: "🤖 This pull request conflicts with {{baseRef}} after other work merged; resolving the conflicts now."
+      sessionPage: true
+      result: true
+      addLabels: ["ai-triage"]
+      removeLabel: "ai-triage"
+  onComplete:
+    emitTo: runs

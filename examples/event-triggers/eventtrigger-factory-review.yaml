@@ -1,12 +1,13 @@
-# Software factory, step 2 (docs/adr/0052 §4): when issue triage, PR triage or
-# a fix run succeeds with an open PR, review that PR read-only. Routed by the run event,
+# Software factory, step 2 (docs/adr/0052 §4): when issue triage (coordinated:
+# factory-triage / factory-triage-stacked, docs/adr/0055), PR triage, a fix run
+# or a conflict resync succeeds with an open PR, review that PR read-only. Routed by the run event,
 # not a GitHub label: the bot's own label/PR webhooks are dropped (self-trigger
 # guard), so the chain never crosses GitHub. The `ai-review` label is only a
 # status display, added at acceptance and removed when the review ends.
 #
-# A fix run that pushed nothing (`outcome.madeNewCommits` false -- e.g. it
-# could not push to a fork's branch, or only replied to comments) is not
-# re-reviewed: factory-handoff gives the PR to a human instead.
+# A fix or resync run that pushed nothing (`outcome.madeNewCommits` false --
+# e.g. it could not push to a fork's branch, or only replied to comments) is
+# not re-reviewed: factory-handoff gives the PR to a human instead.
 #
 # Loop bound: at most 3 reviews per chain (`body.chain.counts`), on top of the
 # gateway's global RUN_EVENT_MAX_DEPTH. A readOnly run's runner appends the
@@ -27,10 +28,10 @@ spec:
   match:
     cel: >-
       source == "runs" && kind == "run" &&
-      body.trigger in ["github-issue-triage", "github-pr-triage", "factory-fix"] &&
+      body.trigger in ["github-issue-triage", "factory-triage", "factory-triage-stacked", "github-pr-triage", "factory-fix", "factory-resync"] &&
       body.status == "succeeded" &&
-      (has(body.outcome.pullRequest) || body.trigger in ["github-pr-triage", "factory-fix"]) &&
-      (body.trigger != "factory-fix" || (has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits)) &&
+      (has(body.outcome.pullRequest) || body.trigger in ["github-pr-triage", "factory-fix", "factory-resync"]) &&
+      (!(body.trigger in ["factory-fix", "factory-resync"]) || (has(body.outcome.madeNewCommits) && body.outcome.madeNewCommits)) &&
       (!("factory-review" in body.chain.counts) || body.chain.counts["factory-review"] < 3)
   params:
     repository: body.params.repository
