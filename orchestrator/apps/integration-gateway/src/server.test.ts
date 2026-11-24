@@ -9,6 +9,7 @@ import { GithubIdentityResolver } from "./identity.js";
 import { testRuns, type TestRuns } from "./__fixtures__/temporal.js";
 import { createRunActivities } from "./runs/activities.js";
 import { LegacyRunDrain } from "./runs/legacy-drain.js";
+import type { RunActivities } from "./runs/contract.js";
 import type { RunSettings } from "./runs/model.js";
 import { InMemoryInflightRunStore, type InflightRun } from "./inflight-runs.js";
 import { InMemoryDeferredEventStore } from "./deferred-events.js";
@@ -216,6 +217,8 @@ async function start(
   overrides: Partial<GatewayServerOptions> = {},
   secrets: Record<string, string> = SECRETS,
   runOpts: Partial<RunSettings> = {},
+  /** Wraps the activities the worker runs (to make one fail, say). */
+  wrapActivities: (a: RunActivities) => RunActivities = (a) => a,
 ): Promise<Harness> {
   const temporal = await testRuns(runOpts);
   const order: string[] = [];
@@ -286,7 +289,7 @@ async function start(
     runs: temporal.runs,
     ...overrides,
   });
-  await temporal.serve(createRunActivities(server.effects, temporal.runs, (line) => logs.push(line)));
+  await temporal.serve(wrapActivities(createRunActivities(server.effects, temporal.runs, (line) => logs.push(line))));
   await server.listen(0);
   const port = (server as unknown as { server: { address: () => AddressInfo } }).server.address().port;
   current = {
@@ -1877,6 +1880,26 @@ describe("held run events and conflict events (docs/adr/0055)", () => {
     await waitFor(() => expect(runEvents(h)).toHaveLength(2));
   });
 
+  it("never publishes a run event twice when its publish dies after the orchestrator accepted it", async () => {
+    const EMITS: AcceptedTrigger = { ...COORDINATE, name: "factory-intake", sessionId: "event:intake", onComplete: { emitTo: "runs" } };
+    // The worker "dies" after /invoke accepted and the next run started: the activity fails.
+    const h = await start({}, SECRETS, {}, (a) => ({
+      ...a,
+      emitRunEvent: async (...args) => {
+        await a.emitRunEvent(...args);
+        throw new Error("worker lost after the relay");
+      },
+    }));
+    chain(h, EMITS, COORDINATE);
+    await postGithub(h);
+    await waitFor(() => expect(h.logs.some((l) => l.includes("ended without an answer"))).toBe(true));
+    await waitFor(() => expect(h.poll).toHaveBeenCalledWith("inv-2", expect.anything()));
+    await settle();
+    // One acceptance, one next-hop run: the activity is not retried.
+    expect(runEvents(h)).toHaveLength(1);
+    expect(h.poll.mock.calls.filter((c) => c[0] === "inv-2")).toHaveLength(1);
+  });
+
   describe("conflict sweep", () => {
     const DIRTY = {
       number: 12,
@@ -1942,6 +1965,25 @@ describe("held run events and conflict events (docs/adr/0055)", () => {
       const sweeps = h.searchOpenPullRequests.mock.calls.length;
       await waitFor(() => expect(h.searchOpenPullRequests.mock.calls.length).toBeGreaterThanOrEqual(sweeps + 2));
       expect(h.submitEvent).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not emit a conflict event again when its publish dies after the orchestrator accepted it", async () => {
+      const h = await start({ eventSources: fastConflicts() }, SECRETS, {}, (a) => ({
+        ...a,
+        emitConflict: async (...args) => {
+          await a.emitConflict(...args);
+          throw new Error("worker lost after the relay");
+        },
+      }));
+      appAssigned(h, "alice");
+      h.submitEvent.mockResolvedValue({ kind: "ignored" });
+      h.searchOpenPullRequests.mockResolvedValue([{ owner: "acme", repo: "widgets", number: 12 }]);
+      h.getPullRequest.mockResolvedValue(DIRTY);
+      await h.temporal.runs.ensureConflictSweeps(["pr-conflicts"]);
+      await waitFor(() => expect(h.searchOpenPullRequests.mock.calls.length).toBeGreaterThanOrEqual(3));
+      // The sweep kept going, and sent the event once.
+      expect(h.submitEvent).toHaveBeenCalledTimes(1);
+      expect(h.logs.some((l) => l.includes("ended without an answer"))).toBe(true);
     });
 
     it("one sweep per source, however often it is ensured", async () => {

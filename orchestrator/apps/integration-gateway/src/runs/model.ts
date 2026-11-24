@@ -192,6 +192,34 @@ export const DEFAULT_RUN_SETTINGS: RunSettings = {
   publishRetryWindowMs: 24 * 60 * 60 * 1000,
 };
 
+/** The longest wait between two publishes of one completion (the backoff doubles up to this). */
+export const PUBLISH_RETRY_MAX_MS = 15 * 60 * 1000;
+/** How long one publish (an emit activity) may take; it is never retried (workflows.ts). */
+export const EMIT_TIMEOUT_MS = 10 * 60 * 1000;
+/** Attempts at polling one turn, each up to `turnTimeoutMs`. */
+export const TURN_ATTEMPTS = 10;
+/** Attempts at one identity-link wait, each up to `linkWaitTimeoutMs`. */
+export const LINK_ATTEMPTS = 3;
+/** How long a run keeps retrying its label removal. */
+export const LABEL_RETRY_MS = 60 * 60 * 1000;
+
+/**
+ * How long a serialize queue waits for its holder to release before passing
+ * it over (docs/adr/0055 §2). It must outlast any holder that is still alive,
+ * or two runs from one queue overlap, so it is the worst case of both holders
+ * back to back -- the held event publishing (retried for
+ * `publishRetryWindowMs`), then the run that publish started: two turns
+ * (before and after an identity link) at every poll retry, the link wait, the
+ * hour of label retries, and its own completion's publish -- plus an hour for
+ * the short steps in between. Only a holder that is gone (terminated) ever
+ * reaches it.
+ */
+export function queueHoldTimeoutMs(s: RunSettings): number {
+  const publishMs = s.publishRetryWindowMs + PUBLISH_RETRY_MAX_MS + EMIT_TIMEOUT_MS;
+  const runMs = 2 * TURN_ATTEMPTS * s.turnTimeoutMs + LINK_ATTEMPTS * s.linkWaitTimeoutMs + LABEL_RETRY_MS;
+  return 2 * publishMs + runMs + 60 * 60 * 1000;
+}
+
 /** One accepted event, as `eventRun` receives it. */
 export interface EventRunInput {
   /** The invocation the orchestrator accepted the event as; the workflow id derives from it. */

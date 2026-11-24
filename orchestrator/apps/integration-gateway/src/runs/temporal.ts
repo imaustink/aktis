@@ -4,7 +4,7 @@ import { Client, Connection, WorkflowExecutionAlreadyStartedError, WorkflowNotFo
 import { NativeConnection, Worker, type WorkerOptions } from "@temporalio/worker";
 import type { RunActivities } from "./contract.js";
 import type { RunStarter } from "./effects.js";
-import { refKey, workflowIds, type EventRunInput, type HeldMemo, type HeldRunEventInput, type QueueHold, type RunSettings } from "./model.js";
+import { queueHoldTimeoutMs, refKey, workflowIds, type EventRunInput, type HeldMemo, type HeldRunEventInput, type QueueHold, type RunSettings } from "./model.js";
 import type { conflictSweep, eventRun, heldRunEvent, runQueue } from "./workflows.js";
 
 /**
@@ -99,7 +99,7 @@ export class TemporalRuns implements RunStarter {
     await this.o.client.workflow.signalWithStart<typeof runQueue, [string]>("runQueue", {
       taskQueue: this.o.taskQueue,
       workflowId: workflowIds.runQueue(this.o.taskQueue, hold.queue),
-      args: [{ queue: hold.queue }],
+      args: [{ queue: hold.queue, holdTimeoutMs: queueHoldTimeoutMs(this.o.settings) }],
       signal: "enqueue",
       signalArgs: [hold.holder],
     });

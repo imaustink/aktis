@@ -15,8 +15,15 @@ import {
 import type { RunActivities } from "./contract.js";
 import {
   githubReplyTarget,
+  EMIT_TIMEOUT_MS,
+  LABEL_RETRY_MS,
+  LINK_ATTEMPTS,
+  PUBLISH_RETRY_MAX_MS,
+  queueHoldTimeoutMs,
   refKey,
+  TURN_ATTEMPTS,
   workflowIds,
+  DEFAULT_RUN_SETTINGS,
   type CompletedRun,
   type EventRunInput,
   type FinishedRun,
@@ -44,12 +51,26 @@ const effects = proxyActivities<RunActivities>({
   retry: { maximumAttempts: 3 },
 });
 
+/**
+ * Publishing a run or conflict event: never retried. Each attempt submits its
+ * own envelope, and the orchestrator accepts every envelope it is sent as a
+ * new run -- so an attempt that dies after `/invoke` accepted (a worker crash,
+ * this timeout) is not repeated: a second attempt would start the next hop
+ * twice. An attempt that fails this way has an unknown outcome; the workflow
+ * logs it and does not publish again. An orchestrator that answers "failed"
+ * (unreachable, a 5xx) is still retried, by `publish`'s own loop.
+ */
+const emits = proxyActivities<Pick<RunActivities, "emitRunEvent" | "emitConflict">>({
+  startToCloseTimeout: EMIT_TIMEOUT_MS,
+  retry: { maximumAttempts: 1 },
+});
+
 /** Polls a turn for as long as it may run: the gateway's poll budget bounds it (settings.turnTimeoutMs). */
 function turnsFor(settings: RunSettings) {
   return proxyActivities<Pick<RunActivities, "awaitTurn">>({
     startToCloseTimeout: settings.turnTimeoutMs,
     heartbeatTimeout: "1 minute",
-    retry: { maximumAttempts: 10 },
+    retry: { maximumAttempts: TURN_ATTEMPTS },
   });
 }
 
@@ -58,21 +79,17 @@ function linksFor(settings: RunSettings) {
   return proxyActivities<Pick<RunActivities, "waitForLink">>({
     startToCloseTimeout: settings.linkWaitTimeoutMs,
     heartbeatTimeout: "1 minute",
-    retry: { maximumAttempts: 3 },
+    retry: { maximumAttempts: LINK_ATTEMPTS },
   });
 }
 
 /** Label removal is retried for an hour: a stranded label means a human can never re-trigger by hand. */
 const labels = proxyActivities<Pick<RunActivities, "removeLabel">>({
   startToCloseTimeout: "1 minute",
-  scheduleToCloseTimeout: "1 hour",
+  scheduleToCloseTimeout: LABEL_RETRY_MS,
   retry: { initialInterval: "2 seconds", backoffCoefficient: 2, maximumInterval: "5 minutes" },
 });
 
-const PUBLISH_RETRY_MAX_MS = 15 * 60 * 1000;
-
-/** A queue's holder that never releases (it was terminated) is passed over after this long -- longer than any run. */
-export const QUEUE_HOLD_TIMEOUT = "9 hours";
 /** A queue with nobody waiting closes after this long; the next enqueue starts it again. */
 const QUEUE_IDLE = "1 hour";
 
@@ -218,10 +235,20 @@ async function publish(
   const name = completed.trigger.name || "trigger";
   let firstFailure: number | undefined;
   for (let attempt = 1; ; attempt++) {
-    const result = await effects.emitRunEvent(completed, {
-      ...(opts.resetDepth ? { resetDepth: true } : {}),
-      ...(opts.holdsQueue ? { holdsQueue: opts.holdsQueue } : {}),
-    });
+    let result: Awaited<ReturnType<RunActivities["emitRunEvent"]>>;
+    try {
+      result = await emits.emitRunEvent(completed, {
+        ...(opts.resetDepth ? { resetDepth: true } : {}),
+        ...(opts.holdsQueue ? { holdsQueue: opts.holdsQueue } : {}),
+      });
+    } catch (error) {
+      // Unknown outcome (see `emits`): the next hop may already be running,
+      // so it is not published again. Nor is a held queue released: if that
+      // run started, it holds the queue and releases it when it finishes; if
+      // not, the queue passes over this holder at its hold timeout.
+      await effects.log(`run event ${name}: publish attempt ${attempt} ended without an answer (${messageOf(error)}); not published again, so it cannot start the next hop twice`);
+      return;
+    }
     if (result !== "failed") {
       if (opts.holdsQueue && result !== "accepted") await effects.releaseQueue(opts.holdsQueue);
       return;
@@ -286,7 +313,9 @@ export async function heldRunEvent(input: HeldRunEventInput): Promise<void> {
  * the held event itself when its publish started nothing, else the run it
  * started, once that run has finished.
  */
-export async function runQueue(input: { queue: string; waiting?: string[] }): Promise<void> {
+export async function runQueue(input: { queue: string; waiting?: string[]; holdTimeoutMs?: number }): Promise<void> {
+  // A holder that never releases (its workflow was terminated) is passed over after this long -- longer than any live holder.
+  const holdTimeoutMs = input.holdTimeoutMs ?? queueHoldTimeoutMs(DEFAULT_RUN_SETTINGS);
   const waiting = [...(input.waiting ?? [])];
   let current: string | undefined;
   let released = false;
@@ -304,7 +333,7 @@ export async function runQueue(input: { queue: string; waiting?: string[] }): Pr
   for (let served = 0; ; served++) {
     if (waiting.length === 0 && !(await condition(() => waiting.length > 0, QUEUE_IDLE))) return;
     if (served >= ITERATIONS_PER_RUN || workflowInfo().continueAsNewSuggested) {
-      await continueAsNew<typeof runQueue>({ queue: input.queue, waiting });
+      await continueAsNew<typeof runQueue>({ queue: input.queue, waiting, holdTimeoutMs });
     }
     current = waiting.shift()!;
     released = false;
@@ -315,7 +344,7 @@ export async function runQueue(input: { queue: string; waiting?: string[] }): Pr
       current = undefined;
       continue;
     }
-    await condition(() => released, QUEUE_HOLD_TIMEOUT);
+    await condition(() => released, holdTimeoutMs);
     current = undefined;
   }
 }
@@ -339,8 +368,17 @@ export async function conflictSweep(input: { source: string; marks?: Record<stri
 
     for (const candidate of await effects.findConflicts(input.source, conflicts)) {
       if (marks[candidate.markKey] !== undefined) continue;
+      let delivered: boolean;
+      try {
+        delivered = await emits.emitConflict(input.source, candidate);
+      } catch (error) {
+        // Unknown outcome (see `emits`): the event may have started a run, so
+        // it is marked rather than sent again. The PR's next base move emits anew.
+        await effects.log(`conflicts ${input.source}: emitting ${candidate.markKey} ended without an answer (${messageOf(error)}); not emitted again`);
+        delivered = true;
+      }
       // Undelivered (the orchestrator was unreachable): try again next sweep.
-      if (await effects.emitConflict(input.source, candidate)) marks[candidate.markKey] = Date.now();
+      if (delivered) marks[candidate.markKey] = Date.now();
     }
     await sleep(conflicts.intervalMs);
     if (workflowInfo().continueAsNewSuggested) break;

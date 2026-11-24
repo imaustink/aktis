@@ -48,7 +48,9 @@ The stack already runs Temporal for the engine.
 3. **A serialize queue is a `runQueue` workflow** per `<group>:<key>`: held
    events join it by signal-with-start and get their turn by signal; the run a
    turn started releases it when it finishes. A holder that never releases is
-   passed over after 9 hours.
+   passed over after a timeout computed from the run settings
+   (`queueHoldTimeoutMs`) to outlast any live holder, so two runs from one
+   queue never overlap.
 4. **A conflicts source is a `conflictSweep` workflow**: one per source,
    started (if not running) by every replica, ending when the source goes
    away. Its once-per-(PR, base commit) marks are workflow state.
@@ -73,6 +75,12 @@ The stack already runs Temporal for the engine.
 - A completion whose publish fails is retried for 24 hours whether or not it
   was held; before, only held ones were, and an immediate publish that failed
   was lost.
+- Publishing a run or conflict event is an activity that is **never retried**:
+  every attempt submits its own envelope and the orchestrator accepts each as
+  a new run, so repeating an attempt that died after `/invoke` accepted would
+  start the next hop twice. Such an attempt (a worker crash mid-publish) is
+  logged and not published again -- at most once, as before. A publish the
+  orchestrator answered as failed is still retried for 24 hours.
 - A gateway rollout costs a run nothing: the worker cancels its activities on
   shutdown, and their retries start on the new pods at once.
 - **Temporal is required** for the gateway, as it already was for the engine
