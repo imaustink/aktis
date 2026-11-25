@@ -318,4 +318,12 @@ export const workflowIds = {
   heldRunEvent: (taskQueue: string, id: string) => `${taskQueue}/held-run-event:${id}`,
   runQueue: (taskQueue: string, queue: string) => `${taskQueue}/run-queue:${queue}`,
   conflictSweep: (taskQueue: string, source: string) => `${taskQueue}/conflict-sweep:${source}`,
+  /**
+   * One per subject, so two replicas refreshing one Claude credential share a
+   * run (claude-auth/workflows.ts). The subject is URI-encoded: it is any
+   * string the orchestrator keys credentials by, and must not be able to
+   * collide with another subject's id or carry a separator.
+   */
+  claudeCredentialRefresh: (taskQueue: string, subject: string) => `${taskQueue}/claude-credential-refresh:${encodeURIComponent(subject)}`,
+  claudeCredentialSweep: (taskQueue: string) => `${taskQueue}/claude-credential-sweep`,
 };
