@@ -23,7 +23,7 @@ import type { ClaudeTokenStore } from "./store.js";
  * Doing it here fixes both, because the gateway is the one place that holds
  * the store and can serialize per subject. It is NOT one process, though: the
  * chart allows several replicas, and a rollout overlaps old and new pods. So
- * the serialization lives in Temporal, not in memory (docs/adr/0057): every
+ * the serialization lives in Temporal, not in memory (docs/adr/0058 §3): every
  * refresh of a subject runs as that subject's `claudeCredentialRefresh`
  * workflow (claude-auth/workflows.ts), whose id is the subject's, and every
  * caller on every replica attaches to the one that is running. The pieces:
