@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
-import { createBrokerServer, DELEGATED_TOKEN_HEADER } from "./server.js";
+import { createBrokerServer, DELEGATED_TOKEN_HEADER, SyncFailedError } from "./server.js";
 import { StaticCorpusRegistry } from "./registry.js";
 import {
   PermissionDeniedError,
@@ -387,4 +387,44 @@ describe("broker server", () => {
     expect(driver.readAsUser).not.toHaveBeenCalled();
   });
 
+});
+
+describe("POST /corpora/:name/sync", () => {
+  const serve = async (runSync?: Parameters<typeof createBrokerServer>[0]["runSync"]) => {
+    const server = createBrokerServer({
+      auth: { orchestratorToken: "orch", syncTokens: new Map([["globex-confluence", "sync"]]) },
+      registry: new StaticCorpusRegistry([
+        { name: "globex-confluence", driver: fakeDriver(), scope: { space: "GLOBEX" }, serviceToken: "service-cred" },
+      ]),
+      ...(runSync ? { runSync } : {}),
+    });
+    server.listen(0);
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const res = await fetch(`${base}/corpora/globex-confluence/sync`, {
+      method: "POST",
+      headers: { authorization: "Bearer sync" },
+    });
+    const body = (await res.json()) as Record<string, unknown>;
+    server.closeAllConnections();
+    server.close();
+    return { status: res.status, body };
+  };
+
+  it("answers with the pass it ran", async () => {
+    const res = await serve(async () => ({ indexed: 2, removed: 1, full: true }));
+    expect(res).toEqual({ status: 200, body: { indexed: 2, removed: 1, full: true } });
+  });
+
+  it("is a 404 for a corpus nothing syncs, and on a broker that does not index", async () => {
+    expect((await serve(async () => undefined)).status).toBe(404);
+    expect((await serve()).status).toBe(404);
+  });
+
+  it("is a 502 naming the failure when the pass failed", async () => {
+    const res = await serve(async () => {
+      throw new SyncFailedError("qdrant unreachable");
+    });
+    expect(res.status).toBe(502);
+    expect(res.body.error).toContain("qdrant unreachable");
+  });
 });

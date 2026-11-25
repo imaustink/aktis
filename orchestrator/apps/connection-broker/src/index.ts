@@ -6,16 +6,19 @@
  *
  *   - Serves the HTTP API: per-user authorization probes for retrieval, and
  *     listing/fetch for ingestion.
- *   - Runs each Connection's reconcile pass on its own schedule.
+ *   - Runs each Corpus's reconcile passes, as a Temporal workflow per Corpus
+ *     (docs/adr/0058) on this process's own worker.
  */
 import * as k8s from "@kubernetes/client-node";
-import { createBrokerServer } from "./server.js";
+import { createBrokerServer, SyncFailedError } from "./server.js";
 import { CrdCorpusRegistry } from "./crd-corpus-registry.js";
 import { collectionOf, reconcileIntervalMs, type CorpusCustomResource } from "./corpus-resource.js";
 import { EMBEDDING_DIMENSIONS, OpenAIEmbedder } from "./embedder.js";
 import { QdrantCorpusWriter } from "./sync/corpus-writer.js";
 import { HttpResourceSource } from "./sync/http-source.js";
-import { SyncScheduler } from "./sync/scheduler.js";
+import { createSyncActivities, type SyncTarget } from "./sync/activities.js";
+import { connectClient, createSyncWorker, CorpusSyncs, SyncPassError } from "./sync/temporal.js";
+import { DEFAULT_TASK_QUEUE } from "./sync/model.js";
 import { QdrantHttpClient } from "./sync/qdrant-client.js";
 import { CorpusStatusWriter } from "./corpus-status.js";
 import { CORPUS_PLURAL } from "./crd-corpus-registry.js";
@@ -93,40 +96,57 @@ async function main(): Promise<void> {
   // Declared before the server so the webhook route can reach it, and left
   // undefined when this deployment does not index — in which case the route
   // reports not-found rather than accepting notifications it cannot act on.
-  let scheduler: SyncScheduler | undefined;
+  let sync: SyncLoop | undefined;
 
   const server = createBrokerServer({
     auth: { orchestratorToken: required("ORCHESTRATOR_TOKEN"), syncTokens },
     registry,
-    // The CronJob the controller creates per Corpus kicks this rather than
-    // re-implementing a pass: the broker already holds the drivers, the
-    // credentials, the writer and the embedder, and a second code path for one
-    // job is how the two drift.
+    // A run-now is the corpus's own workflow's next full pass, so it never
+    // overlaps the scheduled one (docs/adr/0058).
     runSync: async (corpus) => {
-      const report = await scheduler?.runOnce(corpus);
-      return report && { indexed: report.indexed, removed: report.removed, full: report.full };
+      if (!sync?.target(corpus)) return undefined;
+      try {
+        const report = await sync.syncs.runNow(corpus);
+        return { indexed: report.indexed, removed: report.removed, full: report.full };
+      } catch (err) {
+        if (err instanceof SyncPassError) throw new SyncFailedError(err.message);
+        throw err;
+      }
     },
     webhooks: {
       secretFor: (connection) => webhookSecrets.get(connection),
       onChange: (corpus, sourceIds) => {
-        // Fire and forget: a provider's delivery must be acknowledged promptly
-        // or it gets retried and eventually the endpoint gets disabled. The
-        // pass reports through the scheduler's own callbacks.
-        void scheduler?.onWebhook(corpus, sourceIds);
+        // Acknowledged at once: a provider's delivery must be answered
+        // promptly or it gets retried and eventually the endpoint disabled.
+        // The signal lands in the corpus's workflow, which keeps what it names
+        // until a pass has examined it — even while another pass runs.
+        if (!sync?.target(corpus)) return;
+        void sync.syncs
+          .notify(corpus, sourceIds)
+          .catch((err: unknown) => console.error(`sync ${corpus}: could not hand over a webhook:`, err));
       },
     },
   });
   server.listen(port, () => console.log(`connection-broker listening on ${port}`));
 
-  scheduler = startSync(registry, syncTokens, port, status);
+  sync = await startSync(registry, syncTokens, port, status);
 
   const shutdown = () => {
-    scheduler?.stop();
-    registry.stop();
-    server.close(() => process.exit(0));
+    void (async () => {
+      await sync?.stop();
+      registry.stop();
+      server.close(() => process.exit(0));
+    })();
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
+}
+
+interface SyncLoop {
+  syncs: CorpusSyncs;
+  /** The corpus, if this broker syncs it. */
+  target: (corpus: string) => SyncTarget | undefined;
+  stop: () => Promise<void>;
 }
 
 /**
@@ -138,12 +158,12 @@ async function main(): Promise<void> {
  * but it says so, because a broker silently indexing nothing looks exactly like
  * a broker whose sources are empty.
  */
-function startSync(
+async function startSync(
   registry: CrdCorpusRegistry,
   syncTokens: Map<string, string>,
   port: number,
   status: CorpusStatusWriter,
-): SyncScheduler | undefined {
+): Promise<SyncLoop | undefined> {
   const qdrantUrl = process.env.QDRANT_URL;
   const openaiKey = process.env.OPENAI_API_KEY;
   if (!qdrantUrl || !openaiKey) {
@@ -161,32 +181,69 @@ function startSync(
     return undefined;
   }
 
+  // Indexing runs on Temporal (docs/adr/0058): without it there is no
+  // scheduler at all, and a broker that silently indexed nothing would look
+  // exactly like one whose sources are empty.
+  const temporalAddress = process.env.TEMPORAL_ADDRESS;
+  if (!temporalAddress) {
+    console.error(
+      "TEMPORAL_ADDRESS is not set: the broker indexes each Corpus from a Temporal workflow (docs/adr/0058). " +
+        "Set it, or unset QDRANT_URL/OPENAI_API_KEY to serve the API only.",
+    );
+    process.exit(1);
+  }
+  const temporalNamespace = process.env.TEMPORAL_NAMESPACE || "default";
+  const taskQueue = process.env.TEMPORAL_TASK_QUEUE || DEFAULT_TASK_QUEUE;
+
   const qdrant = new QdrantHttpClient({ url: qdrantUrl, apiKey: process.env.QDRANT_API_KEY });
   const embedder = new OpenAIEmbedder({ apiKey: openaiKey, model: process.env.EMBEDDING_MODEL });
 
-  // A connection whose SYNC_TOKEN_<name> is missing is reported exactly once,
+  // A corpus whose SYNC_TOKEN_<name> is missing is reported exactly once,
   // not on every re-read of the targets. It is skipped rather than run with some
-  // other connection's token — that token authorizes precisely one connection's
-  // source, so borrowing it would either 403 or read the wrong connection.
+  // other corpus's token — that token authorizes precisely one corpus's
+  // source, so borrowing it would either 403 or read the wrong corpus.
   const warnedMissingToken = new Set<string>();
 
-  const scheduler = new SyncScheduler({
-    // One source per connection, carrying that connection's own sync token. The
-    // broker scopes each token to a single connection (auth.ts), so a shared
-    // source built with one token would 403 on every other connection's list
-    // and fetch — failing their passes and leaving them silently unindexed. The
-    // target filter below guarantees a token exists before a connection is ever
-    // scheduled, so the lookup here always succeeds.
+  const targets = (): SyncTarget[] =>
+    registry.listResources().flatMap((cr: CorpusCustomResource) => {
+      const binding = registry.get(cr.metadata.name);
+      const collection = collectionOf(cr);
+      const intervalMs = reconcileIntervalMs(cr);
+      // A corpus with no collection has not been reconciled by the
+      // controller yet, and one with no interval is not meant to be
+      // indexed. Both are ordinary states, not errors.
+      if (!binding || !collection || !intervalMs) return [];
+      // A corpus with no sync token cannot be indexed: its source needs
+      // its own token and there is no other to borrow. Reported once so a
+      // missing SYNC_TOKEN_<name> is visible, then skipped.
+      if (!syncTokens.has(binding.name)) {
+        if (!warnedMissingToken.has(binding.name)) {
+          console.error(`corpus ${binding.name} has no SYNC_TOKEN_* configured — not indexing it`);
+          warnedMissingToken.add(binding.name);
+        }
+        return [];
+      }
+      return [{ binding, collection, intervalMs }];
+    });
+  const target = (corpus: string) => targets().find((candidate) => candidate.binding.name === corpus);
+
+  const activities = createSyncActivities({
+    // One source per corpus, carrying that corpus's own sync token. The
+    // broker scopes each token to a single corpus (auth.ts), so a shared
+    // source built with one token would 403 on every other corpus's list
+    // and fetch — failing their passes and leaving them silently unindexed.
+    // `target` guarantees a token exists before a corpus is ever synced, so
+    // the lookup here always succeeds.
     sourceFor: (binding) => {
       const token = syncTokens.get(binding.name);
       if (!token) {
-        // Unreachable via the scheduler (targets() excludes tokenless
-        // connections), but never fall back to another connection's token.
-        throw new Error(`no SYNC_TOKEN_* configured for connection ${binding.name}`);
+        // Unreachable via `target` (it excludes tokenless corpora), but
+        // never fall back to another corpus's token.
+        throw new Error(`no SYNC_TOKEN_* configured for corpus ${binding.name}`);
       }
       return new HttpResourceSource({ baseUrl: `http://127.0.0.1:${port}`, token });
     },
-    // One writer per connection: every point carries its own connection's
+    // One writer per corpus: every point carries its own corpus's
     // allowedRoles, and a shared writer would stamp one client's roles onto
     // another client's chunks.
     writerFor: (binding) =>
@@ -194,31 +251,7 @@ function startSync(
         allowedRoles: binding.allowedRoles,
         vectorSize: EMBEDDING_DIMENSIONS,
       }),
-    targets: () =>
-      registry
-        .listResources()
-        .flatMap((cr: CorpusCustomResource) => {
-          const binding = registry.get(cr.metadata.name);
-          const collection = collectionOf(cr);
-          const intervalMs = reconcileIntervalMs(cr);
-          // A corpus with no collection has not been reconciled by the
-          // controller yet, and one with no interval is not meant to be
-          // indexed. Both are ordinary states, not errors.
-          if (!binding || !collection || !intervalMs) return [];
-          // A connection with no sync token cannot be indexed: its source needs
-          // its own token and there is no other to borrow. Reported once so a
-          // missing SYNC_TOKEN_<name> is visible, then skipped.
-          if (!syncTokens.has(binding.name)) {
-            if (!warnedMissingToken.has(binding.name)) {
-              console.error(
-                `connection ${binding.name} has no SYNC_TOKEN_* configured — not indexing it`,
-              );
-              warnedMissingToken.add(binding.name);
-            }
-            return [];
-          }
-          return [{ binding, collection, intervalMs }];
-        }),
+    target,
     onReport: async (corpus, report) => {
       console.log(
         `sync ${corpus}: indexed=${report.indexed} removed=${report.removed} ` +
@@ -229,10 +262,36 @@ function startSync(
       // is stale by definition.
       await status.record(corpus, report);
     },
-    onError: (corpus, err) => console.error(`sync ${corpus} failed:`, err),
   });
-  scheduler.start();
-  return scheduler;
+
+  const client = await connectClient({ address: temporalAddress, namespace: temporalNamespace });
+  const syncs = new CorpusSyncs({ client, taskQueue });
+  const worker = await createSyncWorker({ address: temporalAddress, namespace: temporalNamespace, taskQueue, activities });
+  const running = worker.run();
+  // A worker that stops on its own (Temporal unreachable for good, a fatal
+  // core error) leaves nothing indexing: exit, so the pod restarts loudly.
+  running.catch((err: unknown) => {
+    console.error("sync worker stopped:", err);
+    process.exit(1);
+  });
+  console.log(`syncing corpora on Temporal ${temporalAddress} (namespace ${temporalNamespace}, task queue ${taskQueue})`);
+
+  // Every replica makes sure every synced Corpus has its loop; the workflow id
+  // makes that one loop however many replicas ask. A Corpus that stops being
+  // synced ends its own loop (it re-reads the Corpus as it waits).
+  const ensure = () => void syncs.ensure(targets().map((t) => t.binding.name));
+  ensure();
+  const timer = setInterval(ensure, 60_000);
+
+  return {
+    syncs,
+    target,
+    stop: async () => {
+      clearInterval(timer);
+      worker.shutdown();
+      await running.catch(() => {});
+    },
+  };
 }
 
 void main().catch((err: unknown) => {

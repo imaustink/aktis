@@ -62,7 +62,7 @@ export interface CrdCorpusRegistryOptions {
 export class CrdCorpusRegistry implements CorpusRegistry {
   private readonly bindings = new Map<string, CorpusBinding>();
   /**
-   * The resources behind the bindings, kept because the sync scheduler needs
+   * The resources behind the bindings, kept because the sync loop needs
    * fields the binding deliberately does not carry — the collection the
    * controller published, and the reconcile interval.
    */
