@@ -2,20 +2,23 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { requireLocalClusterContext } from "../support/guard.js";
 import { kubectl, kubectlApplyStdin, waitFor } from "../support/k8s.js";
 import { withQdrant, pointCount } from "../support/qdrant.js";
+import { syncCorpusNow } from "../support/corpus-sync.js";
 
 /**
- * Slack and Drive corpora, synced through the real CronJob into real Qdrant.
+ * Slack and Drive corpora, synced by the broker's real sync workflow into real
+ * Qdrant.
  *
  * Only Confluence went through the full cluster path before this. The drivers
  * are covered against their fakes, and the broker's routes are covered against
  * fake drivers, but nothing had ever run a SLACK or DRIVE corpus through the
- * controller, the CronJob, the broker and the store together — which is where
+ * controller, the broker's sync, and the store together — which is where
  * every bug in this PR has actually lived.
  *
  * What this spec is for, beyond "it also works":
  *
- *   The CronJob is rendered per Corpus and its sync token is keyed per corpus,
- *   so a second and third provider are the first time that keying is exercised
+ *   Each corpus's sync token is keyed per corpus (the broker's own pass and a
+ *   run-now request both authenticate with it), so a second and third
+ *   provider are the first time that keying is exercised
  *   with more than one entry. A shared token would let any corpus drive
  *   another's ingestion credential, and a mis-keyed one fails as
  *   "unrecognized bearer token" — which reads as a wrong VALUE rather than a
@@ -140,23 +143,12 @@ spec:
     reconcileInterval: 1h
 `;
 
-/** Runs a corpus's sync from its own CronJob — the pod spec production deploys. */
+/**
+ * Runs a corpus's full sync pass now, authenticated with that corpus's own
+ * sync token, through the route production uses (see syncCorpusNow).
+ */
 async function syncNow(corpus: string): Promise<void> {
-  const cronjob = (
-    await kubectl([
-      "get",
-      "cronjob",
-      "-l",
-      `core.aktis.ai/corpus=${corpus}`,
-      "-o",
-      "jsonpath={.items[0].metadata.name}",
-    ])
-  ).trim();
-  expect(cronjob, `${corpus} has no sync CronJob`).not.toBe("");
-
-  const job = `e2e-sync-${corpus}-${Date.now()}`;
-  await kubectl(["create", "job", job, `--from=cronjob/${cronjob}`]);
-  await kubectl(["wait", "--for=condition=complete", `job/${job}`, "--timeout=300s"]);
+  await syncCorpusNow(corpus);
 }
 
 const collectionOf = async (corpus: string) =>

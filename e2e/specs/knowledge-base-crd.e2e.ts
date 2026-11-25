@@ -20,8 +20,8 @@ import { ALPHA_KNOWLEDGE_BASE_LOCK, holdLock } from "../support/locks.js";
  *   - whether the CRDs installed in the cluster are the ones this branch
  *     generates. Helm's crds/ directory is install-only, so a release that
  *     predates a new kind never gets it.
- *   - whether reconciling a Corpus creates the CronJob its sync depends on,
- *     with the schedule its `reconcileInterval` asks for.
+ *   - whether a syncing Corpus actually gets synced: by the broker's own
+ *     per-Corpus workflow (docs/adr/0058), with no CronJob alongside it.
  *
  * Objects are namespaced and deleted in afterAll. Nothing here spends a real
  * credential: the Connection points at the in-cluster fake.
@@ -196,9 +196,10 @@ describe("the chart grants the controller what it watches", () => {
     }
   });
 
-  it("permits the cronjobs a Corpus's sync is reconciled into", async () => {
-    // Added with the CronJob-based sync and just as hand-copied. Without it the
-    // Corpus reconciles, reports healthy, and is never synced by anything.
+  it("permits cronjobs (cron EventSources, and removing legacy Corpus sync CronJobs)", async () => {
+    // Hand-copied like the rest. A Corpus no longer syncs through a CronJob
+    // (docs/adr/0058), but the controller still deletes the ones an earlier
+    // release created, and a cron EventSource ticks through one.
     const rules = await controllerClusterRole();
 
     const batch = new Set(
@@ -313,39 +314,37 @@ describe("reconciling a Corpus", () => {
     expect(resolved.status?.identityProviders).toEqual(["atlassian"]);
   });
 
-  it("creates the sync CronJob, on the schedule the Corpus asked for", async () => {
-    const cronjob = await waitFor(
-      "a sync CronJob exists for the corpus",
+  it("is synced by the broker's own workflow, with no CronJob", async () => {
+    // One scheduler (docs/adr/0058): the broker starts a sync workflow for
+    // every syncing Corpus it sees, and its first pass is a full one. The
+    // per-Corpus CronJob that used to kick the same pass is gone.
+    const synced = await waitFor(
+      "a full pass lands on the corpus's status",
       async () => {
-        const found = await kubectlJson<{ items: { metadata: { name: string }; spec: { schedule: string } }[] }>([
+        const corpus = await kubectlJson<{ status?: { lastReconcileTime?: string } }>([
           "get",
-          "cronjob",
-          "-l",
-          `core.aktis.ai/corpus=${CORPUS}`,
+          "corpus",
+          CORPUS,
           "-o",
           "json",
         ]);
-        return found.items.length > 0 ? found.items[0] : undefined;
+        return corpus.status?.lastReconcileTime ? corpus : undefined;
       },
-      { timeoutMs: 60_000 },
+      // The broker looks for new corpora every minute, then a pass embeds.
+      { timeoutMs: 180_000 },
     );
+    expect(synced.status?.lastReconcileTime).toBeTruthy();
 
-    // `reconcileInterval: 1h` — the controller rounds DOWN, so an hourly
-    // corpus must not end up on a schedule that fires less often than asked.
-    expect(cronjob.spec.schedule).toMatch(/^(\S+\s+){4}\S+$/);
-    expect(cronjob.spec.schedule).toContain("*");
-  });
-
-  it("owns the CronJob, so deleting the Corpus takes it away", async () => {
-    // Otherwise a deleted Corpus leaves a job syncing into a collection
-    // nothing reads, spending a client's credential forever.
-    const cronjobs = await kubectlJson<{
-      items: { metadata: { ownerReferences?: { kind: string; name: string }[] } }[];
-    }>(["get", "cronjob", "-l", `core.aktis.ai/corpus=${CORPUS}`, "-o", "json"]);
-
-    const owners = cronjobs.items[0]?.metadata.ownerReferences ?? [];
-    expect(owners.some((o) => o.kind === "Corpus" && o.name === CORPUS)).toBe(true);
-  });
+    const cronjobs = await kubectlJson<{ items: unknown[] }>([
+      "get",
+      "cronjob",
+      "-l",
+      `core.aktis.ai/corpus=${CORPUS}`,
+      "-o",
+      "json",
+    ]);
+    expect(cronjobs.items).toHaveLength(0);
+  }, 240_000);
 });
 
 describe("a Connection with Corpora drawing from it", () => {

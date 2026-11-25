@@ -364,12 +364,6 @@ agent-orchestrator:
     # a shorter fixture.
     callerToolTopK: 3
 
-core-controller:
-  corpusSync:
-    enabled: true
-    brokerUrl: "http://agent-controller-connection-broker:8080"
-    tokenSecret: e2e-connection-broker-sync-tokens
-
 # The MCP broker (orchestrator/apps/mcp-broker, docs/adr/0045): discovers the fake MCP
 # server's tools into MCPTool CRs and proxies tools/call under the caller's
 # delegated token. The MCPServer CR that points it at the fake server is applied
@@ -397,6 +391,11 @@ connection-broker:
     pullPolicy: IfNotPresent
   qdrant:
     url: "http://agent-controller-qdrant:6333"
+  # Each Corpus's sync is a workflow on the broker's own worker
+  # (docs/adr/0058), on the same dev server as the engine's and the gateway's.
+  temporal:
+    address: temporal-dev-server.controller-agent.svc:7233
+    namespace: default
   # Pointed at the in-cluster stand-in (e2e/manifests/fake-confluence.yaml),
   # the same way integration-gateway reaches fake-github through githubApiUrl.
   # Nothing production-shaped changes: this is the Data Center/Server seam.

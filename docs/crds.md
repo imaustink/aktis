@@ -10,8 +10,8 @@ registers every kind below.
 Two kinds of actor reconcile them:
 
 - **The `core-controller` operator** (`orchestrator/controllers/core-controller`) watches most
-  kinds. Only `ToolRun` and `AgentRun` create Kubernetes Jobs; `Corpus` creates a
-  sync CronJob and a cron `EventSource` a tick CronJob; every other controller only validates the spec and sets a `Ready`
+  kinds. Only `ToolRun` and `AgentRun` create Kubernetes Jobs; a cron `EventSource` creates
+  a tick CronJob (a `Corpus` is synced by the connection-broker's own Temporal workflow, docs/adr/0058); every other controller only validates the spec and sets a `Ready`
   condition.
 - **Out-of-cluster brokers.** The `connection-broker` reads `Connection`/`Corpus`
   for ingestion and retrieval; the `mcp-broker` owns `MCPServer`/`MCPTool`
@@ -270,7 +270,7 @@ collection, stamped with the Corpus's roles at ingest.
   - **CEL:** exactly one scope unit; `sync.reconcileInterval` required unless `mode: none`.
 - **Status:** `provider` + `identityProviders` (copied from the Connection), `collection`, `resources` (indexed count), `lastSyncTime`, `lastReconcileTime`, `webhook`, `Ready` + `Synced` conditions.
 - **Referenced by:** `KnowledgeBase.corpusRefs`.
-- **Acted on by:** `corpus_controller.go` (owns a sync CronJob); `connection-broker` + the vector-store indexer.
+- **Acted on by:** `corpus_controller.go` (collection, inherited fields; deletes a legacy sync CronJob); `connection-broker`, whose per-Corpus `corpusSync` Temporal workflow runs every pass (docs/adr/0058).
 - **Sample:** `config/samples/core_v1alpha1_corpus.yaml` (+ `_slack`, `_gdrive`).
 
 ### KnowledgeBase
