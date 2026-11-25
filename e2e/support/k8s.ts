@@ -366,7 +366,7 @@ export async function jobEnvNames(agentRunName: string): Promise<string[]> {
 
 /**
  * How far apart concurrent spec files' local ports sit -- more than the span of
- * every fixed port this suite uses (18063..18112), so two workers' ranges can
+ * every fixed port this suite uses (18063..18113), so two workers' ranges can
  * never overlap.
  */
 const PORT_STRIDE_PER_WORKER = 200;

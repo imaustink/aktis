@@ -5,6 +5,7 @@ import { withQdrant, listCollections, pointCount } from "../support/qdrant.js";
 import { chatSubject, chatTurn } from "../support/chat.js";
 import { seedAtlassianLink, deleteCredentials } from "../support/credential-store.js";
 import { ALPHA_KNOWLEDGE_BASE_LOCK, holdLock } from "../support/locks.js";
+import { syncCorpusNow } from "../support/corpus-sync.js";
 
 /**
  * A knowledge base, from a synced corpus to what a caller is allowed to read.
@@ -21,7 +22,7 @@ import { ALPHA_KNOWLEDGE_BASE_LOCK, holdLock } from "../support/locks.js";
  * it. A retrieval that returns it to that caller is a leak; a retrieval that
  * hides it from the other is the probe failing closed on someone entitled.
  *
- * Everything below the caller is real: the CronJob's own image, the broker,
+ * Everything below the caller is real: the broker's sync workflow, the broker,
  * the driver, the embeddings, Qdrant, the probe. Only Confluence is a
  * stand-in, and `fake-confluence-fidelity.e2e.ts` is what keeps that honest.
  */
@@ -100,27 +101,12 @@ spec:
 `;
 
 /**
- * Runs the corpus's sync now, rather than waiting for its schedule.
- *
- * The CronJob is what production runs, so the Job is created FROM it — a
- * hand-written Job would test a pod spec nobody deploys.
+ * Runs the corpus's sync now, rather than waiting for its schedule: a full
+ * pass of the corpus's own sync workflow, through the route production uses
+ * (see syncCorpusNow).
  */
 async function syncNow(): Promise<void> {
-  const cronjob = (
-    await kubectl([
-      "get",
-      "cronjob",
-      "-l",
-      `core.aktis.ai/corpus=${CORPUS}`,
-      "-o",
-      "jsonpath={.items[0].metadata.name}",
-    ])
-  ).trim();
-  expect(cronjob, "the corpus has no sync CronJob to trigger").not.toBe("");
-
-  const job = `e2e-sync-${Date.now()}`;
-  await kubectl(["create", "job", job, `--from=cronjob/${cronjob}`]);
-  await kubectl(["wait", "--for=condition=complete", `job/${job}`, "--timeout=300s"]);
+  await syncCorpusNow(CORPUS);
 }
 
 beforeAll(async () => {
@@ -162,7 +148,7 @@ afterAll(async () => {
   await deleteCredentials("identity-link");
 });
 
-describe("the sync CronJob", () => {
+describe("the corpus sync", () => {
   it("writes the corpus into its own collection", async () => {
     await withQdrant(async (base) => {
       const collections = await listCollections(base);
