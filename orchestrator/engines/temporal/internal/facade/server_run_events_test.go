@@ -1,9 +1,7 @@
 package facade
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -16,8 +14,8 @@ import (
 )
 
 // Ported from server.run-events.test.ts (docs/adr/0052): the 202's trigger
-// params/onComplete, target.none, the run outcome on the poll, CheckOutcome,
-// and adopting a turn whose process died.
+// params/onComplete, target.none, the run outcome on the poll, and
+// CheckOutcome.
 
 func runEnvelope(overrides map[string]any) map[string]any {
 	e := map[string]any{
@@ -159,7 +157,7 @@ var runOutcome = json.RawMessage(`{"pullRequest":{"number":12,"url":"https://git
 
 func runTurn(t *testing.T, d *catalog.EventTriggerDescriptor, outcome TurnOutcome) map[string]any {
 	t.Helper()
-	base := serve(t, &Server{Engine: engineReturning(outcome), Triggers: triggerRegistry(t, d), Invocations: &MemoryInvocationStore{}})
+	base := serve(t, &Server{Engine: engineReturning(outcome), Triggers: triggerRegistry(t, d)})
 	return settled(t, base, acceptedID(t, postEvent(t, base, runEnvelope(nil), nil)))
 }
 
@@ -185,9 +183,11 @@ func TestRunOutcomeIsOmitted(t *testing.T) {
 		outcome TurnOutcome
 		status  string
 	}{
-		"when the run reported none":       {trigger("factory-review", factoryReviewSpec()), reviewed(nil), "succeeded"},
-		"on a failed turn":                 {trigger("factory-review", factoryReviewSpec()), TurnOutcome{Error: "boom", RunOutcome: runOutcome}, "failed"},
-		"when the trigger forced no agent": {skill, TurnOutcome{RunOutcome: runOutcome}, "succeeded"},
+		"when the run reported none": {trigger("factory-review", factoryReviewSpec()), reviewed(nil), "succeeded"},
+		"on a failed turn":           {trigger("factory-review", factoryReviewSpec()), TurnOutcome{Error: "boom", RunOutcome: runOutcome}, "failed"},
+		// Only a forced agentRef turn reports one: the engine's conversation
+		// workflow clears it on every other turn, so there is none to drop here.
+		"when a skill turn reported none": {skill, resultOutcome("ok"), "succeeded"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -260,101 +260,4 @@ func TestCheckOutcomeRefusesNonObjects(t *testing.T) {
 	require.ErrorContains(t, err, "not serializable")
 	_, err = CheckOutcome(nil)
 	require.Error(t, err)
-}
-
-// ── adoption ───────────────────────────────────────────────────────────────
-
-// hangingReporter reports its engine id then never settles: the process
-// "dies" mid-turn.
-func hangingReporter(t *testing.T) *fakeEngine {
-	hang := hangingInvoke(t)
-	return &fakeEngine{invokeFn: func(ctx context.Context, in TurnInput) (TurnOutcome, error) {
-		if err := in.ReportEngineInvocation("engine-1"); err != nil {
-			return TurnOutcome{}, err
-		}
-		return hang(ctx, in)
-	}}
-}
-
-func adoptionServer(t *testing.T, engine Engine, store InvocationStore) string {
-	return serve(t, &Server{Engine: engine, Triggers: triggerRegistry(t, trigger("factory-review", factoryReviewSpec())), Invocations: store})
-}
-
-func acceptOn(t *testing.T, base string, store InvocationStore) string {
-	t.Helper()
-	id := acceptedID(t, postEvent(t, base, runEnvelope(nil), nil))
-	waitFor(t, func() bool {
-		r := store.Get(context.Background(), id)
-		return r != nil && r.EngineInvocationID != ""
-	})
-	r := store.Get(context.Background(), id)
-	require.Equal(t, "engine-1", r.EngineInvocationID)
-	require.True(t, r.ForcedAgent)
-	return id
-}
-
-func TestAdoptionANewProcessFinishesTheTurnFromTheEngineID(t *testing.T) {
-	store := &MemoryInvocationStore{}
-	dead := adoptionServer(t, hangingReporter(t), store)
-	id := acceptOn(t, dead, store)
-
-	replacement := hangingReporter(t)
-	replacement.adoptFn = func(_ context.Context, engineID string, _ TurnInput) (TurnOutcome, error) {
-		o := resultOutcome("Reviewed.")
-		o.RunOutcome = json.RawMessage(`{"verdict":"changes-requested"}`)
-		return o, nil
-	}
-	base := adoptionServer(t, replacement, store)
-	record := settled(t, base, id)
-
-	require.Equal(t, []string{"engine-1"}, replacement.adopted())
-	require.Equal(t, map[string]any{"id": id, "status": "succeeded", "result": "Reviewed.", "outcome": map[string]any{"verdict": "changes-requested"}}, record)
-}
-
-func TestAdoptionNeverAdoptsATurnThisProcessIsStillRunning(t *testing.T) {
-	store := &MemoryInvocationStore{}
-	engine := hangingReporter(t)
-	engine.adoptFn = func(context.Context, string, TurnInput) (TurnOutcome, error) { return resultOutcome("x"), nil }
-	base := adoptionServer(t, engine, store)
-	id := acceptOn(t, base, store)
-
-	// And the bookkeeping is hidden from the caller.
-	require.Equal(t, map[string]any{"id": id, "status": "pending"}, getInvocation(t, base, id))
-	stillFalse(t, func() bool { return len(engine.adopted()) > 0 })
-}
-
-// A pending record without an engine id has nothing to adopt by.
-func TestAdoptionSkipsARecordWithoutAnEngineID(t *testing.T) {
-	store := &MemoryInvocationStore{}
-	require.NoError(t, store.Set(context.Background(), InvocationRecord{ID: "orphan", Status: "pending"}))
-	engine := newFakeEngine()
-	base := serve(t, &Server{Engine: engine, Invocations: store})
-	require.Equal(t, "pending", getInvocation(t, base, "orphan")["status"])
-	stillFalse(t, func() bool { return len(engine.adopted()) > 0 })
-}
-
-// A draining process does not start adopting turns it could not finish.
-func TestAdoptionDoesNotStartWhileDraining(t *testing.T) {
-	store := &MemoryInvocationStore{}
-	require.NoError(t, store.Set(context.Background(), InvocationRecord{ID: "orphan", Status: "pending", EngineInvocationID: "engine-9"}))
-	engine := newFakeEngine()
-	s := &Server{Engine: engine, Invocations: store}
-	base := serve(t, s)
-	s.BeginDraining()
-	require.Equal(t, map[string]any{"id": "orphan", "status": "pending"}, getInvocation(t, base, "orphan"))
-	stillFalse(t, func() bool { return len(engine.adopted()) > 0 })
-}
-
-func TestAdoptionRecordsAnAdoptedTurnsEngineFailure(t *testing.T) {
-	store := &MemoryInvocationStore{}
-	dead := adoptionServer(t, hangingReporter(t), store)
-	id := acceptOn(t, dead, store)
-
-	replacement := hangingReporter(t)
-	replacement.adoptFn = func(context.Context, string, TurnInput) (TurnOutcome, error) {
-		return TurnOutcome{}, errors.New("engine 404")
-	}
-	record := settled(t, adoptionServer(t, replacement, store), id)
-	require.Equal(t, "failed", record["status"])
-	require.Equal(t, "engine 404", record["error"])
 }

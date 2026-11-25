@@ -36,6 +36,21 @@ export interface SyncOptions {
   onlySourceIds?: string[];
   /** Guards against an unbounded walk if a driver's cursor never terminates. */
   maxPages?: number;
+  /**
+   * Called after every listed page and every fetched resource. A pass run as
+   * a Temporal activity heartbeats from here, so a worker that dies mid-pass
+   * is noticed within the heartbeat timeout rather than the pass's whole
+   * budget (docs/adr/0058).
+   */
+  onProgress?: (progress: SyncProgress) => void;
+}
+
+export interface SyncProgress {
+  phase: "list" | "fetch";
+  /** Pages listed so far (list) or resources fetched so far (fetch). */
+  done: number;
+  /** Resources to fetch; known only once listing has finished. */
+  total?: number;
 }
 
 export interface SyncReport {
@@ -71,14 +86,15 @@ export async function syncConnection(
 ): Promise<SyncReport> {
   const full = options.onlySourceIds === undefined;
   const refs = full
-    ? await walk(source, target.connection, options.maxPages ?? DEFAULT_MAX_PAGES)
+    ? await walk(source, target.connection, options.maxPages ?? DEFAULT_MAX_PAGES, options.onProgress)
     : options.onlySourceIds!.map((id) => ({ id }) as ResourceRef);
 
   const chunks: Chunk[] = [];
   const fetched: string[] = [];
   const failed: string[] = [];
 
-  for (const ref of refs) {
+  for (const [index, ref] of refs.entries()) {
+    options.onProgress?.({ phase: "fetch", done: index, total: refs.length });
     let document: Document;
     try {
       document = await source.fetch(target.connection, ref.id);
@@ -123,13 +139,19 @@ export async function syncConnection(
  * terminates would otherwise spin forever holding a credential, and the failure
  * would look like a hung Job rather than a bug.
  */
-async function walk(source: ResourceSource, connection: string, maxPages: number): Promise<ResourceRef[]> {
+async function walk(
+  source: ResourceSource,
+  connection: string,
+  maxPages: number,
+  onProgress?: (progress: SyncProgress) => void,
+): Promise<ResourceRef[]> {
   const refs: ResourceRef[] = [];
   let cursor: Cursor;
 
   for (let page = 0; page < maxPages; page += 1) {
     const result = await source.list(connection, cursor);
     refs.push(...result.resources);
+    onProgress?.({ phase: "list", done: page + 1 });
     if (!result.cursor) return refs;
     cursor = result.cursor;
   }

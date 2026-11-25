@@ -273,10 +273,9 @@ func (r *EventSourceReconciler) applyTickServiceAccount(ctx context.Context, sou
 	return r.Update(ctx, &existing)
 }
 
-// applyTickCronJob creates or updates the source's CronJob. Mirrors the
-// Corpus sync-kick CronJob (reconcileSyncCronJob): the Job only KICKS the
-// gateway, which reads the payload from the CR itself, so the CronJob carries
-// nothing a tick could forge.
+// applyTickCronJob creates or updates the source's CronJob. The Job only
+// KICKS the gateway, which reads the payload from the CR itself, so the
+// CronJob carries nothing a tick could forge.
 func (r *EventSourceReconciler) applyTickCronJob(ctx context.Context, source *corev1alpha1.EventSource, name string) error {
 	log := logf.FromContext(ctx)
 	cron := source.Spec.Cron

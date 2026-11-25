@@ -97,7 +97,8 @@ func TestE2EHarnessStreams(t *testing.T) {
 type harnessEngine struct{ outcome TurnOutcome }
 
 func (e harnessEngine) Invoke(context.Context, TurnInput) (TurnOutcome, error) { return e.outcome, nil }
-func (e harnessEngine) Adopt(context.Context, string, TurnInput) (TurnOutcome, error) {
-	return e.outcome, nil
+func (e harnessEngine) Start(context.Context, TurnInput) (string, error)       { return "x.y", nil }
+func (e harnessEngine) Status(context.Context, string) (EngineStatus, error) {
+	return EngineStatus{Outcome: e.outcome}, nil
 }
 func (e harnessEngine) CheckIdentity(context.Context, TurnInput) *IdentityRefusal { return nil }

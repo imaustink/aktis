@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import type { Envelope } from "@aktis/event-triggers";
 import { HISTORY_TASK_QUEUE, testRuns, type TestRuns } from "../__fixtures__/temporal.js";
 import type { AcceptedTrigger, OrchestratorInvokeResult } from "../orchestrator-client.js";
+import type { ClaudeCredentialSweepPlan } from "../claude-auth/refresh-contract.js";
 import type { RunActivities } from "./contract.js";
 import { workflowIds, type IssueRef } from "./model.js";
 
@@ -221,6 +222,55 @@ describe.skipIf(!process.env.CAPTURE_WORKFLOW_HISTORIES)("capture workflow histo
     const id = workflowIds.conflictSweep(t.taskQueue, "conflicts");
     await until(() => closed(t, id), "the sweep to end");
     await save(t, "conflictSweep-marks", id);
+    await t.stop();
+  });
+
+  it("claudeCredentialSweep: a child refresh, a subject already refreshing, a failed listing, then a stop", async () => {
+    const t = await testRuns({}, { taskQueue: HISTORY_TASK_QUEUE });
+    let releaseBob: (() => void) | undefined;
+    const plans: ClaudeCredentialSweepPlan[] = [
+      { kind: "listed", examined: 3, due: ["github:alice", "github:bob"], unrefreshable: 1, intervalMs: 20, marginMs: 1000 },
+      { kind: "failed", detail: "API server unreachable", intervalMs: 20, marginMs: 1000 },
+      { kind: "stop", reason: "Claude credential refresh is disabled", intervalMs: 20, marginMs: 1000 },
+    ];
+    await t.serve({
+      ...activities({}),
+      claudeCredentialsDue: async () => plans.shift() ?? { kind: "stop", reason: "done", intervalMs: 20, marginMs: 1000 },
+      refreshClaudeCredential: async ({ subject }) => {
+        if (subject === "github:bob") await new Promise<void>((r) => (releaseBob = r));
+        return subject === "github:bob" ? { status: "refreshed", expiresAt: "2026-01-01T08:00:00.000Z", sealedCredentialsJson: "iv:tag:sealed" } : { status: "refreshed", expiresAt: "2026-01-01T08:00:00.000Z" };
+      },
+    });
+    const ids = {
+      sweep: workflowIds.claudeCredentialSweep(t.taskQueue),
+      alice: workflowIds.claudeCredentialRefresh(t.taskQueue, "github:alice"),
+      bob: workflowIds.claudeCredentialRefresh(t.taskQueue, "github:bob"),
+    };
+    // A read is already refreshing bob when the sweep reaches him.
+    await t.client.workflow.start("claudeCredentialRefresh", { taskQueue: t.taskQueue, workflowId: ids.bob, args: [{ subject: "github:bob", marginMs: 1000 }] });
+    await until(() => releaseBob !== undefined, "bob's refresh to start");
+    await t.client.workflow.start("claudeCredentialSweep", { taskQueue: t.taskQueue, workflowId: ids.sweep, args: [{ intervalMs: 20 }] });
+    await until(() => closed(t, ids.sweep), "the sweep to stop");
+    releaseBob?.();
+    await until(() => closed(t, ids.bob), "bob's refresh");
+    await save(t, "claudeCredentialSweep-child-skip-fail-stop", ids.sweep);
+    await save(t, "claudeCredentialRefresh-refreshed", ids.alice);
+    await save(t, "claudeCredentialRefresh-sealed", ids.bob);
+    await t.stop();
+  });
+
+  it("claudeCredentialRefresh: an activity that fails is a result, not a retry", async () => {
+    const t = await testRuns({}, { taskQueue: HISTORY_TASK_QUEUE });
+    await t.serve({
+      ...activities({}),
+      refreshClaudeCredential: async () => {
+        throw new Error("worker lost mid-refresh");
+      },
+    });
+    const id = workflowIds.claudeCredentialRefresh(t.taskQueue, "github:carol");
+    await t.client.workflow.start("claudeCredentialRefresh", { taskQueue: t.taskQueue, workflowId: id, args: [{ subject: "github:carol", marginMs: 1000 }] });
+    await until(() => closed(t, id), "the refresh");
+    await save(t, "claudeCredentialRefresh-failed", id);
     await t.stop();
   });
 });

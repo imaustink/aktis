@@ -114,11 +114,11 @@ func main() {
 	// relevance ranking — and a caller sending few (the common case) is
 	// unaffected either way, since the store is not consulted at all below the
 	// top-K threshold.
-	if store, prune, err := startCallerToolStore(ctx); err != nil {
+	if store, collection, err := startCallerToolStore(ctx); err != nil {
 		log.Printf("caller-tool ranking disabled (%v); large tool arrays will be truncated", err)
 	} else {
 		opts = append(opts, gateway.WithCallerTools(store, callerToolTopK()))
-		go prune()
+		go ensurePruneSchedule(ctx, c.ScheduleClient(), cfg.TaskQueue, collection)
 	}
 
 	// Image attachments (package attachments). Off without IMAGE_S3_BUCKET: a
@@ -204,30 +204,30 @@ func callerToolTopK() int {
 	return 0 // let the server's own default stand
 }
 
-// startCallerToolStore opens the caller-tool collection and returns it plus a
-// blocking prune loop.
+// startCallerToolStore opens the caller-tool collection and returns it and
+// its name.
 //
 // Its OWN collection, never the catalog's: a caller's ephemeral, unauthorized
 // definitions must not enter another caller's candidate set, the no-match
 // fallback's catalog sweep, or a sub-agent's toolRefs resolution.
-func startCallerToolStore(ctx context.Context) (*callertools.QdrantStore, func(), error) {
+func startCallerToolStore(ctx context.Context) (*callertools.QdrantStore, string, error) {
 	qdrantHost := os.Getenv("QDRANT_HOST")
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	if qdrantHost == "" || apiKey == "" {
-		return nil, nil, fmt.Errorf("QDRANT_HOST and OPENAI_API_KEY are both required")
+		return nil, "", fmt.Errorf("QDRANT_HOST and OPENAI_API_KEY are both required")
 	}
 	port := 6334
 	if raw := os.Getenv("QDRANT_PORT"); raw != "" {
 		parsed, err := strconv.Atoi(raw)
 		if err != nil {
-			return nil, nil, fmt.Errorf("invalid QDRANT_PORT: %w", err)
+			return nil, "", fmt.Errorf("invalid QDRANT_PORT: %w", err)
 		}
 		port = parsed
 	}
 
 	client, err := qdrant.NewClient(&qdrant.Config{Host: qdrantHost, Port: port})
 	if err != nil {
-		return nil, nil, fmt.Errorf("dial qdrant at %s:%d: %w", qdrantHost, port, err)
+		return nil, "", fmt.Errorf("dial qdrant at %s:%d: %w", qdrantHost, port, err)
 	}
 	collection := os.Getenv("AGENT_QDRANT_CALLER_TOOL_COLLECTION")
 	if collection == "" {
@@ -241,30 +241,38 @@ func startCallerToolStore(ctx context.Context) (*callertools.QdrantStore, func()
 	store := callertools.NewQdrantStore(client, collection, embedder, llm.DefaultEmbedDims)
 	if err := store.EnsureCollection(ctx); err != nil {
 		_ = client.Close()
-		return nil, nil, err
+		return nil, "", err
 	}
 	log.Printf("caller-tool store enabled: qdrant=%s:%d collection=%s", qdrantHost, port, collection)
 
-	prune := func() {
-		ticker := time.NewTicker(callerToolPruneInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				removed, err := store.Prune(ctx, int64(callerToolRetention.Seconds()))
-				if err != nil {
-					log.Printf("caller-tool prune failed: %v", err)
-					continue
-				}
-				if removed > 0 {
-					log.Printf("caller-tool prune reclaimed %d definitions", removed)
-				}
-			}
+	return store, collection, nil
+}
+
+// ensurePruneSchedule keeps the one Temporal Schedule that prunes the
+// collection (docs/adr/0058 §4), instead of a ticker in every replica. The
+// worker runs the passes; it has the same Qdrant settings. Retried for a
+// while because Temporal may still be starting; a failure only means stale
+// definitions live longer, so it is logged, not fatal.
+func ensurePruneSchedule(ctx context.Context, schedules gateway.ScheduleClient, taskQueue, collection string) {
+	delay := time.Second
+	for attempt := 1; ; attempt++ {
+		err := gateway.EnsureCallerToolPruneSchedule(ctx, schedules, taskQueue, collection, callerToolPruneInterval, callerToolRetention)
+		if err == nil {
+			log.Printf("caller-tool prune schedule %s: every %s, retention %s",
+				gateway.CallerToolPruneScheduleID(taskQueue, collection), callerToolPruneInterval, callerToolRetention)
+			return
 		}
+		if attempt == 8 || ctx.Err() != nil {
+			log.Printf("caller-tool prune schedule not set up; unused definitions will not be pruned: %v", err)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, time.Minute)
 	}
-	return store, prune, nil
 }
 
 func getenv(key, fallback string) string {

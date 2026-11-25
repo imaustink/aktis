@@ -30,7 +30,7 @@ import { REPOSITORY } from "./runs/model.js";
 
 export { EVENT_SIGNATURE_HEADER, DEFAULT_RUN_EVENT_MAX_DEPTH } from "./runs/effects.js";
 
-import { ClaudeCredentialRefresher, ClaudeCredentialSweeper } from "./claude-auth/credential-refresher.js";
+import { ClaudeCredentialRefresher, type CredentialRefreshSerializer } from "./claude-auth/credential-refresher.js";
 import { renderSessionPage } from "./session-page.js";
 import type { SessionPageStore } from "./session-page-store.js";
 import { tickUsername, type TokenAuthenticator } from "./tick-auth.js";
@@ -165,14 +165,13 @@ export interface GatewayServerOptions {
   claudeCredentialRefreshEnabled?: boolean;
   /** How close to expiry a stored credential must be before it is refreshed on read. */
   claudeCredentialRefreshMarginMs?: number;
-  /** How often the background sweep renews stored credentials nothing is reading. */
-  claudeCredentialSweepIntervalMs?: number;
   /**
-   * How close to expiry a credential must be for the SWEEP to renew it --
-   * deliberately wider than the on-read margin, since the sweep's job is that a
-   * link is never found dead rather than that one blob is usable right now.
+   * Runs a due refresh as the subject's one Temporal workflow, shared by every
+   * replica (claude-auth/temporal-refresh.ts). Absent, stored `login`
+   * credentials are served as they are: a refresh is never run unserialized.
+   * The background sweep is a workflow too, started by index.ts.
    */
-  claudeCredentialSweepMarginMs?: number;
+  claudeCredentialRefreshes?: CredentialRefreshSerializer;
   /**
    * Session-page feature (issue #81) -- both fields must be set together to
    * enable it: a trigger whose `reply.github.sessionPage` is set gets a link
@@ -226,7 +225,6 @@ export class GatewayServer {
   private readonly identityLinkApi: IdentityLinkApi | undefined;
   private readonly claudeAuthApi: ClaudeAuthApi | undefined;
   private readonly connectionsApi: ConnectionsApi | undefined;
-  private readonly claudeCredentialSweeper: ClaudeCredentialSweeper | undefined;
   /** Every side effect of a run, shared with the run activities (runs/activities.ts). */
   readonly effects: RunEffects;
   private readonly eventSources: EventSourceLookup;
@@ -273,9 +271,10 @@ export class GatewayServer {
             options.identityLinkAuthCodeLinkers,
           )
         : undefined;
-    const refresher = options.claudeAuthStore
+    const refresher = options.claudeAuthStore && options.claudeCredentialRefreshes
       ? new ClaudeCredentialRefresher({
           store: options.claudeAuthStore,
+          serializer: options.claudeCredentialRefreshes,
           enabled: options.claudeCredentialRefreshEnabled ?? true,
           ...(options.claudeCredentialRefreshMarginMs ? { marginMs: options.claudeCredentialRefreshMarginMs } : {}),
         })
@@ -289,7 +288,8 @@ export class GatewayServer {
             options.publicBaseUrl,
             options.claudeLoginFlows,
             // Refresh a near-expiry `login` credential before handing it to a
-            // run, in ONE serialized place. Previously the only thing that ever
+            // run, serialized per subject across every replica (the subject's
+            // Temporal workflow). Previously the only thing that ever
             // refreshed was a run's own in-pod CLI, which made the stored copy
             // dependent on that pod reporting back, and left an unexercised
             // link to age out on its own.
@@ -327,20 +327,6 @@ export class GatewayServer {
       if (claudeAuthApi) claudeAuthApi.completionRedirect = back;
       this.connectionsApi = connectionsApi;
     }
-    // The sweep renews credentials nothing is currently asking for, which is
-    // the only thing that keeps an UNUSED link alive -- refresh-on-read above
-    // fires only when something reads. Shares the refresher, so a sweep and a
-    // concurrent launch collapse onto one refresh per subject rather than
-    // rotating each other's token out.
-    this.claudeCredentialSweeper =
-      refresher && options.claudeAuthStore && (options.claudeCredentialRefreshEnabled ?? true)
-        ? new ClaudeCredentialSweeper({
-            store: options.claudeAuthStore,
-            refresher,
-            ...(options.claudeCredentialSweepIntervalMs ? { intervalMs: options.claudeCredentialSweepIntervalMs } : {}),
-            ...(options.claudeCredentialSweepMarginMs ? { marginMs: options.claudeCredentialSweepMarginMs } : {}),
-          })
-        : undefined;
   }
 
   listen(port: number): Promise<void> {
@@ -352,14 +338,12 @@ export class GatewayServer {
           if (!res.writableEnded) res.end();
         });
       });
-      this.claudeCredentialSweeper?.start();
       this.server.listen(port, resolve);
     });
   }
 
   close(): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.claudeCredentialSweeper?.stop();
       if (!this.server) return resolve();
       this.server.close((err) => (err ? reject(err) : resolve()));
     });

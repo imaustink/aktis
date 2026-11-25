@@ -36,7 +36,7 @@ import type { CorpusRegistry } from "./registry.js";
  *   GET  /corpora/:name/search?q=              — live search, SCOPE- and identity-bounded
  *   POST /corpora/:name/query                  — structured query (SourceQuery body), SCOPE- and identity-bounded
  *   POST /corpora/:name/probe                  — per-user authorization (ADR 0040)
- *   POST /corpora/:name/sync                   — run a reconcile now (sync only)
+ *   POST /corpora/:name/sync                   — run a full reconcile now and answer with it (sync only)
  *   POST /connections/:name/webhook            — provider change notification
  *
  * Data is addressed by CORPUS and webhooks by CONNECTION, which is not an
@@ -54,10 +54,15 @@ export interface ServerOptions {
    * than an error — it simply stays on its reconcile interval.
    */
   /**
-   * Runs a full reconcile for one corpus, for the CronJob that triggers it.
+   * Runs a full reconcile for one corpus now and resolves with its result.
+   * The pass is the corpus's own sync workflow's (docs/adr/0058), so it never
+   * overlaps another pass over the same corpus: one already running is not
+   * joined but followed, since it may have listed the source before whatever
+   * prompted the request. Resolves `undefined` for a corpus this broker does
+   * not sync; rejects with {@link SyncFailedError} when the pass failed.
    *
    * Absent when this deployment does not index, in which case the route
-   * reports not-found rather than accepting a kick it cannot act on.
+   * reports not-found rather than accepting a request it cannot act on.
    */
   runSync?: (corpus: string) => Promise<{ indexed: number; removed: number; full: boolean } | undefined>;
   webhooks?: {
@@ -73,6 +78,9 @@ export interface ServerOptions {
 
 /** Header carrying the calling user's delegated token, per request. */
 export const DELEGATED_TOKEN_HEADER = "x-delegated-token";
+
+/** A requested sync pass ran and failed. */
+export class SyncFailedError extends Error {}
 
 export function createBrokerServer(options: ServerOptions): Server {
   return createServer((req, res) => {
@@ -238,12 +246,19 @@ async function handle(
 
     if (route.kind === "sync") {
       if (!options.runSync) return send(res, 404, { error: "this broker does not index" });
-      const report = await options.runSync(route.name);
-      // A pass already running is not a failure: the CronJob fired while the
-      // previous one was still going, which Forbid concurrency should prevent
-      // and a restart can still produce. 409 lets the Job surface it without
-      // looking like an error.
-      if (!report) return send(res, 409, { error: "a pass is already running" });
+      let report: Awaited<ReturnType<NonNullable<ServerOptions["runSync"]>>>;
+      try {
+        report = await options.runSync(route.name);
+      } catch (err) {
+        // The pass ran and failed (after its retries): the source or the
+        // store is unreachable. Not 500 -- nothing here is broken -- and not
+        // 503, which a caller would retry straight into the same outage.
+        if (err instanceof SyncFailedError) return send(res, 502, { error: err.message });
+        throw err;
+      }
+      // Bound, but with no reconcileInterval, no collection yet, or no sync
+      // token: nothing syncs it, so there is no pass to run.
+      if (!report) return send(res, 404, { error: `corpus ${route.name} is not synced by this broker` });
       return send(res, 200, report);
     }
 

@@ -123,9 +123,9 @@ func run() error {
 		log.Printf("identity-link default flow: %s -- user-code flow, no redirect URI involved", cfg.DefaultIdentityLinkFlow)
 	}
 
-	// Session (sticky read-only flag) and /invoke record stores. On Redis,
-	// any replica can answer any poll, so a rollout no longer loses the turns
-	// accepted around it.
+	// Session store (sticky read-only flag). /invoke keeps no records: an id
+	// names its engine turn (docs/adr/0058 §1). Redis is still read for the
+	// ids a pre-0058 process handed out; remove that one release after 0058.
 	var sessions facade.SessionStore
 	var invocations facade.InvocationStore
 	var redisClient *redis.Client
@@ -138,14 +138,13 @@ func run() error {
 		if err := retry("redis startup check", func() error { return redisClient.Ping(watchCtx).Err() }); err != nil {
 			return err
 		}
-		log.Printf("Using Redis session + invocation stores (invocation ttl %s)", cfg.InvocationTTL)
+		log.Printf("Using the Redis session store")
 		sessions = &facade.RedisSessionStore{Client: redisClient, TTL: cfg.SessionTTL}
-		invocations = &facade.RedisInvocationStore{Client: redisClient, TTL: cfg.InvocationTTL}
+		invocations = &facade.RedisInvocationStore{Client: redisClient}
 	} else {
-		log.Printf("No AGENT_REDIS_URL: /invoke records are in-process, so a poll must reach the SAME pod that accepted it. " +
-			"A rollout loses turns accepted around it, and more than one replica will 404 polls.")
+		log.Printf("No AGENT_REDIS_URL: the sticky read-only flag is in-process, so more than one replica " +
+			"may let a session's follow-up run writable.")
 		sessions = &facade.MemorySessionStore{TTL: cfg.SessionTTL, MaxEntries: cfg.SessionMaxEntries}
-		invocations = &facade.MemoryInvocationStore{}
 	}
 
 	// Just-in-time index for consumer-supplied tools (ADR 0035), in its own
@@ -199,8 +198,8 @@ func run() error {
 
 	// Stop the watch first, so a reconnect racing exit logs nothing spurious.
 	stopWatch()
-	// Refuse NEW turns before draining: a durable record makes an answer
-	// retrievable, not this process's poll of the engine survivable.
+	// Refuse NEW turns before draining, so a caller retries onto the
+	// replacement pod rather than racing this one's exit.
 	server.BeginDraining()
 	drainCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownDrain)
 	if err := server.Shutdown(drainCtx); err != nil {

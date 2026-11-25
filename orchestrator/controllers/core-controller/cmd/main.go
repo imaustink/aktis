@@ -264,11 +264,6 @@ func main() {
 	if err := (&controller.CorpusReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
-		// The CronJob a Corpus owns only needs a shell and curl: it asks the
-		// broker for a pass rather than running one (see reconcileSyncCronJob).
-		SyncKickImage:   envOr("CORPUS_SYNC_KICK_IMAGE", "curlimages/curl:8.11.1"),
-		BrokerURL:       envOr("CONNECTION_BROKER_URL", "http://connection-broker:8080"),
-		SyncTokenSecret: envOr("CORPUS_SYNC_TOKEN_SECRET", "connection-broker-sync-tokens"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "corpus")
 		os.Exit(1)

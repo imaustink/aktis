@@ -35,7 +35,7 @@ func TestConfigDefaults(t *testing.T) {
 		CallerToolTTL: 7 * 24 * time.Hour, CallerToolPruneInterval: time.Hour,
 		EmbeddingModel: "text-embedding-3-small", OpenAIBaseURL: "https://api.openai.com/v1",
 		TurnTimeout: 8 * time.Hour, ShutdownDrain: 25 * time.Second,
-		SessionTTL: 30 * time.Minute, InvocationTTL: time.Hour, SessionMaxEntries: 1000, HTTPPort: 8081,
+		SessionTTL: 30 * time.Minute, SessionMaxEntries: 1000, HTTPPort: 8081,
 		DefaultIdentityLinkFlow: "authcode", OpenWebUIUserRoles: []string{"reader", "writer"},
 		IdentityResolverKind: "static", OIDCRolesClaim: "roles",
 	}, c)

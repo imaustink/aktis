@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Client, Connection, WorkflowExecutionAlreadyStartedError, WorkflowNotFoundError } from "@temporalio/client";
 import { NativeConnection, Worker, type WorkerOptions } from "@temporalio/worker";
+import type { ClaudeCredentialActivities } from "../claude-auth/refresh-contract.js";
 import type { RunActivities } from "./contract.js";
 import type { RunStarter } from "./effects.js";
 import { queueHoldTimeoutMs, refKey, workflowIds, type EventRunInput, type HeldMemo, type HeldRunEventInput, type QueueHold, type RunSettings } from "./model.js";
@@ -173,7 +174,8 @@ function workflowSource(): Pick<WorkerOptions, "workflowBundle" | "workflowsPath
 
 export interface RunWorkerOptions extends TemporalConnectionOptions {
   taskQueue: string;
-  activities: RunActivities;
+  /** The event-run activities and the Claude credential ones (claude-auth/temporal-refresh.ts): one worker runs both. */
+  activities: RunActivities & ClaudeCredentialActivities;
   /** Overrides for tests (a prebuilt bundle, a test connection). */
   connection?: NativeConnection;
   workflowBundle?: WorkerOptions["workflowBundle"];

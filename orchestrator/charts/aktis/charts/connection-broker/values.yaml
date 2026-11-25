@@ -70,6 +70,21 @@ qdrant:
     name: ""
     key: apiKey
 
+# docs/adr/0058: each Corpus's sync -- its interval, the passes webhooks ask
+# for, and POST /corpora/:name/sync -- is a Temporal workflow this broker's
+# own worker runs. Required whenever the broker indexes (qdrant.url and an
+# embeddings key set): it refuses to start without an address then. Same
+# Temporal cluster and namespace as temporal-engine's.
+temporal:
+  # Matches the temporalio/temporal chart's frontend Service (and
+  # temporal-engine.temporal.address).
+  address: temporal-frontend.temporal.svc:7233
+  # Must already exist; the broker does not register namespaces.
+  namespace: default
+  # Every replica polls this queue; workflow ids live under it, so two
+  # releases sharing a namespace must not share it.
+  taskQueue: connection-broker
+
 # Where each provider's API lives, when it is not the vendor's public cloud.
 #
 # Empty means the driver's own default, which is what a Cloud tenant wants. A
