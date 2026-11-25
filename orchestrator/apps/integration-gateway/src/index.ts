@@ -4,6 +4,8 @@ import { setupTelemetry } from "./telemetry.js";
 import { ClaudeSetupTokenFlows } from "./claude-auth/pty-setup-token.js";
 import { ClaudeLoginFlows } from "./claude-auth/pty-login.js";
 import { K8sSecretClaudeTokenStore } from "./claude-auth/k8s-secret-store.js";
+import { ClaudeCredentialRenewer } from "./claude-auth/credential-refresher.js";
+import { createClaudeCredentialActivities, TemporalClaudeCredentials } from "./claude-auth/temporal-refresh.js";
 import { decodeEncryptionKey } from "./credential-store/field-encryption.js";
 import type { SecretApiLike, WatchLike } from "./credential-store/secret-record-store.js";
 import { GithubReplyClient } from "./github-client.js";
@@ -387,8 +389,18 @@ async function main(): Promise<void> {
   let claudeTokenStore: K8sSecretClaudeTokenStore | undefined;
   let claudeAuthFlows: ClaudeSetupTokenFlows | undefined;
   let claudeLoginFlows: ClaudeLoginFlows | undefined;
+  let claudeCredentialKey: Buffer | undefined;
+  let claudeCredentials: TemporalClaudeCredentials | undefined;
   if (config.claudeAuthEnabled) {
-    claudeTokenStore = new K8sSecretClaudeTokenStore(decodeEncryptionKey(config.identityLinkEncryptionKey), {
+    claudeCredentialKey = decodeEncryptionKey(config.identityLinkEncryptionKey);
+    // A due `login` credential is refreshed by the subject's one Temporal
+    // workflow, shared by every replica (claude-auth/temporal-refresh.ts).
+    claudeCredentials = new TemporalClaudeCredentials({
+      client: temporalClient,
+      taskQueue: config.temporalTaskQueue,
+      key: claudeCredentialKey,
+    });
+    claudeTokenStore = new K8sSecretClaudeTokenStore(claudeCredentialKey, {
       namespace: config.credentialNamespace,
       ...credentialStoreApis(),
     });
@@ -477,15 +489,26 @@ async function main(): Promise<void> {
     runEventMaxDepth: config.runEventMaxDepth,
     claudeCredentialRefreshEnabled: config.claudeCredentialRefreshEnabled,
     claudeCredentialRefreshMarginMs: config.claudeCredentialRefreshMarginMs,
-    claudeCredentialSweepIntervalMs: config.claudeCredentialSweepIntervalMs,
-    claudeCredentialSweepMarginMs: config.claudeCredentialSweepMarginMs,
+    ...(claudeCredentials ? { claudeCredentialRefreshes: claudeCredentials } : {}),
   });
 
   const worker = await createRunWorker({
     address: config.temporalAddress,
     namespace: config.temporalNamespace,
     taskQueue: config.temporalTaskQueue,
-    activities: createRunActivities(server.effects, runs, (line) => console.error(line)),
+    activities: {
+      ...createRunActivities(server.effects, runs, (line) => console.error(line)),
+      ...createClaudeCredentialActivities({
+        ...(claudeTokenStore && claudeCredentialKey
+          ? {
+              renewer: new ClaudeCredentialRenewer({ store: claudeTokenStore, enabled: config.claudeCredentialRefreshEnabled }),
+              key: claudeCredentialKey,
+            }
+          : {}),
+        sweepIntervalMs: config.claudeCredentialSweepIntervalMs,
+        sweepMarginMs: config.claudeCredentialSweepMarginMs,
+      }),
+    },
   });
   const workerDone = worker.run().catch((error: unknown) => {
     // A worker that stops runs no workflow: say so and let the pod restart.
@@ -508,7 +531,23 @@ async function main(): Promise<void> {
   // A sweep that starts takes the pre-0057 Redis marks with it (legacy-drain.ts).
   const seedMarks = drain ? (source: string) => drain.conflictMarks(source) : undefined;
   void runs.ensureConflictSweeps(conflictSources(), seedMarks);
-  const conflictTimer = setInterval(() => void runs.ensureConflictSweeps(conflictSources(), seedMarks), 60_000);
+  // The Claude credential sweep (claude-auth/workflows.ts): one workflow,
+  // started if not running by every replica, and re-checked with the
+  // conflict sweeps so one that ended comes back.
+  // A store that cannot enumerate stands the sweep down, out loud: a sweep
+  // that quietly did nothing would look like a working one until a link expired.
+  const claudeSweepable = Boolean(claudeCredentials && config.claudeCredentialRefreshEnabled && claudeTokenStore?.listSubjects);
+  if (claudeCredentials && config.claudeCredentialRefreshEnabled && !claudeSweepable) {
+    console.error("[claude-refresh] sweep disabled: this credential store cannot enumerate subjects");
+  }
+  const ensureClaudeSweep = (): void => {
+    if (claudeSweepable) void claudeCredentials?.ensureSweep(config.claudeCredentialSweepIntervalMs);
+  };
+  ensureClaudeSweep();
+  const conflictTimer = setInterval(() => {
+    void runs.ensureConflictSweeps(conflictSources(), seedMarks);
+    ensureClaudeSweep();
+  }, 60_000);
   conflictTimer.unref();
 
   await server.listen(config.httpPort);

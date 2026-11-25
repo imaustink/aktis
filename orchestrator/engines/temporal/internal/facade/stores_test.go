@@ -2,6 +2,7 @@ package facade
 
 import (
 	"encoding/json"
+	"net/http"
 	"testing"
 	"time"
 
@@ -58,13 +59,6 @@ func TestMemorySessionStoreEvictsTheLeastRecentlyUpdatedPastMaxEntries(t *testin
 	require.Nil(t, s.Get(bg, "chat-2"))
 	require.NotNil(t, s.Get(bg, "chat-1"))
 	require.NotNil(t, s.Get(bg, "chat-3"))
-}
-
-func TestMemoryInvocationStoreRoundTrips(t *testing.T) {
-	s := &MemoryInvocationStore{}
-	require.Nil(t, s.Get(bg, "x"))
-	require.NoError(t, s.Set(bg, InvocationRecord{ID: "x", Status: "pending", EngineInvocationID: "e"}))
-	require.Equal(t, &InvocationRecord{ID: "x", Status: "pending", EngineInvocationID: "e"}, s.Get(bg, "x"))
 }
 
 // ── Redis stores ───────────────────────────────────────────────────────────
@@ -195,9 +189,8 @@ func TestRedisInvocationStoreTTLIsAbsolutePerWrite(t *testing.T) {
 	require.Nil(t, s.Get(bg, "i"))
 }
 
-// Get is a miss on an error (the caller polls again); Set SURFACES it (a lost
-// terminal record costs the caller its answer).
-func TestRedisInvocationStoreGetSwallowsButSetSurfacesErrors(t *testing.T) {
+// Get is a miss on an error: the caller polls again.
+func TestRedisInvocationStoreGetSwallowsErrors(t *testing.T) {
 	captureLog(t)
 	mr, client := newMiniredis(t)
 	s := &RedisInvocationStore{Client: client, TTL: time.Hour}
@@ -205,15 +198,66 @@ func TestRedisInvocationStoreGetSwallowsButSetSurfacesErrors(t *testing.T) {
 	require.Nil(t, s.Get(bg, "bad"))
 	mr.Close()
 	require.Nil(t, s.Get(bg, "inv-1"))
-	require.Error(t, s.Set(bg, InvocationRecord{ID: "inv-1", Status: "pending"}))
 }
 
-// End to end: a Redis-backed pair of servers shares records.
-func TestRedisInvocationStoreBacksTheServer(t *testing.T) {
-	_, client := newMiniredis(t)
+// ── pre-0058 ids (docs/adr/0058 §1) ────────────────────────────────────────
+
+// legacyServer serves ids an old process handed out, from the records it
+// left in Redis, with this process writing nothing.
+func legacyServer(t *testing.T, engine *fakeEngine, records ...InvocationRecord) (string, *miniredis.Miniredis) {
+	t.Helper()
+	mr, client := newMiniredis(t)
 	store := &RedisInvocationStore{Client: client, TTL: time.Hour}
-	a := serve(t, &Server{Engine: engineReturning(resultOutcome("done")), Invocations: store})
-	b := serve(t, &Server{Engine: newFakeEngine(), Invocations: store})
-	id := acceptedID(t, postInvoke(t, a, map[string]any{"request": "x"}, nil))
-	require.Equal(t, map[string]any{"id": id, "status": "succeeded", "result": "done"}, settled(t, b, id))
+	for _, r := range records {
+		require.NoError(t, store.Set(bg, r))
+	}
+	return serve(t, &Server{Engine: engine, Invocations: store}), mr
+}
+
+func TestLegacyIDAnswersATerminalRecordAsItWasWritten(t *testing.T) {
+	done := "Reviewed."
+	base, _ := legacyServer(t, newFakeEngine(), InvocationRecord{
+		ID: "8d0f0b5e-legacy", Status: "succeeded", Result: &done, Outcome: map[string]any{"verdict": "ok"},
+		EngineInvocationID: "conversation-x.u", ForcedAgent: true,
+	})
+	require.Equal(t, map[string]any{
+		"id": "8d0f0b5e-legacy", "status": "succeeded", "result": "Reviewed.", "outcome": map[string]any{"verdict": "ok"},
+	}, getInvocation(t, base, "8d0f0b5e-legacy"))
+}
+
+// What adoption used to do, without adopting: a pending record's engine turn
+// is asked about directly, and nothing is written back.
+func TestLegacyIDWithAnEngineIDIsAnsweredFromTheEngine(t *testing.T) {
+	engine := newFakeEngine()
+	engine.statusFn = func(id string) (EngineStatus, error) {
+		require.Equal(t, "conversation-x.u", id)
+		o := resultOutcome("Reviewed.")
+		o.RunOutcome = json.RawMessage(`{"verdict":"changes-requested"}`)
+		return EngineStatus{Outcome: o}, nil
+	}
+	base, mr := legacyServer(t, engine, InvocationRecord{
+		ID: "orphan", Status: "pending", EngineInvocationID: "conversation-x.u", RemoteControlURL: "https://rc/old",
+	})
+	require.Equal(t, map[string]any{
+		"id": "orphan", "status": "succeeded", "result": "Reviewed.",
+		"outcome": map[string]any{"verdict": "changes-requested"}, "remoteControlUrl": "https://rc/old",
+	}, getInvocation(t, base, "orphan"))
+	raw, err := mr.Get("inv:orphan")
+	require.NoError(t, err)
+	require.Contains(t, raw, `"status":"pending"`, "read-only: the old record is never rewritten")
+	require.Empty(t, engine.invoked())
+}
+
+// A record whose process died before learning its engine id stays pending,
+// as it did before; the caller's own poll budget ends it.
+func TestLegacyIDWithoutAnEngineIDStaysPending(t *testing.T) {
+	base, _ := legacyServer(t, newFakeEngine(), InvocationRecord{ID: "orphan", Status: "pending"})
+	require.Equal(t, map[string]any{"id": "orphan", "status": "pending"}, getInvocation(t, base, "orphan"))
+}
+
+func TestLegacyIDIs404WithoutARecordOrAStore(t *testing.T) {
+	base, _ := legacyServer(t, newFakeEngine())
+	require.Equal(t, http.StatusNotFound, do(t, http.MethodGet, base+"/invoke/nope", nil, nil).StatusCode)
+	bare := serve(t, &Server{Engine: newFakeEngine()})
+	require.Equal(t, http.StatusNotFound, do(t, http.MethodGet, bare+"/invoke/nope", nil, nil).StatusCode)
 }

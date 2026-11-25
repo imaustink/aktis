@@ -85,6 +85,11 @@ func main() {
 	w.RegisterWorkflowWithOptions(workflows.IdentityCheckWorkflow, workflow.RegisterOptions{
 		Name: workflows.IdentityCheckWorkflowName,
 	})
+	// Run by the gateway's caller-tool prune schedule (docs/adr/0058 §4).
+	// Its activity needs Qdrant and is registered with the others below.
+	w.RegisterWorkflowWithOptions(workflows.CallerToolPruneWorkflow, workflow.RegisterOptions{
+		Name: workflows.CallerToolPruneWorkflowName,
+	})
 	// Image attachments (package attachments): the gateway uploads, the
 	// worker reads back for vision calls and presigns for agent pods. Unset
 	// (no IMAGE_S3_BUCKET), a turn carrying a stored image fails loudly.
@@ -197,6 +202,9 @@ func main() {
 			log.Fatalf("open qdrant collections: %v", err)
 		}
 		defer qdrantClient.Close()
+
+		w.RegisterActivityWithOptions((&activities.CallerToolPruneActivities{Client: qdrantClient}).PruneCallerTools,
+			activity.RegisterOptions{Name: activities.PruneCallerToolsActivityName})
 
 		retrieval := &activities.RetrievalActivities{Collections: collections}
 		w.RegisterActivityWithOptions(retrieval.RetrieveSkills, activity.RegisterOptions{Name: activities.RetrieveSkillsActivityName})

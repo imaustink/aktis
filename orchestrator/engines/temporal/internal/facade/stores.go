@@ -161,11 +161,10 @@ type InvocationRecord struct {
 	// already accepted by CheckOutcome.
 	Outcome map[string]any `json:"outcome,omitempty"`
 
-	// EngineInvocationID lets ANY process finish the turn if the one that
-	// started it dies. Internal: never returned to a caller.
+	// EngineInvocationID: a pre-0058 record's engine turn. Internal: never
+	// returned to a caller.
 	EngineInvocationID string `json:"engineInvocationId,omitempty"`
-	// ForcedAgent: a forced agentRef dispatch, the only kind whose outcome is
-	// reported. Internal.
+	// ForcedAgent: read from pre-0058 records only. Internal.
 	ForcedAgent bool `json:"forcedAgent,omitempty"`
 }
 
@@ -176,45 +175,15 @@ func (r InvocationRecord) visible() InvocationRecord {
 	return r
 }
 
-// InvocationStore holds /invoke records.
-//
-// Get treats a store error as a miss (the caller polls again). Set surfaces
-// its error: a lost terminal record costs the caller its answer with no way
-// to ask again.
+// InvocationStore reads the /invoke records a pre-0058 process wrote. Nothing
+// writes them any more: an id now carries what a poll needs (docs/adr/0058
+// §1). A store error is a miss. Remove one release after 0058.
 type InvocationStore interface {
 	Get(ctx context.Context, id string) *InvocationRecord
-	Set(ctx context.Context, record InvocationRecord) error
 }
 
-// MemoryInvocationStore is the single-replica default: records die with the
-// process, and a second replica 404s polls it did not accept.
-type MemoryInvocationStore struct {
-	mu      sync.Mutex
-	records map[string]InvocationRecord
-}
-
-func (s *MemoryInvocationStore) Get(_ context.Context, id string) *InvocationRecord {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	record, ok := s.records[id]
-	if !ok {
-		return nil
-	}
-	return &record
-}
-
-func (s *MemoryInvocationStore) Set(_ context.Context, record InvocationRecord) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.records == nil {
-		s.records = map[string]InvocationRecord{}
-	}
-	s.records[record.ID] = record
-	return nil
-}
-
-// RedisInvocationStore lets any replica answer any poll. TTL is absolute per
-// write and must outlast the longest poll budget a caller uses.
+// RedisInvocationStore reads pre-0058 records ("inv:<uuid>"). Set remains
+// only so tests can write one the way the old process did.
 type RedisInvocationStore struct {
 	Client *redis.Client
 	TTL    time.Duration

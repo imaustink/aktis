@@ -103,7 +103,7 @@ describe("webhook fan-out", () => {
       "eng-mirror",
       "general",
     ]);
-    // An empty id list is what makes the scheduler run a FULL pass.
+    // An empty id list is what makes the sync workflow run a FULL pass.
     expect(onChange.mock.calls.every(([, ids]) => (ids as string[]).length === 0)).toBe(true);
   });
 

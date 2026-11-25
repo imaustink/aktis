@@ -55,6 +55,15 @@ spec:
                   name: {{ .Values.qdrant.apiKeySecret.name }}
                   key: {{ .Values.qdrant.apiKeySecret.key }}
             {{- end }}
+            {{- if .Values.temporal.address }}
+            # Where each Corpus's sync workflow runs (docs/adr/0058).
+            - name: TEMPORAL_ADDRESS
+              value: {{ .Values.temporal.address | quote }}
+            - name: TEMPORAL_NAMESPACE
+              value: {{ .Values.temporal.namespace | quote }}
+            - name: TEMPORAL_TASK_QUEUE
+              value: {{ .Values.temporal.taskQueue | quote }}
+            {{- end }}
             {{- range $provider, $origin := .Values.apiOrigins }}
             {{- if $origin }}
             - name: {{ $provider | upper }}_API_ORIGIN

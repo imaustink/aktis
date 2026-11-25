@@ -40,7 +40,7 @@ export interface CorpusBinding {
  */
 export interface CorpusRegistry {
   get(name: string): CorpusBinding | undefined;
-  /** Every binding, for the sync scheduler and for webhook fan-out. */
+  /** Every binding, for the sync loop and for webhook fan-out. */
   list(): CorpusBinding[];
 }
 

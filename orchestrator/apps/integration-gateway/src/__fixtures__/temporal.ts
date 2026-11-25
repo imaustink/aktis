@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { TestWorkflowEnvironment } from "@temporalio/testing";
 import { bundleWorkflowCode, Runtime, DefaultLogger, type Worker, type WorkflowBundleWithSourceMap } from "@temporalio/worker";
 import { afterAll } from "vitest";
+import type { ClaudeCredentialActivities } from "../claude-auth/refresh-contract.js";
 import type { RunActivities } from "../runs/contract.js";
 import { DEFAULT_RUN_SETTINGS, type RunSettings } from "../runs/model.js";
 import { createRunWorker, TemporalRuns } from "../runs/temporal.js";
@@ -56,7 +57,7 @@ export interface TestRuns {
   client: TestWorkflowEnvironment["client"];
   taskQueue: string;
   /** Starts the worker; call once the activities exist. */
-  serve(activities: RunActivities): Promise<void>;
+  serve(activities: RunActivities & Partial<ClaudeCredentialActivities>): Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -87,7 +88,8 @@ export async function testRuns(opts: Partial<RunSettings> = {}, queue: { taskQue
         address: "",
         namespace: e.namespace ?? "default",
         taskQueue,
-        activities,
+        // A test that drives no Claude credential workflow need not supply their activities.
+        activities: activities as RunActivities & ClaudeCredentialActivities,
         connection: e.nativeConnection,
         workflowBundle: await workflows(),
       });
