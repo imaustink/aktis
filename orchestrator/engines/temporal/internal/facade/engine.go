@@ -36,10 +36,6 @@ type TurnInput struct {
 	// is the "this caller has somewhere to wait" signal: it is what lets a
 	// turn parked on an account link auto-resume (see autoResumeLink).
 	ProgressListener func(stage, message string)
-	// RemoteControlURLListener is told each new Remote Control session URL.
-	// Separate from ProgressListener so a fire-and-forget caller can record
-	// the URL without also opting into the auto-resume hold.
-	RemoteControlURLListener func(url string)
 	// SenderLogin is the verified webhook sender (or the unsigned envelope
 	// field, without an assertion secret).
 	SenderLogin  string
@@ -61,9 +57,6 @@ type TurnInput struct {
 	Params           map[string]string
 	IdentityOverride string
 	Traceparent      string
-	// ReportEngineInvocation records the engine's id for this turn as soon as
-	// the engine accepts it, so another process can finish it.
-	ReportEngineInvocation func(engineInvocationID string) error
 }
 
 // TurnOutcome is how a turn ended: an answer, an error, or tool calls for
@@ -85,11 +78,29 @@ type IdentityRefusal struct {
 	Error map[string]any
 }
 
+// EngineStatus is one look at an engine turn by its engine id.
+type EngineStatus struct {
+	// Pending: still running. Outcome is unset.
+	Pending bool
+	// Unknown: the engine has no such turn (it aged out, or the id is made up).
+	Unknown bool
+	Outcome TurnOutcome
+	// RemoteControlURL is the delegated agent's live Remote Control session,
+	// on a pending turn as well as a finished one.
+	RemoteControlURL string
+}
+
 // Engine runs turns. An interface so the server is testable without HTTP.
 type Engine interface {
+	// Invoke runs a turn to its end, for a caller holding a stream open (chat).
 	Invoke(ctx context.Context, input TurnInput) (TurnOutcome, error)
-	// Adopt finishes a turn a now-dead process started, by its engine id.
-	Adopt(ctx context.Context, engineInvocationID string, input TurnInput) (TurnOutcome, error)
+	// Start hands a turn to the engine and returns the engine's id for it
+	// without waiting. The turn is durable from then on (a Temporal update),
+	// so any process can answer for it through Status (docs/adr/0058 §1).
+	Start(ctx context.Context, input TurnInput) (string, error)
+	// Status looks once at a turn Start accepted. An error is a failure to
+	// ask (unreachable, 5xx), never the turn's own failure.
+	Status(ctx context.Context, engineInvocationID string) (EngineStatus, error)
 	// CheckIdentity asks the engine's accept-phase identity check before a
 	// trigger turn is accepted. nil is no objection, including whenever the
 	// check cannot be made.
@@ -120,6 +131,9 @@ type TemporalEngine struct {
 const (
 	defaultEnginePollInterval = 500 * time.Millisecond
 	defaultEngineTimeout      = 30 * time.Minute
+	// statusTimeout bounds one Status call: the engine's own long-poll (2s)
+	// plus headroom, well inside a poller's patience.
+	statusTimeout = 10 * time.Second
 	// defaultAutoResumeMax covers a human actually going and linking (a
 	// GitHub device code lasts 15 minutes) without pinning a resume loop for
 	// a caller who abandoned the tab.
@@ -200,12 +214,6 @@ func (e *TemporalEngine) Invoke(ctx context.Context, input TurnInput) (TurnOutco
 	if err != nil {
 		return TurnOutcome{}, err
 	}
-	// Best effort: a failure only costs this turn its rollout survivability.
-	if input.ReportEngineInvocation != nil {
-		if err := input.ReportEngineInvocation(id); err != nil {
-			log.Printf("temporal engine: could not record engine invocation %s: %v", id, err)
-		}
-	}
 	record, err := e.poll(ctx, id, input)
 	if err != nil {
 		return TurnOutcome{}, err
@@ -218,14 +226,60 @@ func (e *TemporalEngine) Invoke(ctx context.Context, input TurnInput) (TurnOutco
 	return toOutcome(record), nil
 }
 
-// Adopt polls an engine id another process recorded. No link auto-resume:
-// that needs a live progress listener, which died with its process.
-func (e *TemporalEngine) Adopt(ctx context.Context, engineInvocationID string, input TurnInput) (TurnOutcome, error) {
-	record, err := e.poll(ctx, engineInvocationID, input)
-	if err != nil {
-		return TurnOutcome{}, err
+// Start is Invoke's first half, for /invoke: the same identity rules, then
+// the engine's accept, and nothing after it. What Invoke reports as a failed
+// outcome before reaching the engine is an error here.
+func (e *TemporalEngine) Start(ctx context.Context, input TurnInput) (string, error) {
+	caller, err := e.resolveForwardedCaller(ctx, input)
+	if errors.Is(err, errUnresolvedCaller) {
+		return "", errors.New("unauthorized: could not resolve caller identity")
 	}
-	return toOutcome(record), nil
+	if input.TriggerName != "" && e.SenderAssertionSecret == "" {
+		return "", errors.New("temporal engine: an event-triggered turn needs AGENT_SENDER_ASSERTION_SECRET to sign its dispatch")
+	}
+	return e.start(ctx, input, caller)
+}
+
+// Status asks the engine once. The engine long-polls for up to ~2s before
+// answering pending, so this is bounded rather than left to the caller.
+func (e *TemporalEngine) Status(ctx context.Context, id string) (EngineStatus, error) {
+	ctx, cancel := context.WithTimeout(ctx, statusTimeout)
+	defer cancel()
+	record, code, err := e.fetchRecord(ctx, id)
+	switch {
+	case err != nil:
+		return EngineStatus{}, err
+	case code == http.StatusNotFound:
+		return EngineStatus{Unknown: true}, nil
+	case code < 200 || code > 299:
+		return EngineStatus{}, fmt.Errorf("temporal engine /invoke/%s failed: %d", id, code)
+	case record.Status == "pending":
+		return EngineStatus{Pending: true, RemoteControlURL: record.RemoteControlURL}, nil
+	}
+	return EngineStatus{Outcome: toOutcome(record), RemoteControlURL: record.RemoteControlURL}, nil
+}
+
+// fetchRecord is one GET /invoke/:id. A non-2xx status comes back as the
+// code with a zero record and no error; an error with code 0 is transport.
+func (e *TemporalEngine) fetchRecord(ctx context.Context, id string) (engineRecord, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, e.base()+"/invoke/"+url.PathEscape(id), nil)
+	if err != nil {
+		return engineRecord{}, 0, err
+	}
+	req.Header = e.headers()
+	res, err := e.client().Do(req)
+	if err != nil {
+		return engineRecord{}, 0, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode > 299 {
+		return engineRecord{}, res.StatusCode, nil
+	}
+	var record engineRecord
+	if err := json.NewDecoder(res.Body).Decode(&record); err != nil {
+		return engineRecord{}, res.StatusCode, fmt.Errorf("temporal engine /invoke/%s: %w", id, err)
+	}
+	return record, res.StatusCode, nil
 }
 
 func toOutcome(record engineRecord) TurnOutcome {
@@ -507,15 +561,9 @@ func (e *TemporalEngine) poll(ctx context.Context, id string, input TurnInput) (
 	deadline := e.now().Add(durationOr(e.Timeout, defaultEngineTimeout))
 	interval := durationOr(e.PollInterval, defaultEnginePollInterval)
 	seen := 0
-	announced := ""
 	for {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, e.base()+"/invoke/"+url.PathEscape(id), nil)
-		if err != nil {
-			return engineRecord{}, err
-		}
-		req.Header = e.headers()
-		res, err := e.client().Do(req)
-		if err != nil {
+		record, code, err := e.fetchRecord(ctx, id)
+		if err != nil && code == 0 {
 			if ctx.Err() != nil {
 				return engineRecord{}, ctx.Err()
 			}
@@ -527,25 +575,13 @@ func (e *TemporalEngine) poll(ctx context.Context, id string, input TurnInput) (
 			}
 			continue
 		}
-		if res.StatusCode < 200 || res.StatusCode > 299 {
-			res.Body.Close()
-			return engineRecord{}, fmt.Errorf("temporal engine /invoke/%s failed: %d", id, res.StatusCode)
-		}
-		var record engineRecord
-		err = json.NewDecoder(res.Body).Decode(&record)
-		res.Body.Close()
 		if err != nil {
-			return engineRecord{}, fmt.Errorf("temporal engine /invoke/%s: %w", id, err)
+			return engineRecord{}, err
+		}
+		if code < 200 || code > 299 {
+			return engineRecord{}, fmt.Errorf("temporal engine /invoke/%s failed: %d", id, code)
 		}
 
-		// Checked before the terminal return: the engine also sets it on the
-		// finished record, so a short turn polled once still reports it.
-		if record.RemoteControlURL != "" && record.RemoteControlURL != announced {
-			announced = record.RemoteControlURL
-			if input.RemoteControlURLListener != nil {
-				input.RemoteControlURLListener(record.RemoteControlURL)
-			}
-		}
 		if record.Status != "pending" {
 			return record, nil
 		}

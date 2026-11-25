@@ -65,7 +65,6 @@ type Config struct {
 	ShutdownDrain time.Duration
 
 	SessionTTL        time.Duration
-	InvocationTTL     time.Duration
 	SessionMaxEntries int
 	RedisURL          string
 	HTTPPort          int
@@ -165,7 +164,6 @@ func ConfigFromEnv(getenv func(string) string) Config {
 		TurnTimeout:              seconds("AGENT_RUN_TIMEOUT_SECONDS", 28_800),
 		ShutdownDrain:            time.Duration(num("AGENT_SHUTDOWN_DRAIN_MS", 25_000)) * time.Millisecond,
 		SessionTTL:               seconds("AGENT_SESSION_TTL_SECONDS", 1_800),
-		InvocationTTL:            seconds("AGENT_INVOCATION_TTL_SECONDS", 3_600),
 		SessionMaxEntries:        int(num("AGENT_SESSION_MAX_ENTRIES", 1_000)),
 		RedisURL:                 getenv("AGENT_REDIS_URL"),
 		HTTPPort:                 int(num("AGENT_HTTP_PORT", 8081)),

@@ -63,15 +63,13 @@ type Server struct {
 	CallerToolTopK int
 	// DefaultIdentityLinkFlow applies to any turn that names none.
 	DefaultIdentityLinkFlow string
-	Invocations             InvocationStore
+	// Invocations answers ids a pre-0058 process handed out. Read-only; nil
+	// 404s them. Remove one release after 0058.
+	Invocations InvocationStore
 	// CallerAuth gates every turn-starting route. Nil: no check (tests).
 	CallerAuth *CallerAuthenticator
 
 	draining sync.Map // "draining" -> true
-	driving  sync.Map // invocation id -> struct{}
-	// background is the context the fire-and-forget turns run under: a
-	// turn outlives the request that started it.
-	background context.Context
 
 	httpServer *http.Server
 }
@@ -83,20 +81,6 @@ func (s *Server) isDraining() bool { _, ok := s.draining.Load("draining"); retur
 // is told to retry (503) and reaches the replacement pod instead of being
 // handed a turn whose poll dies with this process.
 func (s *Server) BeginDraining() { s.draining.Store("draining", true) }
-
-func (s *Server) bg() context.Context {
-	if s.background != nil {
-		return s.background
-	}
-	return context.Background()
-}
-
-func (s *Server) invocations() InvocationStore {
-	if s.Invocations == nil {
-		s.Invocations = &MemoryInvocationStore{}
-	}
-	return s.Invocations
-}
 
 func (s *Server) topK() int {
 	if s.CallerToolTopK > 0 {
@@ -489,14 +473,6 @@ func (s *Server) handleInvokeTraced(w http.ResponseWriter, r *http.Request, span
 		}
 	}
 
-	id := uuid.NewString()
-	if err := s.invocations().Set(r.Context(), InvocationRecord{ID: id, Status: "pending", ForcedAgent: trigger != nil && trigger.ForcedAgentID != ""}); err != nil {
-		log.Printf("agent-orchestrator: could not write invocation record %s: %v", id, err)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	s.driving.Store(id, struct{}{})
-
 	input := s.buildTurnInput(r.Context(), turnRequest{
 		request:          request,
 		sessionID:        sessionID,
@@ -508,9 +484,21 @@ func (s *Server) handleInvokeTraced(w http.ResponseWriter, r *http.Request, span
 	input.TargetRepository = targetRepository
 	input.SenderClaims = senderClaims
 	input.Traceparent = span.Traceparent
-	forcedAgent := trigger != nil && trigger.ForcedAgentID != ""
 
-	go s.runInvocation(id, input, sessionID, trigger != nil, forcedAgent)
+	// The engine's accept is awaited here, before the 202: once it answers,
+	// the turn is a Temporal update and its id is all anyone needs to collect
+	// it (docs/adr/0058 §1). Detached from the request so a caller that gives
+	// up mid-accept cannot leave a session half set up.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), startTimeout)
+	defer cancel()
+	id, err := s.startTurn(ctx, input, sessionID, trigger != nil)
+	if err != nil {
+		// Still a 202: the caller learns of a turn that could not start the way
+		// it always has, from its poll, and runs its failure path from there.
+		log.Printf("agent-orchestrator: turn could not start: %v", err)
+		id = failedInvocationID(err.Error())
+		span.Fail("engine_start_failed")
+	}
 
 	attrs := map[string]any{"aktis.invocation_id": id}
 	if triggerResp != nil {
@@ -525,128 +513,119 @@ func (s *Server) handleInvokeTraced(w http.ResponseWriter, r *http.Request, span
 	writeJSON(w, http.StatusAccepted, resp)
 }
 
-// runInvocation drives an accepted /invoke turn to its terminal record. It
-// never panics out: a lost goroutine would leave the record pending forever.
-func (s *Server) runInvocation(id string, input TurnInput, sessionID string, isTrigger, forcedAgent bool) {
-	defer s.driving.Delete(id)
-	ctx := s.bg()
-	defer func() {
-		if rec := recover(); rec != nil {
-			s.persistTerminal(ctx, InvocationRecord{ID: id, Status: "failed", Error: fmt.Sprint(rec)})
-		}
-	}()
+// startTimeout bounds the engine accept a POST /invoke waits for.
+const startTimeout = 60 * time.Second
 
-	// Tracks the latest Remote Control URL onto the still-pending record.
-	input.RemoteControlURLListener = func(url string) {
-		if current := s.invocations().Get(ctx, id); current != nil && current.Status == "pending" {
-			current.RemoteControlURL = url
-			_ = s.invocations().Set(ctx, *current)
-		}
-	}
-	// Persist the turn's read-only mode BEFORE anything launches: its job is
-	// to make later turns read-only, and a turn that can't record that must
-	// not go on to launch runs.
+// startTurn records the session's mode, then has the engine accept the turn.
+// The mode is written FIRST: its job is to make later turns read-only, and a
+// turn that cannot record that must not launch anything.
+func (s *Server) startTurn(ctx context.Context, input TurnInput, sessionID string, isTrigger bool) (string, error) {
 	if sessionID != "" && (input.ReadOnly || isTrigger) {
 		if err := s.setSessionReadOnly(ctx, sessionID, input.ReadOnly); err != nil {
-			s.persistTerminal(ctx, InvocationRecord{ID: id, Status: "failed", Error: err.Error()})
-			return
+			return "", err
 		}
 	}
-	input.ReportEngineInvocation = func(engineID string) error {
-		current := s.invocations().Get(ctx, id)
-		if current == nil || current.Status != "pending" {
-			return nil
-		}
-		current.EngineInvocationID = engineID
-		return s.invocations().Set(ctx, *current)
-	}
-	outcome, err := s.Engine.Invoke(ctx, input)
+	engineID, err := s.Engine.Start(ctx, input)
 	if err != nil {
-		record := InvocationRecord{ID: id, Status: "failed", Error: err.Error()}
-		if current := s.invocations().Get(ctx, id); current != nil {
-			record.RemoteControlURL = current.RemoteControlURL
-		}
-		s.persistTerminal(ctx, record)
-		return
+		return "", err
 	}
-	s.persistTerminalOutcome(ctx, id, outcome, forcedAgent)
+	return turnInvocationPrefix + engineID, nil
 }
 
 // acceptNoneTurn accepts a target.none trigger (docs/adr/0052 §3): its reply
 // side effects and onComplete are real, but nothing runs — no engine turn,
-// and so no identity pre-flight. The record is already succeeded.
+// and so no identity pre-flight. Its id polls as already succeeded.
 func (s *Server) acceptNoneTurn(w http.ResponseWriter, span *Span, trigger *triggerResponse) {
 	if s.isDraining() {
 		w.Header().Set("retry-after", "1")
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "orchestrator is shutting down; retry"})
 		return
 	}
-	id := uuid.NewString()
-	empty := ""
-	if err := s.invocations().Set(context.Background(), InvocationRecord{ID: id, Status: "succeeded", Result: &empty}); err != nil {
-		log.Printf("agent-orchestrator: could not write invocation record %s: %v", id, err)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
+	id := noneInvocationPrefix + uuid.NewString()
 	span.Set(map[string]any{"aktis.invocation_id": id, "aktis.trigger": trigger.Name, "aktis.trigger.target": "none"})
 	w.Header().Set("location", "/invoke/"+id)
 	writeJSON(w, http.StatusAccepted, map[string]any{"id": id, "status": "pending", "trigger": trigger})
 }
 
+// handleGetInvocation answers a poll from the id alone (docs/adr/0058 §1):
+// any replica, a restarted one included, gives the same answer, because the
+// turn lives in Temporal and the id names it.
 func (s *Server) handleGetInvocation(w http.ResponseWriter, r *http.Request, id string) {
-	record := s.invocations().Get(r.Context(), id)
+	switch {
+	case strings.HasPrefix(id, turnInvocationPrefix):
+		record, found := s.engineRecord(r.Context(), id, strings.TrimPrefix(id, turnInvocationPrefix))
+		if !found {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		writeJSON(w, http.StatusOK, record.visible())
+	case strings.HasPrefix(id, noneInvocationPrefix):
+		empty := ""
+		writeJSON(w, http.StatusOK, InvocationRecord{ID: id, Status: "succeeded", Result: &empty})
+	case strings.HasPrefix(id, failedInvocationPrefix):
+		message, ok := decodeFailedInvocationID(id)
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		writeJSON(w, http.StatusOK, InvocationRecord{ID: id, Status: "failed", Error: message})
+	default:
+		s.handleLegacyInvocation(w, r, id)
+	}
+}
+
+// engineRecord asks the engine about a turn. A failure to ASK is not the
+// turn failing: the record stays pending and the caller polls again, as it
+// did while the old process polled the engine on its behalf.
+func (s *Server) engineRecord(ctx context.Context, id, engineID string) (InvocationRecord, bool) {
+	status, err := s.Engine.Status(ctx, engineID)
+	switch {
+	case err != nil:
+		log.Printf("agent-orchestrator: could not poll engine for %s (answering pending): %v", id, err)
+		return InvocationRecord{ID: id, Status: "pending"}, true
+	case status.Unknown:
+		return InvocationRecord{}, false
+	case status.Pending:
+		return InvocationRecord{ID: id, Status: "pending", RemoteControlURL: status.RemoteControlURL}, true
+	}
+	record := recordFromOutcome(id, status.Outcome)
+	record.RemoteControlURL = status.RemoteControlURL
+	return record, true
+}
+
+// handleLegacyInvocation answers an id a pre-0058 process handed out: a
+// UUID naming a Redis record. Read-only: a pending one with an engine id is
+// answered from the engine, the same as a new id. Remove one release after
+// 0058 ships, with RedisInvocationStore.
+func (s *Server) handleLegacyInvocation(w http.ResponseWriter, r *http.Request, id string) {
+	var record *InvocationRecord
+	if s.Invocations != nil {
+		record = s.Invocations.Get(r.Context(), id)
+	}
 	if record == nil {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-	if record.Status == "pending" && !s.isDraining() {
-		s.adoptInvocation(*record)
+	if record.Status == "pending" && record.EngineInvocationID != "" {
+		if live, found := s.engineRecord(r.Context(), id, record.EngineInvocationID); found {
+			if live.RemoteControlURL == "" {
+				live.RemoteControlURL = record.RemoteControlURL
+			}
+			record = &live
+		}
 	}
 	writeJSON(w, http.StatusOK, record.visible())
 }
 
-// adoptInvocation finishes a pending turn whose process died: the engine
-// still holds it, so polling by the engine id the dead process recorded gets
-// the same answer. Two processes adopting the same turn during a rollout is
-// harmless — both write the same terminal record.
-func (s *Server) adoptInvocation(record InvocationRecord) {
-	if record.EngineInvocationID == "" {
-		return
-	}
-	if _, already := s.driving.LoadOrStore(record.ID, struct{}{}); already {
-		return
-	}
-	log.Printf("agent-orchestrator: adopting orphaned invocation %s (engine %s)", record.ID, record.EngineInvocationID)
-	go func() {
-		defer s.driving.Delete(record.ID)
-		ctx := s.bg()
-		input := TurnInput{RemoteControlURLListener: func(url string) {
-			if current := s.invocations().Get(ctx, record.ID); current != nil && current.Status == "pending" {
-				current.RemoteControlURL = url
-				_ = s.invocations().Set(ctx, *current)
-			}
-		}}
-		outcome, err := s.Engine.Adopt(ctx, record.EngineInvocationID, input)
-		if err != nil {
-			s.persistTerminal(ctx, InvocationRecord{ID: record.ID, Status: "failed", Error: err.Error()})
-			return
-		}
-		s.persistTerminalOutcome(ctx, record.ID, outcome, record.ForcedAgent)
-	}()
-}
-
-// persistTerminalOutcome writes a settled turn's record, carrying forward the
-// Remote Control URL the listener recorded (this write replaces the record).
-func (s *Server) persistTerminalOutcome(ctx context.Context, id string, outcome TurnOutcome, forcedAgent bool) {
+// recordFromOutcome is a settled turn's record. A run outcome is reported
+// only once it passes CheckOutcome; the engine already reports one only for
+// a forced agentRef turn (docs/adr/0052 §2).
+func recordFromOutcome(id string, outcome TurnOutcome) InvocationRecord {
 	record := InvocationRecord{ID: id, Status: "succeeded", Result: outcome.Result}
 	if outcome.Error != "" {
-		record.Status = "failed"
-		record.Error = outcome.Error
+		return InvocationRecord{ID: id, Status: "failed", Error: outcome.Error}
 	}
-	if current := s.invocations().Get(ctx, id); current != nil {
-		record.RemoteControlURL = current.RemoteControlURL
-	}
-	if outcome.Error == "" && forcedAgent && len(outcome.RunOutcome) > 0 && string(outcome.RunOutcome) != "null" {
+	if len(outcome.RunOutcome) > 0 && string(outcome.RunOutcome) != "null" {
 		if checked, err := CheckOutcome(outcome.RunOutcome); err == nil {
 			record.Outcome = checked
 		} else {
@@ -656,15 +635,7 @@ func (s *Server) persistTerminalOutcome(ctx context.Context, id string, outcome 
 	if len(outcome.PendingToolCalls) > 0 {
 		record.PendingToolCalls = outcome.PendingToolCalls
 	}
-	s.persistTerminal(ctx, record)
-}
-
-// persistTerminal never fails the caller: a Redis blip at terminal-write time
-// costs THIS record its answer, logged, not the whole process.
-func (s *Server) persistTerminal(ctx context.Context, record InvocationRecord) {
-	if err := s.invocations().Set(ctx, record); err != nil {
-		log.Printf("agent-orchestrator: failed to persist terminal invocation record %s: %v", record.ID, err)
-	}
+	return record
 }
 
 // ── turn input ─────────────────────────────────────────────────────────────
@@ -1045,9 +1016,8 @@ func (s *Server) chatStreaming(w http.ResponseWriter, r *http.Request, t turnReq
 
 // ── lifecycle ──────────────────────────────────────────────────────────────
 
-// Listen serves on port until Shutdown. Background turns run under ctx.
-func (s *Server) Listen(ctx context.Context, port int) error {
-	s.background = ctx
+// Listen serves on port until Shutdown.
+func (s *Server) Listen(_ context.Context, port int) error {
 	s.httpServer = &http.Server{
 		Addr:              fmt.Sprintf(":%d", port),
 		Handler:           s,

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -23,16 +24,30 @@ import (
 // its server span's (docs/adr/0050 §4).
 var anyTraceparent = regexp.MustCompile(`^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$`)
 
-// fakeEngine is an Engine whose calls can be inspected.
+// fakeEngine is an Engine whose calls can be inspected. Start runs invokeFn
+// in the background under an engine id and Status reports on it: the fake
+// stands in for the engine AND Temporal, so two servers sharing one fake are
+// two replicas in front of the same durable turns.
 type fakeEngine struct {
 	mu      sync.Mutex
 	invokes []TurnInput
 	checks  []TurnInput
-	adopts  []string
+	turns   map[string]*fakeTurn
+	nextID  int
 
 	invokeFn func(ctx context.Context, in TurnInput) (TurnOutcome, error)
 	checkFn  func(in TurnInput) *IdentityRefusal
-	adoptFn  func(ctx context.Context, id string, in TurnInput) (TurnOutcome, error)
+	// startErr, when set, fails Start before anything runs.
+	startErr error
+	// statusFn, when set, answers Status instead of the turns map.
+	statusFn func(id string) (EngineStatus, error)
+	// remoteControlURL is reported on every turn's status, pending or not.
+	remoteControlURL string
+}
+
+type fakeTurn struct {
+	done    chan struct{}
+	outcome TurnOutcome
 }
 
 func resultOutcome(s string) TurnOutcome { return TurnOutcome{Result: &s} }
@@ -52,16 +67,62 @@ func (f *fakeEngine) Invoke(ctx context.Context, in TurnInput) (TurnOutcome, err
 	return fn(ctx, in)
 }
 
-func (f *fakeEngine) Adopt(ctx context.Context, id string, in TurnInput) (TurnOutcome, error) {
+func (f *fakeEngine) Start(_ context.Context, in TurnInput) (string, error) {
 	f.mu.Lock()
-	f.adopts = append(f.adopts, id)
-	fn := f.adoptFn
-	f.mu.Unlock()
-	if fn == nil {
-		<-ctx.Done()
-		return TurnOutcome{}, ctx.Err()
+	if f.startErr != nil {
+		err := f.startErr
+		f.mu.Unlock()
+		return "", err
 	}
-	return fn(ctx, id, in)
+	f.invokes = append(f.invokes, in)
+	fn := f.invokeFn
+	f.nextID++
+	id := fmt.Sprintf("conversation-test.update-%d", f.nextID)
+	turn := &fakeTurn{done: make(chan struct{})}
+	if f.turns == nil {
+		f.turns = map[string]*fakeTurn{}
+	}
+	f.turns[id] = turn
+	f.mu.Unlock()
+	go func() {
+		outcome, err := fn(context.Background(), in)
+		if err != nil {
+			outcome = TurnOutcome{Error: err.Error()}
+		}
+		f.mu.Lock()
+		turn.outcome = outcome
+		f.mu.Unlock()
+		close(turn.done)
+	}()
+	return id, nil
+}
+
+func (f *fakeEngine) Status(_ context.Context, id string) (EngineStatus, error) {
+	f.mu.Lock()
+	statusFn := f.statusFn
+	turn := f.turns[id]
+	rc := f.remoteControlURL
+	f.mu.Unlock()
+	if statusFn != nil {
+		return statusFn(id)
+	}
+	if turn == nil {
+		return EngineStatus{Unknown: true}, nil
+	}
+	select {
+	case <-turn.done:
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return EngineStatus{Outcome: turn.outcome, RemoteControlURL: rc}, nil
+	default:
+		return EngineStatus{Pending: true, RemoteControlURL: rc}, nil
+	}
+}
+
+func (f *fakeEngine) setRemoteControlURL(url string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.remoteControlURL = url
 }
 
 func (f *fakeEngine) CheckIdentity(_ context.Context, in TurnInput) *IdentityRefusal {
@@ -85,12 +146,6 @@ func (f *fakeEngine) checked() []TurnInput {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]TurnInput(nil), f.checks...)
-}
-
-func (f *fakeEngine) adopted() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]string(nil), f.adopts...)
 }
 
 // waitInvokes waits until the engine has seen n turns and returns them.
@@ -157,19 +212,15 @@ func stillFalse(t *testing.T, cond func() bool) {
 // comparison. Callers assert those separately.
 func plain(in TurnInput) TurnInput {
 	in.ProgressListener = nil
-	in.RemoteControlURLListener = nil
-	in.ReportEngineInvocation = nil
 	in.Traceparent = ""
 	return in
 }
 
-// requireInvokeTurn is the TS expectation for every /invoke turn: the two
-// bookkeeping callbacks, a traceparent, NO progress listener, and otherwise
-// exactly want.
+// requireInvokeTurn is the expectation for every /invoke turn: a
+// traceparent, NO progress listener (nothing is held open to hear one), and
+// otherwise exactly want.
 func requireInvokeTurn(t *testing.T, want, got TurnInput) {
 	t.Helper()
-	require.NotNil(t, got.RemoteControlURLListener)
-	require.NotNil(t, got.ReportEngineInvocation)
 	require.Nil(t, got.ProgressListener)
 	require.Regexp(t, anyTraceparent, got.Traceparent)
 	require.Equal(t, want, plain(got))

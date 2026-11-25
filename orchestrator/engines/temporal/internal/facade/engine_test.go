@@ -184,47 +184,65 @@ func TestEnginePassesASucceededRecordsOutcomeThroughAsRunOutcome(t *testing.T) {
 	require.Empty(t, out.RunOutcome)
 }
 
-func TestEngineReportsItsIDBeforePolling(t *testing.T) {
+// Start is the accept and nothing after it: one POST, no poll.
+func TestEngineStartReturnsTheEngineIDWithoutPolling(t *testing.T) {
 	g := newFakeGateway(t, ok("ok"))
-	var reported []string
-	var pollsAtReport int
-	in := turn("x")
-	in.ReportEngineInvocation = func(id string) error {
-		reported = append(reported, id)
-		g.mu.Lock()
-		pollsAtReport = g.polls
-		g.mu.Unlock()
-		return nil
-	}
-	_, err := g.engine().Invoke(context.Background(), in)
+	id, err := g.engine().Start(context.Background(), turn("x"))
 	require.NoError(t, err)
-	require.Equal(t, []string{acceptedEngineID}, reported)
-	require.Zero(t, pollsAtReport)
+	require.Equal(t, acceptedEngineID, id)
+	calls := g.all()
+	require.Len(t, calls, 1)
+	require.Equal(t, http.MethodPost, calls[0].Method)
 }
 
-func TestEngineStillRunsTheTurnWhenRecordingTheIDFails(t *testing.T) {
-	logs := captureLog(t)
+func TestEngineStartRefusesWhatInvokeWouldFailBeforeTheEngine(t *testing.T) {
 	g := newFakeGateway(t, ok("ok"))
-	in := turn("x")
-	in.ReportEngineInvocation = func(string) error { return errors.New("redis down") }
-	out, err := g.engine().Invoke(context.Background(), in)
-	require.NoError(t, err)
-	require.Equal(t, "ok", *out.Result)
-	require.Contains(t, logs(), "redis down")
+	trig := turn("x")
+	trig.TriggerName = "review"
+	_, err := g.engine().Start(context.Background(), trig)
+	require.ErrorContains(t, err, "AGENT_SENDER_ASSERTION_SECRET")
+
+	g.onPost = func(w http.ResponseWriter) { w.WriteHeader(http.StatusBadGateway) }
+	_, err = g.engine().Start(context.Background(), turn("x"))
+	require.ErrorContains(t, err, "502")
+	require.Len(t, g.posts(), 1, "the trigger turn never reached the engine")
 }
 
-func TestEngineAdoptPollsAnExistingIDAndMapsTheResult(t *testing.T) {
-	g := newFakeGateway(t, rec("pending", nil), rec("succeeded", map[string]any{"result": "reviewed", "outcome": map[string]any{"verdict": "changes-requested"}}))
-	out, err := g.engine().Adopt(context.Background(), "conversation-old.upd-9", turn("x"))
+func TestEngineStatusMapsEachEngineAnswer(t *testing.T) {
+	rc := map[string]any{"remoteControlUrl": "https://rc"}
+	pending, err := newFakeGateway(t, rec("pending", rc)).engine().Status(context.Background(), "conversation-old.upd-9")
 	require.NoError(t, err)
-	require.Equal(t, "reviewed", *out.Result)
-	require.JSONEq(t, `{"verdict":"changes-requested"}`, string(out.RunOutcome))
-	var paths []string
-	for _, c := range g.all() {
-		require.Equal(t, http.MethodGet, c.Method, "adopt never re-starts the turn")
-		paths = append(paths, c.Path)
-	}
-	require.Equal(t, []string{"/invoke/conversation-old.upd-9", "/invoke/conversation-old.upd-9"}, paths)
+	require.Equal(t, EngineStatus{Pending: true, RemoteControlURL: "https://rc"}, pending)
+
+	done, err := newFakeGateway(t, rec("succeeded", map[string]any{
+		"result": "reviewed", "outcome": map[string]any{"verdict": "changes-requested"}, "remoteControlUrl": "https://rc",
+	})).engine().Status(context.Background(), "conversation-old.upd-9")
+	require.NoError(t, err)
+	require.False(t, done.Pending)
+	require.Equal(t, "reviewed", *done.Outcome.Result)
+	require.JSONEq(t, `{"verdict":"changes-requested"}`, string(done.Outcome.RunOutcome))
+	require.Equal(t, "https://rc", done.RemoteControlURL)
+
+	failed, err := newFakeGateway(t, rec("failed", map[string]any{"error": "boom"})).engine().Status(context.Background(), "x.y")
+	require.NoError(t, err)
+	require.Equal(t, "boom", failed.Outcome.Error)
+}
+
+func TestEngineStatusTellsUnknownFromUnreachable(t *testing.T) {
+	missing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) }))
+	t.Cleanup(missing.Close)
+	unknown, err := (&TemporalEngine{BaseURL: missing.URL}).Status(context.Background(), "x.y")
+	require.NoError(t, err)
+	require.True(t, unknown.Unknown)
+
+	broken := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) }))
+	t.Cleanup(broken.Close)
+	_, err = (&TemporalEngine{BaseURL: broken.URL}).Status(context.Background(), "x.y")
+	require.ErrorContains(t, err, "503")
+
+	broken.Close()
+	_, err = (&TemporalEngine{BaseURL: broken.URL}).Status(context.Background(), "x.y")
+	require.Error(t, err)
 }
 
 func TestEngineReportsAFailedTurnAsAnError(t *testing.T) {
@@ -562,32 +580,6 @@ func TestEngineUnflattensContentNarrationLinesBackIntoTheirStage(t *testing.T) {
 		{"remote-control-url", "https://example.com/rc"},
 		{"", "clone: cloning the repo"},
 	}, got)
-}
-
-func TestEngineRelaysTheRemoteControlURLOnceWithoutAProgressListener(t *testing.T) {
-	url := "https://claude.ai/code/session_abc"
-	g := newFakeGateway(t,
-		rec("pending", nil),
-		rec("pending", map[string]any{"remoteControlUrl": url}),
-		rec("pending", map[string]any{"remoteControlUrl": url}),
-		rec("succeeded", map[string]any{"result": "done", "remoteControlUrl": url}),
-	)
-	var got []string
-	in := turn("x")
-	in.RemoteControlURLListener = func(u string) { got = append(got, u) }
-	_, err := g.engine().Invoke(context.Background(), in)
-	require.NoError(t, err)
-	require.Equal(t, []string{url}, got)
-}
-
-func TestEngineRelaysARemoteControlURLFirstSeenOnTheTerminalRecord(t *testing.T) {
-	g := newFakeGateway(t, rec("succeeded", map[string]any{"result": "done", "remoteControlUrl": "https://claude.ai/code/session_late"}))
-	var got []string
-	in := turn("x")
-	in.RemoteControlURLListener = func(u string) { got = append(got, u) }
-	_, err := g.engine().Invoke(context.Background(), in)
-	require.NoError(t, err)
-	require.Equal(t, []string{"https://claude.ai/code/session_late"}, got)
 }
 
 func TestEngineNeedsNoProgressListener(t *testing.T) {

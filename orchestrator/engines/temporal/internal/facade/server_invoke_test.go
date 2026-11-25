@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -16,70 +15,68 @@ import (
 
 // Ported from apps/agent-orchestrator/src/server.test.ts ("InvokeServer").
 
-// A shared store means whichever replica is asked can answer.
-func TestInvokeServesAPollFromAStoreSoADifferentInstanceCanAnswer(t *testing.T) {
-	shared := &MemoryInvocationStore{}
+// The id is all a poll needs (docs/adr/0058 §1): a replica that never saw
+// the POST answers it, with no store in between.
+func TestInvokeAnyReplicaAnswersAPollFromTheIDAlone(t *testing.T) {
 	engine, settle := deferredEngine(t)
-	accepting := serve(t, &Server{Engine: engine, Invocations: shared})
-	// A second process entirely: same store, its own engine it never calls.
-	other := newFakeEngine()
-	polling := serve(t, &Server{Engine: other, Invocations: shared})
+	accepting := serve(t, &Server{Engine: engine})
+	polling := serve(t, &Server{Engine: engine})
 
 	id := acceptedID(t, postInvoke(t, accepting, map[string]any{"request": "do the thing"}, nil))
+	require.True(t, strings.HasPrefix(id, turnInvocationPrefix), id)
+	require.Equal(t, "pending", getInvocation(t, polling, id)["status"])
 	settle(resultOutcome("done"))
 
-	record := settled(t, polling, id)
-	require.Equal(t, "succeeded", record["status"])
-	require.Empty(t, other.invoked())
+	require.Equal(t, map[string]any{"id": id, "status": "succeeded", "result": "done"}, settled(t, polling, id))
+	require.Len(t, engine.invoked(), 1)
 }
 
-// failingTerminalStore accepts the pending write and fails every terminal one.
-type failingTerminalStore struct {
-	MemoryInvocationStore
-}
-
-func (s *failingTerminalStore) Set(ctx context.Context, record InvocationRecord) error {
-	if record.Status == "pending" {
-		return s.MemoryInvocationStore.Set(ctx, record)
-	}
-	return errors.New("redis terminal write failed")
-}
-
-// A Redis blip at terminal-write time must log and keep the process up,
-// costing only THIS record its answer.
-func TestInvokeLogsAndSurvivesWhenTheTerminalWriteFails(t *testing.T) {
-	logs := captureLog(t)
-	store := &failingTerminalStore{}
-	engine, settle := deferredEngine(t)
-	base := serve(t, &Server{Engine: engine, Invocations: store})
-
-	id := acceptedID(t, postInvoke(t, base, map[string]any{"request": "do the thing"}, nil))
-	settle(resultOutcome("done"))
-
-	waitFor(t, func() bool {
-		out := logs()
-		return strings.Contains(out, "failed to persist terminal invocation record") && strings.Contains(out, "redis terminal write failed")
-	})
-	// Still serving, and the record is still the pending one it could write.
-	require.Equal(t, "pending", getInvocation(t, base, id)["status"])
-}
-
-// The pending record is written before the 202: if that fails the caller must
-// not be handed an id nobody will ever complete.
-func TestInvokeAnswers500AndRunsNothingWhenThePendingWriteFails(t *testing.T) {
+// Failing to ASK the engine is not the turn failing: the poller is told to
+// ask again, not that its turn is gone.
+func TestInvokePollAnswersPendingWhenTheEngineCannotBeAsked(t *testing.T) {
 	logs := captureLog(t)
 	engine := newFakeEngine()
-	base := serve(t, &Server{Engine: engine, Invocations: &alwaysFailingStore{}})
+	base := serve(t, &Server{Engine: engine})
+	id := acceptedID(t, postInvoke(t, base, map[string]any{"request": "do the thing"}, nil))
 
-	res := postInvoke(t, base, map[string]any{"request": "do the thing"}, nil)
-	require.Equal(t, http.StatusInternalServerError, res.StatusCode)
-	stillFalse(t, func() bool { return len(engine.invoked()) > 0 })
-	require.Contains(t, logs(), "could not write invocation record")
+	engine.mu.Lock()
+	engine.statusFn = func(string) (EngineStatus, error) { return EngineStatus{}, errors.New("dial tcp: connection refused") }
+	engine.mu.Unlock()
+	require.Equal(t, map[string]any{"id": id, "status": "pending"}, getInvocation(t, base, id))
+	require.Contains(t, logs(), "connection refused")
 }
 
-type alwaysFailingStore struct{ MemoryInvocationStore }
+func TestInvokePollIs404WhenTheEngineDoesNotKnowTheTurn(t *testing.T) {
+	base := serve(t, &Server{Engine: newFakeEngine()})
+	res := do(t, http.MethodGet, base+"/invoke/"+turnInvocationPrefix+"conversation-gone.u-1", nil, nil)
+	require.Equal(t, http.StatusNotFound, res.StatusCode)
+}
 
-func (*alwaysFailingStore) Set(context.Context, InvocationRecord) error { return errors.New("down") }
+// A turn the engine would not accept is still a 202: the caller hears of it
+// from its poll, the way it always has, and runs its failure path from there.
+func TestInvokeAnswers202WithAFailedIDWhenTheEngineRefusesToStart(t *testing.T) {
+	engine := newFakeEngine()
+	engine.startErr = errors.New("temporal engine /invoke failed: 400 (image too large)")
+	accepting := serve(t, &Server{Engine: engine})
+	other := serve(t, &Server{Engine: newFakeEngine()})
+
+	id := acceptedID(t, postInvoke(t, accepting, map[string]any{"request": "do a thing"}, nil))
+	require.True(t, strings.HasPrefix(id, failedInvocationPrefix), id)
+	want := map[string]any{"id": id, "status": "failed", "error": "temporal engine /invoke failed: 400 (image too large)"}
+	require.Equal(t, want, getInvocation(t, accepting, id))
+	require.Equal(t, want, getInvocation(t, other, id), "stateless: any replica decodes it")
+}
+
+func TestInvokeFailedIDBoundsTheMessageAndRejectsGarbage(t *testing.T) {
+	id := failedInvocationID(strings.Repeat("x", 5000))
+	message, ok := decodeFailedInvocationID(id)
+	require.True(t, ok)
+	require.Len(t, message, maxFailedMessageBytes)
+
+	base := serve(t, &Server{Engine: newFakeEngine()})
+	res := do(t, http.MethodGet, base+"/invoke/"+failedInvocationPrefix+"!!not-base64", nil, nil)
+	require.Equal(t, http.StatusNotFound, res.StatusCode)
+}
 
 func TestInvokeRefusesNewTurnsOnceDraining(t *testing.T) {
 	engine := newFakeEngine()
@@ -116,8 +113,9 @@ func TestInvokeAcceptsReturns202AndTheResultOnceTheTurnResolves(t *testing.T) {
 
 func TestInvokeSurfacesRemoteControlURLWhilePendingAndOnTheTerminalRecord(t *testing.T) {
 	release := make(chan TurnOutcome, 1)
-	engine := &fakeEngine{invokeFn: func(_ context.Context, in TurnInput) (TurnOutcome, error) {
-		in.RemoteControlURLListener("https://claude.ai/code/session_abc123")
+	var engine *fakeEngine
+	engine = &fakeEngine{invokeFn: func(_ context.Context, in TurnInput) (TurnOutcome, error) {
+		engine.setRemoteControlURL("https://claude.ai/code/session_abc123")
 		return <-release, nil
 	}}
 	t.Cleanup(func() {
@@ -171,16 +169,6 @@ func TestInvokeMarksTheInvocationFailedWhenTheEngineCallItselfFails(t *testing.T
 	record := settled(t, base, id)
 	require.Equal(t, "failed", record["status"])
 	require.Equal(t, "temporal engine /invoke failed: 502", record["error"])
-}
-
-// A panicking engine must still leave a terminal record, never a forever-pending one.
-func TestInvokeMarksTheInvocationFailedWhenTheEnginePanics(t *testing.T) {
-	engine := &fakeEngine{invokeFn: func(context.Context, TurnInput) (TurnOutcome, error) { panic("kaboom") }}
-	base := serve(t, &Server{Engine: engine})
-	id := acceptedID(t, postInvoke(t, base, map[string]any{"request": "do a thing"}, nil))
-	record := settled(t, base, id)
-	require.Equal(t, "failed", record["status"])
-	require.Equal(t, "kaboom", record["error"])
 }
 
 func TestInvokeRejectsAMissingOrInvalidBodyWith400(t *testing.T) {
@@ -242,32 +230,15 @@ func TestInvokeCarriesAnOptionalSessionIDIntoTheTurn(t *testing.T) {
 
 // ── event envelopes (ADR 0048, docs/event-triggers.md §5) ──────────────────
 
-type spyInvocationStore struct {
-	MemoryInvocationStore
-	mu   sync.Mutex
-	sets int
-}
-
-func (s *spyInvocationStore) Set(ctx context.Context, r InvocationRecord) error {
-	s.mu.Lock()
-	s.sets++
-	s.mu.Unlock()
-	return s.MemoryInvocationStore.Set(ctx, r)
-}
-
-func (s *spyInvocationStore) count() int { s.mu.Lock(); defer s.mu.Unlock(); return s.sets }
-
 func TestInvokeEventAnswers200IgnoredAndStartsNoTurnWhenNoTriggerMatches(t *testing.T) {
 	engine := newFakeEngine()
-	store := &spyInvocationStore{}
-	base := serve(t, &Server{Engine: engine, Triggers: triggerRegistry(t, reviewTrigger()), Invocations: store})
+	base := serve(t, &Server{Engine: engine, Triggers: triggerRegistry(t, reviewTrigger())})
 
 	// Even with a perfectly good `request`, which must NOT be run as a fallback.
 	res := postInvoke(t, base, map[string]any{"request": "please do something", "event": envelope(nil)}, nil)
 	require.Equal(t, http.StatusOK, res.StatusCode)
 	require.Equal(t, map[string]any{"status": "ignored"}, decode[map[string]any](t, res))
 	stillFalse(t, func() bool { return len(engine.invoked()) > 0 })
-	require.Zero(t, store.count())
 }
 
 func TestInvokeEventIsIgnoredWhenNoTriggerTableIsConfigured(t *testing.T) {
