@@ -119,6 +119,14 @@ export interface ChatOptions {
    */
   withoutUserJwt?: boolean;
   /**
+   * Required with `withoutUserJwt`: a tag unique to the calling spec file that
+   * appears in the goal of every run its turns could launch (put it in the
+   * requests it sends). An unauthenticated turn's run is only recognizable by
+   * entry point `api`, which any other file's direct `/invoke` call shares, so
+   * this tag is what claims it (k8s.ts `anonymous-chat`).
+   */
+  anonymousGoalTag?: string;
+  /**
    * Asks for this OAuth flow if the turn needs an account link, via the same
    * `identity_link_flow` body field an OpenAI-SDK client sends as
    * `extra_body`. Unset takes the deployment default (authcode in e2e).
@@ -238,7 +246,14 @@ async function streamChat(
   // Whatever this turn launches is this spec file's (k8s.ts claimRuns). The
   // engine records the caller it resolved as the run's `launchedBy`: the
   // forwarded user's subject, or -- with no JWT -- the shared bearer subject.
-  claimRuns(opts.withoutUserJwt ? { kind: "anonymous-chat" } : { kind: "chat", launchedBy: chatSubject(userId) });
+  if (opts.withoutUserJwt && !opts.anonymousGoalTag) {
+    throw new Error("e2e: withoutUserJwt needs anonymousGoalTag, or this file would claim every other file's `api` runs");
+  }
+  claimRuns(
+    opts.withoutUserJwt
+      ? { kind: "anonymous-chat", goalIncludes: opts.anonymousGoalTag! }
+      : { kind: "chat", launchedBy: chatSubject(userId) },
+  );
   // ...and so is any credential record the product files under this caller
   // (a link the turn completes), for this file's deleteCredentials to clear.
   if (!opts.withoutUserJwt) ownCredentialSubjects(chatSubject(userId));

@@ -19,7 +19,7 @@ import {
   seedAllClaudeCredentials,
   seedGithubLink,
 } from "../support/credential-store.js";
-import { deleteRedisKeys } from "../support/redis.js";
+import { deleteSessionRecords } from "../support/redis.js";
 import { issueLabeledPayload, postGithubWebhook } from "../support/webhook.js";
 import { fakeGithubRequests, resetFakeGithub, webhookSecret } from "../support/fixtures.js";
 import { E2E_USER_LOCK, holdLock } from "../support/locks.js";
@@ -54,7 +54,25 @@ const SHARED_SERVICE_SUBJECT = "client-integration-gateway";
  * but is entirely test-owned shared state.
  */
 const RUN_ID = Date.now() % 100000;
-const issueNo = (offset: number): number => RUN_ID + offset;
+/** Every issue this file has sent a webhook for, so `resetOwnSessions` can clear exactly those. */
+const issuesUsed = new Set<number>();
+const issueNo = (offset: number): number => {
+  issuesUsed.add(RUN_ID + offset);
+  return RUN_ID + offset;
+};
+
+/** Every chat session id this file uses starts with this. */
+const SESSION_PREFIX = "e2e-identity-keying-";
+
+/**
+ * Clears this file's own facade session records: its chat sessions, and the
+ * `github:<repo>#<n>` session of every issue it has used (which a vitest retry
+ * of a test reuses). Never `sess:*` -- other spec files run concurrently and
+ * their parked turns live there too.
+ */
+async function resetOwnSessions(): Promise<void> {
+  await deleteSessionRecords(`${SESSION_PREFIX}*`, ...[...issuesUsed].map((n) => `github:e2e-org/e2e-repo#${n}`));
+}
 
 /**
  * The regression this suite exists for.
@@ -97,7 +115,7 @@ describe("credential keying converges across entry points (ADR 0029/0030)", () =
     // Every test decides its own seeding, so start with nothing: a leftover
     // record is indistinguishable from a correctly-resolved one.
     await deleteCredentials("claude-auth");
-    await deleteRedisKeys("sess:*");
+    await resetOwnSessions();
   });
 
   async function trigger(issueNumber: number, senderLogin: string): Promise<void> {
@@ -262,7 +280,7 @@ describe("chat and triage converge on one credential (ADR 0031)", () => {
    * silently-different second one instead of a clean re-run.
    */
   function session(label: string): string {
-    return `e2e-identity-keying-${label}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    return `${SESSION_PREFIX}${label}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
 
   /**
@@ -288,7 +306,7 @@ describe("chat and triage converge on one credential (ADR 0031)", () => {
   beforeEach(async () => {
     await resetFakeGithub();
     await deleteCredentials();
-    await deleteRedisKeys("sess:*");
+    await resetOwnSessions();
   });
 
   it("resolves a chat turn's credentials from the principal, not the openwebui subject", async () => {
@@ -407,7 +425,7 @@ describe("chat and triage converge on one credential (ADR 0031)", () => {
     // resume that reaches the poll at all should launch immediately.
     await seedAllClaudeCredentials(CANONICAL);
     const startedAt = await runsMark();
-    const sessionId = `e2e-resume-anchor-${Date.now()}`;
+    const sessionId = `${SESSION_PREFIX}resume-anchor-${Date.now()}`;
 
     // Device flow asked for per turn. The e2e deployment defaults to
     // authcode, and switching that default would change every other chat
@@ -569,7 +587,7 @@ describe("a turn needing two credentials asks for both at once (ADR 0030 §4)", 
     // Nothing seeded: BOTH Claude link flows must be started for real, which is
     // the condition that needs two `claude` PTYs alive at once.
     await deleteCredentials();
-    await deleteRedisKeys("sess:*");
+    await resetOwnSessions();
   });
 
   it("offers both Claude link steps in a single comment, naming them distinctly", async () => {

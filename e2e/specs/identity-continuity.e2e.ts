@@ -3,7 +3,7 @@ import { requireLocalClusterContext } from "../support/guard.js";
 import { agentRunAgentRef, agentRunsSince, cleanupAgentRunsSince, waitFor, runsMark } from "../support/k8s.js";
 import { chatTurn } from "../support/chat.js";
 import { deleteCredentials, seedAllClaudeCredentials } from "../support/credential-store.js";
-import { deleteRedisKeys } from "../support/redis.js";
+import { deleteSessionRecords } from "../support/redis.js";
 import { resetFakeGithub } from "../support/fixtures.js";
 
 requireLocalClusterContext();
@@ -15,8 +15,17 @@ requireLocalClusterContext();
  * it, so any launch in this file means a turn ran as the shared subject.
  */
 const SHARED_SUBJECT = "client-integration-gateway";
+/**
+ * In every request this file sends, so the delegated run's goal (the caller's
+ * message) carries it. A turn with no user JWT launches under entry point
+ * `api`, which other concurrently running files' `/invoke` calls share; this
+ * tag is how this file claims only its own (chat.ts `anonymousGoalTag`).
+ */
+const GOAL_TAG = `e2e-identity-continuity-${process.pid}-${Date.now()}`;
 /** Names the agent outright, like identity-keying's chat specs, so selection is not what's under test. */
-const REQUEST = "Delegate this to stub-agent: fix the failing test in e2e-org/e2e-repo";
+const REQUEST = `Delegate this to stub-agent: fix the failing test in e2e-org/e2e-repo (ref ${GOAL_TAG})`;
+/** Every session id this file uses starts with this (see `session`), and only those records are reset. */
+const SESSION_PREFIX = "e2e-identity-continuity-";
 const CREDENTIAL_AGENTS = ["stub-agent", "claude-code-swe-agent"];
 const LINK_PROMPT = /link your GitHub account/i;
 
@@ -49,7 +58,7 @@ describe("a parked chat turn keeps its caller's identity", () => {
   let suiteStartedAt: Date;
 
   function session(label: string): string {
-    return `e2e-identity-continuity-${label}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    return `${SESSION_PREFIX}${label}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
 
   /** A fresh Open WebUI user per test: never linked, so every turn of theirs parks on GitHub. */
@@ -75,7 +84,7 @@ describe("a parked chat turn keeps its caller's identity", () => {
   beforeEach(async () => {
     await resetFakeGithub();
     await deleteCredentials();
-    await deleteRedisKeys("sess:*");
+    await deleteSessionRecords(`${SESSION_PREFIX}*`);
     await seedAllClaudeCredentials(SHARED_SUBJECT);
   });
 
@@ -85,6 +94,7 @@ describe("a parked chat turn keeps its caller's identity", () => {
     await chatTurn("anonymous", REQUEST, {
       sessionId: session("control"),
       withoutUserJwt: true,
+      anonymousGoalTag: GOAL_TAG,
       allowPark: true,
       timeoutMs: 120_000,
     });
@@ -129,6 +139,7 @@ describe("a parked chat turn keeps its caller's identity", () => {
     await chatTurn("anonymous", "Reply with the single word: hello", {
       sessionId,
       withoutUserJwt: true,
+      anonymousGoalTag: GOAL_TAG,
       allowPark: true,
       timeoutMs: 60_000,
     });

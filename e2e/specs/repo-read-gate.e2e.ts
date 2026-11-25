@@ -11,7 +11,7 @@ import {
 } from "../support/k8s.js";
 import { chatSubject, chatTurn } from "../support/chat.js";
 import { deleteCredentials, seedAllClaudeCredentials, seedGithubLink } from "../support/credential-store.js";
-import { deleteRedisKeys } from "../support/redis.js";
+import { deleteSessionRecords } from "../support/redis.js";
 import { fakeGithubRequests, resetFakeGithub, webhookSecret } from "../support/fixtures.js";
 import { issueLabeledPayload, postGithubWebhook } from "../support/webhook.js";
 import { waitForAgentRunWithParam } from "../support/events.js";
@@ -59,8 +59,11 @@ describe("an agent that acts on GitHub launches only into a repository its calle
   const CHAT_USER = `e2e-gate-${RUN_ID}`;
   let suiteStartedAt: Date;
 
+  /** Every chat session id this file uses starts with this, and only those records are reset. */
+  const SESSION_PREFIX = "e2e-repo-gate-";
+
   function session(label: string): string {
-    return `e2e-repo-gate-${label}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    return `${SESSION_PREFIX}${label}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
 
   /** Waits out the window a launch would take to appear, then asserts none did. */
@@ -91,7 +94,8 @@ describe("an agent that acts on GitHub launches only into a repository its calle
   beforeEach(async () => {
     await resetFakeGithub();
     await deleteCredentials();
-    await deleteRedisKeys("sess:*");
+    // Only this file's sessions: its chat sessions and its webhook's issue.
+    await deleteSessionRecords(`${SESSION_PREFIX}*`, `github:e2e-org/e2e-repo#${RUN_ID}`);
     // Linked and authorized for everything, so the only thing that can stop a
     // launch is the read gate itself.
     await seedGithubLink(chatSubject(CHAT_USER), SENDER);

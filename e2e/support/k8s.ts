@@ -244,7 +244,11 @@ export async function agentRunItemsSince(since: Date): Promise<AgentRunItem[]> {
  *   deployment's shared subject. The engine files that under entry point
  *   `api` (audit.EntryPoint: not per-user, no trigger) -- not `chat`, and not
  *   `webhook`, which shares the same subject. Only identity-continuity sends
- *   these.
+ *   these. Entry point `api` alone is not this file's, though: it is ANY
+ *   direct `/invoke` caller with no trigger, which other concurrently running
+ *   files are too (caller-tools, relayed session-page follow-ups). So the run's
+ *   goal must also contain `goalIncludes`, a tag only this file puts in the
+ *   requests it sends (a delegated run's goal is the caller's message).
  * - `goal`: any non-webhook run whose goal contains `includes` -- for a turn
  *   with nothing else to tell it apart, like a session-page follow-up, which
  *   also runs as the shared subject. Name something only this file's turn
@@ -253,7 +257,7 @@ export async function agentRunItemsSince(since: Date): Promise<AgentRunItem[]> {
 export type RunClaim =
   | { kind: "issue"; repository: string; number: number }
   | { kind: "chat"; launchedBy: string }
-  | { kind: "anonymous-chat" }
+  | { kind: "anonymous-chat"; goalIncludes: string }
   | { kind: "goal"; includes: string };
 
 /**
@@ -287,7 +291,11 @@ function claimMatches(claim: RunClaim, run: AgentRunItem): boolean {
     case "chat":
       return launch?.entryPoint === "chat" && launch.launchedBy === claim.launchedBy;
     case "anonymous-chat":
-      return launch?.entryPoint === "api" && !launch.launchedBy?.startsWith("openwebui:");
+      return (
+        launch?.entryPoint === "api" &&
+        !launch.launchedBy?.startsWith("openwebui:") &&
+        (run.spec?.goal ?? "").includes(claim.goalIncludes)
+      );
     case "goal":
       return launch?.entryPoint !== "webhook" && (run.spec?.goal ?? "").includes(claim.includes);
   }
