@@ -140,11 +140,10 @@ func (s *RedisSessionStore) Set(ctx context.Context, sessionID string, readOnly 
 	return nil
 }
 
-// ── /invoke accept-then-poll records ───────────────────────────────────────
+// ── /invoke poll answers ───────────────────────────────────────────────────
 
 // InvocationRecord is one /invoke turn as a caller polls it. The JSON keys
-// are the contract integration-gateway reads, and match what the TS process
-// wrote to the same Redis keys.
+// are the contract integration-gateway reads.
 type InvocationRecord struct {
 	ID     string `json:"id"`
 	Status string `json:"status"` // pending | succeeded | failed
@@ -160,64 +159,4 @@ type InvocationRecord struct {
 	// Outcome is a forced agentRef run's structured outcome (docs/adr/0052 §2),
 	// already accepted by CheckOutcome.
 	Outcome map[string]any `json:"outcome,omitempty"`
-
-	// EngineInvocationID: a pre-0058 record's engine turn. Internal: never
-	// returned to a caller.
-	EngineInvocationID string `json:"engineInvocationId,omitempty"`
-	// ForcedAgent: read from pre-0058 records only. Internal.
-	ForcedAgent bool `json:"forcedAgent,omitempty"`
-}
-
-// visible is the record without this process's bookkeeping.
-func (r InvocationRecord) visible() InvocationRecord {
-	r.EngineInvocationID = ""
-	r.ForcedAgent = false
-	return r
-}
-
-// InvocationStore reads the /invoke records a pre-0058 process wrote. Nothing
-// writes them any more: an id now carries what a poll needs (docs/adr/0058
-// §1). A store error is a miss. Remove one release after 0058.
-type InvocationStore interface {
-	Get(ctx context.Context, id string) *InvocationRecord
-}
-
-// RedisInvocationStore reads pre-0058 records ("inv:<uuid>"). Set remains
-// only so tests can write one the way the old process did.
-type RedisInvocationStore struct {
-	Client *redis.Client
-	TTL    time.Duration
-	// Prefix defaults to "inv:", the TS process's key space.
-	Prefix string
-}
-
-func (s *RedisInvocationStore) key(id string) string {
-	if s.Prefix == "" {
-		return "inv:" + id
-	}
-	return s.Prefix + id
-}
-
-func (s *RedisInvocationStore) Get(ctx context.Context, id string) *InvocationRecord {
-	raw, err := s.Client.Get(ctx, s.key(id)).Bytes()
-	if err != nil {
-		if !errors.Is(err, redis.Nil) {
-			log.Printf("RedisInvocationStore.get failed (treating as miss): %v", err)
-		}
-		return nil
-	}
-	var record InvocationRecord
-	if err := json.Unmarshal(raw, &record); err != nil {
-		log.Printf("RedisInvocationStore.get failed (treating as miss): %v", err)
-		return nil
-	}
-	return &record
-}
-
-func (s *RedisInvocationStore) Set(ctx context.Context, record InvocationRecord) error {
-	payload, err := json.Marshal(record)
-	if err != nil {
-		return err
-	}
-	return s.Client.Set(ctx, s.key(record.ID), payload, s.TTL).Err()
 }

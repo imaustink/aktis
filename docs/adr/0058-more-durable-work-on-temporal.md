@@ -162,11 +162,9 @@ worker to hand the pass to; giving it one only for a prune is not worth it.
   taking longer than I can wait"; now the caller sees `pending` until the
   turn ends, and its own poll budget decides. An answer is collectable for
   as long as the engine retains the update.
-- **Ids a pre-0058 pod handed out** (bare UUIDs) are answered from Redis,
-  read-only: a terminal record as written, a pending one with an engine id
-  from the engine. Remove `handleLegacyInvocation` and
-  `RedisInvocationStore` one release after this ships.
-  `AGENT_INVOCATION_TTL_SECONDS` is no longer read.
+- **Ids a pre-0058 pod handed out** (bare UUIDs) were answered from Redis,
+  read-only, for one release; since then they are a 404 and the facade
+  reads no `inv:` records. `AGENT_INVOCATION_TTL_SECONDS` is no longer read.
 - **Temporal is required whenever connection-broker indexes** (`QDRANT_URL`,
   `OPENAI_API_KEY` and at least one `SYNC_TOKEN_*`): it exits at startup if
   `TEMPORAL_ADDRESS` is unset. A serve-only broker starts no worker. The

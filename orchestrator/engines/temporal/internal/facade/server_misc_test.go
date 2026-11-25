@@ -232,13 +232,3 @@ func TestInvokeWithExportOnHandsTheTurnAnExportedServerSpansContext(t *testing.T
 	require.Equal(t, int64(202), a["http.response.status_code"])
 	require.Equal(t, id, a["aktis.invocation_id"])
 }
-
-// ── the record bookkeeping never reaches a caller ──────────────────────────
-
-func TestInvocationRecordVisibleStripsBookkeeping(t *testing.T) {
-	r := InvocationRecord{ID: "i", Status: "pending", EngineInvocationID: "engine-1", ForcedAgent: true}
-	v := r.visible()
-	require.Equal(t, InvocationRecord{ID: "i", Status: "pending"}, v)
-	// visible() is a copy: the stored record keeps its bookkeeping.
-	require.Equal(t, "engine-1", r.EngineInvocationID)
-}

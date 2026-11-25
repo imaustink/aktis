@@ -63,9 +63,6 @@ type Server struct {
 	CallerToolTopK int
 	// DefaultIdentityLinkFlow applies to any turn that names none.
 	DefaultIdentityLinkFlow string
-	// Invocations answers ids a pre-0058 process handed out. Read-only; nil
-	// 404s them. Remove one release after 0058.
-	Invocations InvocationStore
 	// CallerAuth gates every turn-starting route. Nil: no check (tests).
 	CallerAuth *CallerAuthenticator
 
@@ -558,7 +555,7 @@ func (s *Server) handleGetInvocation(w http.ResponseWriter, r *http.Request, id 
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		writeJSON(w, http.StatusOK, record.visible())
+		writeJSON(w, http.StatusOK, record)
 	case strings.HasPrefix(id, noneInvocationPrefix):
 		empty := ""
 		writeJSON(w, http.StatusOK, InvocationRecord{ID: id, Status: "succeeded", Result: &empty})
@@ -570,7 +567,7 @@ func (s *Server) handleGetInvocation(w http.ResponseWriter, r *http.Request, id 
 		}
 		writeJSON(w, http.StatusOK, InvocationRecord{ID: id, Status: "failed", Error: message})
 	default:
-		s.handleLegacyInvocation(w, r, id)
+		w.WriteHeader(http.StatusNotFound)
 	}
 }
 
@@ -591,30 +588,6 @@ func (s *Server) engineRecord(ctx context.Context, id, engineID string) (Invocat
 	record := recordFromOutcome(id, status.Outcome)
 	record.RemoteControlURL = status.RemoteControlURL
 	return record, true
-}
-
-// handleLegacyInvocation answers an id a pre-0058 process handed out: a
-// UUID naming a Redis record. Read-only: a pending one with an engine id is
-// answered from the engine, the same as a new id. Remove one release after
-// 0058 ships, with RedisInvocationStore.
-func (s *Server) handleLegacyInvocation(w http.ResponseWriter, r *http.Request, id string) {
-	var record *InvocationRecord
-	if s.Invocations != nil {
-		record = s.Invocations.Get(r.Context(), id)
-	}
-	if record == nil {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-	if record.Status == "pending" && record.EngineInvocationID != "" {
-		if live, found := s.engineRecord(r.Context(), id, record.EngineInvocationID); found {
-			if live.RemoteControlURL == "" {
-				live.RemoteControlURL = record.RemoteControlURL
-			}
-			record = &live
-		}
-	}
-	writeJSON(w, http.StatusOK, record.visible())
 }
 
 // recordFromOutcome is a settled turn's record. A run outcome is reported
