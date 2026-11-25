@@ -378,7 +378,7 @@ adding an entry there publishes a new image.
 [scripts/dev-up.sh](scripts/dev-up.sh) automates the full local deploy (start
 a local cluster, build images, install/upgrade both Helm releases, apply CRs).
 The cluster is [ferry](https://github.com/imaustink/ferry) on an Apple-silicon
-Mac that has it installed and minikube elsewhere; kind or a cluster of your own
+Mac (install it first; there is no Docker Desktop fallback) and minikube elsewhere; kind or a cluster of your own
 slot in with one setting — see [docs/local-cluster.md](docs/local-cluster.md).
 
 The only step the script can't do for you is creating secrets — do this once

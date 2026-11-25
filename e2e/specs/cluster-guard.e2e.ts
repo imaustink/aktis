@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { customClusterContext } from "../support/guard.js";
+import { builtInContexts, customClusterContext, fileClusterProvider } from "../support/guard.js";
 
 /**
  * The one door in the context guard that is not a hardcoded name, checked with
@@ -44,6 +44,44 @@ describe("the context guard's custom-cluster door", () => {
 });
 
 /**
+ * On an Apple-silicon Mac the local cluster is ferry, and the suite must not
+ * wander onto a leftover Docker Desktop-backed `minikube` or `kind-aktis`
+ * context just because it is still current. Off the Mac nothing changes.
+ */
+describe("the built-in contexts allowed on this machine", () => {
+  const mac = { platform: "darwin", arch: "arm64" };
+
+  it("is only ferry on an Apple-silicon Mac by default", () => {
+    expect(builtInContexts({ ...mac, provider: undefined })).toEqual(["ferry-aktis"]);
+    expect(builtInContexts({ ...mac, provider: "" })).toEqual(["ferry-aktis"]);
+    expect(builtInContexts({ ...mac, provider: "ferry" })).toEqual(["ferry-aktis"]);
+  });
+
+  it("is only the deliberately selected provider's context on a Mac", () => {
+    expect(builtInContexts({ ...mac, provider: "minikube" })).toEqual(["minikube"]);
+    expect(builtInContexts({ ...mac, provider: "kind" })).toEqual(["kind-aktis"]);
+    // custom adds its own context through customClusterContext, nothing here;
+    // an unknown name allows nothing rather than everything.
+    expect(builtInContexts({ ...mac, provider: "custom" })).toEqual([]);
+    expect(builtInContexts({ ...mac, provider: "production" })).toEqual([]);
+  });
+
+  it("is every built-in context elsewhere", () => {
+    const all = ["ferry-aktis", "minikube", "kind-aktis"];
+    expect(builtInContexts({ platform: "linux", arch: "x64", provider: undefined })).toEqual(all);
+    expect(builtInContexts({ platform: "linux", arch: "arm64", provider: "ferry" })).toEqual(all);
+    expect(builtInContexts({ platform: "darwin", arch: "x64", provider: undefined })).toEqual(all);
+  });
+
+  it("reads the provider from cluster.local.env", () => {
+    expect(fileClusterProvider("AKTIS_CLUSTER=minikube\n")).toBe("minikube");
+    expect(fileClusterProvider('export AKTIS_CLUSTER="kind"\n')).toBe("kind");
+    expect(fileClusterProvider("# AKTIS_CLUSTER=kind\n")).toBeUndefined();
+    expect(fileClusterProvider("")).toBeUndefined();
+  });
+});
+
+/**
  * The guard's verdict must still bind the LAST kubectl call of a run, not just
  * the first. `current-context` is machine-wide: another terminal or session can
  * select a different cluster mid-run, and the guard is memoized, so re-running
@@ -61,7 +99,7 @@ describe("a mid-run context switch cannot redirect the suite", () => {
     const dir = mkdtempSync(join(tmpdir(), "e2e-kubectl-ctx-"));
     const ctxFile = join(dir, "ctx");
     const calls = join(dir, "calls");
-    writeFileSync(ctxFile, "minikube\n");
+    writeFileSync(ctxFile, "ferry-aktis\n");
     writeFileSync(
       join(dir, "kubectl"),
       `#!/bin/sh\ncase "$*" in\n  *"config current-context"*) cat '${ctxFile}' ;;\n  *) echo "$*" >> '${calls}'; echo '{}' ;;\nesac\n`,
@@ -79,7 +117,7 @@ describe("a mid-run context switch cannot redirect the suite", () => {
 
       const recorded = readFileSync(calls, "utf8").trim().split("\n");
       expect(recorded).toHaveLength(2);
-      for (const line of recorded) expect(line).toMatch(/^--context minikube /);
+      for (const line of recorded) expect(line).toMatch(/^--context ferry-aktis /);
       expect(recorded[1]).toContain("delete agentrun after-the-switch");
     } finally {
       process.env.PATH = original;

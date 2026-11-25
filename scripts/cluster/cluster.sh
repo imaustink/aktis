@@ -9,7 +9,7 @@
 #   ./scripts/cluster/cluster.sh skaffold ...    skaffold, with the provider's flags
 #
 # The provider comes from AKTIS_CLUSTER (environment, then cluster.local.env),
-# defaulting to ferry on an Apple-silicon Mac that has it and minikube
+# defaulting to ferry on an Apple-silicon Mac and minikube
 # elsewhere.
 
 set -euo pipefail

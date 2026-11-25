@@ -89,7 +89,7 @@ describe("agentRunsSince tolerates the cluster's second-granularity timestamps",
     // `get agentruns -o json` under test.
     writeFileSync(
       join(dir, "kubectl"),
-      `#!/bin/sh\ncase "$*" in\n  *"config current-context"*) echo minikube ;;\n  *) cat <<'JSON'\n${payload}\nJSON\n  ;;\nesac\n`,
+      `#!/bin/sh\ncase "$*" in\n  *"config current-context"*) echo ferry-aktis ;;\n  *) cat <<'JSON'\n${payload}\nJSON\n  ;;\nesac\n`,
       { mode: 0o755 },
     );
     process.env.PATH = `${dir}:${original ?? ""}`;

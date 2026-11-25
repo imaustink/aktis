@@ -20,7 +20,7 @@
 # Selection, first match wins:
 #   1. AKTIS_CLUSTER in the environment
 #   2. AKTIS_CLUSTER in <repo>/cluster.local.env (gitignored)
-#   3. ferry on an Apple-silicon Mac that has it installed, otherwise minikube
+#   3. ferry on an Apple-silicon Mac (installed or not -- see below), otherwise minikube
 # except `custom`, which only counts when cluster.local.env itself selects it
 # (the same rule e2e/support/guard.ts applies).
 #
@@ -34,8 +34,13 @@ CLUSTER_LOCAL_ENV="$CLUSTER_REPO_ROOT/cluster.local.env"
 
 cluster_die() { echo "✗ $*" >&2; exit 1; }
 
+# On Apple silicon the default is ferry whether or not it is installed yet:
+# provider_up then stops with the install command. Falling back to minikube
+# instead would quietly launch Docker Desktop (cluster_ensure_docker) and put
+# the dev and e2e stacks on a cluster nobody chose. Pick minikube/kind
+# deliberately with AKTIS_CLUSTER if that is what you want.
 cluster_default_provider() {
-  if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]] && command -v ferry >/dev/null 2>&1; then
+  if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
     echo ferry
   else
     echo minikube

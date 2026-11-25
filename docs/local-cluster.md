@@ -5,13 +5,18 @@ both need a Kubernetes cluster on your machine. Which one is a choice:
 
 | provider | context | when |
 | --- | --- | --- |
-| `ferry` | `ferry-aktis` | **the default on an Apple-silicon Mac** with [ferry](https://github.com/imaustink/ferry) installed |
+| `ferry` | `ferry-aktis` | **the default on an Apple-silicon Mac** — install [ferry](https://github.com/imaustink/ferry) first; the scripts stop with the install command rather than fall back to Docker Desktop |
 | `minikube` | `minikube` | the default everywhere else |
 | `kind` | `kind-aktis` | if you prefer it |
 | `custom` | yours | any other Kubernetes: Apple's `container` cluster, k3d, OrbStack, Docker Desktop's |
 
 CI is not on this list and is not affected by it: no workflow brings a cluster
 up through these scripts.
+
+On an Apple-silicon Mac the e2e suite also only accepts `ferry-aktis` unless
+you selected another provider with `AKTIS_CLUSTER` (`e2e/support/guard.ts`), so
+a leftover `minikube`, `kind-aktis` or Docker Desktop context is refused rather
+than tested against.
 
 ```sh
 ./scripts/cluster/cluster.sh up        # start it, point kubectl at it
