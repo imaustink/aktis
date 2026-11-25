@@ -38,3 +38,25 @@ export async function deleteRedisKeys(pattern: string): Promise<number> {
   for (const key of keys) await redisCli(["DEL", key]);
   return keys.length;
 }
+
+/**
+ * Deletes the chat facade's session records (`sess:<sessionId>`, the
+ * orchestrator's RedisSessionStore) whose session id matches one of
+ * `sessionIdPatterns` (Redis glob syntax).
+ *
+ * Never `sess:*`: spec files run CONCURRENTLY against one Redis
+ * (vitest.config.ts), so that would drop other files' parked turns and
+ * session-page records mid-test. Each file passes only patterns for the
+ * session ids it creates itself -- its own chat session prefix, its own
+ * issues' `<trigger prefix>:<owner>/<repo>#<n>` keys.
+ */
+export async function deleteSessionRecords(...sessionIdPatterns: string[]): Promise<number> {
+  let deleted = 0;
+  for (const pattern of sessionIdPatterns) {
+    if (!pattern || /^[*?]/.test(pattern)) {
+      throw new Error(`e2e: session pattern ${JSON.stringify(pattern)} is not scoped to one spec file`);
+    }
+    deleted += await deleteRedisKeys(`sess:${pattern}`);
+  }
+  return deleted;
+}

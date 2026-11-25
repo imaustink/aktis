@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { requireLocalClusterContext } from "../support/guard.js";
-import { cleanupAgentRunsSince } from "../support/k8s.js";
+import { cleanupAgentRunsSince, runsMark } from "../support/k8s.js";
 import { seedAllClaudeCredentials } from "../support/credential-store.js";
 import {
   EVENT_SECRETS,
@@ -71,7 +71,7 @@ describe("reply.http from slack / ci / generic-hmac", () => {
   let replySecret: string;
 
   beforeAll(async () => {
-    startedAt = new Date();
+    startedAt = await runsMark();
     await ensureEventSecrets();
     await resetFakeSink();
     replySecret = await replySigningSecret();

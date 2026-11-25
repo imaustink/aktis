@@ -192,11 +192,22 @@ integration-gateway:
     # webhook's senderLogin (ADR 0029), not handed to it preconfigured. If
     # these subjects were already canonical the identity-keying spec would
     # pass without the code under test doing anything.
+    #
+    # One login per spec file that drives webhooks: the files run
+    # concurrently, and a shared login would mean a shared credential subject
+    # (github:<login>) that one file seeds while another needs it empty.
+    # e2e-user / E2E-User belong to the identity specs alone.
     githubIdentities: |
       {
-        "e2e-user":       {"subject": "e2e-static-user",  "roles": ["reader", "writer"]},
-        "e2e-other-user": {"subject": "e2e-static-other", "roles": ["reader", "writer"]},
-        "E2E-User":       {"subject": "e2e-static-user",  "roles": ["reader", "writer"]}
+        "e2e-user":            {"subject": "e2e-static-user",       "roles": ["reader", "writer"]},
+        "e2e-other-user":      {"subject": "e2e-static-other",      "roles": ["reader", "writer"]},
+        "E2E-User":            {"subject": "e2e-static-user",       "roles": ["reader", "writer"]},
+        "e2e-happy-user":      {"subject": "e2e-static-happy",      "roles": ["reader", "writer"]},
+        "e2e-label-user":      {"subject": "e2e-static-label",      "roles": ["reader", "writer"]},
+        "e2e-readonly-user":   {"subject": "e2e-static-readonly",   "roles": ["reader", "writer"]},
+        "e2e-gh-trigger-user": {"subject": "e2e-static-gh-trigger", "roles": ["reader", "writer"]},
+        "e2e-filtering-user":  {"subject": "e2e-static-filtering",  "roles": ["reader", "writer"]},
+        "e2e-resilience-user": {"subject": "e2e-static-resilience", "roles": ["reader", "writer"]}
       }
 
     # Aggressively short, and this is load-bearing for suite reliability.

@@ -7,27 +7,37 @@ import {
   cleanupAgentRunsSince,
   waitFor,
   withPortForward,
+  runsMark,
 } from "../support/k8s.js";
-import { chatSubject, chatTurn } from "../support/chat.js";
+import { ANY_LINK_PROMPT, chatSubject, chatTurn } from "../support/chat.js";
 import { identityLinkLogin, identityLinkTokenStatus } from "../support/gateway-api.js";
 import {
   claudeCredentialSubjects,
   deleteCredentials,
   githubLinkExpiry,
-  hasGithubLink,
+  ownCredentialSubjects,
   seedAllClaudeCredentials,
   seedGithubLink,
 } from "../support/credential-store.js";
-import { deleteRedisKeys } from "../support/redis.js";
-import { bounceRedis } from "../support/resilience.js";
+import { deleteSessionRecords } from "../support/redis.js";
 import { issueLabeledPayload, postGithubWebhook } from "../support/webhook.js";
 import { fakeGithubRequests, resetFakeGithub, webhookSecret } from "../support/fixtures.js";
+import { E2E_USER_LOCK, holdLock } from "../support/locks.js";
 
 requireLocalClusterContext();
+
+// Shares github:e2e-user, and asserts on every GitHub login request, with
+// repo-read-gate.e2e.ts; see E2E_USER_LOCK. (The Redis-restart describe that
+// lived here is identity-redis-restart.e2e.ts, in the exclusive phase.)
+holdLock(E2E_USER_LOCK);
 
 const GATEWAY_PORT = 18092;
 const SENDER = "e2e-user";
 const CANONICAL = `github:${SENDER}`;
+// Written by the product, not only seeded here: adoption MOVES a chat
+// caller's credential onto this principal, and the next test must not
+// inherit it.
+ownCredentialSubjects(CANONICAL);
 /** What integration-gateway's own OIDC service token resolves to for EVERY webhook turn. */
 const SHARED_SERVICE_SUBJECT = "client-integration-gateway";
 
@@ -44,7 +54,25 @@ const SHARED_SERVICE_SUBJECT = "client-integration-gateway";
  * but is entirely test-owned shared state.
  */
 const RUN_ID = Date.now() % 100000;
-const issueNo = (offset: number): number => RUN_ID + offset;
+/** Every issue this file has sent a webhook for, so `resetOwnSessions` can clear exactly those. */
+const issuesUsed = new Set<number>();
+const issueNo = (offset: number): number => {
+  issuesUsed.add(RUN_ID + offset);
+  return RUN_ID + offset;
+};
+
+/** Every chat session id this file uses starts with this. */
+const SESSION_PREFIX = "e2e-identity-keying-";
+
+/**
+ * Clears this file's own facade session records: its chat sessions, and the
+ * `github:<repo>#<n>` session of every issue it has used (which a vitest retry
+ * of a test reuses). Never `sess:*` -- other spec files run concurrently and
+ * their parked turns live there too.
+ */
+async function resetOwnSessions(): Promise<void> {
+  await deleteSessionRecords(`${SESSION_PREFIX}*`, ...[...issuesUsed].map((n) => `github:e2e-org/e2e-repo#${n}`));
+}
 
 /**
  * The regression this suite exists for.
@@ -87,7 +115,7 @@ describe("credential keying converges across entry points (ADR 0029/0030)", () =
     // Every test decides its own seeding, so start with nothing: a leftover
     // record is indistinguishable from a correctly-resolved one.
     await deleteCredentials("claude-auth");
-    await deleteRedisKeys("sess:*");
+    await resetOwnSessions();
   });
 
   async function trigger(issueNumber: number, senderLogin: string): Promise<void> {
@@ -103,9 +131,37 @@ describe("credential keying converges across entry points (ADR 0029/0030)", () =
     });
   }
 
+  /**
+   * Waits for the gate's refusal on `issueNumber` -- the link prompt comment --
+   * then asserts nothing launched.
+   *
+   * This replaced a fixed 60s sleep, and is the stronger check as well as the
+   * faster one: the gateway posts the prompt only once the turn has FINISHED as
+   * link-required (runs/workflows.ts), and re-submits only after a link lands,
+   * so after the prompt no launch can follow. A sleep passed equally when the
+   * turn never reached the gate at all.
+   */
+  async function expectRefusedWithoutLaunch(issueNumber: number, startedAt: Date): Promise<void> {
+    await waitFor(
+      `the link prompt on issue #${issueNumber} (the gate's refusal)`,
+      async () =>
+        (await fakeGithubRequests()).find(
+          (r) =>
+            r.method === "POST" &&
+            r.path === `/repos/e2e-org/e2e-repo/issues/${issueNumber}/comments` &&
+            typeof r.body === "string" &&
+            ANY_LINK_PROMPT.test(r.body),
+        ),
+      // A Claude link prompt waits on a PTY flow bounded at 30s, behind
+      // whatever else the cluster is doing.
+      { timeoutMs: 180_000 },
+    );
+    expect(await agentRunsSince(startedAt)).toHaveLength(0);
+  }
+
   it("resolves a webhook turn's Claude credentials from github:<senderLogin>", async () => {
     await seedAllClaudeCredentials(CANONICAL);
-    const startedAt = new Date();
+    const startedAt = await runsMark();
 
     await trigger(issueNo(1), SENDER);
 
@@ -152,31 +208,25 @@ describe("credential keying converges across entry points (ADR 0029/0030)", () =
     // turn keyed on this one subject, so whoever authorized first silently
     // shared their Claude credential with every other user of the system.
     await seedAllClaudeCredentials(SHARED_SERVICE_SUBJECT);
-    const startedAt = new Date();
+    const startedAt = await runsMark();
 
     await trigger(issueNo(2), SENDER);
-
-    // Give the turn real time to launch if it were going to; absence is the
-    // assertion here, so it must not be a race.
-    await new Promise((r) => setTimeout(r, 60_000));
-    expect(await agentRunsSince(startedAt)).toHaveLength(0);
+    await expectRefusedWithoutLaunch(issueNo(2), startedAt);
   });
 
   it("does not let one sender's credential satisfy another sender's turn", async () => {
     await seedAllClaudeCredentials("github:someone-else");
-    const startedAt = new Date();
+    const startedAt = await runsMark();
 
     await trigger(issueNo(3), SENDER);
-
-    await new Promise((r) => setTimeout(r, 60_000));
-    expect(await agentRunsSince(startedAt)).toHaveLength(0);
+    await expectRefusedWithoutLaunch(issueNo(3), startedAt);
   });
   it("treats webhook casing and OAuth casing as one subject", async () => {
     // GitHub echoes original casing in webhooks but normalizes it in the OAuth
     // user API. Two casings keying two records is precisely the re-prompt loop
     // this all started from.
     await seedAllClaudeCredentials(CANONICAL);
-    const startedAt = new Date();
+    const startedAt = await runsMark();
 
     await trigger(issueNo(4), "E2E-User");
 
@@ -230,7 +280,7 @@ describe("chat and triage converge on one credential (ADR 0031)", () => {
    * silently-different second one instead of a clean re-run.
    */
   function session(label: string): string {
-    return `e2e-identity-keying-${label}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    return `${SESSION_PREFIX}${label}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
 
   /**
@@ -256,7 +306,7 @@ describe("chat and triage converge on one credential (ADR 0031)", () => {
   beforeEach(async () => {
     await resetFakeGithub();
     await deleteCredentials();
-    await deleteRedisKeys("sess:*");
+    await resetOwnSessions();
   });
 
   it("resolves a chat turn's credentials from the principal, not the openwebui subject", async () => {
@@ -264,7 +314,7 @@ describe("chat and triage converge on one credential (ADR 0031)", () => {
     // own subject it would find nothing and park, so a launch is the proof.
     await seedGithubLink(CHAT_SUBJECT, SENDER);
     await seedAllClaudeCredentials(CANONICAL);
-    const startedAt = new Date();
+    const startedAt = await runsMark();
 
     await chatTurn(CHAT_USER, REQUEST, { sessionId: session("principal-not-openwebui-subject") });
 
@@ -284,7 +334,7 @@ describe("chat and triage converge on one credential (ADR 0031)", () => {
     // Converging must MOVE it, not re-prompt for it.
     await seedGithubLink(CHAT_SUBJECT, SENDER);
     await seedAllClaudeCredentials(CHAT_SUBJECT);
-    const startedAt = new Date();
+    const startedAt = await runsMark();
 
     await chatTurn(CHAT_USER, REQUEST, { sessionId: session("adopts-pre-principal") });
 
@@ -305,7 +355,7 @@ describe("chat and triage converge on one credential (ADR 0031)", () => {
     // record; nothing may pull in one keyed to anyone else.
     await seedGithubLink(CHAT_SUBJECT, SENDER);
     await seedAllClaudeCredentials("github:someone-else");
-    const startedAt = new Date();
+    const startedAt = await runsMark();
 
     // The turn must not LAUNCH. How it declines is deliberately not asserted:
     // with nothing at this caller's principal the pre-flight tries to start a
@@ -320,6 +370,9 @@ describe("chat and triage converge on one credential (ADR 0031)", () => {
     await chatTurn(CHAT_USER, REQUEST, {
       sessionId: session("no-cross-human-credential"),
       allowPark: true,
+      // The refusal is decided before the prompt streams; the dwell still
+      // covers a few auto-resumes, each of which must refuse too.
+      stopParkedAfter: { match: ANY_LINK_PROMPT },
       timeoutMs: 90_000,
     });
 
@@ -339,7 +392,7 @@ describe("chat and triage converge on one credential (ADR 0031)", () => {
     // the prompt is what this asserts on.
     await seedGithubLink(CHAT_SUBJECT, SENDER, { expired: true });
     await seedAllClaudeCredentials(CANONICAL);
-    const startedAt = new Date();
+    const startedAt = await runsMark();
 
     const turn = await chatTurn(CHAT_USER, REQUEST, { sessionId: session("expired-link-no-reprompt") });
 
@@ -371,8 +424,8 @@ describe("chat and triage converge on one credential (ADR 0031)", () => {
     // fake-github completes a device code on its very first poll, so a
     // resume that reaches the poll at all should launch immediately.
     await seedAllClaudeCredentials(CANONICAL);
-    const startedAt = new Date();
-    const sessionId = `e2e-resume-anchor-${Date.now()}`;
+    const startedAt = await runsMark();
+    const sessionId = `${SESSION_PREFIX}resume-anchor-${Date.now()}`;
 
     // Device flow asked for per turn. The e2e deployment defaults to
     // authcode, and switching that default would change every other chat
@@ -412,11 +465,12 @@ describe("chat and triage converge on one credential (ADR 0031)", () => {
     // still exists for a link that genuinely cannot be started; it simply is not
     // what an unlinked caller hits.
     await seedAllClaudeCredentials(CANONICAL);
-    const startedAt = new Date();
+    const startedAt = await runsMark();
 
     const turn = await chatTurn(CHAT_USER, REQUEST, {
       sessionId: session("no-link-at-all"),
       allowPark: true,
+      stopParkedAfter: { match: ANY_LINK_PROMPT },
       timeoutMs: 90_000,
     });
 
@@ -481,98 +535,6 @@ describe("an expired GitHub link refreshes rather than reading as dead (ADR 0031
 });
 
 /**
- * The credential store outlives the infrastructure it runs alongside
- * (docs/adr/0034).
- *
- * This is the spec the reported incident needed and no existing one covered.
- * Every keying spec above seeds a credential and asserts WHERE it is read from,
- * which is exactly the right question and completely blind to the one that
- * actually broke: whether it is still there at all. The store was Redis, that
- * Redis runs with `--save "" --appendonly no` on an emptyDir, its pod restarted,
- * and every credential in the cluster was gone. The pre-flight then behaved
- * perfectly -- resolved the right principal, looked under it, found nothing --
- * and asked a user who had authorized months earlier to authorize again.
- *
- * Which is why the assertion is deliberately made ACROSS a real pod deletion
- * rather than against a store abstraction: nothing observable in-process
- * distinguishes "durable" from "durable until this pod moves". Redis is left
- * ephemeral on purpose. The credentials are not in it any more, and that is the
- * property under test.
- */
-describe("linked credentials survive a Redis restart (ADR 0034)", () => {
-  const CHAT_USER = "e2e-durability-user";
-  const SUBJECT = chatSubject(CHAT_USER);
-  const REQUEST = "Delegate this to stub-agent: fix the failing test in e2e-org/e2e-repo";
-  /** Either agent proves the point -- both declare the Claude providers the gate resolves. */
-  const CREDENTIAL_AGENTS = ["stub-agent", "claude-code-swe-agent"];
-  let suiteStartedAt: Date;
-
-  /** Local mirror of the sibling block's helper; the constants above are block-scoped. */
-  async function expectCredentialAgent(startedAt: Date, what: string): Promise<{ name: string }> {
-    const run = await waitFor(what, async () => (await agentRunsSince(startedAt))[0], { timeoutMs: 420_000 });
-    const ref = await agentRunAgentRef(run.name);
-    expect(CREDENTIAL_AGENTS, `planner selected ${ref}`).toContain(ref);
-    return run;
-  }
-
-  beforeAll(() => {
-    suiteStartedAt = new Date();
-  });
-
-  afterAll(async () => {
-    await cleanupAgentRunsSince(suiteStartedAt);
-  });
-
-  beforeEach(async () => {
-    await resetFakeGithub();
-    await deleteCredentials();
-    await deleteRedisKeys("sess:*");
-  });
-
-  it("keeps both Claude credentials and the GitHub link across the restart", async () => {
-    await seedGithubLink(SUBJECT, SENDER);
-    await seedAllClaudeCredentials(CANONICAL);
-
-    expect(await claudeCredentialSubjects("setup-token")).toContain(CANONICAL);
-    expect(await claudeCredentialSubjects("login")).toContain(CANONICAL);
-    expect(await hasGithubLink(SUBJECT)).toBe(true);
-
-    const { oldPod, newPodReadyMs } = await bounceRedis();
-    console.log(`  [durability] replaced Redis pod ${oldPod}; new pod Ready in ${newPodReadyMs}ms`);
-
-    // Before ADR 0034 all three of these were empty here, which is the whole
-    // incident in three assertions.
-    expect(await claudeCredentialSubjects("setup-token")).toContain(CANONICAL);
-    expect(await claudeCredentialSubjects("login")).toContain(CANONICAL);
-    expect(await hasGithubLink(SUBJECT)).toBe(true);
-  });
-
-  it("still authorizes a turn after the restart instead of asking for a re-link", async () => {
-    // The behavioural half. Surviving as a stored record is necessary but not
-    // sufficient -- the gateway has to still READ it after its own connection to
-    // the vanished pod broke, which is the failure mode a store-level assertion
-    // alone would miss.
-    await seedGithubLink(SUBJECT, SENDER);
-    await seedAllClaudeCredentials(CANONICAL);
-    await bounceRedis();
-
-    const startedAt = new Date();
-    await chatTurn(CHAT_USER, REQUEST);
-
-    // A launch is the proof: the gate refuses to launch without both Claude
-    // credentials resolved, so reaching an AgentRun means it found them where
-    // the restart was supposed to have destroyed them.
-    const run = await expectCredentialAgent(
-      startedAt,
-      "an AgentRun to launch on credentials that outlived the Redis restart",
-    );
-    const envNames = await agentRunSecretEnvNames(run.name);
-    expect(envNames).toContain("CLAUDE_CODE_OAUTH_TOKEN");
-    expect(envNames).toContain("CLAUDE_LOGIN_CREDENTIALS_JSON");
-  });
-});
-
-/**
  * A turn that needs more than one credential asks for all of them ONCE.
  *
  * The regression, in the user's words: "I was prompted to auth in the triage
@@ -625,7 +587,7 @@ describe("a turn needing two credentials asks for both at once (ADR 0030 §4)", 
     // Nothing seeded: BOTH Claude link flows must be started for real, which is
     // the condition that needs two `claude` PTYs alive at once.
     await deleteCredentials();
-    await deleteRedisKeys("sess:*");
+    await resetOwnSessions();
   });
 
   it("offers both Claude link steps in a single comment, naming them distinctly", async () => {

@@ -79,16 +79,13 @@ export async function ensureFakeGithub(): Promise<void> {
 }
 
 /**
- * Every request fake-github has recorded.
- *
- * Uses `fetchThrough` rather than a bare `fetch` for a reason with a scar: this
- * is polled repeatedly by `commentOn`-style waits, and Node's fetch has no
- * default timeout, so a port-forward dropped mid-poll left this awaiting a socket
- * nobody would ever answer. `waitFor` was then stuck inside a probe that could not
- * finish and never re-checked its own deadline — a resilience run sat silent for
- * eight minutes on exactly this.
+ * Where this spec file's view of fake-github's request log starts: an index
+ * into the log, set by {@link resetFakeGithub}. Module state, so it is per spec
+ * FILE (vitest isolates each file's modules).
  */
-export async function fakeGithubRequests(): Promise<RecordedRequest[]> {
+let requestsFrom = 0;
+
+async function allRecordedRequests(): Promise<RecordedRequest[]> {
   return withPortForward("fake-github", 80, FAKE_GITHUB_PORT, async (_baseUrl, forward) => {
     const res = await fetchThrough(forward, "/_e2e/requests");
     return (await res.json()) as RecordedRequest[];
@@ -96,13 +93,36 @@ export async function fakeGithubRequests(): Promise<RecordedRequest[]> {
 }
 
 /**
- * Clears fake-github's recorded requests so a test asserts only on traffic it
- * caused. Called in `beforeAll` rather than `afterAll`: a run that crashes
- * mid-test should leave its evidence in place for inspection.
+ * Every request fake-github has recorded since this spec file last called
+ * {@link resetFakeGithub}.
+ *
+ * Uses `fetchThrough` rather than a bare `fetch` for a reason with a scar: this
+ * is polled repeatedly by `commentOn`-style waits, and Node's fetch has no
+ * default timeout, so a port-forward dropped mid-poll left this awaiting a socket
+ * nobody would ever answer. `waitFor` was then stuck inside a probe that could not
+ * finish and never re-checked its own deadline — a resilience run sat silent for
+ * eight minutes on exactly this.
+ *
+ * Spec files run concurrently, so this can include OTHER files' traffic from
+ * the same window. Filter on something this file owns (an issue number, a
+ * repository) before asserting; an assertion over ALL traffic (no `/login/`
+ * calls, say) needs the file to hold the matching lock (support/locks.ts).
+ */
+export async function fakeGithubRequests(): Promise<RecordedRequest[]> {
+  return (await allRecordedRequests()).slice(requestsFrom);
+}
+
+/**
+ * Starts this spec file's view of fake-github's recorded requests afresh, so a
+ * test asserts only on traffic from after this point. Called in `beforeAll` /
+ * `beforeEach` rather than `afterAll`: a run that crashes mid-test should leave
+ * its evidence in place for inspection.
+ *
+ * Moves this file's read position instead of clearing the log, which is shared
+ * by every spec file: with files running concurrently, a clear erased requests
+ * a neighbour had just caused and was about to assert on.
  */
 export async function resetFakeGithub(): Promise<void> {
   await ensureFakeGithub();
-  await withPortForward("fake-github", 80, FAKE_GITHUB_PORT, async (_baseUrl, forward) => {
-    await fetchThrough(forward, "/_e2e/reset", { method: "POST" });
-  });
+  requestsFrom = (await allRecordedRequests()).length;
 }

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { requireLocalClusterContext } from "../support/guard.js";
-import { cleanupAgentRunsSince, fetchThrough, waitFor } from "../support/k8s.js";
+import { claimRuns, cleanupAgentRunsSince, fetchThrough, waitFor, runsMark } from "../support/k8s.js";
 import { resetFakeGithub } from "../support/fixtures.js";
 import { seedAllClaudeCredentials } from "../support/credential-store.js";
 import { resetStubPacing } from "../support/resilience.js";
@@ -49,7 +49,9 @@ requireLocalClusterContext();
  * show is that the flag ARRIVES.
  */
 
-const SENDER = "e2e-user";
+// This file's own sender, so its credential subject (github:<sender>) is no
+// concurrent spec file's: identity-keying needs github:e2e-user EMPTY.
+const SENDER = "e2e-readonly-user";
 const OWNER = "e2e-org";
 const REPO = "e2e-repo";
 /** The /invoke caller every gateway-relayed turn without a verified sender runs as (values-e2e.yaml staticIdentities). */
@@ -118,7 +120,7 @@ describe("EventTrigger target.readOnly reaches the run", () => {
 
   it("issue labeled ai-review -> github-issue-review: read-only on the CR, in the Job, and in the process", async () => {
     const issue = next();
-    const startedAt = new Date();
+    const startedAt = await runsMark();
     await deliver(secret, "issues", issue, "ai-review");
 
     const run = await waitForAgentRunWithParam(startedAt, "number", String(issue));
@@ -131,7 +133,7 @@ describe("EventTrigger target.readOnly reaches the run", () => {
   it("PR labeled ai-review -> github-pr-review is read-only; PR labeled ai-triage -> github-pr-triage is NOT (control)", async () => {
     const reviewPr = next();
     const triagePr = next();
-    const startedAt = new Date();
+    const startedAt = await runsMark();
     await deliver(secret, "pull_request", reviewPr, "ai-review");
     await deliver(secret, "pull_request", triagePr, "ai-triage");
 
@@ -159,7 +161,7 @@ describe("EventTrigger target.readOnly reaches the run", () => {
       // One review on a fresh issue; everything below continues ITS session
       // (`github:e2e-org/e2e-repo#<issue>`, both triggers' sessionKey).
       issue = next();
-      const startedAt = new Date();
+      const startedAt = await runsMark();
       await deliver(secret, "issues", issue, "ai-review");
       const run = await waitForAgentRunWithParam(startedAt, "number", String(issue));
       expect(run.readOnly).toBe(true);
@@ -177,7 +179,11 @@ describe("EventTrigger target.readOnly reaches the run", () => {
       const token = /\/sessions\/([A-Za-z0-9_-]+)/.exec(ack?.text ?? "")?.[1];
       expect(token, "the review's ack comment carries no session-page link").toBeTruthy();
 
-      const startedAt = new Date();
+      const startedAt = await runsMark();
+      // The follow-up carries no params and runs as the shared subject, so
+      // the only thing that marks a run it launches as this file's is its
+      // goal, which restates the prompt's issue.
+      claimRuns({ kind: "goal", includes: `#${issue}` });
       const status = await withGateway(async (forward) => {
         const res = await fetchThrough(forward, `/sessions/${token}/prompts`, {
           method: "POST",
@@ -209,9 +215,10 @@ describe("EventTrigger target.readOnly reaches the run", () => {
       );
 
       // A plain conversational turn -- no trigger, so no params to match on;
-      // any run launched since the prompt is this turn's (the suite is serial).
-      // The invariant: nothing it launched may be writable. The follow-up may
-      // launch nothing at all, so this loop can be vacuous; the sticky flag
+      // the goal claim above is what picks out a run it launched from the
+      // runs concurrent spec files launch meanwhile. The invariant: nothing it
+      // launched may be writable. The follow-up may launch nothing at all, so
+      // this loop can be vacuous; the sticky flag
       // for a follow-up is pinned by the Go engine's
       // TestReadOnlyIsStickyUntilATriggerSetsItAgain.
       const runs = await agentRunDetailsSince(startedAt);
@@ -227,7 +234,7 @@ describe("EventTrigger target.readOnly reaches the run", () => {
         (last, c, i) => (c.text.includes(STUB_REPLY_MARKER) ? i : last),
         reviewReplyIndex,
       );
-      const startedAt = new Date();
+      const startedAt = await runsMark();
       await deliver(secret, "issues", issue, "ai-triage");
       const run = await waitForAgentRunWithParam(startedAt, "label", "ai-triage");
       expect(run.params.number).toBe(String(issue));

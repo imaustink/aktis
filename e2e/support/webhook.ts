@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { fetchThrough, type PortForward } from "./k8s.js";
+import { claimRuns, fetchThrough, type PortForward } from "./k8s.js";
 
 /**
  * Signs and posts events to integration-gateway's generic ingestion endpoints
@@ -182,6 +182,16 @@ function githubSender(login: string, isBot = false) {
 }
 
 /**
+ * Every GitHub payload built here is for a delivery this spec file is about to
+ * send, so building one claims the run it may launch (k8s.ts claimRuns): the
+ * file's run helpers then recognize that run as its own, by the repository and
+ * number the shipped GitHub triggers copy into `spec.params`.
+ */
+function claimIssue(owner: string, repo: string, number: number): void {
+  claimRuns({ kind: "issue", repository: `${owner}/${repo}`, number });
+}
+
+/**
  * An `issues.labeled` payload -- the ai-triage / ai-review entry point.
  *
  * `sender.login` is the only per-user identifier a webhook-driven turn carries
@@ -208,6 +218,7 @@ export function issueLabeledPayload({
   title?: string;
   body?: string;
 }) {
+  claimIssue(owner, repo, issueNumber);
   return {
     action: "labeled",
     label: { name: label },
@@ -236,6 +247,7 @@ export function issueOpenedPayload({
   senderLogin: string;
   labels?: string[];
 }) {
+  claimIssue(owner, repo, issueNumber);
   return {
     action: "opened",
     issue: {
@@ -269,6 +281,7 @@ export function pullRequestPayload({
   title?: string;
   body?: string;
 }) {
+  claimIssue(owner, repo, number);
   return {
     action,
     number,

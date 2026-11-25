@@ -7,14 +7,21 @@ import {
   cleanupAgentRunsSince,
   waitFor,
   withPortForward,
+  runsMark,
 } from "../support/k8s.js";
 import { chatSubject, chatTurn } from "../support/chat.js";
 import { deleteCredentials, seedAllClaudeCredentials, seedGithubLink } from "../support/credential-store.js";
-import { deleteRedisKeys } from "../support/redis.js";
+import { deleteSessionRecords } from "../support/redis.js";
 import { fakeGithubRequests, resetFakeGithub, webhookSecret } from "../support/fixtures.js";
 import { issueLabeledPayload, postGithubWebhook } from "../support/webhook.js";
+import { waitForAgentRunWithParam } from "../support/events.js";
+import { E2E_USER_LOCK, holdLock } from "../support/locks.js";
 
 requireLocalClusterContext();
+
+// Seeds github:e2e-user, and asserts no GitHub login was started by anyone;
+// identity-keying.e2e.ts needs that subject empty and starts logins.
+holdLock(E2E_USER_LOCK);
 
 /**
  * The repository read gate (the Temporal engine's authz.gateRepository).
@@ -52,8 +59,11 @@ describe("an agent that acts on GitHub launches only into a repository its calle
   const CHAT_USER = `e2e-gate-${RUN_ID}`;
   let suiteStartedAt: Date;
 
+  /** Every chat session id this file uses starts with this, and only those records are reset. */
+  const SESSION_PREFIX = "e2e-repo-gate-";
+
   function session(label: string): string {
-    return `e2e-repo-gate-${label}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    return `${SESSION_PREFIX}${label}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
 
   /** Waits out the window a launch would take to appear, then asserts none did. */
@@ -84,7 +94,8 @@ describe("an agent that acts on GitHub launches only into a repository its calle
   beforeEach(async () => {
     await resetFakeGithub();
     await deleteCredentials();
-    await deleteRedisKeys("sess:*");
+    // Only this file's sessions: its chat sessions and its webhook's issue.
+    await deleteSessionRecords(`${SESSION_PREFIX}*`, `github:e2e-org/e2e-repo#${RUN_ID}`);
     // Linked and authorized for everything, so the only thing that can stop a
     // launch is the read gate itself.
     await seedGithubLink(chatSubject(CHAT_USER), SENDER);
@@ -93,7 +104,7 @@ describe("an agent that acts on GitHub launches only into a repository its calle
 
   describe("from chat", () => {
     it("launches into a repository the caller can read, checked with their own token", async () => {
-      const startedAt = new Date();
+      const startedAt = await runsMark();
 
       await chatTurn(CHAT_USER, "Delegate this to stub-swe-agent: fix the failing test in e2e-org/e2e-repo", {
         sessionId: session("readable"),
@@ -109,7 +120,7 @@ describe("an agent that acts on GitHub launches only into a repository its calle
     });
 
     it("launches nothing into a repository the caller cannot read", async () => {
-      const startedAt = new Date();
+      const startedAt = await runsMark();
 
       const turn = await chatTurn(
         CHAT_USER,
@@ -131,7 +142,7 @@ describe("an agent that acts on GitHub launches only into a repository its calle
     // unit tests; what this pins end to end is that the turn is refused and
     // nothing launches either way.
     it("refuses rather than launching when the request names no repository", async () => {
-      const startedAt = new Date();
+      const startedAt = await runsMark();
 
       const turn = await chatTurn(CHAT_USER, "Delegate this to stub-swe-agent: fix the failing test", {
         sessionId: session("unnamed"),
@@ -144,7 +155,7 @@ describe("an agent that acts on GitHub launches only into a repository its calle
     });
 
     it("resolves a bare repository name against the deployment's default owner", async () => {
-      const startedAt = new Date();
+      const startedAt = await runsMark();
 
       await chatTurn(CHAT_USER, "Delegate this to stub-swe-agent: fix the failing test in the e2e-repo repository", {
         sessionId: session("bare"),
@@ -159,7 +170,7 @@ describe("an agent that acts on GitHub launches only into a repository its calle
 
   describe("from a webhook", () => {
     it("launches into the event's repository without ever touching a user GitHub token", async () => {
-      const startedAt = new Date();
+      const startedAt = await runsMark();
       const secret = await webhookSecret();
 
       await withPortForward("agent-controller-integration-gateway", 8090, GATEWAY_PORT, async (baseUrl) => {
@@ -180,12 +191,12 @@ describe("an agent that acts on GitHub launches only into a repository its calle
       });
 
       // Budget matches identity-keying's webhook specs, for the same measured
-      // reason: a relayed turn queues behind any parked ones.
-      const run = await waitFor(
-        "stub-swe-agent to launch from the review webhook",
-        async () => (await agentRunsSince(startedAt))[0],
-        { timeoutMs: 900_000 },
-      );
+      // reason: a relayed turn queues behind any parked ones. Found by the
+      // issue it was for, not as the newest run: a chat run launched late by
+      // an earlier test is newer, and DOES carry a GITHUB_TOKEN (chat reads
+      // as its caller), which failed the assertion below on a run that was
+      // never this webhook's.
+      const run = await waitForAgentRunWithParam(startedAt, "number", String(RUN_ID), 900_000);
       expect(await agentRunAgentRef(run.name)).toBe(GATED_AGENT);
 
       const env = await agentRunSecretEnvNames(run.name);

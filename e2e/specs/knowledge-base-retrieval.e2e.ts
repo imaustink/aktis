@@ -4,6 +4,7 @@ import { kubectl, kubectlApplyStdin, waitFor } from "../support/k8s.js";
 import { withQdrant, listCollections, pointCount } from "../support/qdrant.js";
 import { chatSubject, chatTurn } from "../support/chat.js";
 import { seedAtlassianLink, deleteCredentials } from "../support/credential-store.js";
+import { ALPHA_KNOWLEDGE_BASE_LOCK, holdLock } from "../support/locks.js";
 
 /**
  * A knowledge base, from a synced corpus to what a caller is allowed to read.
@@ -26,6 +27,10 @@ import { seedAtlassianLink, deleteCredentials } from "../support/credential-stor
  */
 
 requireLocalClusterContext();
+
+// Syncs and queries e2e-alpha / alpha-docs, which knowledge-base-crd.e2e.ts
+// deletes and recreates.
+holdLock(ALPHA_KNOWLEDGE_BASE_LOCK);
 
 const CONNECTION = "e2e-fake-atlassian";
 const CORPUS = "alpha-docs";

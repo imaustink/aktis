@@ -1,7 +1,6 @@
 import { execFile } from "node:child_process";
 import { connect } from "node:net";
-import { requireLocalClusterContext } from "./guard.js";
-import { fetchThrough, openPortForward, waitFor, withPortForward, type PortForward } from "./k8s.js";
+import { fetchThrough, kubectlArgs, localPortFor, openPortForward, waitFor, withPortForward, type PortForward } from "./k8s.js";
 
 /**
  * Reads the orchestrator's REAL Qdrant, so a spec can assert on which
@@ -69,9 +68,8 @@ const QDRANT_GRPC_PORT = 6334;
  * the gRPC listener does not answer HTTP/1.1.
  */
 export async function openQdrantGrpc(): Promise<{ address: string; close: () => void }> {
-  requireLocalClusterContext();
-  const localPort = LOCAL_PORT + 2;
-  const child = execFile("kubectl", ["-n", "controller-agent", "port-forward", `svc/${QDRANT_SERVICE}`, `${localPort}:${QDRANT_GRPC_PORT}`]);
+  const localPort = localPortFor(LOCAL_PORT + 2);
+  const child = execFile("kubectl", kubectlArgs(["port-forward", `svc/${QDRANT_SERVICE}`, `${localPort}:${QDRANT_GRPC_PORT}`]));
   let exited = false;
   child.on("exit", () => {
     exited = true;
@@ -135,6 +133,38 @@ export async function allPointCounts(): Promise<Record<keyof typeof COLLECTIONS,
     agents: await pointCount(baseUrl, COLLECTIONS.agents),
     callerTools: await pointCount(baseUrl, COLLECTIONS.callerTools),
   }));
+}
+
+/**
+ * Points in the engine's CATALOG collections (tools, skills, agents) whose
+ * payload mentions `needle` anywhere, as `<collection>:<name>`.
+ *
+ * The way to ask "did anything of MINE land in the catalog" when other spec
+ * files run concurrently: they legitimately add catalog entries (an MCP tool,
+ * a Skill), so a point COUNT that held still in a serial suite no longer
+ * does. Give what you send a token no one else uses and look for it.
+ */
+export async function catalogPointsMentioning(needle: string): Promise<string[]> {
+  return withQdrant(async (baseUrl) => {
+    const found: string[] = [];
+    for (const key of ["tools", "skills", "agents"] as const) {
+      const collection = COLLECTIONS[key];
+      const res = await fetchThrough({ baseUrl }, `/collections/${collection}/points/scroll`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ limit: 10_000, with_payload: true, with_vector: false }),
+      });
+      if (res.status === 404) continue;
+      if (!res.ok) throw new Error(`e2e: qdrant scroll ${collection} failed: ${res.status} ${await res.text()}`);
+      const body = (await res.json()) as { result: { points: { payload?: Record<string, unknown> }[] } };
+      for (const p of body.result.points) {
+        if (JSON.stringify(p.payload ?? {}).includes(needle)) {
+          found.push(`${key}:${String(p.payload?.name ?? p.payload?.id ?? "?")}`);
+        }
+      }
+    }
+    return found;
+  });
 }
 
 /**

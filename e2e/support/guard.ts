@@ -61,19 +61,27 @@ function allowedContexts(): string[] {
   return custom ? [...LOCAL_CLUSTER_CONTEXTS, custom] : LOCAL_CLUSTER_CONTEXTS;
 }
 
-let verified = false;
+let verified: string | undefined;
 
 /**
- * Aborts unless kubectl is pointed at a local throwaway cluster. Every spec
- * file calls this at module scope, before any fixture allocates anything, so a
- * misconfigured run fails on import rather than midway through creating
- * objects somewhere it shouldn't.
+ * Aborts unless kubectl is pointed at a local throwaway cluster, and returns
+ * the context it verified. Every spec file calls this at module scope, before
+ * any fixture allocates anything, so a misconfigured run fails on import rather
+ * than midway through creating objects somewhere it shouldn't.
  *
  * Memoized: the check shells out, and every spec calling it would otherwise
  * pay for it repeatedly in a serial suite.
+ *
+ * Because it is memoized, the RETURNED name is the guarantee, not the check:
+ * every kubectl spawn must pass it as `--context` (support/k8s.ts's
+ * `kubectlArgs`). `current-context` is machine-wide state that any other
+ * terminal or session can change mid-run, and a memoized "it was fine at
+ * import" does not stop the next call from following the switch. That
+ * happened: a run kept going against `kind-substrate` after another session
+ * selected it, with a teardown that deletes AgentRuns and Secrets.
  */
-export function requireLocalClusterContext(): void {
-  if (verified) return;
+export function requireLocalClusterContext(): string {
+  if (verified) return verified;
 
   let current: string;
   try {
@@ -100,5 +108,6 @@ export function requireLocalClusterContext(): void {
     );
   }
 
-  verified = true;
+  verified = current;
+  return current;
 }

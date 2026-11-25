@@ -128,6 +128,8 @@ interface Flow {
   output: string;
   exited: boolean;
   killed: boolean;
+  /** A code was pasted into this flow; it is mid-exchange or done, so `start()` must not hand it out again. */
+  submitted: boolean;
   idleTimer: ReturnType<typeof setTimeout>;
   /**
    * Callbacks interested in "something changed" (new output, or exit) --
@@ -155,12 +157,42 @@ interface Flow {
  */
 export class ClaudeSetupTokenFlows {
   private readonly flows = new Map<string, Flow>();
+  /**
+   * The live, not-yet-submitted flow per subject, with the promise its
+   * `start()` returned. See `start()` for why one subject gets one flow.
+   */
+  private readonly liveBySubject = new Map<string, { flowId: string; ready: Promise<{ flowId: string; authorizeUrl: string }> }>();
 
   constructor(private readonly spawnImpl: typeof pty.spawn = pty.spawn) {}
 
-  /** Spawns `claude setup-token` and resolves once its authorize URL appears in the PTY output. */
+  /** Spawns `claude setup-token` -- or hands back the subject's still-live flow -- and resolves once its authorize URL appears in the PTY output. */
   start(subject: string): Promise<{ flowId: string; authorizeUrl: string }> {
+    // One live flow per subject. Every caller-facing link prompt calls this,
+    // and the same prompt is re-issued often: the chat facade re-submits a
+    // parked turn every few seconds, and a turn missing two Claude
+    // credentials can anchor only one of them, so the other was started
+    // afresh on every resume. Each start is a ~150 MiB `claude` process held
+    // for FLOW_IDLE_TIMEOUT_MS, so re-prompting one waiting human OOM-killed
+    // the gateway within a minute. Handing back the outstanding flow is also
+    // what the human needs: the link they may already have open stays valid.
+    const live = this.liveBySubject.get(subject);
+    if (live) {
+      const flow = this.flows.get(live.flowId);
+      if (flow && !flow.exited && !flow.killed && !flow.submitted) {
+        // Shown again just now, so it gets a full window from now.
+        clearTimeout(flow.idleTimer);
+        flow.idleTimer = setTimeout(() => this.reap(live.flowId), FLOW_IDLE_TIMEOUT_MS);
+        return live.ready;
+      }
+      this.liveBySubject.delete(subject);
+    }
     const flowId = randomUUID();
+    const ready = this.spawnFlow(flowId, subject);
+    this.liveBySubject.set(subject, { flowId, ready });
+    return ready;
+  }
+
+  private spawnFlow(flowId: string, subject: string): Promise<{ flowId: string; authorizeUrl: string }> {
     const proc = this.spawnImpl("claude", ["setup-token"], {
       name: "xterm-color",
       cols: PTY_COLS,
@@ -174,6 +206,7 @@ export class ClaudeSetupTokenFlows {
       output: "",
       exited: false,
       killed: false,
+      submitted: false,
       idleTimer: setTimeout(() => this.reap(flowId), FLOW_IDLE_TIMEOUT_MS),
       listeners: new Set(),
     };
@@ -232,6 +265,7 @@ export class ClaudeSetupTokenFlows {
     if (!flow) return Promise.resolve({ status: "error", message: "This authorization link has expired. Please try again." });
 
     clearTimeout(flow.idleTimer);
+    flow.submitted = true;
     const outputBefore = flow.output.length;
 
     // Feeding the code to the CLI, confirmed empirically against the live
@@ -341,6 +375,7 @@ export class ClaudeSetupTokenFlows {
     const flow = this.flows.get(flowId);
     if (!flow || flow.killed) return;
     flow.killed = true;
+    if (this.liveBySubject.get(flow.subject)?.flowId === flowId) this.liveBySubject.delete(flow.subject);
     clearTimeout(flow.idleTimer);
     flow.listeners.clear();
     try {

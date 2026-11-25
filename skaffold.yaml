@@ -396,15 +396,21 @@ profiles:
               - orchestrator/charts/aktis/values-minikube-demo.yaml
               - orchestrator/charts/aktis/values-e2e.yaml
             skipBuildDependencies: false
+            # Each tag carries the build's digest when there is one. The tag
+            # alone is the git commit (+"-dirty"), which does not change
+            # between rebuilds of a dirty tree, and every image here is
+            # IfNotPresent: a rebuilt image under an unchanged tag was never
+            # pulled, so the pod kept running the PREVIOUS build. A digest
+            # makes the reference change exactly when the image does.
             setValueTemplates:
               agent-orchestrator.image.repository: "{{.IMAGE_REPO_agent_orchestrator}}"
-              agent-orchestrator.image.tag: "{{.IMAGE_TAG_agent_orchestrator}}"
+              agent-orchestrator.image.tag: "{{.IMAGE_TAG_agent_orchestrator}}{{if .IMAGE_DIGEST_agent_orchestrator}}@{{.IMAGE_DIGEST_agent_orchestrator}}{{end}}"
               core-controller.image.repository: "{{.IMAGE_REPO_core_controller}}"
-              core-controller.image.tag: "{{.IMAGE_TAG_core_controller}}"
+              core-controller.image.tag: "{{.IMAGE_TAG_core_controller}}{{if .IMAGE_DIGEST_core_controller}}@{{.IMAGE_DIGEST_core_controller}}{{end}}"
               integration-gateway.image.repository: "{{.IMAGE_REPO_integration_gateway}}"
-              integration-gateway.image.tag: "{{.IMAGE_TAG_integration_gateway}}"
+              integration-gateway.image.tag: "{{.IMAGE_TAG_integration_gateway}}{{if .IMAGE_DIGEST_integration_gateway}}@{{.IMAGE_DIGEST_integration_gateway}}{{end}}"
               connection-broker.image.repository: "{{.IMAGE_REPO_connection_broker}}"
-              connection-broker.image.tag: "{{.IMAGE_TAG_connection_broker}}"
+              connection-broker.image.tag: "{{.IMAGE_TAG_connection_broker}}{{if .IMAGE_DIGEST_connection_broker}}@{{.IMAGE_DIGEST_connection_broker}}{{end}}"
               # The chart defaults connection-broker to pullPolicy Always (its
               # production :latest tag needs freshness). skaffold builds a local,
               # digest-tagged image that exists only in the local cluster and in
@@ -413,13 +419,13 @@ profiles:
               # by default; override the broker to match for the local path.
               connection-broker.image.pullPolicy: "IfNotPresent"
               mcp-broker.image.repository: "{{.IMAGE_REPO_mcp_broker}}"
-              mcp-broker.image.tag: "{{.IMAGE_TAG_mcp_broker}}"
+              mcp-broker.image.tag: "{{.IMAGE_TAG_mcp_broker}}{{if .IMAGE_DIGEST_mcp_broker}}@{{.IMAGE_DIGEST_mcp_broker}}{{end}}"
               temporal-engine.worker.image.repository: "{{.IMAGE_REPO_temporal_engine_worker}}"
-              temporal-engine.worker.image.tag: "{{.IMAGE_TAG_temporal_engine_worker}}"
+              temporal-engine.worker.image.tag: "{{.IMAGE_TAG_temporal_engine_worker}}{{if .IMAGE_DIGEST_temporal_engine_worker}}@{{.IMAGE_DIGEST_temporal_engine_worker}}{{end}}"
               temporal-engine.gateway.image.repository: "{{.IMAGE_REPO_temporal_engine_gateway}}"
-              temporal-engine.gateway.image.tag: "{{.IMAGE_TAG_temporal_engine_gateway}}"
+              temporal-engine.gateway.image.tag: "{{.IMAGE_TAG_temporal_engine_gateway}}{{if .IMAGE_DIGEST_temporal_engine_gateway}}@{{.IMAGE_DIGEST_temporal_engine_gateway}}{{end}}"
               temporal-engine.catalogSync.image.repository: "{{.IMAGE_REPO_temporal_engine_catalog_sync}}"
-              temporal-engine.catalogSync.image.tag: "{{.IMAGE_TAG_temporal_engine_catalog_sync}}"
+              temporal-engine.catalogSync.image.tag: "{{.IMAGE_TAG_temporal_engine_catalog_sync}}{{if .IMAGE_DIGEST_temporal_engine_catalog_sync}}@{{.IMAGE_DIGEST_temporal_engine_catalog_sync}}{{end}}"
           # A profile replaces deploy.helm.releases wholesale -- omitting this
           # silently drops the chart that owns every Tool/Skill/Agent CR, so
           # the cluster keeps whatever CRs an older install left behind,

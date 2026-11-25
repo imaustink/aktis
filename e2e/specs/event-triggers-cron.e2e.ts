@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { requireLocalClusterContext } from "../support/guard.js";
-import { cleanupAgentRunsSince, kubectl, kubectlJson, waitFor } from "../support/k8s.js";
+import { cleanupAgentRunsSince, kubectl, kubectlJson, waitFor, runsMark } from "../support/k8s.js";
 import { seedAllClaudeCredentials } from "../support/credential-store.js";
 import {
   TICK_TOKEN_AUDIENCE,
@@ -78,7 +78,7 @@ describe("cron EventSources", () => {
   const manualJobs: string[] = [];
 
   beforeAll(async () => {
-    startedAt = new Date();
+    startedAt = await runsMark();
     await seedAllClaudeCredentials(SHARED_SUBJECT);
   });
 
