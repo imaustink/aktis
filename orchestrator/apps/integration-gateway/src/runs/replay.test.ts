@@ -21,7 +21,7 @@ describe("workflow replay (docs/adr/0057)", () => {
   it("replays every committed history without a determinism error", async () => {
     const files = (await readdir(DIR)).filter((f) => f.endsWith(".json")).sort();
     // One history per workflow type, at least: a type with none is not checked at all.
-    for (const type of ["eventRun", "heldRunEvent", "runQueue", "conflictSweep"]) {
+    for (const type of ["eventRun", "heldRunEvent", "runQueue", "conflictSweep", "claudeCredentialRefresh", "claudeCredentialSweep"]) {
       expect(files.some((f) => f.startsWith(`${type}-`)), `no history for ${type}`).toBe(true);
     }
     const histories = await Promise.all(

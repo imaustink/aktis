@@ -59,6 +59,12 @@ import {
  * on a change that is not gated; fix the change, don't re-capture them.
  */
 
+/**
+ * The Claude credential refresh and sweep (claude-auth/workflows.ts) run on
+ * the same worker: this file is the bundle's entry point.
+ */
+export { claudeCredentialRefresh, claudeCredentialSweep } from "../claude-auth/workflows.js";
+
 /** Short side effects: comments, labels, relays. Each is best effort inside, so a retry only covers a crashed worker. */
 const effects = proxyActivities<RunActivities>({
   startToCloseTimeout: "2 minutes",

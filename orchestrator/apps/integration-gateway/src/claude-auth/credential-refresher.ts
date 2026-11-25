@@ -20,8 +20,19 @@ import type { ClaudeTokenStore } from "./store.js";
  *      in the shipped binary -- so a refresh token is NOT indefinitely valid
  *      and an idle link is a link on a timer.
  *
- * Doing it here fixes both, because the gateway is the one place that is
- * single, durable, and able to serialize per subject.
+ * Doing it here fixes both, because the gateway is the one place that holds
+ * the store and can serialize per subject. It is NOT one process, though: the
+ * chart allows several replicas, and a rollout overlaps old and new pods. So
+ * the serialization lives in Temporal, not in memory (docs/adr/0057): every
+ * refresh of a subject runs as that subject's `claudeCredentialRefresh`
+ * workflow (claude-auth/workflows.ts), whose id is the subject's, and every
+ * caller on every replica attaches to the one that is running. The pieces:
+ *
+ *   - {@link ClaudeCredentialRefresher}: the read path. Serves a healthy blob
+ *     without leaving the process; hands a due one to the workflow.
+ *   - {@link ClaudeCredentialRenewer}: what the workflow's activity runs --
+ *     re-read, re-check, refresh, persist -- and the sweep's listing.
+ *   - claude-auth/temporal-refresh.ts: starting/attaching to the workflows.
  *
  * ONE INVARIANT DOMINATES THIS FILE: the instant Anthropic returns new tokens,
  * the old refresh token is dead. From that moment the new blob is the only
@@ -120,6 +131,16 @@ export function needsRefresh(blob: string, marginMs = DEFAULT_REFRESH_MARGIN_MS,
 }
 
 /**
+ * True when the blob carries a refresh token at all. A blob without one can
+ * never be refreshed, so a due one is served as it is without asking Temporal
+ * to serialize a refresh that cannot happen.
+ */
+export function isRefreshable(blob: string): boolean {
+  const parsed = readOauth(blob);
+  return parsed !== null && fields(parsed.inner).refreshToken !== undefined;
+}
+
+/**
  * Rebuilds the credentials blob with the new tokens, PRESERVING every other
  * field. The file carries things this code has no business understanding
  * (subscription type, scopes, account hints); dropping them would hand runs a
@@ -160,7 +181,7 @@ export interface RefreshDeps {
  * anything other than a 2xx carrying a parseable token pair, the caller keeps
  * using the credential it already had and the run behaves exactly as it does
  * today. The only way this can make things worse is if the service accepts a
- * refresh and we then lose the result -- which is why `ClaudeCredentialRefresher`
+ * refresh and we then lose the result -- which is why `ClaudeCredentialRenewer`
  * persists before returning and shouts if it cannot.
  */
 export async function refreshCredentialsBlob(blob: string, deps: RefreshDeps = {}): Promise<RefreshOutcome> {
@@ -227,21 +248,197 @@ export async function refreshCredentialsBlob(blob: string, deps: RefreshDeps = {
   };
 }
 
-export interface ClaudeCredentialRefresherDeps extends RefreshDeps {
-  store: Pick<ClaudeTokenStore, "get" | "set">;
+/** What one refresh of a subject came to. Token material is only ever in `credentialsJson`, which never leaves the process (see temporal-refresh.ts). */
+export interface RenewResult {
+  status: RefreshStatus | "missing" | "disabled";
+  /** The refreshed blob, on `"refreshed"` only. */
+  credentialsJson?: string;
+  /**
+   * On `"refreshed"`: whether the blob read back from the store. False means
+   * the old refresh token is spent and this blob is the ONLY live copy -- it
+   * must still reach the caller.
+   */
+  persisted?: boolean;
+  expiresAt?: string;
+  detail?: string;
+}
+
+/** One sweep's listing: the subjects due for renewal, or why there is nothing to sweep. */
+export type SweepListing =
+  /** The sweep has nothing it may do here (refresh disabled, a store that cannot enumerate): it ends. */
+  | { kind: "stop"; reason: string }
+  /** The listing itself failed; the next sweep tries again. */
+  | { kind: "failed"; detail: string }
+  | { kind: "listed"; examined: number; due: string[]; unrefreshable: number };
+
+export interface ClaudeCredentialRenewerDeps extends RefreshDeps {
+  store: Pick<ClaudeTokenStore, "get" | "set" | "listSubjects">;
   log?: (message: string) => void;
   /** Set false to leave stored credentials strictly alone (an operational off switch). */
   enabled?: boolean;
 }
 
 /**
- * Keeps one subject's stored `login` credential fresh, serialized per subject.
+ * Refreshes and persists one subject's stored `login` credential -- the body
+ * of the `claudeCredentialRefresh` workflow's one activity, and so the only
+ * code in the gateway that ever spends a stored refresh token.
  *
- * The serialization is the point, not an optimization: two callers refreshing
- * the same credential concurrently would each spend the same refresh token, and
- * whichever landed second would invalidate the first -- reproducing, inside the
- * gateway, exactly the rotation race that made runs fragile. Sharing one
- * in-flight promise per subject makes concurrent launches cost one refresh.
+ * It must only ever run inside that workflow: the workflow's id is the
+ * subject's, so Temporal runs at most one per subject across every replica,
+ * and that is the whole of the serialization. Two callers refreshing the same
+ * credential concurrently would each spend the same refresh token, and
+ * whichever landed second would invalidate the first.
+ *
+ * It re-reads the store rather than trusting the caller's copy: by the time a
+ * refresh runs, an earlier one (or a run's own write-back) may already have
+ * rotated the token, and refreshing from a stale blob would spend a dead token.
+ */
+export class ClaudeCredentialRenewer {
+  /**
+   * Belt and braces within one worker: an activity Temporal has already timed
+   * out may still be running here, and a new refresh of the subject must not
+   * overlap it. Across replicas the workflow id is what serializes.
+   */
+  private readonly inFlight = new Map<string, Promise<RenewResult>>();
+  private readonly log: (message: string) => void;
+
+  constructor(private readonly deps: ClaudeCredentialRenewerDeps) {
+    this.log = deps.log ?? ((m) => console.log(m));
+  }
+
+  async renew(subject: string, marginMs: number): Promise<RenewResult> {
+    for (let pending = this.inFlight.get(subject); pending; pending = this.inFlight.get(subject)) {
+      await pending.catch(() => undefined);
+    }
+    const attempt = this.renewOnce(subject, marginMs).finally(() => this.inFlight.delete(subject));
+    this.inFlight.set(subject, attempt);
+    return attempt;
+  }
+
+  private async renewOnce(subject: string, marginMs: number): Promise<RenewResult> {
+    if (this.deps.enabled === false) return { status: "disabled" };
+    const now = this.deps.now ?? Date.now;
+    const blob = (await this.deps.store.get(subject, "login"))?.credentialsJson;
+    if (!blob) return { status: "missing" };
+    if (!needsRefresh(blob, marginMs, now())) return { status: "not-needed" };
+
+    const outcome = await refreshCredentialsBlob(blob, this.deps);
+
+    if (outcome.status !== "refreshed" || !outcome.credentialsJson) {
+      // Nothing was rotated, so the stored credential is still whatever it was.
+      // `rejected` is worth saying out loud (a human will have to re-link) but
+      // deleting the record is deliberately NOT done here: the orchestrator's
+      // existing re-auth path owns invalidation, and a refresh endpoint hiccup
+      // that merely looked like a rejection must not cost a working link.
+      this.log(
+        `[claude-refresh] ${outcome.status} for ${subject}${outcome.detail ? `: ${outcome.detail}` : ""}; serving the stored credential unchanged`,
+      );
+      return { status: outcome.status, ...(outcome.detail ? { detail: outcome.detail } : {}) };
+    }
+
+    // From here the OLD refresh token is dead and this blob is the only living
+    // copy of the credential. Persisting it is not bookkeeping, it is the
+    // difference between a durable link and a re-link prompt.
+    const refreshed = {
+      status: "refreshed" as const,
+      credentialsJson: outcome.credentialsJson,
+      ...(outcome.expiresAt ? { expiresAt: outcome.expiresAt } : {}),
+    };
+    try {
+      await this.deps.store.set(subject, {
+        kind: "login",
+        credentialsJson: outcome.credentialsJson,
+        createdAt: new Date(now()).toISOString(),
+      });
+      const readBack = await this.deps.store.get(subject, "login");
+      if (readBack?.credentialsJson !== outcome.credentialsJson) {
+        // `set` swallows its own storage errors by design, so a silent drop
+        // would otherwise be indistinguishable from success -- and it is the
+        // one outcome that destroys the link.
+        this.log(
+          `[claude-refresh] STORED-BUT-UNVERIFIED for ${subject}: the refreshed credential did not read back. ` +
+            `The previous refresh token is already spent, so the stored credential is now stale and this link will need re-linking.`,
+        );
+        return { ...refreshed, persisted: false };
+      }
+    } catch (err) {
+      this.log(
+        `[claude-refresh] FAILED TO PERSIST refreshed credential for ${subject} (${err instanceof Error ? err.message : String(err)}). ` +
+          `The previous refresh token is already spent, so this link will need re-linking.`,
+      );
+      // Still hand back the live blob: this caller can at least succeed, and
+      // the run's own write-back may yet persist it.
+      return { ...refreshed, persisted: false };
+    }
+
+    this.log(`[claude-refresh] refreshed ${subject}'s Remote Control credential (expires ${outcome.expiresAt})`);
+    return { ...refreshed, persisted: true };
+  }
+
+  /**
+   * The sweep's listing: every subject whose `login` credential is inside
+   * `marginMs` of expiry and can be refreshed at all.
+   */
+  async due(marginMs: number): Promise<SweepListing> {
+    if (this.deps.enabled === false) return { kind: "stop", reason: "Claude credential refresh is disabled" };
+    if (!this.deps.store.listSubjects) {
+      // Standing down is stated, not silent: a sweeper that quietly did nothing
+      // would look exactly like a working one right up until someone's link
+      // expired.
+      return { kind: "stop", reason: "this credential store cannot enumerate subjects" };
+    }
+    let subjects: string[];
+    try {
+      subjects = await this.deps.store.listSubjects("login");
+    } catch (err) {
+      // A list that failed is not an empty store, and treating it as one is
+      // how a sweep does nothing forever: the workflow says so out loud.
+      return { kind: "failed", detail: err instanceof Error ? err.message : String(err) };
+    }
+    const now = this.deps.now ?? Date.now;
+    const due: string[] = [];
+    let unrefreshable = 0;
+    for (const subject of subjects) {
+      const blob = (await this.deps.store.get(subject, "login"))?.credentialsJson;
+      if (!blob || !needsRefresh(blob, marginMs, now())) continue;
+      if (isRefreshable(blob)) due.push(subject);
+      else unrefreshable += 1;
+    }
+    return { kind: "listed", examined: subjects.length, due, unrefreshable };
+  }
+}
+
+/** Serializes a refresh across every replica: claude-auth/temporal-refresh.ts in production. */
+export interface CredentialRefreshSerializer {
+  /**
+   * Runs (or attaches to the running) refresh of `subject`. Returns the blob
+   * to serve when it is one the store does not have (refreshed, but it would
+   * not persist); otherwise nothing, meaning "read the store again". Throws
+   * when the refresh could not be reached or did not answer in time.
+   */
+  refresh(subject: string, marginMs: number): Promise<{ credentialsJson?: string }>;
+}
+
+export interface ClaudeCredentialRefresherDeps {
+  store: Pick<ClaudeTokenStore, "get">;
+  serializer: CredentialRefreshSerializer;
+  log?: (message: string) => void;
+  /** Set false to leave stored credentials strictly alone (an operational off switch). */
+  enabled?: boolean;
+  marginMs?: number;
+  now?: () => number;
+}
+
+/**
+ * The read path: the freshest `login` blob for a subject, about to be handed
+ * to a run.
+ *
+ * A healthy blob never leaves the process. A due one is refreshed through the
+ * {@link CredentialRefreshSerializer} -- the subject's one Temporal workflow --
+ * and never here: a refresh here would be serialized only within this
+ * process, and the gateway runs as several. Concurrent callers in this process
+ * share one in-flight promise first, so a burst of launches costs one workflow
+ * start; callers on other replicas attach to the same workflow.
  */
 export class ClaudeCredentialRefresher {
   private readonly inFlight = new Map<string, Promise<string | undefined>>();
@@ -258,69 +455,47 @@ export class ClaudeCredentialRefresher {
    * that was already stored, so the caller is never worse off than before.
    */
   async ensureFresh(subject: string): Promise<string | undefined> {
-    const existing = await this.deps.store.get(subject, "login");
-    const blob = existing?.credentialsJson;
+    const blob = (await this.deps.store.get(subject, "login"))?.credentialsJson;
     if (!blob) return undefined;
     if (this.deps.enabled === false) return blob;
-    if (!needsRefresh(blob, this.deps.marginMs ?? DEFAULT_REFRESH_MARGIN_MS, (this.deps.now ?? Date.now)())) {
+    const marginMs = this.deps.marginMs ?? DEFAULT_REFRESH_MARGIN_MS;
+    if (!needsRefresh(blob, marginMs, (this.deps.now ?? Date.now)())) return blob;
+    if (!isRefreshable(blob)) {
+      this.log(`[claude-refresh] unrefreshable for ${subject}: blob carries no refreshToken; serving the stored credential unchanged`);
       return blob;
     }
 
     const pending = this.inFlight.get(subject);
     if (pending) return pending;
 
-    const attempt = this.refreshAndStore(subject, blob).finally(() => this.inFlight.delete(subject));
+    const attempt = this.refresh(subject, blob, marginMs).finally(() => this.inFlight.delete(subject));
     this.inFlight.set(subject, attempt);
     return attempt;
   }
 
-  private async refreshAndStore(subject: string, blob: string): Promise<string | undefined> {
-    const outcome = await refreshCredentialsBlob(blob, this.deps);
-
-    if (outcome.status !== "refreshed" || !outcome.credentialsJson) {
-      // Nothing was rotated, so the stored credential is still whatever it was.
-      // `rejected` is worth saying out loud (a human will have to re-link) but
-      // deleting the record is deliberately NOT done here: the orchestrator's
-      // existing re-auth path owns invalidation, and a refresh endpoint hiccup
-      // that merely looked like a rejection must not cost a working link.
+  private async refresh(subject: string, blob: string, marginMs: number): Promise<string | undefined> {
+    let result: { credentialsJson?: string };
+    try {
+      result = await this.deps.serializer.refresh(subject, marginMs);
+    } catch (err) {
+      // Never fall back to refreshing here: an unserialized refresh is the
+      // rotation race this all exists to prevent. The stored blob is what the
+      // caller would have had before refresh existed, and it is only inside
+      // its margin, not necessarily expired.
       this.log(
-        `[claude-refresh] ${outcome.status} for ${subject}${outcome.detail ? `: ${outcome.detail}` : ""}; serving the stored credential unchanged`,
+        `[claude-refresh] REFRESH UNAVAILABLE for ${subject} (${err instanceof Error ? err.message : String(err)}); ` +
+          `serving the stored credential unrefreshed. While this persists, no Claude credential is being renewed.`,
       );
       return blob;
     }
-
-    // From here the OLD refresh token is dead and this blob is the only living
-    // copy of the credential. Persisting it is not bookkeeping, it is the
-    // difference between a durable link and a re-link prompt.
+    if (result.credentialsJson) return result.credentialsJson;
+    // Refreshed and persisted, refreshed by someone else first, or left alone
+    // (transient, rejected): the store has the blob to serve either way.
     try {
-      await this.deps.store.set(subject, {
-        kind: "login",
-        credentialsJson: outcome.credentialsJson,
-        createdAt: new Date((this.deps.now ?? Date.now)()).toISOString(),
-      });
-      const readBack = await this.deps.store.get(subject, "login");
-      if (readBack?.credentialsJson !== outcome.credentialsJson) {
-        // `set` swallows its own storage errors by design, so a silent drop
-        // would otherwise be indistinguishable from success -- and it is the
-        // one outcome that destroys the link.
-        this.log(
-          `[claude-refresh] STORED-BUT-UNVERIFIED for ${subject}: the refreshed credential did not read back. ` +
-            `The previous refresh token is already spent, so the stored credential is now stale and this link will need re-linking.`,
-        );
-        return outcome.credentialsJson;
-      }
-    } catch (err) {
-      this.log(
-        `[claude-refresh] FAILED TO PERSIST refreshed credential for ${subject} (${err instanceof Error ? err.message : String(err)}). ` +
-          `The previous refresh token is already spent, so this link will need re-linking.`,
-      );
-      // Still hand back the live blob: this caller can at least succeed, and
-      // the run's own write-back may yet persist it.
-      return outcome.credentialsJson;
+      return (await this.deps.store.get(subject, "login"))?.credentialsJson ?? blob;
+    } catch {
+      return blob;
     }
-
-    this.log(`[claude-refresh] refreshed ${subject}'s Remote Control credential (expires ${outcome.expiresAt})`);
-    return outcome.credentialsJson;
   }
 }
 
@@ -335,109 +510,3 @@ export const DEFAULT_SWEEP_INTERVAL_MS = 60 * 60_000;
  * the read path's job is only that the blob it is about to hand out is usable.
  */
 export const DEFAULT_SWEEP_MARGIN_MS = 4 * 60 * 60_000;
-
-export interface CredentialSweeperDeps {
-  store: Pick<ClaudeTokenStore, "get" | "listSubjects">;
-  /** Refreshes one subject -- the same serialized path the read path uses. */
-  refresher: Pick<ClaudeCredentialRefresher, "ensureFresh">;
-  intervalMs?: number;
-  marginMs?: number;
-  log?: (message: string) => void;
-  now?: () => number;
-}
-
-/**
- * Renews stored Remote Control credentials on a timer, independently of whether
- * anything is using them.
- *
- * Refresh-on-read cannot cover this: it only fires when something reads, so a
- * link nobody exercises is a link nothing renews. And a refresh token is not
- * valid forever -- the CLI ships `refresh_token_expired` and
- * `refresh_token_expires_in` as strings, so an idle link is on a timer whether
- * or not we act. Left alone, a user who links today and triggers nothing for
- * long enough is asked to link again for no reason they can see.
- *
- * Runs in the gateway because that is the only long-lived, single-instance
- * component that holds the store. Reuses `ClaudeCredentialRefresher.ensureFresh`
- * rather than refreshing directly, so the sweep and a concurrent launch share
- * one in-flight refresh per subject instead of rotating each other's token out.
- */
-export class ClaudeCredentialSweeper {
-  private timer: ReturnType<typeof setInterval> | undefined;
-  private running = false;
-  private readonly log: (message: string) => void;
-
-  constructor(private readonly deps: CredentialSweeperDeps) {
-    this.log = deps.log ?? ((m) => console.log(m));
-  }
-
-  start(): void {
-    if (this.timer) return;
-    if (!this.deps.store.listSubjects) {
-      // Standing down is stated, not silent: a sweeper that quietly did nothing
-      // would look exactly like a working one right up until someone's link
-      // expired.
-      this.log("[claude-refresh] sweep disabled: this credential store cannot enumerate subjects");
-      return;
-    }
-    const intervalMs = this.deps.intervalMs ?? DEFAULT_SWEEP_INTERVAL_MS;
-    this.timer = setInterval(() => void this.sweep(), intervalMs);
-    this.timer.unref?.();
-    // Sweep once at startup too, so a gateway that restarts often still renews
-    // (and so a deployment does not wait a full interval to find out the sweep
-    // is broken).
-    void this.sweep();
-  }
-
-  stop(): void {
-    if (this.timer) clearInterval(this.timer);
-    this.timer = undefined;
-  }
-
-  /**
-   * One pass. Refreshes every `login` credential inside the sweep margin,
-   * sequentially -- there is no hurry here, and a burst of parallel token
-   * requests on a schedule is a worse neighbour than a slow loop.
-   */
-  async sweep(): Promise<{ examined: number; refreshed: number; failed: number }> {
-    if (this.running) return { examined: 0, refreshed: 0, failed: 0 };
-    this.running = true;
-    const marginMs = this.deps.marginMs ?? DEFAULT_SWEEP_MARGIN_MS;
-    const now = this.deps.now ?? Date.now;
-    let examined = 0;
-    let refreshed = 0;
-    let failed = 0;
-    try {
-      let subjects: string[];
-      try {
-        subjects = (await this.deps.store.listSubjects?.("login")) ?? [];
-      } catch (err) {
-        // Deliberately loud: a list that failed is not an empty store, and
-        // treating it as one is how a sweep does nothing forever.
-        this.log(
-          `[claude-refresh] sweep could not list stored credentials: ${err instanceof Error ? err.message : String(err)}`,
-        );
-        return { examined: 0, refreshed: 0, failed: 1 };
-      }
-
-      for (const subject of subjects) {
-        examined += 1;
-        const record = await this.deps.store.get(subject, "login");
-        const blob = record?.credentialsJson;
-        if (!blob || !needsRefresh(blob, marginMs, now())) continue;
-        const before = credentialExpiresAt(blob);
-        const after = credentialExpiresAt((await this.deps.refresher.ensureFresh(subject)) ?? blob);
-        // `ensureFresh` never throws and reports its own failures; compare
-        // expiries to know whether this pass actually renewed anything.
-        if (after && after !== before) refreshed += 1;
-        else failed += 1;
-      }
-      if (refreshed > 0 || failed > 0) {
-        this.log(`[claude-refresh] sweep: ${examined} examined, ${refreshed} refreshed, ${failed} still due`);
-      }
-      return { examined, refreshed, failed };
-    } finally {
-      this.running = false;
-    }
-  }
-}
