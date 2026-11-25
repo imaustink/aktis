@@ -106,23 +106,6 @@ The stack already runs Temporal for the engine.
    workflow code and fails on any determinism error. A failure there means
    the change needs a patch, not new histories. Re-capture only to add a
    path worth covering, or after a patch has been fully removed.
-8. **Claude credential refresh is serialized by the same worker**
-   (`src/claude-auth/workflows.ts`). Anthropic rotates the refresh token on
-   every refresh, so two concurrent refreshes of one subject's `login`
-   credential invalidate each other; an in-memory lock serialized them only
-   within one replica. A due refresh is a `claudeCredentialRefresh` workflow
-   with the id `<queue>/claude-credential-refresh:<subject, URI-encoded>`,
-   started with `USE_EXISTING` so every replica asking at once attaches to
-   one run. Its one activity re-reads, refreshes and persists, and is never
-   retried (a retry could spend a rotated token). A healthy blob is served
-   without touching Temporal; if Temporal does not answer, the stored blob is
-   served unrefreshed -- never a local refresh. The tokens stay out of
-   history: a persisted refresh is read back from the store, and only a
-   refresh that could not be persisted returns its blob, sealed under the
-   credential store's key. The periodic renewal is one
-   `claudeCredentialSweep` workflow (`<queue>/claude-credential-sweep`),
-   started if not running by every replica, refreshing each due subject
-   through a child `claudeCredentialRefresh` of the same id.
 
 ## Consequences
 
