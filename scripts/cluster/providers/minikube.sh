@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # minikube — the original local cluster, and the default wherever ferry cannot
-# run (Linux, Intel Macs, or a Mac without ferry installed).
+# run (Linux, Intel Macs). On an Apple-silicon Mac it is only used when
+# selected deliberately with AKTIS_CLUSTER=minikube.
 
 # Sized up front, because minikube has to be. 6GB/4 CPUs holds the demo stack;
 # the e2e stack is tight in it (see values-e2e.yaml's notes on request sizes).

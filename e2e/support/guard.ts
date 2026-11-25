@@ -93,6 +93,36 @@ export function builtInContexts(opts: {
   return context ? [context] : [];
 }
 
+function readArm64Sysctl(): string | undefined {
+  try {
+    return execFileSync("sysctl", ["-n", "hw.optional.arm64"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The machine's architecture for builtInContexts -- the HARDWARE, not this
+ * process. `process.arch` is the arch of the running Node binary, so an x64
+ * Node under Rosetta (Intel Homebrew in /usr/local, a Rosetta terminal) reports
+ * `x64` on an M-series Mac, which would re-allow the Docker Desktop-backed
+ * contexts. On darwin, `sysctl hw.optional.arm64` is `1` on Apple silicon
+ * whatever the process arch (and absent on an Intel Mac). Same check as
+ * scripts/cluster/lib.sh's cluster_is_apple_silicon. Elsewhere, and if sysctl
+ * fails, `process.arch` stands.
+ */
+export function hostArch(
+  platform: string,
+  processArch: string,
+  readSysctl: () => string | undefined = readArm64Sysctl,
+): string {
+  if (platform !== "darwin" || processArch === "arm64") return processArch;
+  return readSysctl() === "1" ? "arm64" : processArch;
+}
+
 function allowedContexts(): string[] {
   let text = "";
   try {
@@ -102,7 +132,7 @@ function allowedContexts(): string[] {
   }
   const builtIn = builtInContexts({
     platform: process.platform,
-    arch: process.arch,
+    arch: hostArch(process.platform, process.arch),
     provider: process.env.AKTIS_CLUSTER || fileClusterProvider(text),
   });
   const custom = customClusterContext(text);

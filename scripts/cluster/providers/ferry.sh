@@ -29,7 +29,7 @@ ferry_api_ready() {
 }
 
 provider_up() {
-  [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]] \
+  cluster_is_apple_silicon \
     || cluster_die "ferry only runs on Apple-silicon Macs. Pick another provider: AKTIS_CLUSTER=minikube|kind|custom (docs/local-cluster.md)."
   command -v ferry >/dev/null 2>&1 \
     || cluster_die "ferry is not installed. Install it with:  curl -sfL https://get.ferry.kurpuis.com | FERRY_SKIP_START=1 FERRY_SKIP_SERVICE=1 sh -"

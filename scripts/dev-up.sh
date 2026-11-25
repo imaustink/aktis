@@ -3,8 +3,9 @@
 # actual build+deploy (see skaffold.yaml at repo root).
 #
 # Which local cluster this runs on is a choice (docs/local-cluster.md): ferry
-# on an Apple-silicon Mac that has it, minikube elsewhere, or whatever
-# AKTIS_CLUSTER names -- ferry | minikube | kind | custom.
+# on an Apple-silicon Mac (it stops with the install command if ferry is
+# missing), minikube elsewhere, or whatever AKTIS_CLUSTER names --
+# ferry | minikube | kind | custom.
 #
 # Usage:
 #   ./scripts/dev-up.sh              # prep, then `skaffold run` (one-shot deploy)

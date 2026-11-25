@@ -34,13 +34,24 @@ CLUSTER_LOCAL_ENV="$CLUSTER_REPO_ROOT/cluster.local.env"
 
 cluster_die() { echo "✗ $*" >&2; exit 1; }
 
+# True on an Apple-silicon Mac, judged by the HARDWARE, not this shell's
+# architecture. `uname -m` reports the running binary's arch, so an x86_64
+# shell under Rosetta (an Intel Homebrew bash, a Rosetta terminal) says
+# x86_64 on an M-series Mac; `hw.optional.arm64` is 1 there either way, and
+# absent on an Intel Mac. e2e/support/guard.ts's hostArch makes the same check.
+cluster_is_apple_silicon() {
+  [[ "$(uname -s)" == "Darwin" ]] || return 1
+  [[ "$(uname -m)" == "arm64" ]] && return 0
+  [[ "$(sysctl -n hw.optional.arm64 2>/dev/null)" == "1" ]]
+}
+
 # On Apple silicon the default is ferry whether or not it is installed yet:
 # provider_up then stops with the install command. Falling back to minikube
 # instead would quietly launch Docker Desktop (cluster_ensure_docker) and put
 # the dev and e2e stacks on a cluster nobody chose. Pick minikube/kind
 # deliberately with AKTIS_CLUSTER if that is what you want.
 cluster_default_provider() {
-  if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
+  if cluster_is_apple_silicon; then
     echo ferry
   else
     echo minikube

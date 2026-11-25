@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { builtInContexts, customClusterContext, fileClusterProvider } from "../support/guard.js";
+import { builtInContexts, customClusterContext, fileClusterProvider, hostArch } from "../support/guard.js";
 
 /**
  * The one door in the context guard that is not a hardcoded name, checked with
@@ -71,6 +71,23 @@ describe("the built-in contexts allowed on this machine", () => {
     expect(builtInContexts({ platform: "linux", arch: "x64", provider: undefined })).toEqual(all);
     expect(builtInContexts({ platform: "linux", arch: "arm64", provider: "ferry" })).toEqual(all);
     expect(builtInContexts({ platform: "darwin", arch: "x64", provider: undefined })).toEqual(all);
+  });
+
+  it("judges Apple silicon by the hardware, so Rosetta does not re-allow Docker contexts", () => {
+    // x64 Node under Rosetta on an M-series Mac: the sysctl still says arm64.
+    expect(hostArch("darwin", "x64", () => "1")).toBe("arm64");
+    expect(builtInContexts({ platform: "darwin", arch: hostArch("darwin", "x64", () => "1"), provider: undefined }))
+      .toEqual(["ferry-aktis"]);
+    // Intel Mac: no hw.optional.arm64 (or 0).
+    expect(hostArch("darwin", "x64", () => undefined)).toBe("x64");
+    expect(hostArch("darwin", "x64", () => "0")).toBe("x64");
+    // Native arm64 and non-Mac never consult sysctl.
+    const never = () => {
+      throw new Error("sysctl read off the Rosetta path");
+    };
+    expect(hostArch("darwin", "arm64", never)).toBe("arm64");
+    expect(hostArch("linux", "x64", never)).toBe("x64");
+    expect(hostArch("linux", "arm64", never)).toBe("arm64");
   });
 
   it("reads the provider from cluster.local.env", () => {
