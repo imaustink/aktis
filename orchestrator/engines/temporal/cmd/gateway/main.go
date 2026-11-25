@@ -250,9 +250,11 @@ func startCallerToolStore(ctx context.Context) (*callertools.QdrantStore, string
 
 // ensurePruneSchedule keeps the one Temporal Schedule that prunes the
 // collection (docs/adr/0058 §4), instead of a ticker in every replica. The
-// worker runs the passes; it has the same Qdrant settings. Retried for a
-// while because Temporal may still be starting; a failure only means stale
-// definitions live longer, so it is logged, not fatal.
+// worker runs the passes; it has the same Qdrant settings. Retried until it
+// succeeds or the process ends -- Temporal may take a while to come up on a
+// fresh install, and giving up would leave nothing pruning until a restart.
+// A failure only means stale definitions live longer, so it is logged, not
+// fatal.
 func ensurePruneSchedule(ctx context.Context, schedules gateway.ScheduleClient, taskQueue, collection string) {
 	delay := time.Second
 	for attempt := 1; ; attempt++ {
@@ -262,9 +264,13 @@ func ensurePruneSchedule(ctx context.Context, schedules gateway.ScheduleClient, 
 				gateway.CallerToolPruneScheduleID(taskQueue, collection), callerToolPruneInterval, callerToolRetention)
 			return
 		}
-		if attempt == 8 || ctx.Err() != nil {
-			log.Printf("caller-tool prune schedule not set up; unused definitions will not be pruned: %v", err)
+		if ctx.Err() != nil {
 			return
+		}
+		// Loud at first, then once every ten tries so a long outage does not
+		// flood the log.
+		if attempt <= 8 || attempt%10 == 0 {
+			log.Printf("caller-tool prune schedule not set up yet (attempt %d, retrying); unused definitions are not pruned meanwhile: %v", attempt, err)
 		}
 		select {
 		case <-ctx.Done():

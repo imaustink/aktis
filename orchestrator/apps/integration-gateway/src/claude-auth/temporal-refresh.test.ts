@@ -186,7 +186,7 @@ describe("Claude credential sweep on Temporal", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(JSON.parse(s.records.get("github:stale")?.credentialsJson ?? "{}").claudeAiOauth.refreshToken).toBe("rt-new");
     expect(JSON.parse(s.records.get("github:healthy")?.credentialsJson ?? "{}").claudeAiOauth.refreshToken).toBe("rt-old");
-    expect(logs.find((l) => l.includes("sweep:"))).toMatch(/2 examined, 1 refreshed, 0 already refreshing, 0 still due/);
+    expect(logs.find((l) => l.includes("sweep:"))).toMatch(/2 examined, 1 refreshed, 0 already fresh, 0 already refreshing, 0 still due/);
     const running = [];
     for await (const w of t.client.workflow.list({ query: `WorkflowType = 'claudeCredentialSweep' AND ExecutionStatus = 'Running' AND TaskQueue = '${t.taskQueue}'` })) running.push(w);
     expect(running.length).toBeLessThanOrEqual(1);

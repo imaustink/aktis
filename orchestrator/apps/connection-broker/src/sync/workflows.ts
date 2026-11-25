@@ -43,10 +43,15 @@ import {
  * a change that is not gated; fix the change, don't re-capture them.
  */
 
-/** Reading a Corpus's settings from the broker's registry: cheap, and retried while a pod restarts. */
+/**
+ * Reading a Corpus's settings from the broker's registry: cheap, and retried
+ * for a few minutes -- across a rollout, or while a replica's watch catches
+ * up -- before the loop gives up. Retry options are not replayed, so they may
+ * change without `patched()`.
+ */
 const settings = proxyActivities<Pick<SyncActivities, "syncTarget" | "log">>({
   startToCloseTimeout: "1 minute",
-  retry: { maximumAttempts: 5 },
+  retry: { maximumAttempts: 10, maximumInterval: "1 minute" },
 });
 
 /**
@@ -54,11 +59,17 @@ const settings = proxyActivities<Pick<SyncActivities, "syncTarget" | "log">>({
  * mid-pass is noticed within the heartbeat timeout and the pass is retried --
  * from the start -- on another replica. A pass is idempotent (point ids are
  * content hashes), so repeating one costs only time.
+ *
+ * Every rolling restart a pass spans costs it an attempt (a worker shutting
+ * down cancels it), so a pass has enough attempts to outlast several, within
+ * an overall budget; backoff is capped so a source that is down is retried
+ * every few minutes, not hammered.
  */
 const passes = proxyActivities<Pick<SyncActivities, "runPass">>({
   startToCloseTimeout: "6 hours",
+  scheduleToCloseTimeout: "12 hours",
   heartbeatTimeout: "2 minutes",
-  retry: { maximumAttempts: 3, initialInterval: "10 seconds", backoffCoefficient: 3 },
+  retry: { maximumAttempts: 10, initialInterval: "10 seconds", backoffCoefficient: 3, maximumInterval: "5 minutes" },
 });
 
 export const sourcesChanged = defineSignal<[string[]]>(SOURCES_CHANGED_SIGNAL);
@@ -104,6 +115,10 @@ export async function corpusSync(input: CorpusSyncInput): Promise<void> {
   });
 
   let target = await settings.syncTarget(corpus);
+  // A loop started afresh (an earlier one ended, or never existed) schedules
+  // from the last full pass the Corpus's status records, rather than passing
+  // at once. Reads a field old histories never recorded, so it replays as before.
+  if (lastFullPassAt === undefined && target?.lastReconcileAt !== undefined) lastFullPassAt = target.lastReconcileAt;
   for (let cycle = 0; target; cycle++) {
     if ((cycle >= CYCLES_PER_RUN || workflowInfo().continueAsNewSuggested) && allHandlersFinished()) {
       await continueAsNew<typeof corpusSync>({

@@ -242,6 +242,13 @@ func (e *TemporalEngine) Start(ctx context.Context, input TurnInput) (string, er
 
 // Status asks the engine once. The engine long-polls for up to ~2s before
 // answering pending, so this is bounded rather than left to the caller.
+//
+// Only a failure to get an answer -- transport, or a 5xx while the engine
+// rolls -- is an error, which the poll answers as pending. The engine
+// rejecting the id itself (400: not an id it could have issued; 404: no such
+// turn) is Unknown. Any other 4xx (a wrong engine token, say) would repeat on
+// every poll, so it fails the turn rather than leave it pending until the
+// caller's budget runs out.
 func (e *TemporalEngine) Status(ctx context.Context, id string) (EngineStatus, error) {
 	ctx, cancel := context.WithTimeout(ctx, statusTimeout)
 	defer cancel()
@@ -249,8 +256,10 @@ func (e *TemporalEngine) Status(ctx context.Context, id string) (EngineStatus, e
 	switch {
 	case err != nil:
 		return EngineStatus{}, err
-	case code == http.StatusNotFound:
+	case code == http.StatusNotFound || code == http.StatusBadRequest:
 		return EngineStatus{Unknown: true}, nil
+	case code >= 400 && code <= 499:
+		return EngineStatus{Outcome: TurnOutcome{Error: fmt.Sprintf("temporal engine /invoke/%s refused the poll: %d", id, code)}}, nil
 	case code < 200 || code > 299:
 		return EngineStatus{}, fmt.Errorf("temporal engine /invoke/%s failed: %d", id, code)
 	case record.Status == "pending":

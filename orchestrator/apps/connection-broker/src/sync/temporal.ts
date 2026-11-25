@@ -7,6 +7,7 @@ import {
   WorkflowNotFoundError,
   WorkflowUpdateFailedError,
 } from "@temporalio/client";
+import { ApplicationFailure } from "@temporalio/common";
 import { NativeConnection, Worker, type WorkerOptions } from "@temporalio/worker";
 import { SOURCES_CHANGED_SIGNAL, SYNC_NOW_UPDATE, workflowIds, type PassResult, type SyncActivities } from "./model.js";
 import type { corpusSync } from "./workflows.js";
@@ -78,14 +79,21 @@ export class CorpusSyncs {
   /**
    * Runs a full pass that starts after this call and returns its result. A
    * pass already running is not joined: it may have listed the source before
-   * whatever prompted this request.
+   * whatever prompted this request. Undefined when the Corpus is no longer
+   * synced -- it went while the request waited, or its loop closed first --
+   * which the route answers 404.
    */
-  async runNow(corpus: string): Promise<PassResult> {
+  async runNow(corpus: string): Promise<PassResult | undefined> {
     await this.start(corpus);
     try {
       return await this.o.client.workflow.getHandle(this.workflowId(corpus)).executeUpdate<PassResult, []>(SYNC_NOW_UPDATE);
     } catch (error) {
-      if (error instanceof WorkflowUpdateFailedError) throw new SyncPassError(errorText(error.cause ?? error));
+      if (error instanceof WorkflowNotFoundError) return undefined;
+      if (error instanceof WorkflowUpdateFailedError) {
+        const cause = error.cause;
+        if (cause instanceof ApplicationFailure && cause.type === "CorpusNotSynced") return undefined;
+        throw new SyncPassError(errorText(cause ?? error));
+      }
       throw error;
     }
   }

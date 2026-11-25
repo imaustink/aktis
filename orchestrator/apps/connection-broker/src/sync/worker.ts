@@ -14,9 +14,13 @@ export interface ResourceSource {
 
 /** The corpus side: what is already indexed, and where new points go. */
 export interface CorpusWriter {
-  /** Every chunk currently indexed for this connection. */
-  indexed(collection: string): Promise<IndexedChunk[]>;
-  upsert(collection: string, chunks: Chunk[]): Promise<void>;
+  /**
+   * Every chunk currently indexed for this connection. `onProgress` is called
+   * after each page read, `upsert`'s after each batch embedded and written, so
+   * a pass that spends minutes here still heartbeats (docs/adr/0058 §2).
+   */
+  indexed(collection: string, onProgress?: (done: number) => void): Promise<IndexedChunk[]>;
+  upsert(collection: string, chunks: Chunk[], onProgress?: (done: number) => void): Promise<void>;
   remove(collection: string, contentHashes: string[]): Promise<void>;
 }
 
@@ -37,19 +41,24 @@ export interface SyncOptions {
   /** Guards against an unbounded walk if a driver's cursor never terminates. */
   maxPages?: number;
   /**
-   * Called after every listed page and every fetched resource. A pass run as
-   * a Temporal activity heartbeats from here, so a worker that dies mid-pass
-   * is noticed within the heartbeat timeout rather than the pass's whole
-   * budget (docs/adr/0058).
+   * Called after every listed page, every fetched resource, every page of
+   * what is indexed and every batch written, and once before the removal. A
+   * pass run as a Temporal activity heartbeats from here, so a worker that
+   * dies mid-pass is noticed within the heartbeat timeout rather than the
+   * pass's whole budget -- and a live pass is never mistaken for a dead one,
+   * however long it embeds (docs/adr/0058 §2).
    */
   onProgress?: (progress: SyncProgress) => void;
 }
 
 export interface SyncProgress {
-  phase: "list" | "fetch";
-  /** Pages listed so far (list) or resources fetched so far (fetch). */
+  phase: "list" | "fetch" | "indexed" | "write" | "remove";
+  /**
+   * Pages listed (list), resources fetched (fetch), indexed pages read
+   * (indexed), chunks written (write); 0 for remove.
+   */
   done: number;
-  /** Resources to fetch; known only once listing has finished. */
+  /** Resources to fetch, or chunks to write. */
   total?: number;
 }
 
@@ -117,10 +126,18 @@ export async function syncConnection(
   const scope: ReconcileScope =
     full && failed.length === 0 ? { kind: "full" } : { kind: "partial", sourceIds: fetched };
 
-  const plan = reconcile(chunks, await corpus.indexed(target.collection), scope);
+  const progress = options.onProgress;
+  const indexed = await corpus.indexed(target.collection, progress && ((done) => progress({ phase: "indexed", done })));
+  const plan = reconcile(chunks, indexed, scope);
 
-  if (plan.upsert.length > 0) await corpus.upsert(target.collection, plan.upsert);
-  if (plan.remove.length > 0) await corpus.remove(target.collection, plan.remove);
+  if (plan.upsert.length > 0) {
+    const total = plan.upsert.length;
+    await corpus.upsert(target.collection, plan.upsert, progress && ((done) => progress({ phase: "write", done, total })));
+  }
+  if (plan.remove.length > 0) {
+    progress?.({ phase: "remove", done: 0, total: plan.remove.length });
+    await corpus.remove(target.collection, plan.remove);
+  }
 
   return {
     connection: target.connection,

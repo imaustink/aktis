@@ -103,6 +103,8 @@ export async function claudeCredentialSweep(input: ClaudeCredentialSweepInput): 
         await sweeps.log(`[claude-refresh] sweep could not list stored credentials: ${plan.detail}`);
       } else {
         let refreshed = 0;
+        /** Refreshed already by the time its child ran (a read, or another replica's sweep). */
+        let alreadyFresh = 0;
         let stillDue = plan.unrefreshable;
         let alreadyRunning = 0;
         for (const subject of plan.due) {
@@ -113,7 +115,8 @@ export async function claudeCredentialSweep(input: ClaudeCredentialSweepInput): 
               parentClosePolicy: ParentClosePolicy.ABANDON,
             });
             const result = await child.result();
-            if (result.status === "refreshed" || result.status === "not-needed") refreshed += 1;
+            if (result.status === "refreshed") refreshed += 1;
+            else if (result.status === "not-needed") alreadyFresh += 1;
             else if (result.status !== "missing") stillDue += 1;
           } catch (error) {
             if (isCancellation(error)) throw error;
@@ -121,9 +124,12 @@ export async function claudeCredentialSweep(input: ClaudeCredentialSweepInput): 
             else stillDue += 1;
           }
         }
-        if (refreshed > 0 || stillDue > 0 || alreadyRunning > 0) {
+        // Same condition as before alreadyFresh was split out of refreshed, so
+        // the log activity is scheduled exactly when it was (replay).
+        if (refreshed > 0 || alreadyFresh > 0 || stillDue > 0 || alreadyRunning > 0) {
           await sweeps.log(
-            `[claude-refresh] sweep: ${plan.examined} examined, ${refreshed} refreshed, ${alreadyRunning} already refreshing, ${stillDue} still due`,
+            `[claude-refresh] sweep: ${plan.examined} examined, ${refreshed} refreshed, ${alreadyFresh} already fresh, ` +
+              `${alreadyRunning} already refreshing, ${stillDue} still due`,
           );
         }
       }

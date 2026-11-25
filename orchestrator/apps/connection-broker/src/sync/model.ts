@@ -30,6 +30,12 @@ export interface CorpusSyncInput {
 /** What one Corpus's pass needs to know about it right now; `null` when it is no longer synced here. */
 export interface SyncTargetInfo {
   intervalMs: number;
+  /**
+   * When the Corpus's status says its last full pass ended (ms since the
+   * epoch). A loop started without `lastFullPassAt` -- a fresh one after an
+   * earlier loop ended -- schedules from this rather than passing at once.
+   */
+  lastReconcileAt?: number;
 }
 
 /** A pass's outcome, as the workflow keeps it. `failed` is capped so a broken source cannot bloat the history. */
@@ -47,7 +53,12 @@ export const FAILED_IDS_KEPT = 20;
 
 /** The activities the workflow calls (activities.ts). */
 export interface SyncActivities {
-  /** The Corpus's current sync settings, or `null` once it is gone or no longer syncable. */
+  /**
+   * The Corpus's current sync settings, or `null` once it is gone or no
+   * longer syncable. A replica that cannot see a Corpus the cluster still
+   * syncs throws (retryably) rather than answer `null`: one lagging replica
+   * must not end the loop for all of them.
+   */
   syncTarget(corpus: string): Promise<SyncTargetInfo | null>;
   /**
    * One pass, full when `sourceIds` is absent. Records the Corpus's status

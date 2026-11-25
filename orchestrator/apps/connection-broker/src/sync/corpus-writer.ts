@@ -100,7 +100,7 @@ export class QdrantCorpusWriter implements CorpusWriter {
    * them. Vectors are excluded because only the ids matter here and they are by
    * far the larger half of a point.
    */
-  async indexed(collection: string): Promise<IndexedChunk[]> {
+  async indexed(collection: string, onProgress?: (done: number) => void): Promise<IndexedChunk[]> {
     // A collection that does not exist has nothing indexed, which is the true
     // answer rather than an error. It is also the state EVERY connection is in
     // on its first sync: syncConnection asks what is indexed before it writes
@@ -111,6 +111,7 @@ export class QdrantCorpusWriter implements CorpusWriter {
 
     const out: IndexedChunk[] = [];
     let offset: string | number | undefined;
+    let pages = 0;
 
     do {
       const page = await this.client.scroll(collection, {
@@ -129,12 +130,13 @@ export class QdrantCorpusWriter implements CorpusWriter {
       }
 
       offset = page.next_page_offset ?? undefined;
+      onProgress?.(++pages);
     } while (offset !== undefined);
 
     return out;
   }
 
-  async upsert(collection: string, chunks: Chunk[]): Promise<void> {
+  async upsert(collection: string, chunks: Chunk[], onProgress?: (done: number) => void): Promise<void> {
     // Qdrant rejects an empty update as a 400, and "nothing changed" is the
     // normal outcome of a reconcile over an unedited space.
     if (chunks.length === 0) return;
@@ -171,6 +173,7 @@ export class QdrantCorpusWriter implements CorpusWriter {
           },
         })),
       });
+      onProgress?.(start + batch.length);
     }
   }
 

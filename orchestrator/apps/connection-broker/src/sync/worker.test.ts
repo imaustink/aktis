@@ -45,11 +45,13 @@ function corpus(indexed: IndexedChunk[] = []): CorpusWriter & { upserted: Chunk[
   return {
     upserted,
     removed,
-    async indexed() {
+    async indexed(_c, onProgress) {
+      onProgress?.(1);
       return indexed;
     },
-    async upsert(_c, chunks) {
+    async upsert(_c, chunks, onProgress) {
       upserted.push(...chunks);
+      onProgress?.(chunks.length);
     },
     async remove(_c, hashes) {
       removed.push(...hashes);
@@ -58,6 +60,18 @@ function corpus(indexed: IndexedChunk[] = []): CorpusWriter & { upserted: Chunk[
 }
 
 describe("syncConnection", () => {
+  // The activity heartbeats from onProgress; a pass that spent minutes
+  // embedding without one would be timed out and retried while still writing.
+  it("reports progress while reading the index, writing and removing, not only listing and fetching", async () => {
+    const src = source({ "page-1": doc("page-1", "# A\n\none") });
+    const store = corpus([{ contentHash: "stale", sourceId: "deleted-page" }]);
+    const phases: string[] = [];
+    await syncConnection(src, store, target, { onProgress: (p) => phases.push(p.phase) });
+    expect(new Set(phases)).toEqual(new Set(["list", "fetch", "indexed", "write", "remove"]));
+    expect(phases.indexOf("write")).toBeGreaterThan(phases.indexOf("indexed"));
+    expect(store.removed).toHaveLength(1);
+  });
+
   it("walks every page and indexes what it finds", async () => {
     const src = source({ "page-1": doc("page-1", "# A\n\none"), "page-2": doc("page-2", "# B\n\ntwo") }, { pageSize: 1 });
     const store = corpus();

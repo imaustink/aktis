@@ -151,7 +151,7 @@ describe("corpusSync", () => {
     await t.stop();
   });
 
-  it("ends once its corpus is no longer synced, and fails a run-now waiting on it", async () => {
+  it("ends once its corpus is no longer synced, and a run-now waiting on it answers not-synced", async () => {
     const t = await testSyncs();
     const fake = new FakeSyncSource("docs");
     await t.serve(fake.activities());
@@ -160,8 +160,34 @@ describe("corpusSync", () => {
     await until(() => fake.passesOf("docs").length === 1, "the first pass");
     fake.present.delete("docs");
 
-    await expect(t.syncs.runNow("docs")).rejects.toThrow(SyncPassError);
+    // undefined is the route's 404, not a failed pass's 502.
+    await expect(t.syncs.runNow("docs")).resolves.toBeUndefined();
     await until(() => closed(t, "docs"), "the loop to end");
+    await t.stop();
+  });
+
+  it("a failed run-now pass is a SyncPassError", async () => {
+    const t = await testSyncs();
+    const fake = new FakeSyncSource("docs");
+    await t.serve(fake.activities());
+
+    await t.syncs.ensure(["docs"]);
+    await until(() => fake.passesOf("docs").length === 1, "the first pass");
+    fake.failNext = "source is down";
+    await expect(t.syncs.runNow("docs")).rejects.toThrow(SyncPassError);
+    await t.stop();
+  });
+
+  it("a fresh loop schedules from the Corpus's last recorded full pass instead of passing at once", async () => {
+    const t = await testSyncs();
+    const fake = new FakeSyncSource("docs");
+    fake.lastReconcileAt = Date.now();
+    await t.serve(fake.activities());
+
+    await t.syncs.ensure(["docs"]);
+    await new Promise((r) => setTimeout(r, 500));
+    expect(fake.passesOf("docs")).toHaveLength(0);
+    expect(await t.syncs.isRunning("docs")).toBe(true);
     await t.stop();
   });
 });

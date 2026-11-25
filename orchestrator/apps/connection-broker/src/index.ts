@@ -17,6 +17,7 @@ import { EMBEDDING_DIMENSIONS, OpenAIEmbedder } from "./embedder.js";
 import { QdrantCorpusWriter } from "./sync/corpus-writer.js";
 import { HttpResourceSource } from "./sync/http-source.js";
 import { createSyncActivities, type SyncTarget } from "./sync/activities.js";
+import type { Worker } from "@temporalio/worker";
 import { connectClient, createSyncWorker, CorpusSyncs, SyncPassError } from "./sync/temporal.js";
 import { DEFAULT_TASK_QUEUE } from "./sync/model.js";
 import { QdrantHttpClient } from "./sync/qdrant-client.js";
@@ -105,8 +106,14 @@ async function main(): Promise<void> {
     // overlaps the scheduled one (docs/adr/0058).
     runSync: async (corpus) => {
       if (!sync?.target(corpus)) return undefined;
+      const syncs = sync.syncs();
+      // Indexing is configured but its Temporal connection is not up yet (or
+      // was lost); the API keeps serving and the run-now says why.
+      if (!syncs) throw new SyncFailedError("indexing is not connected to Temporal yet; retry shortly");
       try {
-        const report = await sync.syncs.runNow(corpus);
+        const report = await syncs.runNow(corpus);
+        // The Corpus stopped being synced while the request waited.
+        if (!report) return undefined;
         return { indexed: report.indexed, removed: report.removed, full: report.full };
       } catch (err) {
         if (err instanceof SyncPassError) throw new SyncFailedError(err.message);
@@ -121,7 +128,13 @@ async function main(): Promise<void> {
         // The signal lands in the corpus's workflow, which keeps what it names
         // until a pass has examined it — even while another pass runs.
         if (!sync?.target(corpus)) return;
-        void sync.syncs
+        const syncs = sync.syncs();
+        if (!syncs) {
+          // The next full pass, once Temporal is reachable, picks this up.
+          console.error(`sync ${corpus}: webhook not handed over, Temporal is not connected yet`);
+          return;
+        }
+        void syncs
           .notify(corpus, sourceIds)
           .catch((err: unknown) => console.error(`sync ${corpus}: could not hand over a webhook:`, err));
       },
@@ -129,7 +142,26 @@ async function main(): Promise<void> {
   });
   server.listen(port, () => console.log(`connection-broker listening on ${port}`));
 
-  sync = await startSync(registry, syncTokens, port, status);
+  // Asks the cluster, not the watch cache, whether a Corpus this replica
+  // cannot see is still meant to be indexed (docs/adr/0058 §2).
+  const customObjects = kubeConfig.makeApiClient(k8s.CustomObjectsApi);
+  const confirm = async (corpus: string): Promise<"gone" | "syncable"> => {
+    try {
+      const cr = (await customObjects.getNamespacedCustomObject({
+        group,
+        version,
+        namespace,
+        plural: CORPUS_PLURAL,
+        name: corpus,
+      })) as CorpusCustomResource;
+      return collectionOf(cr) && reconcileIntervalMs(cr) ? "syncable" : "gone";
+    } catch (err) {
+      if ((err as { code?: number }).code === 404) return "gone";
+      throw err;
+    }
+  };
+
+  sync = startSync(registry, syncTokens, port, status, confirm);
 
   const shutdown = () => {
     void (async () => {
@@ -143,7 +175,8 @@ async function main(): Promise<void> {
 }
 
 interface SyncLoop {
-  syncs: CorpusSyncs;
+  /** Undefined until the Temporal connection and worker are up (and while they reconnect). */
+  syncs: () => CorpusSyncs | undefined;
   /** The corpus, if this broker syncs it. */
   target: (corpus: string) => SyncTarget | undefined;
   stop: () => Promise<void>;
@@ -158,12 +191,13 @@ interface SyncLoop {
  * but it says so, because a broker silently indexing nothing looks exactly like
  * a broker whose sources are empty.
  */
-async function startSync(
+function startSync(
   registry: CrdCorpusRegistry,
   syncTokens: Map<string, string>,
   port: number,
   status: CorpusStatusWriter,
-): Promise<SyncLoop | undefined> {
+  confirm: (corpus: string) => Promise<"gone" | "syncable">,
+): SyncLoop | undefined {
   const qdrantUrl = process.env.QDRANT_URL;
   const openaiKey = process.env.OPENAI_API_KEY;
   if (!qdrantUrl || !openaiKey) {
@@ -213,6 +247,7 @@ async function startSync(
       // controller yet, and one with no interval is not meant to be
       // indexed. Both are ordinary states, not errors.
       if (!binding || !collection || !intervalMs) return [];
+      const reconciled = cr.status?.lastReconcileTime ? Date.parse(cr.status.lastReconcileTime) : NaN;
       // A corpus with no sync token cannot be indexed: its source needs
       // its own token and there is no other to borrow. Reported once so a
       // missing SYNC_TOKEN_<name> is visible, then skipped.
@@ -223,7 +258,7 @@ async function startSync(
         }
         return [];
       }
-      return [{ binding, collection, intervalMs }];
+      return [{ binding, collection, intervalMs, ...(Number.isFinite(reconciled) ? { lastReconcileAt: reconciled } : {}) }];
     });
   const target = (corpus: string) => targets().find((candidate) => candidate.binding.name === corpus);
 
@@ -252,6 +287,7 @@ async function startSync(
         vectorSize: EMBEDDING_DIMENSIONS,
       }),
     target,
+    confirm,
     onReport: async (corpus, report) => {
       console.log(
         `sync ${corpus}: indexed=${report.indexed} removed=${report.removed} ` +
@@ -264,32 +300,74 @@ async function startSync(
     },
   });
 
-  const client = await connectClient({ address: temporalAddress, namespace: temporalNamespace });
-  const syncs = new CorpusSyncs({ client, taskQueue });
-  const worker = await createSyncWorker({ address: temporalAddress, namespace: temporalNamespace, taskQueue, activities });
-  const running = worker.run();
-  // A worker that stops on its own (Temporal unreachable for good, a fatal
-  // core error) leaves nothing indexing: exit, so the pod restarts loudly.
-  running.catch((err: unknown) => {
-    console.error("sync worker stopped:", err);
-    process.exit(1);
-  });
-  console.log(`syncing corpora on Temporal ${temporalAddress} (namespace ${temporalNamespace}, task queue ${taskQueue})`);
+  // Temporal is reached in the background, retried for as long as it takes:
+  // the probe, retrieval and fetch API this process also serves must not go
+  // down because indexing cannot start (docs/adr/0058 §2). A worker that stops
+  // on its own is reconnected the same way.
+  let syncs: CorpusSyncs | undefined;
+  let worker: Worker | undefined;
+  let stopped = false;
+  /** Ends the wait between connection attempts early (on stop). */
+  let wake: (() => void) | undefined;
+  const ensure = () => {
+    if (syncs) void syncs.ensure(targets().map((t) => t.binding.name));
+  };
 
-  // Every replica makes sure every synced Corpus has its loop; the workflow id
-  // makes that one loop however many replicas ask. A Corpus that stops being
-  // synced ends its own loop (it re-reads the Corpus as it waits).
-  const ensure = () => void syncs.ensure(targets().map((t) => t.binding.name));
-  ensure();
+  const connect = async (): Promise<void> => {
+    for (let attempt = 0; !stopped; attempt++) {
+      try {
+        const client = await connectClient({ address: temporalAddress, namespace: temporalNamespace });
+        worker = await createSyncWorker({ address: temporalAddress, namespace: temporalNamespace, taskQueue, activities });
+        const running = worker.run();
+        syncs = new CorpusSyncs({ client, taskQueue });
+        console.log(`syncing corpora on Temporal ${temporalAddress} (namespace ${temporalNamespace}, task queue ${taskQueue})`);
+        attempt = 0;
+        // Every replica makes sure every synced Corpus has its loop; the
+        // workflow id makes that one loop however many replicas ask.
+        ensure();
+        await running;
+        if (stopped) return;
+        console.error("sync worker stopped; reconnecting to Temporal");
+      } catch (err) {
+        if (stopped) return;
+        console.error(
+          `SYNC IS NOT RUNNING: could not start the Temporal sync worker on ${temporalAddress} ` +
+            `(attempt ${attempt + 1}); the API keeps serving, indexing waits:`,
+          err,
+        );
+      }
+      syncs = undefined;
+      worker = undefined;
+      const delayMs = Math.min(60_000, 1_000 * 2 ** Math.min(attempt, 6));
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, delayMs);
+        wake = () => {
+          clearTimeout(t);
+          resolve();
+        };
+      });
+      wake = undefined;
+    }
+  };
+  const connecting = connect();
+
+  // A Corpus that stops being synced ends its own loop (it re-reads the
+  // Corpus as it waits); a new one is started here within a minute.
   const timer = setInterval(ensure, 60_000);
 
   return {
-    syncs,
+    syncs: () => syncs,
     target,
     stop: async () => {
+      stopped = true;
       clearInterval(timer);
-      worker.shutdown();
-      await running.catch(() => {});
+      wake?.();
+      try {
+        worker?.shutdown();
+      } catch {
+        // Not running yet (still being created): the loop sees `stopped`.
+      }
+      await connecting;
     },
   };
 }

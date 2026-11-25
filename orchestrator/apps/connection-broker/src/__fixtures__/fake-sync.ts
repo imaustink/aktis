@@ -8,6 +8,8 @@ import type { PassResult, SyncActivities } from "../sync/model.js";
  */
 export class FakeSyncSource {
   intervalMs = 60_000;
+  /** What the Corpus's status says about its last full pass, if anything. */
+  lastReconcileAt: number | undefined;
   /** Corpora that are synced; one removed here is "gone". */
   readonly present = new Set<string>();
   readonly passes: { corpus: string; sourceIds?: string[] }[] = [];
@@ -40,7 +42,10 @@ export class FakeSyncSource {
 
   activities(): SyncActivities {
     return {
-      syncTarget: async (corpus) => (this.present.has(corpus) ? { intervalMs: this.intervalMs } : null),
+      syncTarget: async (corpus) =>
+        this.present.has(corpus)
+          ? { intervalMs: this.intervalMs, ...(this.lastReconcileAt !== undefined ? { lastReconcileAt: this.lastReconcileAt } : {}) }
+          : null,
       runPass: async (corpus, sourceIds) => {
         if (!this.present.has(corpus)) return null;
         this.active += 1;
