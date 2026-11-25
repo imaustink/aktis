@@ -1,4 +1,5 @@
-import { kubectl, withPortForward } from "./k8s.js";
+import { claimRuns, kubectl, withPortForward } from "./k8s.js";
+import { ownCredentialSubjects } from "./credential-store.js";
 import {
   assembleSseContent,
   assembleSseToolCalls,
@@ -123,7 +124,32 @@ export interface ChatOptions {
    * `extra_body`. Unset takes the deployment default (authcode in e2e).
    */
   identityLinkFlow?: "device" | "authcode";
+  /**
+   * Ends a parked turn early: once the streamed text matches `match`, keep
+   * listening for `dwellMs` more, then disconnect and report `parked: true`.
+   * Requires `allowPark`.
+   *
+   * Without it a parked turn always costs its full `timeoutMs` -- the facade
+   * holds the stream open for the human's whole link window -- even though the
+   * property most specs assert (the gate refused and asked for a link) was
+   * settled the moment the prompt streamed. That was most of this suite's
+   * wall time.
+   *
+   * Disconnecting is not free, which is why this is opt-in: the facade's
+   * auto-resume loop (engine.go autoResumeLink) runs on the request's context
+   * and stops with it. The dwell keeps the old coverage of those resumes --
+   * the default spans about three of them (defaultAutoResumeEvery = 4s) -- but
+   * a spec whose subject IS a later resume (a JWT expiring mid-wait, another
+   * caller resuming the session) must keep its full park and not use this.
+   */
+  stopParkedAfter?: { match: RegExp; dwellMs?: number };
 }
+
+/** Matches every provider's link prompt (authz.go: "[link your <label> account](...)"). */
+export const ANY_LINK_PROMPT = /link your \S+ account/i;
+
+/** Default dwell after the prompt: about three auto-resumes at the facade's 4s spacing. */
+const DEFAULT_PARK_DWELL_MS = 15_000;
 
 export async function chatTurn(userId: string, request: string, opts: ChatOptions = {}): Promise<ChatTurnResult> {
   const { raw, parked } = await streamChat(userId, [{ role: "user", content: request }], opts);
@@ -209,8 +235,30 @@ async function streamChat(
         opts.jwtExpiresInSeconds === undefined ? {} : { expiresInSeconds: opts.jwtExpiresInSeconds },
       );
   const sessionId = opts.sessionId ?? `e2e-chat-${userId}-${process.pid}`;
-
+  // Whatever this turn launches is this spec file's (k8s.ts claimRuns). The
+  // engine records the caller it resolved as the run's `launchedBy`: the
+  // forwarded user's subject, or -- with no JWT -- the shared bearer subject.
+  claimRuns(opts.withoutUserJwt ? { kind: "anonymous-chat" } : { kind: "chat", launchedBy: chatSubject(userId) });
+  // ...and so is any credential record the product files under this caller
+  // (a link the turn completes), for this file's deleteCredentials to clear.
+  if (!opts.withoutUserJwt) ownCredentialSubjects(chatSubject(userId));
+  if (opts.stopParkedAfter && !opts.allowPark) {
+    throw new Error("e2e: stopParkedAfter ends the turn as a park, so it needs allowPark");
+  }
   return withPortForward(ORCHESTRATOR_SERVICE, ORCHESTRATOR_PORT, CHAT_PORT, async (baseUrl) => {
+    // ONE controller, aborted by our own timers: the deadline, and
+    // `stopParkedAfter`'s dwell. Both surface as the same abort and take the
+    // same park path below. Deliberately not `AbortSignal.any([AbortSignal
+    // .timeout(), ...])`: a timeout signal reachable only through `any()` can be
+    // garbage collected and never fire, and a deadline that silently never
+    // fires is the exact failure the bounded-wait rules in e2e/README.md exist
+    // to prevent.
+    const abort = new AbortController();
+    const deadline = setTimeout(
+      () => abort.abort(new DOMException("chat turn deadline elapsed", "TimeoutError")),
+      opts.timeoutMs ?? 420_000,
+    );
+    let dwell: ReturnType<typeof setTimeout> | undefined;
     try {
       const res = await fetch(`${baseUrl}/v1/chat/completions`, {
         method: "POST",
@@ -239,7 +287,7 @@ async function streamChat(
         // A chat turn that needs a link holds its connection open for the whole
         // flow expiry, and a delegated turn waits on a real agent run. Generous,
         // but bounded: an unbounded fetch turns a hung turn into a hung suite.
-        signal: AbortSignal.timeout(opts.timeoutMs ?? 420_000),
+        signal: abort.signal,
       });
       if (!res.ok) {
         throw new Error(`e2e: chat completion failed: ${res.status} ${await res.text()}`);
@@ -258,6 +306,12 @@ async function streamChat(
           const { done, value } = await reader.read();
           if (done) break;
           raw += decoder.decode(value, { stream: true });
+          if (opts.stopParkedAfter && dwell === undefined && opts.stopParkedAfter.match.test(assembleSseContent(raw))) {
+            dwell = setTimeout(
+              () => abort.abort(new DOMException("parked turn ended after its dwell", "AbortError")),
+              opts.stopParkedAfter.dwellMs ?? DEFAULT_PARK_DWELL_MS,
+            );
+          }
         }
       } catch (err) {
         if (opts.allowPark && isAbort(err)) return { raw, parked: true };
@@ -269,11 +323,14 @@ async function streamChat(
       // that expects a park may swallow it; anything else is a real fault and
       // must surface, including a genuine hang.
       //
-      // Checked by NAME rather than `instanceof Error`: `AbortSignal.timeout`
-      // rejects with a DOMException, and undici may surface it wrapped, so the
+      // Checked by NAME rather than `instanceof Error`: the deadline aborts
+      // with a DOMException, and undici may surface it wrapped, so the
       // reason can sit on `cause`.
       if (opts.allowPark && isAbort(err)) return { raw: "", parked: true };
       throw err;
+    } finally {
+      clearTimeout(deadline);
+      clearTimeout(dwell);
     }
   });
 }

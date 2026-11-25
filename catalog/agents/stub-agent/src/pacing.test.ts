@@ -32,3 +32,31 @@ describe("readPacing", () => {
     expect(isImmediate(readPacing({ STUB_SILENT_FOR_MS: "1000" }))).toBe(false);
   });
 });
+
+describe("readPacing with a per-run directive", () => {
+  it("reads the directive out of the turn's text", () => {
+    const text = "Steps to reproduce.\n[stub-pacing narrateForMs=120000 narrateEveryMs=5000]\nThanks";
+    expect(readPacing({}, text)).toEqual({ narrateForMs: 120000, narrateEveryMs: 5000, silentForMs: 0 });
+  });
+
+  it("REPLACES the env pacing, so another spec's CR patch cannot leak into this run", () => {
+    const env = { STUB_NARRATE_FOR_MS: "50000", STUB_SILENT_FOR_MS: "90000" };
+    expect(readPacing(env, "[stub-pacing silentForMs=1000]")).toEqual({
+      narrateForMs: 0,
+      narrateEveryMs: 2000,
+      silentForMs: 1000,
+    });
+  });
+
+  it("falls back to the env vars when the turn carries no directive", () => {
+    expect(readPacing({ STUB_SILENT_FOR_MS: "1000" }, "a plain goal").silentForMs).toBe(1000);
+  });
+
+  it("clamps directive values like env values", () => {
+    expect(readPacing({}, "[stub-pacing silentForMs=999999999]").silentForMs).toBe(10 * 60 * 1000);
+  });
+
+  it("treats a bare directive as immediate, overriding a paced CR", () => {
+    expect(isImmediate(readPacing({ STUB_SILENT_FOR_MS: "1000" }, "[stub-pacing]"))).toBe(true);
+  });
+});

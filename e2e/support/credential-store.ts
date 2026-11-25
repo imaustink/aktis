@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { kubectl, kubectlApplyStdin } from "./k8s.js";
+import { kubectl, kubectlApplyStdin, kubectlJson } from "./k8s.js";
 
 /**
  * Reads and seeds the durable credential store (docs/adr/0034) through
@@ -68,6 +68,7 @@ async function secretField(name: string, field: string): Promise<string | undefi
  * run replaces rather than 409s.
  */
 async function putRecord(prefix: string, subject: string, fields: Record<string, string>): Promise<void> {
+  ownedSubjects.add(subject);
   const manifest = {
     apiVersion: "v1",
     kind: "Secret",
@@ -84,18 +85,63 @@ async function putRecord(prefix: string, subject: string, fields: Record<string,
 }
 
 /**
- * Deletes every seeded and real credential record, so a test starts from a
- * known-unlinked state.
+ * Deletes this spec file's credential records, seeded or real, so its next
+ * test starts from a known-unlinked state.
  *
- * By label, which is why the app stamps one: the object names are hashes, so
- * there is no glob that finds them and no way to enumerate the subjects that
- * might exist.
+ * Found by label, which is why the app stamps one: the object names are
+ * hashes, so there is no glob that finds them. Then narrowed to the subjects
+ * this file OWNS (`ownedSubjects`): spec files run concurrently, and this used
+ * to delete every record in the cluster -- including the credential a
+ * neighbouring file had just seeded for a turn still in flight, which then
+ * parked on a link prompt for a reason that looks exactly like a keying bug.
+ * A file whose tests share a subject with another file's must therefore use a
+ * subject of its own (a distinct GitHub sender, a distinct chat user).
  */
 export async function deleteCredentials(kind?: "identity-link" | "claude-auth"): Promise<number> {
   const selector = kind ? `${CREDENTIAL_LABEL}=${kind}` : CREDENTIAL_LABEL;
-  const names = await secretNames(selector);
-  for (const name of names) await kubectl(["delete", "secret", name, "--ignore-not-found"]);
-  return names.length;
+  const list = await kubectlJson<{ items: { metadata: { name: string }; data?: Record<string, string> }[] }>([
+    "get",
+    "secrets",
+    "-l",
+    selector,
+  ]);
+  const doomed = list.items
+    .filter((s) => {
+      const subject = s.data?.[RECORD_KEY_FIELD] && Buffer.from(s.data[RECORD_KEY_FIELD], "base64").toString("utf8");
+      return subject !== undefined && ownedSubjects.has(subject) && !NEVER_DELETED.has(subject);
+    })
+    .map((s) => s.metadata.name);
+  for (const name of doomed) await kubectl(["delete", "secret", name, "--ignore-not-found"]);
+  return doomed.length;
+}
+
+/**
+ * The deployment-wide shared subject: integration-gateway's own OIDC service
+ * subject, which every webhook turn and every JWT-less chat turn runs as.
+ *
+ * Never deleted. Several concurrent spec files seed it, all with the same
+ * fixture credentials and all needing them PRESENT; none needs it absent (the
+ * negative controls seed it on purpose). A delete-then-reseed by one file opened
+ * a window in which another file's turn parked for want of a credential.
+ */
+const NEVER_DELETED = new Set(["client-integration-gateway"]);
+
+/**
+ * The credential subjects this spec file owns: every subject it seeded, plus
+ * any it declared with {@link ownCredentialSubjects}. Module state, so per spec
+ * FILE (vitest isolates each file's modules).
+ */
+const ownedSubjects = new Set<string>();
+
+/**
+ * Declares subjects whose records this spec file may delete even though it did
+ * not seed them itself -- a record the PRODUCT writes in response to the file's
+ * turns (a link a device flow completes, a credential adopted onto a
+ * principal), which `deleteCredentials` would otherwise leave behind for the
+ * file's next test.
+ */
+export function ownCredentialSubjects(...subjects: string[]): void {
+  for (const subject of subjects) ownedSubjects.add(subject);
 }
 
 /**

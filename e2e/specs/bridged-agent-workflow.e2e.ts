@@ -3,7 +3,7 @@ import { connect } from "node:net";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { requireLocalClusterContext } from "../support/guard.js";
-import { agentRunsSince, cleanupAgentRunsSince, waitFor } from "../support/k8s.js";
+import { agentRunsSince, cleanupAgentRunsSince, kubectlArgs, localPortFor, waitFor, runsMark } from "../support/k8s.js";
 import { withPortForward } from "../support/k8s.js";
 import { issueLabeledPayload, postGithubWebhook } from "../support/webhook.js";
 import { fakeGithubRequests, resetFakeGithub, webhookSecret } from "../support/fixtures.js";
@@ -20,8 +20,7 @@ import { seedAllClaudeCredentials } from "../support/credential-store.js";
  * connect is the correct readiness signal for a gRPC port.
  */
 async function withTemporalPortForward<T>(localPort: number, body: () => Promise<T>): Promise<T> {
-  requireLocalClusterContext();
-  const child = execFile("kubectl", ["-n", "controller-agent", "port-forward", "svc/temporal-dev-server", `${localPort}:7233`]);
+  const child = execFile("kubectl", kubectlArgs(["port-forward", "svc/temporal-dev-server", `${localPort}:7233`]));
   let exited: string | undefined;
   child.on("exit", (code, signal) => {
     exited = `kubectl port-forward svc/temporal-dev-server exited (code ${code ?? "null"}, signal ${signal ?? "null"})`;
@@ -86,7 +85,8 @@ requireLocalClusterContext();
 
 // 18090/18091/18092 belong to happy-path/resilience/identity-keying respectively.
 const GATEWAY_PORT = 18093;
-const TEMPORAL_PORT = 17234;
+// Offset per worker like every other local port here (k8s.ts localPortFor).
+const TEMPORAL_PORT = localPortFor(17234);
 // Must be one of values-e2e.yaml's `integration-gateway.config.githubIdentities`
 // entries -- an unlisted sender resolves no identity and the turn is dropped
 // before it ever reaches the orchestrator, silently (no error, no AgentRun).
@@ -127,7 +127,7 @@ describe("Temporal engine: a bridged pod agent actually runs as BridgedAgentWork
   });
 
   it("launches a real BridgedAgentWorkflow execution for the bridged agent an EventTrigger names", async () => {
-    const startedAt = new Date();
+    const startedAt = await runsMark();
     const issueNumber = Date.now() % 100000;
 
     const status = await withPortForward("agent-controller-integration-gateway", 8090, GATEWAY_PORT, async (baseUrl) => {

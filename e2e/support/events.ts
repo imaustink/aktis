@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import {
+  agentRunItemsSince,
   fetchThrough,
   kubectl,
   kubectlApplyStdin,
@@ -367,31 +368,20 @@ export interface AgentRunDetail {
   jobName?: string;
 }
 
-/** Same widening as k8s.ts's agentRunsSince (second-granularity timestamps + host/node skew). */
-const SINCE_SLACK_MS = 3_000;
-
 export async function agentRunDetailsSince(since: Date): Promise<AgentRunDetail[]> {
-  const cutoff = since.getTime() - SINCE_SLACK_MS;
-  const list = await kubectlJson<{
-    items: {
-      metadata: { name: string; creationTimestamp: string; annotations?: Record<string, string> };
-      spec?: { agentRef?: string; goal?: string; readOnly?: boolean; params?: Record<string, string> };
-      status?: { phase?: string; jobName?: string };
-    }[];
-  }>(["get", "agentruns"]);
-  return list.items
-    .filter((i) => new Date(i.metadata.creationTimestamp).getTime() >= cutoff)
-    .sort((a, b) => b.metadata.creationTimestamp.localeCompare(a.metadata.creationTimestamp))
-    .map((i) => ({
-      name: i.metadata.name,
-      createdAt: i.metadata.creationTimestamp,
-      phase: i.status?.phase,
-      agentRef: i.spec?.agentRef,
-      goal: i.spec?.goal,
-      readOnly: i.spec?.readOnly === true,
-      params: i.spec?.params ?? {},
-      jobName: i.status?.jobName,
-    }));
+  // The same listing agentRunsSince uses: the widened window, the runs that
+  // existed at a RunsMark excluded, and -- once this file has claimed a turn --
+  // only this file's runs (k8s.ts claimRuns).
+  return (await agentRunItemsSince(since)).map((i) => ({
+    name: i.metadata.name,
+    createdAt: i.metadata.creationTimestamp,
+    phase: i.status?.phase,
+    agentRef: i.spec?.agentRef,
+    goal: i.spec?.goal,
+    readOnly: i.spec?.readOnly === true,
+    params: i.spec?.params ?? {},
+    jobName: i.status?.jobName,
+  }));
 }
 
 /**
@@ -453,6 +443,9 @@ export interface ToolRunDetail {
   args: string[];
   phase?: string;
 }
+
+/** Same widening as k8s.ts's agentRunsSince (second-granularity timestamps + host/node skew). */
+const SINCE_SLACK_MS = 3_000;
 
 export async function toolRunDetailsSince(since: Date): Promise<ToolRunDetail[]> {
   const cutoff = since.getTime() - SINCE_SLACK_MS;

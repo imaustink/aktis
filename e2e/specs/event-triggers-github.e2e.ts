@@ -1,9 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { requireLocalClusterContext } from "../support/guard.js";
-import { cleanupAgentRunsSince, waitFor } from "../support/k8s.js";
+import { cleanupAgentRunsSince, waitFor, runsMark } from "../support/k8s.js";
 import { resetFakeGithub } from "../support/fixtures.js";
 import { seedAllClaudeCredentials } from "../support/credential-store.js";
-import { paceStubAgent, resetStubPacing } from "../support/resilience.js";
+import { pacingDirective } from "../support/resilience.js";
 import {
   EXAMPLE_ACK_TEXT,
   STUB_REPLY_MARKER,
@@ -17,6 +17,7 @@ import {
 import { issueLabeledPayload, postGithubDelivery } from "../support/webhook.js";
 
 requireLocalClusterContext();
+
 
 /**
  * The `github-issue-triage` EventTrigger, end to end (docs/event-triggers.md,
@@ -40,7 +41,9 @@ requireLocalClusterContext();
  * true, every review assertion there would still pass -- these would not.
  */
 
-const SENDER = "e2e-user";
+// This file's own sender, so its credential subject (github:<sender>) is no
+// concurrent spec file's: identity-keying needs github:e2e-user EMPTY.
+const SENDER = "e2e-gh-trigger-user";
 const OWNER = "e2e-org";
 const REPO = "e2e-repo";
 const LABEL = "ai-triage";
@@ -68,12 +71,12 @@ function expectedParams(issue: number): Record<string, string> {
   };
 }
 
-async function labelIssue(secret: string, issue: number): Promise<void> {
+async function labelIssue(secret: string, issue: number, body = ISSUE_BODY): Promise<void> {
   const { status } = await withGateway((forward) =>
     postGithubDelivery(
       forward,
       "issues",
-      issueLabeledPayload({ owner: OWNER, repo: REPO, issueNumber: issue, label: LABEL, senderLogin: SENDER, title: ISSUE_TITLE, body: ISSUE_BODY }),
+      issueLabeledPayload({ owner: OWNER, repo: REPO, issueNumber: issue, label: LABEL, senderLogin: SENDER, title: ISSUE_TITLE, body }),
       secret,
     ),
   );
@@ -89,20 +92,18 @@ describe("EventTrigger github-issue-triage", () => {
     suiteStartedAt = new Date();
     secret = await githubWebhookSecret();
     await resetFakeGithub();
-    await resetStubPacing();
     // stub-agent declares Claude providers; without a credential at the
     // sender's canonical subject the gate parks and nothing launches.
     await seedAllClaudeCredentials(`github:${SENDER}`);
   });
 
   afterAll(async () => {
-    await resetStubPacing();
     await cleanupAgentRunsSince(suiteStartedAt);
   });
 
   it("launches a writable stub-agent run with the trigger's params, acks first, posts the result, and removes the label", async () => {
     const issue = nextIssue();
-    const startedAt = new Date();
+    const startedAt = await runsMark();
     await labelIssue(secret, issue);
 
     const run = await waitForAgentRunWithParam(startedAt, "number", String(issue));
@@ -164,30 +165,27 @@ describe("EventTrigger github-issue-triage", () => {
     // Silence past the idle window is a failed turn (resilience.e2e.ts's
     // negative control). A failed run is exactly when someone re-applies the
     // label, so it must come off.
-    await paceStubAgent({ silentForMs: IDLE_WINDOW_MS * 2 });
+    // Paced by a directive in the issue body, so only THIS run goes silent
+    // (support/resilience.ts pacingDirective).
     const issue = nextIssue();
-    const startedAt = new Date();
-    try {
-      await labelIssue(secret, issue);
-      const run = await waitForAgentRunWithParam(startedAt, "number", String(issue));
-      expect(run.readOnly).toBe(false);
+    const startedAt = await runsMark();
+    await labelIssue(secret, issue, `${ISSUE_BODY}\n${pacingDirective({ silentForMs: IDLE_WINDOW_MS * 2 })}`);
+    const run = await waitForAgentRunWithParam(startedAt, "number", String(issue));
+    expect(run.readOnly).toBe(false);
 
-      const activity = await waitFor(
-        `label removal + a post-ack comment on failed #${issue}`,
-        async () => {
-          const a = await issueActivity(OWNER, REPO, issue);
-          const ack = a.comments.findIndex((c) => c.text.includes(EXAMPLE_ACK_TEXT));
-          const after = ack >= 0 ? a.comments.slice(ack + 1) : [];
-          return a.labelDeletes.length > 0 && after.length > 0 ? { a, after } : undefined;
-        },
-        { timeoutMs: 420_000 },
-      );
-      // The post-ack comment reports the failure; it is NOT a stub reply
-      // (the stub never answered). Red if a failed turn were reported as success.
-      expect(activity.after.some((c) => c.text.includes(STUB_REPLY_MARKER))).toBe(false);
-      expect(activity.a.labelDeletes.map((d) => decodeURIComponent(d.path.split("/labels/")[1] ?? ""))).toContain(LABEL);
-    } finally {
-      await resetStubPacing();
-    }
+    const activity = await waitFor(
+      `label removal + a post-ack comment on failed #${issue}`,
+      async () => {
+        const a = await issueActivity(OWNER, REPO, issue);
+        const ack = a.comments.findIndex((c) => c.text.includes(EXAMPLE_ACK_TEXT));
+        const after = ack >= 0 ? a.comments.slice(ack + 1) : [];
+        return a.labelDeletes.length > 0 && after.length > 0 ? { a, after } : undefined;
+      },
+      { timeoutMs: 420_000 },
+    );
+    // The post-ack comment reports the failure; it is NOT a stub reply
+    // (the stub never answered). Red if a failed turn were reported as success.
+    expect(activity.after.some((c) => c.text.includes(STUB_REPLY_MARKER))).toBe(false);
+    expect(activity.a.labelDeletes.map((d) => decodeURIComponent(d.path.split("/labels/")[1] ?? ""))).toContain(LABEL);
   });
 });

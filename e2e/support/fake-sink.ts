@@ -55,19 +55,29 @@ export async function ensureFakeSink(): Promise<void> {
   await kubectl(["rollout", "status", "deploy/fake-sink", "--timeout=120s"]);
 }
 
-export async function fakeSinkRequests(): Promise<SinkRequest[]> {
+/** This spec file's read position in fake-sink's shared log (see fixtures.ts resetFakeGithub). */
+let requestsFrom = 0;
+
+async function allSinkRequests(): Promise<SinkRequest[]> {
   return withPortForward("fake-sink", 80, FAKE_SINK_LOCAL_PORT, async (_baseUrl, forward) => {
     const res = await fetchThrough(forward, "/_e2e/requests");
     return (await res.json()) as SinkRequest[];
   });
 }
 
-/** Clears the recording. Called in beforeAll, never afterAll, so a crashed run leaves its evidence. */
+/** What fake-sink recorded since this spec file last called {@link resetFakeSink}. */
+export async function fakeSinkRequests(): Promise<SinkRequest[]> {
+  return (await allSinkRequests()).slice(requestsFrom);
+}
+
+/**
+ * Starts this spec file's view of the recording afresh. Called in beforeAll,
+ * never afterAll, so a crashed run leaves its evidence. Moves a read position
+ * rather than clearing the shared log, which concurrent spec files also read.
+ */
 export async function resetFakeSink(): Promise<void> {
   await ensureFakeSink();
-  await withPortForward("fake-sink", 80, FAKE_SINK_LOCAL_PORT, async (_baseUrl, forward) => {
-    await fetchThrough(forward, "/_e2e/reset", { method: "POST" });
-  });
+  requestsFrom = (await allSinkRequests()).length;
 }
 
 /**

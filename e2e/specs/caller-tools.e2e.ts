@@ -4,7 +4,15 @@ import { requireLocalClusterContext } from "../support/guard.js";
 import { fetchThrough, kubectl, kubectlApplyStdin, waitFor, type PortForward } from "../support/k8s.js";
 import { chatToolTurn, type ChatMessage, type ChatToolDefinition } from "../support/chat.js";
 import { invokeStatus, invokeTurn } from "../support/invoke.js";
-import { COLLECTIONS, allPointCounts, listCollections, openQdrantGrpc, payloadNames, withQdrant } from "../support/qdrant.js";
+import {
+  COLLECTIONS,
+  allPointCounts,
+  catalogPointsMentioning,
+  listCollections,
+  openQdrantGrpc,
+  payloadNames,
+  withQdrant,
+} from "../support/qdrant.js";
 import { runGoTests } from "../support/go-test.js";
 
 // Module scope, before any fixture: a suite pointed at the wrong cluster must
@@ -132,8 +140,6 @@ describe("caller-supplied tools: the store's queries against a real Qdrant", () 
 });
 
 describe("caller-supplied tools: the round trip through the chat facade", () => {
-  let baseline: Awaited<ReturnType<typeof allPointCounts>>;
-
   beforeAll(async () => {
     const manifestPath = new URL("../manifests/caller-tool-skills.yaml", import.meta.url).pathname;
     await kubectlApplyStdin(await readFile(manifestPath, "utf8"));
@@ -153,8 +159,6 @@ describe("caller-supplied tools: the round trip through the chat facade", () => 
       },
       { timeoutMs: 120_000, intervalMs: 3_000 },
     );
-
-    baseline = await allPointCounts();
   });
 
   afterAll(async () => {
@@ -202,11 +206,13 @@ describe("caller-supplied tools: the round trip through the chat facade", () => 
     // so the index is skipped entirely and the collection is correctly untouched
     // too. The "more tools than top-K" test below is where indexing actually
     // happens, and that is where the growth assertion belongs.
-    const after = await allPointCounts();
-
-    expect(after.tools).toBe(baseline.tools);
-    expect(after.skills).toBe(baseline.skills);
-    expect(after.agents).toBe(baseline.agents);
+    //
+    // Asserted by content, not by catalog point COUNTS: spec files run
+    // concurrently and some add catalog entries (an MCP tool, a Skill) while
+    // this runs. Every caller tool this file sends carries RUN_TOKEN in its
+    // description, so a caller tool indexed into the catalog under ANY name
+    // still shows up here.
+    expect(await catalogPointsMentioning(RUN_TOKEN)).toEqual([]);
     // And the caller's tool never appears in the catalog under any name.
     const catalogNames = await withQdrant((url) => payloadNames(url, COLLECTIONS.tools));
     expect(catalogNames).not.toContain("get_device_battery");
@@ -277,8 +283,8 @@ describe("caller-supplied tools: the round trip through the chat facade", () => 
     const indexed = await withQdrant((url) => payloadNames(url, COLLECTIONS.callerTools));
     expect(indexed).toContain("get_device_battery");
     expect(indexed).toContain("convert_currency");
-    // And still nothing in the catalog.
-    expect(after.tools).toBe(baseline.tools);
+    // And still nothing in the catalog (by content; see the catalogs test above).
+    expect(await catalogPointsMentioning(RUN_TOKEN)).toEqual([]);
   });
 
   it("re-sending the same tool array adds no points, and an EDITED tool adds exactly one", async () => {

@@ -23,6 +23,28 @@ patches:
       kind: EventTrigger
       metadata:
         name: factory-intake
+  # Removed: every trigger on the run-completion chain (docs/adr/0052).
+  # The `runs` SOURCE stays: the webhook triggers declare
+  # `onComplete.emitTo: runs` and go NotReady (EmitToNotFound) -- dispatching
+  # nothing -- if it is missing. With no trigger on it, an emitted completion
+  # launches nothing. factory-review matches the completion of
+  # github-issue-triage/github-pr-triage, and factory-handoff/factory-fix the
+  # completion of github-pr-review: the triggers nearly every webhook spec
+  # fires. Left in, each successful turn launched a follow-up run seconds
+  # AFTER its test had moved on, into the next test's window. That was the
+  # cause of the suite's recurring "launches nothing" flakes (a run that was
+  # not the test's own) and of specs that read the newest run picking a
+  # chained one, each costing a failed attempt plus a retry. No spec asserts
+  # the chain; it is covered by
+  # orchestrator/engines/temporal/internal/catalog/examples_test.go and the
+  # gateway's runs/__histories__ workflow replays.
+  - target: { kind: EventTrigger, name: "factory-(coordinate|fix|handoff|park|review|triage|triage-stacked)" }
+    patch: |
+      $patch: delete
+      apiVersion: core.aktis.ai/v1alpha1
+      kind: EventTrigger
+      metadata:
+        name: ignored
   # Removed: the conflict sweep would call the GitHub search API on a timer,
   # which the hermetic cluster has no credentials for. (Its trigger goes with
   # it, rather than sitting NotReady on a missing source.)

@@ -7,6 +7,7 @@ import {
   jobEnvNames,
   waitFor,
   withPortForward,
+  runsMark,
 } from "../support/k8s.js";
 import { issueLabeledPayload, postGithubWebhook } from "../support/webhook.js";
 import { fakeGithubRequests, resetFakeGithub, webhookSecret } from "../support/fixtures.js";
@@ -17,7 +18,9 @@ import { seedAllClaudeCredentials } from "../support/credential-store.js";
 requireLocalClusterContext();
 
 const GATEWAY_PORT = 18090;
-const SENDER = "e2e-user";
+// This file's own sender, so its credential subject (github:<sender>) is no
+// concurrent spec file's: identity-keying needs github:e2e-user EMPTY.
+const SENDER = "e2e-happy-user";
 const OWNER = "e2e-org";
 const REPO = "e2e-repo";
 
@@ -71,7 +74,7 @@ describe("happy path: GitHub issue label -> triage -> agent run -> comment poste
   });
 
   it("runs the full chain and posts the agent's reply back to the issue", async () => {
-    const startedAt = new Date();
+    const startedAt = await runsMark();
     // Unique per run: the issue number IS the session key, so a fixed one makes
     // a re-run inherit the previous run's session instead of starting fresh.
     const issueNumber = Date.now() % 100000;

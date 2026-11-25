@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { requireLocalClusterContext } from "../support/guard.js";
-import { cleanupAgentRunsSince } from "../support/k8s.js";
+import { cleanupAgentRunsSince, runsMark } from "../support/k8s.js";
 import {
   applyEventTrigger,
   deleteEventFixtures,
@@ -50,7 +50,7 @@ describe("POST /invoke with an event envelope", () => {
   let startedAt: Date;
 
   beforeAll(async () => {
-    startedAt = new Date();
+    startedAt = await runsMark();
     await resetFakeSink();
 
     // ── per-test triggers ──

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { requireLocalClusterContext } from "../support/guard.js";
-import { agentRunAgentRef, agentRunsSince, cleanupAgentRunsSince, waitFor } from "../support/k8s.js";
+import { agentRunAgentRef, agentRunsSince, cleanupAgentRunsSince, waitFor, runsMark } from "../support/k8s.js";
 import { chatTurn } from "../support/chat.js";
 import { deleteCredentials, seedAllClaudeCredentials } from "../support/credential-store.js";
 import { deleteRedisKeys } from "../support/redis.js";
@@ -80,7 +80,7 @@ describe("a parked chat turn keeps its caller's identity", () => {
   });
 
   it("control: the shared subject's seeded credentials launch a turn that IS the shared subject's", async () => {
-    const startedAt = new Date();
+    const startedAt = await runsMark();
 
     await chatTurn("anonymous", REQUEST, {
       sessionId: session("control"),
@@ -96,7 +96,7 @@ describe("a parked chat turn keeps its caller's identity", () => {
   });
 
   it("does not fall back to the shared subject when the forwarded JWT expires mid-wait", async () => {
-    const startedAt = new Date();
+    const startedAt = await runsMark();
 
     // 15s of JWT against a ~4s resume cadence: the old code's fourth or fifth
     // resume already went out unauthenticated. The turn is held for a minute
@@ -117,7 +117,7 @@ describe("a parked chat turn keeps its caller's identity", () => {
   });
 
   it("does not let another caller on the same conversation resume someone else's parked request", async () => {
-    const startedAt = new Date();
+    const startedAt = await runsMark();
     const sessionId = session("hijack");
 
     const owner = await chatTurn(unlinkedUser("owner"), REQUEST, { sessionId, allowPark: true, timeoutMs: 30_000 });
@@ -137,7 +137,7 @@ describe("a parked chat turn keeps its caller's identity", () => {
   });
 
   it("refuses a chat turn whose forwarded JWT has already expired, rather than running it as the shared subject", async () => {
-    const startedAt = new Date();
+    const startedAt = await runsMark();
 
     // Refused at the facade's authentication gate (docs/adr/0053 follow-up 1),
     // before any turn starts: an expired JWT does not verify, and a chat turn

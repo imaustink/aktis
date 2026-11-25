@@ -8,13 +8,21 @@ const exec = promisify(execFile);
 export const NAMESPACE = "controller-agent";
 
 /**
- * Runs kubectl and returns stdout. Re-checks the context on every call rather
- * than trusting that the module-scope guard ran: a spec that forgot to import
- * the guard would otherwise reach the cluster through this helper.
+ * The leading arguments for EVERY kubectl spawn in this suite: the verified
+ * context, pinned, and the namespace. Runs the guard rather than trusting that
+ * the module-scope one ran, so a spec that forgot to import it still cannot
+ * reach a cluster through this.
+ *
+ * `--context` is the part that matters: without it kubectl follows the
+ * machine-wide current-context, which can change mid-run (see guard.ts).
  */
+export function kubectlArgs(args: string[]): string[] {
+  return ["--context", requireLocalClusterContext(), "-n", NAMESPACE, ...args];
+}
+
+/** Runs kubectl (pinned by `kubectlArgs`) and returns stdout. */
 export async function kubectl(args: string[]): Promise<string> {
-  requireLocalClusterContext();
-  const { stdout } = await exec("kubectl", ["-n", NAMESPACE, ...args], { maxBuffer: 32 * 1024 * 1024 });
+  const { stdout } = await exec("kubectl", kubectlArgs(args), { maxBuffer: 32 * 1024 * 1024 });
   return stdout;
 }
 
@@ -30,11 +38,10 @@ export async function kubectlJson<T = unknown>(args: string[]): Promise<T> {
  * temp file just to hand kubectl a path adds a cleanup path that can fail.
  */
 export async function kubectlApplyStdin(manifest: string): Promise<string> {
-  requireLocalClusterContext();
   return new Promise((resolve, reject) => {
     const child = execFile(
       "kubectl",
-      ["-n", NAMESPACE, "apply", "-f", "-"],
+      kubectlArgs(["apply", "-f", "-"]),
       { maxBuffer: 32 * 1024 * 1024 },
       (err, stdout, stderr) => (err ? reject(new Error(`kubectl apply -f - failed: ${stderr || err.message}`)) : resolve(stdout)),
     );
@@ -166,10 +173,10 @@ const K8S_TIMESTAMP_GRANULARITY_MS = 1_000;
  * from this process. Skew in the node-behind direction hides runs exactly like the
  * truncation above.
  *
- * Two seconds is deliberately far below the ~20s minimum spacing between triggers
- * in any spec, so this can widen the window without ever letting a PREVIOUS
- * turn's run be mistaken for the current one -- which would be the worse failure,
- * since it would make an assertion pass against the wrong run.
+ * This widening alone does NOT keep a PREVIOUS test's run out: tests are not
+ * reliably seconds apart (one may end the moment its launch appears). Mark a
+ * test's start with `runsMark()`, not `new Date()`, so runs that already
+ * existed are excluded by name -- see RunsMark.
  */
 const CLOCK_SKEW_TOLERANCE_MS = 2_000;
 
@@ -179,16 +186,158 @@ const CLOCK_SKEW_TOLERANCE_MS = 2_000;
  *
  * The cutoff is `since` widened by the timestamp granularity and a skew
  * allowance; see those constants for why comparing directly is a silent trap.
+ *
+ * Each entry also says where the run came from -- agent, creation time, and
+ * the head of its goal (a webhook's goal names the issue, a chat turn's is
+ * the request) -- so an absence assertion that catches a run it did not
+ * expect names that run in its diff instead of an anonymous `{ …(2) }`.
  */
-export async function agentRunsSince(since: Date): Promise<{ name: string; phase?: string }[]> {
+export async function agentRunsSince(since: Date): Promise<AgentRunSummary[]> {
+  return (await agentRunItemsSince(since)).map((i) => ({
+    name: i.metadata.name,
+    phase: i.status?.phase,
+    agentRef: i.spec?.agentRef,
+    created: i.metadata.creationTimestamp,
+    goal: (i.spec?.goal ?? "").replace(/\s+/g, " ").slice(0, 100),
+  }));
+}
+
+/** The slice of an AgentRun CR the run helpers read. */
+export interface AgentRunItem {
+  metadata: { name: string; creationTimestamp: string; annotations?: Record<string, string> };
+  spec?: {
+    agentRef?: string;
+    goal?: string;
+    readOnly?: boolean;
+    params?: Record<string, string>;
+    /** Who launched it, from where (the engine's launch record). */
+    launch?: { entryPoint?: string; launchedBy?: string };
+  };
+  status?: { phase?: string; jobName?: string };
+}
+
+/**
+ * The AgentRuns created since `since` THAT THIS SPEC FILE LAUNCHED, newest first.
+ * The one listing every run helper builds on; see {@link claimRuns} for "this
+ * spec file launched".
+ */
+export async function agentRunItemsSince(since: Date): Promise<AgentRunItem[]> {
   const cutoffMs = since.getTime() - K8S_TIMESTAMP_GRANULARITY_MS - CLOCK_SKEW_TOLERANCE_MS;
-  const list = await kubectlJson<{
-    items: { metadata: { name: string; creationTimestamp: string }; status?: { phase?: string } }[];
-  }>(["get", "agentruns"]);
+  const existed = since instanceof RunsMark ? since.existing : undefined;
+  const list = await kubectlJson<{ items: AgentRunItem[] }>(["get", "agentruns"]);
   return list.items
     .filter((i) => new Date(i.metadata.creationTimestamp).getTime() >= cutoffMs)
-    .sort((a, b) => b.metadata.creationTimestamp.localeCompare(a.metadata.creationTimestamp))
-    .map((i) => ({ name: i.metadata.name, phase: i.status?.phase }));
+    .filter((i) => !existed?.has(i.metadata.name))
+    .filter(isOwnedRun)
+    .sort((a, b) => b.metadata.creationTimestamp.localeCompare(a.metadata.creationTimestamp));
+}
+
+/**
+ * Something a spec file did that can launch an AgentRun, by which the run can
+ * be recognized as that file's.
+ *
+ * - `issue`: a GitHub delivery for `repository#number`. The run's
+ *   `spec.params` carry both (the shipped GitHub triggers' params).
+ * - `chat`: a chat turn whose caller the engine resolved to `launchedBy`
+ *   (`spec.launch.launchedBy`, `openwebui:<id>` for a forwarded JWT).
+ * - `anonymous-chat`: a chat turn sent WITHOUT a user JWT, which runs as the
+ *   deployment's shared subject. The engine files that under entry point
+ *   `api` (audit.EntryPoint: not per-user, no trigger) -- not `chat`, and not
+ *   `webhook`, which shares the same subject. Only identity-continuity sends
+ *   these.
+ * - `goal`: any non-webhook run whose goal contains `includes` -- for a turn
+ *   with nothing else to tell it apart, like a session-page follow-up, which
+ *   also runs as the shared subject. Name something only this file's turn
+ *   could put in a goal (an issue number).
+ */
+export type RunClaim =
+  | { kind: "issue"; repository: string; number: number }
+  | { kind: "chat"; launchedBy: string }
+  | { kind: "anonymous-chat" }
+  | { kind: "goal"; includes: string };
+
+/**
+ * Every claim this spec file has made. Module state, and that is the point:
+ * vitest gives each spec file its own module graph (`isolate`, the default),
+ * so this set is per FILE even though files share one worker process pool.
+ */
+const claims: RunClaim[] = [];
+
+/**
+ * Records that this spec file did something that may launch a run. Called by
+ * the helpers that send turns (`chatTurn`, the GitHub payload builders), so a
+ * spec never has to.
+ *
+ * Why it exists: spec files run CONCURRENTLY against one cluster
+ * (vitest.config.ts). A time window alone ("runs created since this test
+ * started") then also contains every other file's runs, so "the newest run" is
+ * a coin toss, "nothing launched" fails on a neighbour's launch, and teardown
+ * deletes a neighbour's run mid-test. Once a file has claimed anything, the run
+ * helpers see only the runs one of its claims matches.
+ */
+export function claimRuns(claim: RunClaim): void {
+  claims.push(claim);
+}
+
+function claimMatches(claim: RunClaim, run: AgentRunItem): boolean {
+  const launch = run.spec?.launch;
+  switch (claim.kind) {
+    case "issue":
+      return run.spec?.params?.repository === claim.repository && run.spec?.params?.number === String(claim.number);
+    case "chat":
+      return launch?.entryPoint === "chat" && launch.launchedBy === claim.launchedBy;
+    case "anonymous-chat":
+      return launch?.entryPoint === "api" && !launch.launchedBy?.startsWith("openwebui:");
+    case "goal":
+      return launch?.entryPoint !== "webhook" && (run.spec?.goal ?? "").includes(claim.includes);
+  }
+}
+
+/**
+ * True when one of this file's claims matches `run` -- or when this file has
+ * claimed nothing at all. A file that never sends a turn through a claiming
+ * helper (an event-trigger spec driving the `/invoke` API, say, or the
+ * cluster-free checks in waitfor-guard) keeps the unfiltered view it always
+ * had, and matches its runs by params itself.
+ */
+function isOwnedRun(run: AgentRunItem): boolean {
+  return claims.length === 0 || claims.some((c) => claimMatches(c, run));
+}
+
+/**
+ * A test's start: the time, AND the AgentRuns that already existed then.
+ *
+ * `agentRunsSince` widens its cutoff by a few seconds (timestamps are
+ * second-granular, and clocks skew), and that window is ambiguous on its
+ * own: a run the PREVIOUS test launched in its last seconds falls inside it.
+ * Its doc once leaned on tests being ~20s apart; once the suite stopped
+ * sleeping between them, a test that ends the moment its launch appears put
+ * that launch inside the next test's window, and the next test's "launched
+ * nothing" failed on it. A run that existed when this test started cannot be
+ * this test's, so `agentRunsSince(mark)` excludes those by name and keeps the
+ * widened window only for runs created after the mark.
+ *
+ * It IS a Date, so every helper that takes `since: Date` accepts it unchanged.
+ */
+export class RunsMark extends Date {
+  constructor(readonly existing: ReadonlySet<string>) {
+    super();
+  }
+}
+
+/** Marks a test's start; use in place of `new Date()` for anything compared against AgentRuns. */
+export async function runsMark(): Promise<RunsMark> {
+  const list = await kubectlJson<{ items: { metadata: { name: string } }[] }>(["get", "agentruns"]);
+  return new RunsMark(new Set(list.items.map((i) => i.metadata.name)));
+}
+
+export interface AgentRunSummary {
+  name: string;
+  phase?: string;
+  agentRef?: string;
+  created: string;
+  /** The first 100 characters of the run's goal, whitespace collapsed. */
+  goal: string;
 }
 
 /**
@@ -208,6 +357,29 @@ export async function jobEnvNames(agentRunName: string): Promise<string[]> {
 }
 
 /**
+ * How far apart concurrent spec files' local ports sit -- more than the span of
+ * every fixed port this suite uses (18063..18112), so two workers' ranges can
+ * never overlap.
+ */
+const PORT_STRIDE_PER_WORKER = 200;
+
+/**
+ * The local port THIS worker uses for a fixed base port.
+ *
+ * Spec files run concurrently (vitest.config.ts), each in its own worker
+ * process, and every helper here forwards to a fixed local port. Two files
+ * forwarding the same service at once would fight over one port: the loser's
+ * `kubectl port-forward` exits on "address already in use", or -- worse -- its
+ * readiness poll is answered by the OTHER file's forward. Offsetting by the
+ * worker's pool id gives each concurrent file its own range, and a file still
+ * runs its own tests serially, so within a worker the fixed ports stay exclusive.
+ */
+export function localPortFor(basePort: number): number {
+  const worker = Number(process.env.VITEST_POOL_ID ?? "1");
+  return basePort + PORT_STRIDE_PER_WORKER * (Number.isFinite(worker) && worker > 0 ? worker - 1 : 0);
+}
+
+/**
  * Port-forwards a Service and returns the base URL plus its teardown.
  *
  * The caller owns the lifetime, which {@link withPortForward} does not allow.
@@ -223,10 +395,10 @@ export async function jobEnvNames(agentRunName: string): Promise<string[]> {
 export async function openPortForward(
   service: string,
   remotePort: number,
-  localPort: number,
+  basePort: number,
 ): Promise<PortForward> {
-  requireLocalClusterContext();
-  const child = execFile("kubectl", ["-n", NAMESPACE, "port-forward", `svc/${service}`, `${localPort}:${remotePort}`]);
+  const localPort = localPortFor(basePort);
+  const child = execFile("kubectl", kubectlArgs(["port-forward", `svc/${service}`, `${localPort}:${remotePort}`]));
   // A forward that dies takes its listener with it, and a `fetch` already issued
   // against it can then wait forever on a socket nobody will answer -- the exact
   // shape that hung a resilience run for eight silent minutes. Recording the exit
@@ -385,6 +557,12 @@ export async function agentRunSecretEnvNames(agentRunName: string): Promise<stri
  * explicit sweep is a backstop for any Secret whose owner was already gone.
  */
 export async function cleanupAgentRunsSince(since: Date): Promise<number> {
+  // Deletes only runs this file can PROVE are its own. A file that claimed
+  // nothing sees every run (see isOwnedRun), and with files running
+  // concurrently that includes a neighbour's run still in flight; deleting it
+  // would fail that neighbour for a reason that looks like a product bug. Its
+  // runs are left to the controller's retention instead.
+  if (claims.length === 0) return 0;
   const runs = await agentRunsSince(since);
   // A failed test's artifacts are the evidence for the failure, and this is
   // what used to delete them before anyone could look (see

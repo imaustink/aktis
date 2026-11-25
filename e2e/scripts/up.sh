@@ -151,7 +151,31 @@ step "Applying the example EventSources/EventTriggers..."
 # shipped examples through an overlay that only swaps in hermetic agents,
 # Secrets and reply sinks. After skaffold, so the CRDs and the Agents/Skills/
 # Tools the triggers name already exist.
-kubectl apply -n "$NS" -k "$REPO_ROOT/e2e/manifests/event-triggers" >/dev/null
+applied="$(kubectl apply -n "$NS" -k "$REPO_ROOT/e2e/manifests/event-triggers" -o name | sort)"
+# `apply` never deletes, so a source or trigger the overlay stopped rendering
+# (or a per-test CR a crashed spec left behind) would keep matching on an
+# existing cluster and only vanish on a fresh one. Converge to exactly what
+# the overlay renders. That is how the run-completion chain the overlay
+# removes stays removed on a cluster that already had it.
+existing="$(kubectl get -n "$NS" eventtriggers,eventsources -o name | sort)"
+stale="$(comm -13 <(printf '%s\n' "$applied") <(printf '%s\n' "$existing") | grep -v '^$' || true)"
+if [[ -n "$stale" ]]; then
+  # shellcheck disable=SC2086 # one name per word, by construction
+  kubectl delete -n "$NS" --wait=false $stale >/dev/null
+  echo "  ✓ removed $(wc -l <<<"$stale" | tr -d ' ') event CR(s) the overlay no longer renders"
+fi
+# A NotReady trigger dispatches nothing, and every spec that drives it then
+# times out at its full budget instead of failing here. (Removing a source a
+# trigger still names -- e.g. its `onComplete.emitTo` -- does exactly that.)
+# ci-failure-skill is the one expected exception: its Skill is applied by its
+# own spec, so it is TargetNotFound until then.
+if ! kubectl wait -n "$NS" --for=condition=Ready --timeout=60s \
+    $(grep '^eventtrigger' <<<"$applied" | grep -v '/ci-failure-skill$') >/dev/null; then
+  kubectl get -n "$NS" eventtriggers \
+    -o custom-columns='NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,REASON:.status.conditions[?(@.type=="Ready")].reason,MESSAGE:.status.conditions[?(@.type=="Ready")].message' >&2
+  echo "e2e: event triggers are not Ready -- see above" >&2
+  exit 1
+fi
 echo "  ✓ e2e/manifests/event-triggers"
 
 step "Restarting integration-gateway to re-read its webhook secrets..."
@@ -214,6 +238,66 @@ step "Waiting for the stack to be ready..."
 # inside a test's waitFor timeout, where it looks like a product bug.
 kubectl -n "$NS" wait --for=condition=Available --timeout=300s \
   deploy/agent-orchestrator deploy/agent-controller-integration-gateway
+
+step "Pre-pulling agent images onto every node..."
+# Every agent run's FIRST pod on a node pulls and extracts its image there.
+# claude-code-swe-agent is ~770 MiB compressed and several times that unpacked,
+# and the local cluster's nodes have ~8 GiB of disk: extracting it while other
+# agent pods are already using that disk failed with "no space left on device",
+# and the run sat in ImagePullBackOff until its spec timed out. The specs run
+# concurrently, so that overlap is the normal case, not bad luck. Doing every
+# pull here, on an idle cluster, means no spec ever waits on one.
+agent_images="$(kubectl -n "$NS" get agents -o jsonpath='{range .items[*]}{.spec.image}{"\n"}{end}' | sort -u | grep -v '^$' || true)"
+if [[ -n "$agent_images" ]]; then
+  init_containers=""
+  i=0
+  while IFS= read -r image; do
+    init_containers+="
+      - name: pull-$i
+        image: \"$image\"
+        imagePullPolicy: IfNotPresent
+        command: [\"sh\", \"-c\", \"exit 0\"]"
+    i=$((i + 1))
+  done <<<"$agent_images"
+  kubectl -n "$NS" delete daemonset e2e-image-prepull --ignore-not-found --wait=true >/dev/null
+  kubectl -n "$NS" apply -f - >/dev/null <<EOF
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: e2e-image-prepull
+spec:
+  selector:
+    matchLabels: {app: e2e-image-prepull}
+  template:
+    metadata:
+      labels: {app: e2e-image-prepull}
+    spec:
+      tolerations: [{operator: Exists}]
+      initContainers:$init_containers
+      containers:
+      - name: done
+        image: "$(head -1 <<<"$agent_images")"
+        command: ["sh", "-c", "sleep 3600"]
+EOF
+  if kubectl -n "$NS" rollout status daemonset/e2e-image-prepull --timeout=300s >/dev/null 2>&1; then
+    echo "  ✓ $i agent image(s) present on every node"
+  else
+    # Warned, not fatal: the usual cause is a node whose disk cannot hold the
+    # image at all (ferry machines have a fixed ~8 GiB), which nothing here
+    # can fix, and the suite can still pass when no agent pod lands there.
+    # But any spec whose agent pod DOES land there will time out on
+    # ImagePullBackOff, so say which node and why, up front.
+    echo "  ⚠ some nodes could not pull every agent image:" >&2
+    kubectl -n "$NS" get pods -l app=e2e-image-prepull \
+      -o custom-columns='NODE:.spec.nodeName,STATUS:.status.initContainerStatuses[*].state.waiting.reason' --no-headers \
+      | grep -v '<none>' | sed 's/^/      /' >&2 || true
+    kubectl get events -n "$NS" --field-selector reason=Failed -o custom-columns=M:.message --no-headers 2>/dev/null \
+      | grep -o 'no space left on device' | head -1 | sed 's/^/      cause: /' >&2 || true
+    echo "    Agent runs scheduled on those nodes will sit in ImagePullBackOff." >&2
+    echo "    Free disk there (or recreate the node), then re-run this script." >&2
+  fi
+  kubectl -n "$NS" delete daemonset e2e-image-prepull --wait=false >/dev/null
+fi
 
 echo ""
 echo "✓ e2e stack is up. Run the suite with:"

@@ -98,9 +98,29 @@ Needs `node`, `kubectl` and a Go toolchain (`go`, the version in
 against the live cluster (`support/go-test.ts`), because the code they check
 is Go (docs/adr/0056).
 
-Tests are **serial** (`fileParallelism: false`, `maxConcurrency: 1`): they
-share one cluster, and several assert on global state (Redis keys, AgentRun
-lists) that concurrent runs would race on.
+Spec **files run concurrently** against the one cluster; the tests inside a
+file stay serial (`maxConcurrency: 1`). Two phases (`vitest.config.ts`):
+everything runs at once first, then the files listed in `EXCLUSIVE` -- the
+ones that restart shared services, pace the shared stub agent, or assert that
+nothing at all launched -- run one at a time, on their own.
+
+What lets files share the cluster lives in `support/`, and a new spec has to
+go through it:
+
+- **AgentRuns.** `agentRunsSince` and friends return only runs this file
+  launched, recognized from what `chatTurn` and the GitHub payload builders
+  record (`claimRuns` in `k8s.ts`). A file that sends a turn some other way and
+  then looks for "the newest run" needs a claim of its own.
+- **Recorded traffic.** `resetFakeGithub` / `resetFakeSink` move this file's
+  read position instead of clearing the shared log; filter what you read by an
+  issue number or path you own.
+- **Credentials.** `deleteCredentials` removes only subjects this file seeded
+  (or declared with `ownCredentialSubjects`). Use a GitHub sender and chat user
+  no other file uses; a new sender must be added to `githubIdentities` in
+  `values-e2e.yaml`.
+- **Ports.** Fixed local ports are offset per worker (`localPortFor`).
+- **Anything else shared** -- one identity two files need in opposite states,
+  an assertion over all traffic -- takes a named lock (`support/locks.ts`).
 
 Other knobs: `E2E_NO_EGRESS=1` skips the one spec that needs the public
 internet; `E2E_SKIP_WEB_FETCH_BUILD=1` skips building the web-fetch image in

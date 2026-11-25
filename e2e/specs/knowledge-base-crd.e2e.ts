@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { requireLocalClusterContext } from "../support/guard.js";
 import { kubectl, kubectlJson, kubectlApplyStdin, waitFor, NAMESPACE } from "../support/k8s.js";
+import { ALPHA_KNOWLEDGE_BASE_LOCK, holdLock } from "../support/locks.js";
 
 /**
  * The Connection/Corpus/KnowledgeBase CRDs against the controller that
@@ -27,6 +28,10 @@ import { kubectl, kubectlJson, kubectlApplyStdin, waitFor, NAMESPACE } from "../
  */
 
 requireLocalClusterContext();
+
+// Creates, breaks and deletes e2e-alpha / alpha-docs, which
+// knowledge-base-retrieval.e2e.ts syncs and queries.
+holdLock(ALPHA_KNOWLEDGE_BASE_LOCK);
 
 const CONNECTION = "e2e-fake-atlassian";
 const CORPUS = "alpha-docs";

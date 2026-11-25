@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { requireLocalClusterContext } from "../support/guard.js";
-import { cleanupAgentRunsSince, waitFor } from "../support/k8s.js";
+import { cleanupAgentRunsSince, waitFor, runsMark } from "../support/k8s.js";
 import { resetFakeGithub } from "../support/fixtures.js";
 import { seedAllClaudeCredentials } from "../support/credential-store.js";
 import { resetStubPacing } from "../support/resilience.js";
@@ -35,20 +35,23 @@ requireLocalClusterContext();
  * AgentRun, no ack comment, no label removal.
  *
  * An absence is only meaningful if the same window would have seen a presence,
- * so the file ENDS with a control: an otherwise identical matching delivery
- * that must launch and ack. And every sender used here has a seeded Claude
+ * so the deliveries END with a control: an otherwise identical matching delivery
+ * that must launch and ack, and whose launch-and-ack time IS the window the
+ * absences are checked after. And every sender used here has a seeded Claude
  * credential, so a delivery wrongly let through would LAUNCH rather than park
  * invisibly on a missing credential.
  */
 
 const OWNER = "e2e-org";
 const REPO = "e2e-repo";
-const SENDER = "e2e-user";
+// This file's own sender, so its credential subject (github:<sender>) is no
+// concurrent spec file's: identity-keying needs github:e2e-user EMPTY.
+const SENDER = "e2e-filtering-user";
 /** Not in values-e2e.yaml's githubIdentities allowlist -> the GitHub sender provider resolves nothing. */
 const STRANGER = "e2e-stranger";
 
-/** Long enough for a wrongly-relayed delivery to have produced an ack and an AgentRun. */
-const ABSENCE_WINDOW_MS = 75_000;
+/** Budget for the control delivery to launch and ack; it is also the absence window (see the test). */
+const CONTROL_BUDGET_MS = 300_000;
 
 let counter = 0;
 const BASE = 81_000 + (Date.now() % 15_000);
@@ -81,7 +84,7 @@ describe("github deliveries that must not dispatch", () => {
   }
 
   it("accepts and ignores every non-matching or untrusted delivery", async () => {
-    const startedAt = new Date();
+    const startedAt = await runsMark();
 
     // ── no trigger matches ──
     const opened = next();
@@ -114,9 +117,32 @@ describe("github deliveries that must not dispatch", () => {
     await send("ai-triage applied by an unresolvable sender", "issues", stranger,
       issueLabeledPayload({ owner: OWNER, repo: REPO, issueNumber: stranger, label: "ai-triage", senderLogin: STRANGER }));
 
-    await new Promise((r) => setTimeout(r, ABSENCE_WINDOW_MS));
+    // ── the control, which is also the window ──
+    // An otherwise identical matching delivery from a resolvable human, sent
+    // AFTER every delivery above. Once it has launched and acked, a delivery
+    // wrongly let through has had at least as long as a real dispatch takes to
+    // do the same. This replaced a fixed 75s sleep: the window is now measured
+    // from the system's own latency, and an absence can no longer pass because
+    // the cluster was simply too slow to act inside a guessed number.
+    // If these time out, the absences below prove nothing about filtering.
+    const control = next();
+    const { status } = await withGateway((forward) =>
+      postGithubDelivery(
+        forward,
+        "issues",
+        issueLabeledPayload({ owner: OWNER, repo: REPO, issueNumber: control, label: "ai-triage", senderLogin: SENDER }),
+        secret,
+      ),
+    );
+    expect(status).toBe(202);
+    await waitForAgentRunWithParam(startedAt, "number", String(control), CONTROL_BUDGET_MS);
+    await waitFor(
+      "the control's ack comment",
+      async () => (await issueActivity(OWNER, REPO, control)).comments.find((c) => c.text.includes(EXAMPLE_ACK_TEXT)),
+      { timeoutMs: CONTROL_BUDGET_MS },
+    );
 
-    const runs = await agentRunDetailsSince(startedAt);
+    const runs = (await agentRunDetailsSince(startedAt)).filter((r) => r.params.number !== String(control));
     expect(
       runs.map((r) => `${r.name} (${r.agentRef}, params.number=${r.params.number}: ${sent.get(Number(r.params.number)) ?? "?"})`),
       "a delivery that must not dispatch launched an AgentRun",
@@ -127,26 +153,5 @@ describe("github deliveries that must not dispatch", () => {
       expect(activity.comments.map((c) => c.text), `${what}: no comment may be posted`).toEqual([]);
       expect(activity.labelDeletes, `${what}: no label may be removed`).toEqual([]);
     }
-  });
-
-  it("control: the same window DOES see a matching delivery from a resolvable human", async () => {
-    const issue = next();
-    const startedAt = new Date();
-    const { status } = await withGateway((forward) =>
-      postGithubDelivery(
-        forward,
-        "issues",
-        issueLabeledPayload({ owner: OWNER, repo: REPO, issueNumber: issue, label: "ai-triage", senderLogin: SENDER }),
-        secret,
-      ),
-    );
-    expect(status).toBe(202);
-    // If these time out, the absences above prove nothing about filtering.
-    await waitForAgentRunWithParam(startedAt, "number", String(issue), ABSENCE_WINDOW_MS * 4);
-    await waitFor(
-      "the control's ack comment",
-      async () => (await issueActivity(OWNER, REPO, issue)).comments.find((c) => c.text.includes(EXAMPLE_ACK_TEXT)),
-      { timeoutMs: ABSENCE_WINDOW_MS * 2 },
-    );
   });
 });

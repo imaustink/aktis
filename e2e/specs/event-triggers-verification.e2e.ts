@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { requireLocalClusterContext } from "../support/guard.js";
-import { cleanupAgentRunsSince, kubectl } from "../support/k8s.js";
+import { cleanupAgentRunsSince, kubectl, runsMark } from "../support/k8s.js";
 import {
   agentRunDetailsSince,
   ciBearerToken,
@@ -23,8 +23,15 @@ import {
   slackTimestamp,
   slackUrlVerificationPayload,
 } from "../support/webhook.js";
+import { EXCLUSIVE_LOCK, holdLock } from "../support/locks.js";
 
 requireLocalClusterContext();
+
+// Runs in the suite's exclusive phase (vitest.config.ts): this file
+// asserts that NOTHING launched in its window -- any concurrent file's run
+// would fail it -- and its rejected deliveries carry nothing to tell "ours"
+// from a neighbour's.
+holdLock(EXCLUSIVE_LOCK);
 
 /**
  * Ingress verification for every scheme the example EventSources use
@@ -52,7 +59,7 @@ describe("webhook + tick verification", () => {
   let tick: string;
 
   beforeAll(async () => {
-    startedAt = new Date();
+    startedAt = await runsMark();
     await ensureEventSecrets();
     [github, slack, ci, hmac, tick] = await Promise.all([
       githubWebhookSecret(),

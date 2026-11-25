@@ -1,3 +1,6 @@
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { customClusterContext } from "../support/guard.js";
 
@@ -11,7 +14,8 @@ import { customClusterContext } from "../support/guard.js";
  * property: it must yield a context only when the file both selects the
  * `custom` provider and names one, and never fall back to "anything goes".
  *
- * Deliberately no `requireLocalClusterContext()`: this touches nothing.
+ * Deliberately no `requireLocalClusterContext()`: this touches nothing (the
+ * context-switch block below stubs kubectl on PATH).
  */
 describe("the context guard's custom-cluster door", () => {
   it("yields the named context when the file selects the custom provider", () => {
@@ -36,5 +40,49 @@ describe("the context guard's custom-cluster door", () => {
 
   it("ignores a commented-out selection", () => {
     expect(customClusterContext("# AKTIS_CLUSTER=custom\nAKTIS_CLUSTER_CONTEXT=production\n")).toBeUndefined();
+  });
+});
+
+/**
+ * The guard's verdict must still bind the LAST kubectl call of a run, not just
+ * the first. `current-context` is machine-wide: another terminal or session can
+ * select a different cluster mid-run, and the guard is memoized, so re-running
+ * it per call proves nothing after the first. A run did exactly this -- kept
+ * going against `kind-substrate` after another session switched to it, with a
+ * teardown that deletes AgentRuns and Secrets. The defence is that every spawn
+ * carries the verified context as `--context`, so a switch is simply ignored.
+ *
+ * Checked by stubbing `kubectl` at the process boundary: the stub answers
+ * `config current-context` from a file the test rewrites, and records every
+ * other invocation's arguments.
+ */
+describe("a mid-run context switch cannot redirect the suite", () => {
+  it("keeps passing the verified context after current-context changes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "e2e-kubectl-ctx-"));
+    const ctxFile = join(dir, "ctx");
+    const calls = join(dir, "calls");
+    writeFileSync(ctxFile, "minikube\n");
+    writeFileSync(
+      join(dir, "kubectl"),
+      `#!/bin/sh\ncase "$*" in\n  *"config current-context"*) cat '${ctxFile}' ;;\n  *) echo "$*" >> '${calls}'; echo '{}' ;;\nesac\n`,
+      { mode: 0o755 },
+    );
+    const original = process.env.PATH;
+    process.env.PATH = `${dir}:${original ?? ""}`;
+    try {
+      // Imported here, after PATH points at the stub, so the guard's one real
+      // check reads the stub's answer.
+      const { kubectl } = await import("../support/k8s.js");
+      await kubectl(["get", "agentruns"]);
+      writeFileSync(ctxFile, "kind-substrate\n");
+      await kubectl(["delete", "agentrun", "after-the-switch"]);
+
+      const recorded = readFileSync(calls, "utf8").trim().split("\n");
+      expect(recorded).toHaveLength(2);
+      for (const line of recorded) expect(line).toMatch(/^--context minikube /);
+      expect(recorded[1]).toContain("delete agentrun after-the-switch");
+    } finally {
+      process.env.PATH = original;
+    }
   });
 });

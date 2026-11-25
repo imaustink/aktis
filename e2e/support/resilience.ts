@@ -61,6 +61,23 @@ export async function paceStubAgent(pacing: StubPacing): Promise<void> {
   ]);
 }
 
+/**
+ * A pacing directive to put in a turn's text (an issue body, a chat request):
+ * the stub paces THAT run, and only that run (catalog/agents/stub-agent
+ * src/pacing.ts). Prefer it to {@link paceStubAgent}, which patches the shared
+ * stub-agent CR and so paces every stub run any concurrent spec file launches
+ * meanwhile -- only the exclusive phase (vitest.config.ts) may do that.
+ *
+ * `replyAckRetryMs` is a runtime knob, not the stub's, so it has no directive
+ * form; it still needs the CR.
+ */
+export function pacingDirective(pacing: Omit<StubPacing, "replyAckRetryMs">): string {
+  const knobs = Object.entries(pacing)
+    .filter(([, v]) => v !== undefined)
+    .map(([k, v]) => `${k}=${v}`);
+  return `[stub-pacing ${knobs.join(" ")}]`;
+}
+
 /** Restores the stub to replying immediately, so later specs are unaffected. */
 export async function resetStubPacing(): Promise<void> {
   await paceStubAgent({});

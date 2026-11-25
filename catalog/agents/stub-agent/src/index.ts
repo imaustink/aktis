@@ -33,9 +33,11 @@ await runAgent(async (session) => {
   const observed = observedCredentialEnv(process.env);
   await session.progress(`credential env present: ${observed.join(", ") || "(none)"}`, { stage: "inspect", pct: 60 });
 
-  // Optional pacing (resilience.e2e.ts). Absent these env vars the stub replies
-  // immediately, exactly as before, so happy-path/identity-keying are unaffected.
-  const pacing = readPacing(process.env);
+  // Optional pacing (resilience.e2e.ts): a `[stub-pacing ...]` directive in
+  // the turn (its goal, or a param such as the issue body the goal was built
+  // from), else the CR's env vars. Absent both the stub replies immediately,
+  // exactly as before, so happy-path/identity-keying are unaffected.
+  const pacing = readPacing(process.env, [session.goal, ...Object.values(session.params ?? {})].join("\n"));
   if (!isImmediate(pacing)) {
     const narrateUntil = Date.now() + pacing.narrateForMs;
     while (Date.now() < narrateUntil) {
