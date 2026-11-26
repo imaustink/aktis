@@ -17,8 +17,8 @@ import { EMBEDDING_DIMENSIONS, OpenAIEmbedder } from "./embedder.js";
 import { QdrantCorpusWriter } from "./sync/corpus-writer.js";
 import { HttpResourceSource } from "./sync/http-source.js";
 import { createSyncActivities, type SyncTarget } from "./sync/activities.js";
-import type { Worker } from "@temporalio/worker";
 import { connectClient, createSyncWorker, CorpusSyncs, SyncPassError } from "./sync/temporal.js";
+import { superviseSync } from "./sync/supervisor.js";
 import { DEFAULT_TASK_QUEUE } from "./sync/model.js";
 import { QdrantHttpClient } from "./sync/qdrant-client.js";
 import { CorpusStatusWriter } from "./corpus-status.js";
@@ -305,51 +305,32 @@ function startSync(
   // down because indexing cannot start (docs/adr/0058 §2). A worker that stops
   // on its own is reconnected the same way.
   let syncs: CorpusSyncs | undefined;
-  let worker: Worker | undefined;
-  let stopped = false;
-  /** Ends the wait between connection attempts early (on stop). */
-  let wake: (() => void) | undefined;
   const ensure = () => {
     if (syncs) void syncs.ensure(targets().map((t) => t.binding.name));
   };
 
-  const connect = async (): Promise<void> => {
-    for (let attempt = 0; !stopped; attempt++) {
-      try {
-        const client = await connectClient({ address: temporalAddress, namespace: temporalNamespace });
-        worker = await createSyncWorker({ address: temporalAddress, namespace: temporalNamespace, taskQueue, activities });
-        const running = worker.run();
-        syncs = new CorpusSyncs({ client, taskQueue });
-        console.log(`syncing corpora on Temporal ${temporalAddress} (namespace ${temporalNamespace}, task queue ${taskQueue})`);
-        attempt = 0;
-        // Every replica makes sure every synced Corpus has its loop; the
-        // workflow id makes that one loop however many replicas ask.
-        ensure();
-        await running;
-        if (stopped) return;
-        console.error("sync worker stopped; reconnecting to Temporal");
-      } catch (err) {
-        if (stopped) return;
-        console.error(
-          `SYNC IS NOT RUNNING: could not start the Temporal sync worker on ${temporalAddress} ` +
-            `(attempt ${attempt + 1}); the API keeps serving, indexing waits:`,
-          err,
-        );
-      }
+  const supervisor = superviseSync({
+    connectClient: () => connectClient({ address: temporalAddress, namespace: temporalNamespace }),
+    createWorker: () =>
+      createSyncWorker({ address: temporalAddress, namespace: temporalNamespace, taskQueue, activities }),
+    onConnected: (client) => {
+      syncs = new CorpusSyncs({ client, taskQueue });
+      console.log(`syncing corpora on Temporal ${temporalAddress} (namespace ${temporalNamespace}, task queue ${taskQueue})`);
+      // Every replica makes sure every synced Corpus has its loop; the
+      // workflow id makes that one loop however many replicas ask.
+      ensure();
+    },
+    onDisconnected: () => {
       syncs = undefined;
-      worker = undefined;
-      const delayMs = Math.min(60_000, 1_000 * 2 ** Math.min(attempt, 6));
-      await new Promise<void>((resolve) => {
-        const t = setTimeout(resolve, delayMs);
-        wake = () => {
-          clearTimeout(t);
-          resolve();
-        };
-      });
-      wake = undefined;
-    }
-  };
-  const connecting = connect();
+    },
+    onError: (err, attempt) =>
+      console.error(
+        `SYNC IS NOT RUNNING: could not start the Temporal sync worker on ${temporalAddress} ` +
+          `(attempt ${attempt}); the API keeps serving, indexing waits:`,
+        err,
+      ),
+    onWorkerStopped: () => console.error("sync worker stopped; reconnecting to Temporal"),
+  });
 
   // A Corpus that stops being synced ends its own loop (it re-reads the
   // Corpus as it waits); a new one is started here within a minute.
@@ -359,15 +340,8 @@ function startSync(
     syncs: () => syncs,
     target,
     stop: async () => {
-      stopped = true;
       clearInterval(timer);
-      wake?.();
-      try {
-        worker?.shutdown();
-      } catch {
-        // Not running yet (still being created): the loop sees `stopped`.
-      }
-      await connecting;
+      await supervisor.stop();
     },
   };
 }
