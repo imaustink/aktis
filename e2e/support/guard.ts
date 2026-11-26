@@ -25,6 +25,18 @@ const LOCAL_CLUSTER_CONTEXTS = ["ferry-aktis", "minikube", "kind-aktis"];
 /** Gitignored, per checkout. The same file scripts/cluster/lib.sh reads. */
 const CLUSTER_LOCAL_ENV = fileURLToPath(new URL("../../cluster.local.env", import.meta.url));
 
+function parseEnvFile(envFileText: string): Map<string, string> {
+  const values = new Map<string, string>();
+  for (const raw of envFileText.split("\n")) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const match = /^(?:export\s+)?([A-Z_][A-Z0-9_]*)=(.*)$/.exec(line);
+    if (!match) continue;
+    values.set(match[1]!, match[2]!.trim().replace(/^(['"])(.*)\1$/, "$2"));
+  }
+  return values;
+}
+
 /**
  * The one way to add a context without editing this file: the `custom`
  * provider, for a cluster the built-in providers do not manage (Apple's
@@ -38,27 +50,93 @@ const CLUSTER_LOCAL_ENV = fileURLToPath(new URL("../../cluster.local.env", impor
  * off.
  */
 export function customClusterContext(envFileText: string): string | undefined {
-  const values = new Map<string, string>();
-  for (const raw of envFileText.split("\n")) {
-    const line = raw.trim();
-    if (!line || line.startsWith("#")) continue;
-    const match = /^(?:export\s+)?([A-Z_][A-Z0-9_]*)=(.*)$/.exec(line);
-    if (!match) continue;
-    values.set(match[1]!, match[2]!.trim().replace(/^(['"])(.*)\1$/, "$2"));
-  }
+  const values = parseEnvFile(envFileText);
   if (values.get("AKTIS_CLUSTER") !== "custom") return undefined;
   return values.get("AKTIS_CLUSTER_CONTEXT") || undefined;
 }
 
+/** Each built-in provider's context (its `provider_context`). */
+const PROVIDER_CONTEXTS: Record<string, string> = {
+  ferry: "ferry-aktis",
+  minikube: "minikube",
+  kind: "kind-aktis",
+};
+
+/** `AKTIS_CLUSTER` as written in cluster.local.env, if it is. */
+export function fileClusterProvider(envFileText: string): string | undefined {
+  return parseEnvFile(envFileText).get("AKTIS_CLUSTER") || undefined;
+}
+
+/**
+ * The built-in contexts the suite may use on this machine.
+ *
+ * On an Apple-silicon Mac the local cluster is ferry (scripts/cluster/lib.sh's
+ * default there), so ONLY `ferry-aktis` is allowed unless a provider was chosen
+ * deliberately -- `AKTIS_CLUSTER` in the environment or cluster.local.env, the
+ * same precedence lib.sh uses -- and then only that provider's context. Without
+ * this a Mac that still had a `minikube` or `kind-aktis` context lying around
+ * (both Docker Desktop-backed) would run the suite there instead of on ferry,
+ * which is how local runs kept landing on Docker Desktop after the move.
+ *
+ * Everywhere else every built-in context stays allowed, as before. Either way
+ * the result is a subset of LOCAL_CLUSTER_CONTEXTS: a provider name can only
+ * narrow the list, never add to it (only the `custom` door does that).
+ */
+export function builtInContexts(opts: {
+  platform: string;
+  arch: string;
+  provider: string | undefined;
+}): string[] {
+  if (opts.platform !== "darwin" || opts.arch !== "arm64") return LOCAL_CLUSTER_CONTEXTS;
+  const provider = opts.provider || "ferry";
+  const context = PROVIDER_CONTEXTS[provider];
+  return context ? [context] : [];
+}
+
+function readArm64Sysctl(): string | undefined {
+  try {
+    return execFileSync("sysctl", ["-n", "hw.optional.arm64"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The machine's architecture for builtInContexts -- the HARDWARE, not this
+ * process. `process.arch` is the arch of the running Node binary, so an x64
+ * Node under Rosetta (Intel Homebrew in /usr/local, a Rosetta terminal) reports
+ * `x64` on an M-series Mac, which would re-allow the Docker Desktop-backed
+ * contexts. On darwin, `sysctl hw.optional.arm64` is `1` on Apple silicon
+ * whatever the process arch (and absent on an Intel Mac). Same check as
+ * scripts/cluster/lib.sh's cluster_is_apple_silicon. Elsewhere, and if sysctl
+ * fails, `process.arch` stands.
+ */
+export function hostArch(
+  platform: string,
+  processArch: string,
+  readSysctl: () => string | undefined = readArm64Sysctl,
+): string {
+  if (platform !== "darwin" || processArch === "arm64") return processArch;
+  return readSysctl() === "1" ? "arm64" : processArch;
+}
+
 function allowedContexts(): string[] {
-  let text: string;
+  let text = "";
   try {
     text = readFileSync(CLUSTER_LOCAL_ENV, "utf8");
   } catch {
-    return LOCAL_CLUSTER_CONTEXTS;
+    // No file: the defaults apply.
   }
+  const builtIn = builtInContexts({
+    platform: process.platform,
+    arch: hostArch(process.platform, process.arch),
+    provider: process.env.AKTIS_CLUSTER || fileClusterProvider(text),
+  });
   const custom = customClusterContext(text);
-  return custom ? [...LOCAL_CLUSTER_CONTEXTS, custom] : LOCAL_CLUSTER_CONTEXTS;
+  return custom ? [...builtIn, custom] : builtIn;
 }
 
 let verified: string | undefined;
@@ -103,6 +181,7 @@ export function requireLocalClusterContext(): string {
           allowed.map((c) => `"${c}"`).join(", ")
         }.`,
         `Start and select the local cluster with:  ./scripts/cluster/cluster.sh up`,
+        `(On an Apple-silicon Mac that is ferry, context "ferry-aktis" -- not Docker Desktop, minikube or kind.)`,
         `(docs/local-cluster.md covers using a cluster of your own.)`,
       ].join("\n"),
     );

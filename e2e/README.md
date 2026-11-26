@@ -24,6 +24,11 @@ the tests create and delete namespaced objects, and a suite that silently ran
 there would be destructive. The guard runs before any fixture, and there is
 deliberately no environment variable to override it.
 
+On an Apple-silicon Mac the list narrows to the selected provider's context:
+`ferry-aktis`, unless `AKTIS_CLUSTER` (environment or `cluster.local.env`)
+picks `minikube` or `kind`. Local runs on a Mac go through ferry, not Docker
+Desktop.
+
 The one way to add a context is the `custom` provider: `AKTIS_CLUSTER=custom`
 plus `AKTIS_CLUSTER_CONTEXT=<name>` in the gitignored `cluster.local.env`. It
 names one exact context, in a file that is never committed and never exists in

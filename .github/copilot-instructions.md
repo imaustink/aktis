@@ -38,14 +38,45 @@ contract) and never imports from a sibling directly — only from `framework/*`.
   `--workspace=agent-orchestrator`).
 - Build the shared package before typechecking/testing a dependent workspace
   if you've changed it: `npm run build --workspace=@aktis/messaging`.
-- Docker builds use the **repo root** as build context (not the tool/app
-  dir), because images need to COPY in `framework/messaging`:
-  `docker build -f catalog/tools/recipe-scraper/Dockerfile -t recipe-scraper:latest .`
+- Image builds use the **repo root** as build context (not the tool/app
+  dir), because images need to COPY in `framework/messaging`. To get an image
+  into the local cluster, build it through the provider wrapper rather than
+  bare `docker build` (on ferry there is no Docker daemon involved):
+  `./scripts/cluster/build-image.sh -t recipe-scraper:latest -f catalog/tools/recipe-scraper/Dockerfile .`
   (agent-orchestrator is Go: `orchestrator/engines/temporal/Dockerfile.agent-orchestrator`, built from that module).
-- This repo is **not a git repository** — use `mv`/`cp`, not `git mv`, when
-  restructuring files. After moving a workspace package, reinstall; if
-  `package-lock.json` still references the old path afterward, do a full
-  clean reinstall (`rm -rf node_modules package-lock.json */*/node_modules && npm install`).
+- After moving a workspace package, reinstall; if `package-lock.json` still
+  references the old path afterward, do a full clean reinstall
+  (`rm -rf node_modules package-lock.json */*/node_modules && npm install`).
+
+## Local cluster and e2e tests
+
+On an Apple-silicon Mac the local cluster is **ferry** (kube context
+`ferry-aktis`), **never Docker Desktop**, minikube or kind unless the user has
+explicitly selected one with `AKTIS_CLUSTER`. See
+[docs/local-cluster.md](../docs/local-cluster.md).
+
+- Bring the e2e stack up with `./e2e/scripts/up.sh`, then run
+  `npm run e2e -w e2e` (or one file: `npm run e2e -w e2e -- specs/<name>.e2e.ts`).
+  `up.sh` starts ferry and switches kubectl to `ferry-aktis` itself; to only
+  start the cluster, `./scripts/cluster/cluster.sh up`.
+- Do **not** start or rely on Docker Desktop for any of this, don't run
+  `minikube start`/`kind create cluster`, don't `docker build` images for the
+  cluster, and don't set `AKTIS_CLUSTER` yourself. Images reach ferry through
+  `ferry image build` via `scripts/cluster/build-image.sh`, and skaffold must
+  run through `./scripts/cluster/cluster.sh skaffold ...` (it adds ferry's
+  registry as `--default-repo`).
+- If ferry is missing, stop and tell the user to install it
+  (`curl -sfL https://get.ferry.kurpuis.com | FERRY_SKIP_START=1 FERRY_SKIP_SERVICE=1 sh -`)
+  rather than switching to another cluster.
+- Never point the suite, skaffold or `kubectl` writes at any other context.
+  The user's default context can be a **live cluster**. `e2e/support/guard.ts`
+  refuses anything but `ferry-aktis` on a Mac; don't weaken it, and don't
+  `kubectl config use-context` to something else to get past it.
+- To inspect the ferry profile directly: `FERRY_PROFILE=aktis ferry status`.
+  Always set `FERRY_PROFILE=aktis` on `ferry` commands, otherwise they act on
+  the user's other ferry clusters.
+- CI never starts a local cluster; it only runs the cluster-free specs
+  (see `.github/workflows/ci.yml`).
 
 ## Conventions
 
