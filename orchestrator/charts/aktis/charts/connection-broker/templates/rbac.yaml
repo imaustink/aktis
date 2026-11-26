@@ -31,10 +31,8 @@ rules:
   - apiGroups: ["core.aktis.ai"]
     resources: ["connections", "corpora"]
     verbs: ["get", "list", "watch"]
-  # Reporting sync results back onto the Corpus that asked for them.
-  - apiGroups: ["core.aktis.ai"]
-    resources: ["corpora/status"]
-    verbs: ["get", "patch", "update"]
+  # No corpora/status: sync results are written by corpus-sync, under its own
+  # ServiceAccount (sync-rbac.yaml, docs/adr/0059).
   # The ingestion credentials those Connections name. Read only, and in this
   # namespace only: the broker is the process holding every client's
   # third-party credentials, so its reach into the cluster is what is most

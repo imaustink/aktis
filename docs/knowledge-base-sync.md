@@ -35,7 +35,7 @@ and one `KnowledgeBase` CR composing them. That is criteria 1, 2 and 4.
 | `kb-ingest` tool with four hand-written connectors | `Connection` CRs over a shared provider-driver interface (0038 §1) |
 | `openwebui-kb` tool as the storage layer | per-Connection Qdrant collections, fanned out by the KnowledgeBase (0039 §1) |
 | `_sync-state.json` document inside the KB | content-hash point ids (0039 §6) |
-| chart-rendered CronJob per source | webhook signals + one per-Corpus reconcile workflow on Temporal (0038 §4, 0058) |
+| chart-rendered CronJob per source | webhook signals + one per-Corpus reconcile workflow on Temporal, run by the Go `corpus-sync` worker (0038 §4, 0058, 0059) |
 | Open WebUI's RAG | our own retrieval; Open WebUI is just the chat UI |
 | `knowledge-base` Skill with three intents | still needed — see below |
 

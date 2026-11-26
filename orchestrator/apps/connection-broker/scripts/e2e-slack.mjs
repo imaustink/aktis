@@ -14,8 +14,8 @@
  * keys in orchestrator/apps/connection-broker/.env — see .env.example.
  *
  * No OAuth dance: Slack issues both tokens from the app page. It does NOT
- * write to Qdrant; this is about the driver, and e2e-broker.mjs covers the
- * write path.
+ * write to Qdrant; this is about the driver. The write path is corpus-sync's
+ * (orchestrator/engines/temporal/internal/corpussync, docs/adr/0059).
  */
 import { findEnvFile, loadEnv, requireKeys } from "./lib/env.mjs";
 import { envSecretReader, loadSample, withScope, withSite } from "./lib/manifests.mjs";

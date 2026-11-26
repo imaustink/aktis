@@ -326,6 +326,15 @@ profiles:
             dependencies:
               dockerfile:
                 path: Dockerfile.catalog-sync
+        # The connection-broker subchart's indexer (docs/adr/0059), built from
+        # the engine module like catalog-sync.
+        - image: temporal-engine-corpus-sync
+          context: orchestrator/engines/temporal
+          custom:
+            buildCommand: ../../../scripts/cluster/build-image.sh -f Dockerfile.corpus-sync
+            dependencies:
+              dockerfile:
+                path: Dockerfile.corpus-sync
         - image: localtool-executor-node
           context: orchestrator/sidecars/localtool-executor
           custom:
@@ -418,6 +427,9 @@ profiles:
               # fail ("can't be pulled"). Every other image here is IfNotPresent
               # by default; override the broker to match for the local path.
               connection-broker.image.pullPolicy: "IfNotPresent"
+              connection-broker.sync.image.repository: "{{.IMAGE_REPO_temporal_engine_corpus_sync}}"
+              connection-broker.sync.image.tag: "{{.IMAGE_TAG_temporal_engine_corpus_sync}}{{if .IMAGE_DIGEST_temporal_engine_corpus_sync}}@{{.IMAGE_DIGEST_temporal_engine_corpus_sync}}{{end}}"
+              connection-broker.sync.image.pullPolicy: "IfNotPresent"
               mcp-broker.image.repository: "{{.IMAGE_REPO_mcp_broker}}"
               mcp-broker.image.tag: "{{.IMAGE_TAG_mcp_broker}}{{if .IMAGE_DIGEST_mcp_broker}}@{{.IMAGE_DIGEST_mcp_broker}}{{end}}"
               temporal-engine.worker.image.repository: "{{.IMAGE_REPO_temporal_engine_worker}}"

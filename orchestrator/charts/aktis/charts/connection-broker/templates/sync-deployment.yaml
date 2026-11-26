@@ -1,0 +1,86 @@
+{{- if include "connection-broker.syncEnabled" . }}
+{{- /*
+corpus-sync (docs/adr/0059): one Temporal workflow per synced Corpus, run by
+this Deployment. It reaches sources only through the broker's Service, with
+each Corpus's sync token, and its ServiceAccount (sync-rbac.yaml) reads
+Corpora and writes their status -- no Connections, no Secrets.
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "connection-broker.syncFullname" . }}
+  labels: {{- include "connection-broker.syncLabels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.sync.replicaCount }}
+  selector:
+    matchLabels: {{- include "connection-broker.syncSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "connection-broker.syncSelectorLabels" . | nindent 8 }}
+      {{- with .Values.sync.podAnnotations }}
+      annotations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "connection-broker.syncServiceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: corpus-sync
+          image: "{{ .Values.sync.image.repository }}:{{ .Values.sync.image.tag }}"
+          imagePullPolicy: {{ .Values.sync.image.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            # Where the Corpora live (and their status is written).
+            - name: NAMESPACE
+              value: {{ include "connection-broker.knowledgeBaseNamespace" . | quote }}
+            # Every list and fetch goes through the broker, which holds the
+            # third-party credentials (docs/adr/0038 §3).
+            - name: BROKER_URL
+              value: {{ printf "http://%s.%s.svc:%v" (include "connection-broker.fullname" .) .Release.Namespace .Values.service.port | quote }}
+            - name: QDRANT_URL
+              value: {{ .Values.qdrant.url | quote }}
+            - name: QDRANT_GRPC_PORT
+              value: {{ .Values.qdrant.grpcPort | quote }}
+            {{- if .Values.qdrant.apiKeySecret.name }}
+            - name: QDRANT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.qdrant.apiKeySecret.name }}
+                  key: {{ .Values.qdrant.apiKeySecret.key }}
+            {{- end }}
+            - name: EMBEDDING_MODEL
+              value: {{ .Values.embeddings.model | quote }}
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.embeddings.apiKeySecret.name }}
+                  key: {{ .Values.embeddings.apiKeySecret.key }}
+            - name: TEMPORAL_ADDRESS
+              value: {{ .Values.temporal.address | quote }}
+            - name: TEMPORAL_NAMESPACE
+              value: {{ .Values.temporal.namespace | quote }}
+            - name: CORPUS_SYNC_TASK_QUEUE
+              value: {{ .Values.temporal.taskQueue | quote }}
+            - name: LEGACY_TASK_QUEUE
+              value: {{ .Values.temporal.legacyTaskQueue | quote }}
+          {{- if .Values.syncTokenSecret.name }}
+          # SYNC_TOKEN_<CORPUS>, the same Secret the broker authorizes them
+          # against: each reads one Corpus's source.
+          envFrom:
+            - secretRef:
+                name: {{ .Values.syncTokenSecret.name }}
+                optional: true
+          {{- end }}
+          resources: {{- toYaml .Values.sync.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

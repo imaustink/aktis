@@ -327,6 +327,13 @@ jobs:
         with:
           version: v3.18.4
 
+      # broker-contract drives the Go corpus-sync client (docs/adr/0059)
+      # against the TypeScript broker through `go test`.
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: orchestrator/engines/temporal/go.mod
+          cache-dependency-path: orchestrator/engines/temporal/go.sum
+
       - run: npm ci
 
       # The one e2e spec that needs no cluster and no credentials. It exists

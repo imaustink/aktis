@@ -1,8 +1,19 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 /** The repository root, from this file's location. */
 export const REPO_ROOT = fileURLToPath(new URL("../../", import.meta.url));
+
+export interface GoTestOptions {
+  /** Module-relative directory of the package, e.g. "./internal/facade". */
+  pkg: string;
+  /** The module's directory, repo-relative. */
+  module: string;
+  pattern: string;
+  mustPass: string[];
+  env?: Record<string, string>;
+  timeoutMs?: number;
+}
 
 /**
  * Runs `go test -run <pattern>` in a Go module of this repo and requires every
@@ -17,25 +28,53 @@ export const REPO_ROOT = fileURLToPath(new URL("../../", import.meta.url));
  *
  * Needs `go` on PATH, at the version in the module's go.mod.
  */
-export function runGoTests(options: {
-  /** Module-relative directory of the package, e.g. "./internal/facade". */
-  pkg: string;
-  /** The module's directory, repo-relative. */
-  module: string;
-  pattern: string;
-  mustPass: string[];
-  env?: Record<string, string>;
-  timeoutMs?: number;
-}): string {
-  const run = spawnSync("go", ["test", "-count=1", "-v", "-run", options.pattern, options.pkg], {
+export function runGoTests(options: GoTestOptions): string {
+  const run = spawnSync("go", goTestArgs(options), {
     cwd: `${REPO_ROOT}${options.module}`,
     env: { ...process.env, ...options.env },
     encoding: "utf8",
     timeout: options.timeoutMs ?? 300_000,
   });
   if (run.error) throw new Error(`could not run go (is it on PATH?): ${run.error.message}`);
-  const output = `${run.stdout ?? ""}${run.stderr ?? ""}`;
-  if (run.status !== 0) throw new Error(`go test ${options.pattern} failed (exit ${run.status}):\n${output}`);
+  return checkGoTestOutput(options, run.status, `${run.stdout ?? ""}${run.stderr ?? ""}`);
+}
+
+/**
+ * {@link runGoTests} without blocking the event loop, for a Go test that calls
+ * back into a server this spec runs in-process (which `spawnSync` would leave
+ * unable to answer).
+ */
+export function runGoTestsAsync(options: GoTestOptions): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("go", goTestArgs(options), {
+      cwd: `${REPO_ROOT}${options.module}`,
+      env: { ...process.env, ...options.env },
+    });
+    let output = "";
+    child.stdout.on("data", (chunk: Buffer) => (output += chunk.toString("utf8")));
+    child.stderr.on("data", (chunk: Buffer) => (output += chunk.toString("utf8")));
+    const timer = setTimeout(() => child.kill("SIGKILL"), options.timeoutMs ?? 300_000);
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(new Error(`could not run go (is it on PATH?): ${err.message}`));
+    });
+    child.on("close", (status) => {
+      clearTimeout(timer);
+      try {
+        resolve(checkGoTestOutput(options, status, output));
+      } catch (err) {
+        reject(err);
+      }
+    });
+  });
+}
+
+function goTestArgs(options: GoTestOptions): string[] {
+  return ["test", "-count=1", "-v", "-run", options.pattern, options.pkg];
+}
+
+function checkGoTestOutput(options: GoTestOptions, status: number | null, output: string): string {
+  if (status !== 0) throw new Error(`go test ${options.pattern} failed (exit ${status}):\n${output}`);
   for (const test of options.mustPass) {
     if (!output.includes(`--- PASS: ${test} `)) throw new Error(`${test} did not pass (skipped or not run):\n${output}`);
   }

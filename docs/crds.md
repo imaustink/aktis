@@ -11,10 +11,11 @@ Two kinds of actor reconcile them:
 
 - **The `core-controller` operator** (`orchestrator/controllers/core-controller`) watches most
   kinds. Only `ToolRun` and `AgentRun` create Kubernetes Jobs; a cron `EventSource` creates
-  a tick CronJob (a `Corpus` is synced by the connection-broker's own Temporal workflow, docs/adr/0058); every other controller only validates the spec and sets a `Ready`
+  a tick CronJob (a `Corpus` is synced by a Temporal workflow that the connection-broker's corpus-sync worker runs, docs/adr/0058, 0059); every other controller only validates the spec and sets a `Ready`
   condition.
 - **Out-of-cluster brokers.** The `connection-broker` reads `Connection`/`Corpus`
-  for ingestion and retrieval; the `mcp-broker` owns `MCPServer`/`MCPTool`
+  for ingestion and retrieval, and its `corpus-sync` worker reads `Corpus` and
+  writes its sync status; the `mcp-broker` owns `MCPServer`/`MCPTool`
   entirely (there is **no** in-cluster controller for those two — see
   [ADR 0045](adr/0045-mcp-server-proxied-tools.md)); `integration-gateway` reads
   `EventSource`s to serve webhooks. The `agent-orchestrator` and
@@ -270,7 +271,7 @@ collection, stamped with the Corpus's roles at ingest.
   - **CEL:** exactly one scope unit; `sync.reconcileInterval` required unless `mode: none`.
 - **Status:** `provider` + `identityProviders` (copied from the Connection), `collection`, `resources` (indexed count), `lastSyncTime`, `lastReconcileTime`, `webhook`, `Ready` + `Synced` conditions.
 - **Referenced by:** `KnowledgeBase.corpusRefs`.
-- **Acted on by:** `corpus_controller.go` (collection, inherited fields; deletes a legacy sync CronJob); `connection-broker`, whose per-Corpus `corpusSync` Temporal workflow runs every pass (docs/adr/0058).
+- **Acted on by:** `corpus_controller.go` (collection, inherited fields; deletes a legacy sync CronJob); `connection-broker`, and its Go `corpus-sync` worker, whose per-Corpus `CorpusSync` Temporal workflow runs every pass and writes `resources`/`lastSyncTime`/`lastReconcileTime` (docs/adr/0058, 0059).
 - **Sample:** `config/samples/core_v1alpha1_corpus.yaml` (+ `_slack`, `_gdrive`).
 
 ### KnowledgeBase

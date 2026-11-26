@@ -44,19 +44,11 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.orchestratorTokenSecret.name }}
                   key: {{ .Values.orchestratorTokenSecret.key }}
-            {{- if .Values.qdrant.url }}
-            - name: QDRANT_URL
-              value: {{ .Values.qdrant.url | quote }}
-            {{- end }}
-            {{- if .Values.qdrant.apiKeySecret.name }}
-            - name: QDRANT_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.qdrant.apiKeySecret.name }}
-                  key: {{ .Values.qdrant.apiKeySecret.key }}
-            {{- end }}
-            {{- if .Values.temporal.address }}
-            # Where each Corpus's sync workflow runs (docs/adr/0058).
+            {{- if include "connection-broker.syncEnabled" . }}
+            # Where corpus-sync runs each Corpus's workflow (docs/adr/0059):
+            # webhooks signal it and POST /corpora/:name/sync updates it. Set
+            # only when the indexer is deployed, so the broker never waits on
+            # a queue nothing polls.
             - name: TEMPORAL_ADDRESS
               value: {{ .Values.temporal.address | quote }}
             - name: TEMPORAL_NAMESPACE
@@ -69,15 +61,6 @@ spec:
             - name: {{ $provider | upper }}_API_ORIGIN
               value: {{ $origin | quote }}
             {{- end }}
-            {{- end }}
-            - name: EMBEDDING_MODEL
-              value: {{ .Values.embeddings.model | quote }}
-            {{- if .Values.embeddings.apiKeySecret.name }}
-            - name: OPENAI_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.embeddings.apiKeySecret.name }}
-                  key: {{ .Values.embeddings.apiKeySecret.key }}
             {{- end }}
           {{- if .Values.syncTokenSecret.name }}
           # Every key becomes SYNC_TOKEN_<CONNECTION>. One token per connection,

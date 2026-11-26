@@ -44,6 +44,18 @@ func NewEmbedder(baseURL, apiKey, model string) *Embedder {
 	}
 }
 
+// StatusError is a non-200 answer from the embeddings endpoint. Typed so a
+// caller can tell a request the provider refused as too large (400) from any
+// other failure (corpussync splits and retries the former).
+type StatusError struct {
+	Status  int
+	Message string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("embeddings returned %d: %s", e.Status, e.Message)
+}
+
 type embeddingRequest struct {
 	Model string   `json:"model"`
 	Input []string `json:"input"`
@@ -94,15 +106,18 @@ func (e *Embedder) Embed(ctx context.Context, inputs []string) (_ [][]float32, e
 	}
 
 	var parsed embeddingResponse
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return nil, fmt.Errorf("decode embedding response (status %d): %w", resp.StatusCode, err)
-	}
+	decodeErr := json.Unmarshal(raw, &parsed)
 	if resp.StatusCode != http.StatusOK {
+		// A refusal is reported by its status even when its body is not JSON
+		// (a proxy's error page): callers decide on the status.
 		msg := string(raw)
-		if parsed.Error != nil {
+		if decodeErr == nil && parsed.Error != nil {
 			msg = parsed.Error.Message
 		}
-		return nil, fmt.Errorf("embeddings returned %d: %s", resp.StatusCode, msg)
+		return nil, &StatusError{Status: resp.StatusCode, Message: msg}
+	}
+	if decodeErr != nil {
+		return nil, fmt.Errorf("decode embedding response (status %d): %w", resp.StatusCode, decodeErr)
 	}
 	if len(parsed.Data) != len(inputs) {
 		return nil, fmt.Errorf("embeddings returned %d vectors for %d inputs", len(parsed.Data), len(inputs))

@@ -264,12 +264,28 @@ describe("every process that watches these kinds is granted them", () => {
     expect([...granted]).toContain("corpora");
   });
 
-  it("lets the broker report a sync back onto the Corpus", async () => {
+  it("lets corpus-sync report a sync back onto the Corpus", async () => {
     // Without corpora/status the sync succeeds and records nothing, so the
-    // Corpus shows no lastSyncTime however many times it ran.
+    // Corpus shows no lastSyncTime however many times it ran. corpus-sync
+    // writes it since docs/adr/0059.
+    const granted = grantedKinds(await roleFor("app.kubernetes.io/component=corpus-sync"));
+
+    expect([...granted]).toContain("corpora");
+    expect([...granted]).toContain("corpora/status");
+  });
+
+  it("gives corpus-sync no Connections and no Secrets: the credentials stay with the broker", async () => {
+    const role = await roleFor("app.kubernetes.io/component=corpus-sync");
+
+    expect([...grantedKinds(role)]).not.toContain("connections");
+    const coreResources = role.rules.filter((rule) => rule.apiGroups.includes("")).flatMap((rule) => rule.resources);
+    expect(coreResources).not.toContain("secrets");
+  });
+
+  it("no longer lets the broker write Corpus status (docs/adr/0059)", async () => {
     const granted = grantedKinds(await roleFor("connection-broker"));
 
-    expect([...granted]).toContain("corpora/status");
+    expect([...granted]).not.toContain("corpora/status");
   });
 
   it("grants the engine's catalog-sync all three kinds it derives a skill from", async () => {
