@@ -56,9 +56,25 @@ export interface SyncActivityDeps {
  */
 export function createSyncActivities(deps: SyncActivityDeps): SyncActivities {
   const log = deps.log ?? ((line: string) => console.error(line));
-  /** `null` only when the cluster agrees the Corpus is no longer synced. */
+  /**
+   * `null` when the cluster agrees the Corpus is no longer synced, or when
+   * this is the activity's last attempt. Without that bound, a Corpus no
+   * replica holds a SYNC_TOKEN_* for would fail retryably on every attempt and
+   * the workflow would fail rather than end. Ending is safe for the
+   * watch-lag case too: every replica that does see the Corpus starts its loop
+   * again within a minute (docs/adr/0058 §2).
+   */
   const notHere = async (corpus: string): Promise<null> => {
     if (deps.confirm && (await deps.confirm(corpus)) === "syncable") {
+      const info = activityContext()?.info;
+      const maxAttempts = info?.retryPolicy?.maximumAttempts;
+      if (info && maxAttempts && info.attempt >= maxAttempts) {
+        log(
+          `sync ${corpus}: still not visible here after ${info.attempt} attempts ` +
+            `(no replica has its SYNC_TOKEN_*, or the watch is far behind); ending its loop`,
+        );
+        return null;
+      }
       throw ApplicationFailure.retryable(
         `corpus ${corpus} is synced, but this replica cannot see it yet (watch lag, or no SYNC_TOKEN_* here)`,
         "CorpusNotVisibleHere",

@@ -1,4 +1,5 @@
 import { ApplicationFailure } from "@temporalio/common";
+import { MockActivityEnvironment } from "@temporalio/testing";
 import { describe, expect, it, vi } from "vitest";
 import type { CorpusBinding } from "../registry.js";
 import { createSyncActivities, type SyncTarget } from "./activities.js";
@@ -175,6 +176,32 @@ describe("runPass", () => {
       expect(error?.type).toBe("CorpusNotVisibleHere");
       expect(error?.nonRetryable).toBe(false);
     }
+  });
+
+  // A Corpus no replica holds a token for would otherwise fail every attempt
+  // and fail the workflow; the last attempt ends the loop instead.
+  it("answers null on its last attempt rather than failing the workflow", async () => {
+    const { source, writer } = deps();
+    const log = vi.fn();
+    const activities = createSyncActivities({
+      sourceFor: () => source,
+      writerFor: () => writer,
+      target: () => undefined,
+      confirm: async () => "syncable",
+      log,
+    });
+    const retryPolicy = { maximumAttempts: 10 };
+    const middle = new MockActivityEnvironment({ attempt: 9, retryPolicy });
+    const error = await middle.run(() => activities.syncTarget("tokenless")).then(
+      () => undefined,
+      (e: unknown) => e as ApplicationFailure,
+    );
+    expect(error?.type).toBe("CorpusNotVisibleHere");
+
+    const last = new MockActivityEnvironment({ attempt: 10, retryPolicy });
+    expect(await last.run(() => activities.syncTarget("tokenless"))).toBeNull();
+    expect(await last.run(() => activities.runPass("tokenless"))).toBeNull();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("ending its loop"));
   });
 });
 

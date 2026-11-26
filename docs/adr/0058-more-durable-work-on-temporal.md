@@ -62,8 +62,8 @@ window are gone.
   `failed.<base64url message>` id that polls as `failed`, so
   integration-gateway's failure path is unchanged. A `target.none` turn gets
   `none.<uuid>`, polling as succeeded with result `""`.
-- A poll that cannot get an answer from the engine (transport error, 5xx)
-  answers `pending` (the caller asks again) rather than failing the turn; an
+- A poll that cannot get an answer from the engine (transport error, 5xx,
+  or a 408/429 from a proxy in front of it) answers `pending` (the caller asks again) rather than failing the turn; an
   id the engine does not know or rejects as malformed (404, 400) is a 404;
   any other 4xx from the engine (a wrong engine token) fails the turn, since
   it would repeat on every poll. Forging an id gains nothing: the caller already holds the `/invoke`
@@ -94,7 +94,9 @@ namespace (`TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`), task queue
   Corpus asks the Kubernetes API before answering "gone"; if the cluster
   still syncs it (the replica's watch lags, or it lacks a token a newer pod
   has) the activity fails retryably instead, so one lagging replica does not
-  end the loop for all. A loop started afresh schedules from the Corpus
+  end the loop for all. Its last attempt answers "gone" all the same, so a
+  Corpus no replica holds a token for ends its loop rather than failing the
+  workflow; a replica that does see it starts the loop again. A loop started afresh schedules from the Corpus
   status's `lastReconcileTime` rather than passing at once. It continues as
   new every 200 turns (or when Temporal suggests it).
 - **A pass is an activity** over the existing `syncConnection`,
