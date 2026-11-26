@@ -13,8 +13,7 @@ import (
 //   - "none.<uuid>": a target.none acceptance, succeeded with result "".
 //   - "failed.<base64url message>": a turn that never reached the engine.
 //
-// A pre-0058 process handed out bare UUIDs backed by a Redis record; those
-// have no '.' and are answered by handleLegacyInvocation.
+// Any other id, a bare UUID a pre-0058 process handed out included, is a 404.
 //
 // Forging any of these gains nothing: the caller already holds the /invoke
 // token, a made-up engine id is unknown to the engine (404), and the other

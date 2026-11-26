@@ -1,3 +1,5 @@
+import { ApplicationFailure } from "@temporalio/common";
+import { MockActivityEnvironment } from "@temporalio/testing";
 import { describe, expect, it, vi } from "vitest";
 import type { CorpusBinding } from "../registry.js";
 import { createSyncActivities, type SyncTarget } from "./activities.js";
@@ -142,6 +144,65 @@ describe("runPass", () => {
     expect(await activities.runPass("gone")).toBeNull();
     expect(await activities.syncTarget("gone")).toBeNull();
   });
+
+  it("answers null only when the cluster agrees the corpus is gone", async () => {
+    const { source, writer } = deps();
+    const activities = createSyncActivities({
+      sourceFor: () => source,
+      writerFor: () => writer,
+      target: () => undefined,
+      confirm: async () => "gone",
+    });
+    expect(await activities.runPass("gone")).toBeNull();
+    expect(await activities.syncTarget("gone")).toBeNull();
+  });
+
+  // One lagging replica (watch behind, or no token yet mid-rollout) must not
+  // end the loop for every replica: it fails retryably instead.
+  it("fails retryably when this replica cannot see a corpus the cluster still syncs", async () => {
+    const { source, writer } = deps();
+    const activities = createSyncActivities({
+      sourceFor: () => source,
+      writerFor: () => writer,
+      target: () => undefined,
+      confirm: async () => "syncable",
+    });
+    for (const call of [() => activities.runPass("lagging"), () => activities.syncTarget("lagging")]) {
+      const error = await call().then(
+        () => undefined,
+        (e: unknown) => e as ApplicationFailure,
+      );
+      expect(error).toBeInstanceOf(ApplicationFailure);
+      expect(error?.type).toBe("CorpusNotVisibleHere");
+      expect(error?.nonRetryable).toBe(false);
+    }
+  });
+
+  // A Corpus no replica holds a token for would otherwise fail every attempt
+  // and fail the workflow; the last attempt ends the loop instead.
+  it("answers null on its last attempt rather than failing the workflow", async () => {
+    const { source, writer } = deps();
+    const log = vi.fn();
+    const activities = createSyncActivities({
+      sourceFor: () => source,
+      writerFor: () => writer,
+      target: () => undefined,
+      confirm: async () => "syncable",
+      log,
+    });
+    const retryPolicy = { maximumAttempts: 10 };
+    const middle = new MockActivityEnvironment({ attempt: 9, retryPolicy });
+    const error = await middle.run(() => activities.syncTarget("tokenless")).then(
+      () => undefined,
+      (e: unknown) => e as ApplicationFailure,
+    );
+    expect(error?.type).toBe("CorpusNotVisibleHere");
+
+    const last = new MockActivityEnvironment({ attempt: 10, retryPolicy });
+    expect(await last.run(() => activities.syncTarget("tokenless"))).toBeNull();
+    expect(await last.run(() => activities.runPass("tokenless"))).toBeNull();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("ending its loop"));
+  });
 });
 
 describe("syncTarget", () => {
@@ -156,5 +217,15 @@ describe("syncTarget", () => {
     expect(await activities.syncTarget("a")).toEqual({ intervalMs: 1_000 });
     intervalMs = 5_000;
     expect(await activities.syncTarget("a")).toEqual({ intervalMs: 5_000 });
+  });
+
+  it("passes on when the Corpus's status says it last fully synced", async () => {
+    const { source, writer } = deps();
+    const activities = createSyncActivities({
+      sourceFor: () => source,
+      writerFor: () => writer,
+      target: (c) => ({ ...target(c), lastReconcileAt: 1_700_000_000_000 }),
+    });
+    expect(await activities.syncTarget("a")).toEqual({ intervalMs: 60_000, lastReconcileAt: 1_700_000_000_000 });
   });
 });

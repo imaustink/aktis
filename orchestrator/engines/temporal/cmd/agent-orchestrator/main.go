@@ -124,10 +124,8 @@ func run() error {
 	}
 
 	// Session store (sticky read-only flag). /invoke keeps no records: an id
-	// names its engine turn (docs/adr/0058 §1). Redis is still read for the
-	// ids a pre-0058 process handed out; remove that one release after 0058.
+	// names its engine turn (docs/adr/0058 §1).
 	var sessions facade.SessionStore
-	var invocations facade.InvocationStore
 	var redisClient *redis.Client
 	if cfg.RedisURL != "" {
 		opts, err := redis.ParseURL(cfg.RedisURL)
@@ -140,7 +138,6 @@ func run() error {
 		}
 		log.Printf("Using the Redis session store")
 		sessions = &facade.RedisSessionStore{Client: redisClient, TTL: cfg.SessionTTL}
-		invocations = &facade.RedisInvocationStore{Client: redisClient}
 	} else {
 		log.Printf("No AGENT_REDIS_URL: the sticky read-only flag is in-process, so more than one replica " +
 			"may let a session's follow-up run writable.")
@@ -173,7 +170,6 @@ func run() error {
 		CallerTools:             callerTools,
 		CallerToolTopK:          cfg.CallerToolTopK,
 		DefaultIdentityLinkFlow: cfg.DefaultIdentityLinkFlow,
-		Invocations:             invocations,
 		CallerAuth:              callerAuth,
 	}
 	if cfg.SenderAssertionSecret == "" {

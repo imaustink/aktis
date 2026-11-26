@@ -1,4 +1,4 @@
-import { CancelledFailure, Context } from "@temporalio/activity";
+import { ApplicationFailure, CancelledFailure, Context } from "@temporalio/activity";
 import type { CorpusBinding } from "../registry.js";
 import { FAILED_IDS_KEPT, type PassResult, type SyncActivities, type SyncTargetInfo } from "./model.js";
 import { syncConnection, type CorpusWriter, type ResourceSource, type SyncReport } from "./worker.js";
@@ -8,6 +8,8 @@ export interface SyncTarget {
   binding: CorpusBinding;
   collection: string;
   intervalMs: number;
+  /** The Corpus status's `lastReconcileTime`, in ms since the epoch. */
+  lastReconcileAt?: number;
 }
 
 export interface SyncActivityDeps {
@@ -29,8 +31,17 @@ export interface SyncActivityDeps {
    * narrowing who can retrieve a whole client's material.
    */
   writerFor: (binding: CorpusBinding) => CorpusWriter;
-  /** The corpus, if this broker syncs it (read fresh on every call, so edits apply). */
+  /** The corpus, if this replica syncs it (read fresh on every call, so edits apply). */
   target: (corpus: string) => SyncTarget | undefined;
+  /**
+   * Asked when `target` finds nothing: whether the Corpus is really gone (or
+   * no longer meant to be indexed), read from the cluster rather than this
+   * replica's watch cache. "syncable" means this replica is behind -- its
+   * watch has not caught up, or it lacks the sync token a newer pod has --
+   * and the activity fails retryably so another attempt, perhaps on another
+   * replica, answers. Absent: a miss is taken as gone.
+   */
+  confirm?: (corpus: string) => Promise<"gone" | "syncable">;
   /**
    * Called for every completed pass. This is where a Corpus's status is
    * written back — see CorpusStatusWriter for why that matters.
@@ -45,15 +56,45 @@ export interface SyncActivityDeps {
  */
 export function createSyncActivities(deps: SyncActivityDeps): SyncActivities {
   const log = deps.log ?? ((line: string) => console.error(line));
+  /**
+   * `null` when the cluster agrees the Corpus is no longer synced, or when
+   * this is the activity's last attempt. Without that bound, a Corpus no
+   * replica holds a SYNC_TOKEN_* for would fail retryably on every attempt and
+   * the workflow would fail rather than end. Ending is safe for the
+   * watch-lag case too: every replica that does see the Corpus starts its loop
+   * again within a minute (docs/adr/0058 §2).
+   */
+  const notHere = async (corpus: string): Promise<null> => {
+    if (deps.confirm && (await deps.confirm(corpus)) === "syncable") {
+      const info = activityContext()?.info;
+      const maxAttempts = info?.retryPolicy?.maximumAttempts;
+      if (info && maxAttempts && info.attempt >= maxAttempts) {
+        log(
+          `sync ${corpus}: still not visible here after ${info.attempt} attempts ` +
+            `(no replica has its SYNC_TOKEN_*, or the watch is far behind); ending its loop`,
+        );
+        return null;
+      }
+      throw ApplicationFailure.retryable(
+        `corpus ${corpus} is synced, but this replica cannot see it yet (watch lag, or no SYNC_TOKEN_* here)`,
+        "CorpusNotVisibleHere",
+      );
+    }
+    return null;
+  };
   return {
     async syncTarget(corpus): Promise<SyncTargetInfo | null> {
       const target = deps.target(corpus);
-      return target ? { intervalMs: target.intervalMs } : null;
+      if (!target) return notHere(corpus);
+      return {
+        intervalMs: target.intervalMs,
+        ...(target.lastReconcileAt !== undefined ? { lastReconcileAt: target.lastReconcileAt } : {}),
+      };
     },
 
     async runPass(corpus, sourceIds): Promise<PassResult | null> {
       const target = deps.target(corpus);
-      if (!target) return null;
+      if (!target) return notHere(corpus);
       // Inside an activity only: a direct call (a unit test) has no context.
       // A cancelled pass (the worker shutting down, the heartbeat timing out)
       // stops at its next step, so its retry on another replica does not run

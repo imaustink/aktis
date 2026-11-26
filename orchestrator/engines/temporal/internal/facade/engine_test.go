@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -243,6 +244,37 @@ func TestEngineStatusTellsUnknownFromUnreachable(t *testing.T) {
 	broken.Close()
 	_, err = (&TemporalEngine{BaseURL: broken.URL}).Status(context.Background(), "x.y")
 	require.Error(t, err)
+}
+
+// Only a failure to get an answer polls as pending. An id the engine rejects
+// outright (a forged "t.foo") is unknown, and a 4xx that would repeat on every
+// poll (a wrong engine token) fails the turn instead of leaving it pending
+// until the caller's budget runs out. 408 and 429 are transient and still poll.
+func TestEngineStatusEnds4xxInsteadOfPollingForever(t *testing.T) {
+	statusOf := func(code int) (EngineStatus, error) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(code) }))
+		t.Cleanup(server.Close)
+		return (&TemporalEngine{BaseURL: server.URL}).Status(context.Background(), "foo")
+	}
+
+	malformed, err := statusOf(http.StatusBadRequest)
+	require.NoError(t, err)
+	require.True(t, malformed.Unknown)
+
+	for _, code := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		refused, err := statusOf(code)
+		require.NoError(t, err)
+		require.False(t, refused.Unknown)
+		require.False(t, refused.Pending)
+		require.Contains(t, refused.Outcome.Error, strconv.Itoa(code))
+	}
+
+	// A proxy, ingress or mesh in front of the engine can time out or throttle
+	// a poll; that is transient, so it polls pending like a 5xx.
+	for _, code := range []int{http.StatusRequestTimeout, http.StatusTooManyRequests} {
+		_, err := statusOf(code)
+		require.ErrorContains(t, err, strconv.Itoa(code))
+	}
 }
 
 func TestEngineReportsAFailedTurnAsAnError(t *testing.T) {

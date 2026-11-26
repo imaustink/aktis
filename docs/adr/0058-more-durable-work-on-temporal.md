@@ -62,9 +62,11 @@ window are gone.
   `failed.<base64url message>` id that polls as `failed`, so
   integration-gateway's failure path is unchanged. A `target.none` turn gets
   `none.<uuid>`, polling as succeeded with result `""`.
-- A poll that cannot reach the engine answers `pending` (the caller asks
-  again) rather than failing the turn; an id the engine does not know is a
-  404. Forging an id gains nothing: the caller already holds the `/invoke`
+- A poll that cannot get an answer from the engine (transport error, 5xx,
+  or a 408/429 from a proxy in front of it) answers `pending` (the caller asks again) rather than failing the turn; an
+  id the engine does not know or rejects as malformed (404, 400) is a 404;
+  any other 4xx from the engine (a wrong engine token) fails the turn, since
+  it would repeat on every poll. Forging an id gains nothing: the caller already holds the `/invoke`
   token, an invented engine id is unknown, and the other shapes only echo
   what they say.
 - A run outcome is passed through after `CheckOutcome`. The facade no
@@ -88,11 +90,20 @@ namespace (`TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`), task queue
 - **The loop**: a full pass when it starts, then wait for the interval or a
   signal; repeat. The Corpus is re-read after every pass and every five
   minutes while waiting, so an edited interval applies and a deleted or
-  no-longer-syncable Corpus ends its loop. It continues as new every 200
-  turns (or when Temporal suggests it).
+  no-longer-syncable Corpus ends its loop. A replica that cannot see the
+  Corpus asks the Kubernetes API before answering "gone"; if the cluster
+  still syncs it (the replica's watch lags, or it lacks a token a newer pod
+  has) the activity fails retryably instead, so one lagging replica does not
+  end the loop for all. Its last attempt answers "gone" all the same, so a
+  Corpus no replica holds a token for ends its loop rather than failing the
+  workflow; a replica that does see it starts the loop again. A loop started afresh schedules from the Corpus
+  status's `lastReconcileTime` rather than passing at once. It continues as
+  new every 200 turns (or when Temporal suggests it).
 - **A pass is an activity** over the existing `syncConnection`,
-  heartbeating per listed page and fetched resource (2-minute heartbeat
-  timeout, 6-hour budget, 3 attempts). A retried pass restarts from the
+  heartbeating per listed page, fetched resource, page of the index read
+  and batch embedded and written (2-minute heartbeat timeout, 6 hours an
+  attempt, 10 attempts within 12 hours, backoff capped at 5 minutes -- a
+  rolling restart costs a running pass an attempt). A retried pass restarts from the
   beginning: listing completes before any fetch, so a cursor checkpoint would
   also have to carry every ref listed so far, and a repeated pass is
   idempotent and re-embeds nothing it already wrote. The status write-back
@@ -104,8 +115,9 @@ namespace (`TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`), task queue
   pass still deletes only what it examined.
 - **`POST /corpora/:name/sync` is a `syncNow` update**, answered by a full
   pass that *started after the request*: 200 `{indexed, removed, full}`,
-  502 when it failed after its retries, 404 when the broker does not sync
-  that Corpus. No 409 any more.
+  502 when it failed after its retries or the broker is not yet connected
+  to Temporal, 404 when the broker does not sync that Corpus (including one
+  that stopped being synced while the request waited). No 409 any more.
 - **core-controller no longer creates a sync CronJob.** It deletes one an
   earlier release created (`corpus-sync-<corpus>`, controlled by that
   Corpus) on its next reconcile. Its `cronjobs` RBAC stays for cron
@@ -145,8 +157,9 @@ The engine gateway keeps a Schedule, id
 skipped, whose action is a `CallerToolPruneWorkflow` on the engine task
 queue; the worker runs its `PruneCallerTools` activity against the same
 Qdrant (the chart gives both the same settings). Every replica creates it,
-or updates it in place to its own interval and retention. A failure to set
-it up is logged, not fatal: stale definitions only live longer.
+or updates it in place to its own interval and retention, retrying with a
+capped backoff until it succeeds. A failure to set it up is logged, not
+fatal: stale definitions only live longer.
 
 agent-orchestrator's own caller-tool store keeps its ticker. It may live in a
 different Qdrant with a different TTL, and that process runs no Temporal
@@ -162,14 +175,16 @@ worker to hand the pass to; giving it one only for a prune is not worth it.
   taking longer than I can wait"; now the caller sees `pending` until the
   turn ends, and its own poll budget decides. An answer is collectable for
   as long as the engine retains the update.
-- **Ids a pre-0058 pod handed out** (bare UUIDs) are answered from Redis,
-  read-only: a terminal record as written, a pending one with an engine id
-  from the engine. Remove `handleLegacyInvocation` and
-  `RedisInvocationStore` one release after this ships.
-  `AGENT_INVOCATION_TTL_SECONDS` is no longer read.
+- **Ids a pre-0058 pod handed out** (bare UUIDs) were answered from Redis,
+  read-only, for one release; since then they are a 404 and the facade
+  reads no `inv:` records. `AGENT_INVOCATION_TTL_SECONDS` is no longer read.
 - **Temporal is required whenever connection-broker indexes** (`QDRANT_URL`,
   `OPENAI_API_KEY` and at least one `SYNC_TOKEN_*`): it exits at startup if
-  `TEMPORAL_ADDRESS` is unset. A serve-only broker starts no worker. The
+  `TEMPORAL_ADDRESS` is unset. A Temporal that cannot be reached does not
+  take the broker down: the worker is started, and restarted, in the
+  background, logging loudly, while the probe, retrieval and fetch API keeps
+  serving; webhooks that arrive meanwhile are left to the next full pass. A
+  serve-only broker starts no worker. The
   chart sets `connection-broker.temporal.{address,namespace,taskQueue}`,
   defaulting to the engine's; the namespace must already exist.
 - A new syncing Corpus gets its first full pass within about a minute; a

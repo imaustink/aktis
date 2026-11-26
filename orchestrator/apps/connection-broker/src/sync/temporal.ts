@@ -7,6 +7,7 @@ import {
   WorkflowNotFoundError,
   WorkflowUpdateFailedError,
 } from "@temporalio/client";
+import { ApplicationFailure } from "@temporalio/common";
 import { NativeConnection, Worker, type WorkerOptions } from "@temporalio/worker";
 import { SOURCES_CHANGED_SIGNAL, SYNC_NOW_UPDATE, workflowIds, type PassResult, type SyncActivities } from "./model.js";
 import type { corpusSync } from "./workflows.js";
@@ -78,14 +79,21 @@ export class CorpusSyncs {
   /**
    * Runs a full pass that starts after this call and returns its result. A
    * pass already running is not joined: it may have listed the source before
-   * whatever prompted this request.
+   * whatever prompted this request. Undefined when the Corpus is no longer
+   * synced -- it went while the request waited, or its loop closed first --
+   * which the route answers 404.
    */
-  async runNow(corpus: string): Promise<PassResult> {
+  async runNow(corpus: string): Promise<PassResult | undefined> {
     await this.start(corpus);
     try {
       return await this.o.client.workflow.getHandle(this.workflowId(corpus)).executeUpdate<PassResult, []>(SYNC_NOW_UPDATE);
     } catch (error) {
-      if (error instanceof WorkflowUpdateFailedError) throw new SyncPassError(errorText(error.cause ?? error));
+      if (error instanceof WorkflowNotFoundError) return undefined;
+      if (error instanceof WorkflowUpdateFailedError) {
+        const cause = error.cause;
+        if (cause instanceof ApplicationFailure && cause.type === "CorpusNotSynced") return undefined;
+        throw new SyncPassError(errorText(cause ?? error));
+      }
       throw error;
     }
   }
@@ -140,23 +148,63 @@ export interface SyncWorkerOptions extends TemporalConnectionOptions {
   workflowBundle?: WorkerOptions["workflowBundle"];
 }
 
+/** A sync worker, and the Temporal connection it holds. */
+export interface SyncWorker {
+  run(): Promise<void>;
+  shutdown(): void;
+  /**
+   * Releases the worker's hold on its connection and closes the connection
+   * if it was opened here (not one passed in as `connection`). Called once
+   * `run()` has settled, or instead of `run()` for a worker never run.
+   */
+  close(): Promise<void>;
+}
+
 /**
  * The worker running the sync workflows and their passes. A pass holds an
  * activity slot for its whole length, so the slots bound how many corpora
  * index at once on one replica; the rest wait in the queue (or go to another
  * replica).
  */
-export async function createSyncWorker(o: SyncWorkerOptions): Promise<Worker> {
-  const connection = o.connection ?? (await NativeConnection.connect({ address: o.address }));
-  return Worker.create({
-    connection,
-    namespace: o.namespace,
-    taskQueue: o.taskQueue,
-    ...(o.workflowBundle ? { workflowBundle: o.workflowBundle } : workflowSource()),
-    activities: o.activities,
-    maxConcurrentActivityTaskExecutions: 20,
-    shutdownGraceTime: "10 seconds",
-  });
+export async function createSyncWorker(o: SyncWorkerOptions): Promise<SyncWorker> {
+  const owned = o.connection ? undefined : await NativeConnection.connect({ address: o.address });
+  const connection = o.connection ?? owned!;
+  let worker: Worker;
+  try {
+    worker = await Worker.create({
+      connection,
+      namespace: o.namespace,
+      taskQueue: o.taskQueue,
+      ...(o.workflowBundle ? { workflowBundle: o.workflowBundle } : workflowSource()),
+      activities: o.activities,
+      maxConcurrentActivityTaskExecutions: 20,
+      shutdownGraceTime: "10 seconds",
+    });
+  } catch (error) {
+    // Otherwise a Temporal that stays half-up (say, the namespace isn't
+    // registered yet) leaks one native connection per retry.
+    await owned?.close().catch(() => {});
+    throw error;
+  }
+  let ran = false;
+  return {
+    run: () => {
+      ran = true;
+      return worker.run();
+    },
+    shutdown: () => worker.shutdown(),
+    close: async () => {
+      if (!ran) {
+        // A created worker holds its connection until it has run and shut
+        // down (the SDK refuses to close it before), so drain it at once.
+        ran = true;
+        const running = worker.run();
+        worker.shutdown();
+        await running;
+      }
+      await owned?.close();
+    },
+  };
 }
 
 function errorText(error: unknown): string {

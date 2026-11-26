@@ -24,7 +24,7 @@ export interface CorpusCustomResource {
     scope: { space?: string; channel?: string; folderID?: string; jobID?: string; all?: boolean };
     sync?: { mode?: string; reconcileInterval?: string };
   };
-  status?: { collection?: string; provider?: string };
+  status?: { collection?: string; provider?: string; lastReconcileTime?: string };
 }
 
 /**
