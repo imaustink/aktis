@@ -159,6 +159,15 @@ claudeCodeSweAgent:
   githubAppPrivateKeySecretKey: GITHUB_APP_PRIVATE_KEY
   githubAppInstallationIdSecretKey: GITHUB_APP_INSTALLATION_ID
   githubAppSlug: k5s-bot
+  # The glyph-agent Pocket ID user's passkey, so the agent can sign in to
+  # Glyph PR previews (glyph repo: scripts/preview-login.mjs and its
+  # glyph-preview-login skill). Previews only: Pocket ID refuses glyph-agent
+  # on Glyph production. The Secret is created out of band from the passkey
+  # enrollment (homelab: kubernetes/manifests/services/pocket-id/).
+  extraSecretEnv:
+    - name: GLYPH_AGENT_PASSKEY
+      secretName: glyph-agent-passkey
+      key: credential.json
   identityLink:
     enabled: true
     providers:

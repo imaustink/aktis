@@ -312,6 +312,14 @@ claudeCodeSweAgent:
   githubAppIdSecretKey: ""
   githubAppPrivateKeySecretKey: ""
   githubAppInstallationIdSecretKey: ""
+  # Extra environment variables from Secret keys, for credentials the agent
+  # needs beyond GitHub and Claude (e.g. a test identity for an app's preview
+  # environments). Each Secret must be in this release's namespace (Agent
+  # secretEnv resolves same-namespace only). Only the reference lives here:
+  #   - name: GLYPH_AGENT_PASSKEY
+  #     secretName: glyph-agent-passkey
+  #     key: credential.json
+  extraSecretEnv: []
   githubAppSlug: ""
   # Claude Code model id/alias (e.g. "sonnet", "claude-opus-5-5"). Empty uses
   # the CLI's own default. claude-opus-5-5 needs the image's CLI >= 2.1.280.
