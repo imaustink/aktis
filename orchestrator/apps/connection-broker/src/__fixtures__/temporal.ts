@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { TestWorkflowEnvironment } from "@temporalio/testing";
-import { bundleWorkflowCode, DefaultLogger, Runtime, type Worker, type WorkflowBundleWithSourceMap } from "@temporalio/worker";
+import { bundleWorkflowCode, DefaultLogger, Runtime, type WorkflowBundleWithSourceMap } from "@temporalio/worker";
 import { afterAll } from "vitest";
 import type { SyncActivities } from "../sync/model.js";
-import { CorpusSyncs, createSyncWorker } from "../sync/temporal.js";
+import { CorpusSyncs, createSyncWorker, type SyncWorker } from "../sync/temporal.js";
 
 /**
  * A real Temporal for tests of the Corpus sync workflow (docs/adr/0058): one
@@ -59,7 +59,7 @@ export async function testSyncs(queue: { taskQueue?: string } = {}): Promise<Tes
   const e = await temporal();
   const taskQueue = queue.taskQueue ?? `test-${randomUUID()}`;
   const syncs = new CorpusSyncs({ client: e.client, taskQueue, log: () => {} });
-  let worker: Worker | undefined;
+  let worker: SyncWorker | undefined;
   let running: Promise<void> | undefined;
   const handle: TestSyncs = {
     syncs,

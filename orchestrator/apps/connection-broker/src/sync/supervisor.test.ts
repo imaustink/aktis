@@ -16,11 +16,12 @@ function client() {
 }
 
 /** A worker whose run() ends when shutdown() is called. */
-function worker(): SupervisedWorker & { runs: number; shutdowns: number } {
+function worker(): SupervisedWorker & { runs: number; shutdowns: number; close: ReturnType<typeof vi.fn> } {
   const done = deferred();
   const w = {
     runs: 0,
     shutdowns: 0,
+    close: vi.fn(async () => {}),
     run: () => {
       w.runs++;
       return done.promise;
@@ -60,6 +61,8 @@ describe("superviseSync", () => {
     expect(w.runs).toBe(0);
     expect(h.onConnected).not.toHaveBeenCalled();
     expect(c.connection.close).toHaveBeenCalledTimes(1);
+    // The unrun worker's connection is freed too.
+    expect(w.close).toHaveBeenCalledTimes(1);
   });
 
   it("closes the client when creating the worker fails, then retries", async () => {
@@ -82,6 +85,7 @@ describe("superviseSync", () => {
 
     await sup.stop();
     expect(w.shutdowns).toBe(1);
+    expect(w.close).toHaveBeenCalledTimes(1);
     expect(clients[1]!.connection.close).toHaveBeenCalledTimes(1);
     expect(h.onDisconnected).toHaveBeenCalled();
   });
@@ -102,9 +106,11 @@ describe("superviseSync", () => {
     await vi.waitFor(() => expect(h.onConnected).toHaveBeenCalledTimes(2));
     expect(h.onWorkerStopped).toHaveBeenCalledTimes(1);
     expect(clients[0]!.connection.close).toHaveBeenCalledTimes(1);
+    expect(workers[0]!.close).toHaveBeenCalledTimes(1);
 
     await sup.stop();
     expect(clients[1]!.connection.close).toHaveBeenCalledTimes(1);
+    expect(workers[1]!.close).toHaveBeenCalledTimes(1);
   });
 
   it("ends the backoff wait early on stop()", async () => {

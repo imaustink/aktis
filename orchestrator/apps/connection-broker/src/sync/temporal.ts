@@ -148,23 +148,63 @@ export interface SyncWorkerOptions extends TemporalConnectionOptions {
   workflowBundle?: WorkerOptions["workflowBundle"];
 }
 
+/** A sync worker, and the Temporal connection it holds. */
+export interface SyncWorker {
+  run(): Promise<void>;
+  shutdown(): void;
+  /**
+   * Releases the worker's hold on its connection and closes the connection
+   * if it was opened here (not one passed in as `connection`). Called once
+   * `run()` has settled, or instead of `run()` for a worker never run.
+   */
+  close(): Promise<void>;
+}
+
 /**
  * The worker running the sync workflows and their passes. A pass holds an
  * activity slot for its whole length, so the slots bound how many corpora
  * index at once on one replica; the rest wait in the queue (or go to another
  * replica).
  */
-export async function createSyncWorker(o: SyncWorkerOptions): Promise<Worker> {
-  const connection = o.connection ?? (await NativeConnection.connect({ address: o.address }));
-  return Worker.create({
-    connection,
-    namespace: o.namespace,
-    taskQueue: o.taskQueue,
-    ...(o.workflowBundle ? { workflowBundle: o.workflowBundle } : workflowSource()),
-    activities: o.activities,
-    maxConcurrentActivityTaskExecutions: 20,
-    shutdownGraceTime: "10 seconds",
-  });
+export async function createSyncWorker(o: SyncWorkerOptions): Promise<SyncWorker> {
+  const owned = o.connection ? undefined : await NativeConnection.connect({ address: o.address });
+  const connection = o.connection ?? owned!;
+  let worker: Worker;
+  try {
+    worker = await Worker.create({
+      connection,
+      namespace: o.namespace,
+      taskQueue: o.taskQueue,
+      ...(o.workflowBundle ? { workflowBundle: o.workflowBundle } : workflowSource()),
+      activities: o.activities,
+      maxConcurrentActivityTaskExecutions: 20,
+      shutdownGraceTime: "10 seconds",
+    });
+  } catch (error) {
+    // Otherwise a Temporal that stays half-up (say, the namespace isn't
+    // registered yet) leaks one native connection per retry.
+    await owned?.close().catch(() => {});
+    throw error;
+  }
+  let ran = false;
+  return {
+    run: () => {
+      ran = true;
+      return worker.run();
+    },
+    shutdown: () => worker.shutdown(),
+    close: async () => {
+      if (!ran) {
+        // A created worker holds its connection until it has run and shut
+        // down (the SDK refuses to close it before), so drain it at once.
+        ran = true;
+        const running = worker.run();
+        worker.shutdown();
+        await running;
+      }
+      await owned?.close();
+    },
+  };
 }
 
 function errorText(error: unknown): string {

@@ -14,6 +14,8 @@ export interface SupervisedClient {
 export interface SupervisedWorker {
   run(): Promise<void>;
   shutdown(): void;
+  /** Frees the worker's connection; called once, after `run()` settles or instead of it. */
+  close(): Promise<void>;
 }
 
 export interface SyncSupervisorOptions<C extends SupervisedClient, W extends SupervisedWorker> {
@@ -53,12 +55,14 @@ export function superviseSync<C extends SupervisedClient, W extends SupervisedWo
     for (let attempt = 0; !stopped; attempt++) {
       try {
         const client = await o.connectClient();
+        let created: W | undefined;
         try {
           if (stopped) return;
-          worker = await o.createWorker();
+          created = await o.createWorker();
           // stop() ran while the worker was being created, so it had nothing
           // to shut down. Running it now would never end.
           if (stopped) return;
+          worker = created;
           const running = worker.run();
           o.onConnected(client);
           attempt = 0;
@@ -68,8 +72,9 @@ export function superviseSync<C extends SupervisedClient, W extends SupervisedWo
         } finally {
           worker = undefined;
           o.onDisconnected();
-          // Closed on every path, so a Temporal that stays half-up does not
-          // leak one client connection per retry.
+          // Both connections are closed on every path, so a Temporal that
+          // stays half-up does not leak one pair per retry.
+          await created?.close().catch(() => {});
           await closeQuietly(client);
         }
       } catch (err) {
