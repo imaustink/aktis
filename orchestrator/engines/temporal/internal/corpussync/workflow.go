@@ -50,11 +50,13 @@ var settingsOptions = workflow.ActivityOptions{
 // pass retried (from the start) elsewhere. Every rolling restart a pass spans
 // costs it an attempt, so it has enough to outlast several, within an overall
 // budget; backoff is capped so a source that is down is retried every few
-// minutes, not hammered.
+// minutes, not hammered. A pass heartbeats between fetches, not during one, so
+// the heartbeat timeout sits above the source's per-fetch HTTP timeout (5m, see
+// NewHTTPSource): a slow fetch of a large PDF must not fail every attempt.
 var passOptions = workflow.ActivityOptions{
 	StartToCloseTimeout:    6 * time.Hour,
 	ScheduleToCloseTimeout: 12 * time.Hour,
-	HeartbeatTimeout:       2 * time.Minute,
+	HeartbeatTimeout:       6 * time.Minute,
 	RetryPolicy: &temporal.RetryPolicy{
 		MaximumAttempts:    10,
 		InitialInterval:    10 * time.Second,
