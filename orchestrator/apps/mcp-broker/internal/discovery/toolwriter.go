@@ -145,14 +145,37 @@ func (w *ToolWriter) patch(ctx context.Context, name string, body resource.MCPTo
 	// A merge patch of metadata+spec: labels and ownerReferences are restamped
 	// (so a hand-edit that stripped them is corrected) and the spec is brought
 	// to the desired state. Status is a subresource and is left untouched.
-	patch, err := json.Marshal(struct {
-		Metadata resource.MCPToolMeta `json:"metadata"`
-		Spec     resource.MCPToolSpec `json:"spec"`
-	}{body.Metadata, body.Spec})
+	patch, err := mergePatch(body)
 	if err == nil {
 		_, err = w.client().Patch(ctx, name, types.MergePatchType, patch, metav1.PatchOptions{})
 	}
 	w.report(name, err)
+}
+
+// mergePatch builds the JSON merge patch body for an existing MCPTool.
+//
+// allowedPrincipals is omitted from the spec when empty (so a newly created
+// public tool carries no key at all), but a merge patch treats an absent key as
+// "leave unchanged". An exposure taken from private back to public would then
+// keep its old principal list forever. When the desired spec has no
+// principals, the patch therefore sends an explicit null, which merge-patch
+// reads as "delete this field" (ADR 0060).
+func mergePatch(body resource.MCPTool) ([]byte, error) {
+	rawSpec, err := json.Marshal(body.Spec)
+	if err != nil {
+		return nil, err
+	}
+	var spec map[string]any
+	if err := json.Unmarshal(rawSpec, &spec); err != nil {
+		return nil, err
+	}
+	if len(body.Spec.AllowedPrincipals) == 0 {
+		spec["allowedPrincipals"] = nil
+	}
+	return json.Marshal(struct {
+		Metadata resource.MCPToolMeta `json:"metadata"`
+		Spec     map[string]any       `json:"spec"`
+	}{body.Metadata, spec})
 }
 
 func (w *ToolWriter) delete(ctx context.Context, name string) {
