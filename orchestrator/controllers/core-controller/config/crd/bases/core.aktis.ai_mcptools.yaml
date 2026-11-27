@@ -58,6 +58,20 @@ spec:
               broker reconciles it back. Operators change what is exposed on the MCPServer,
               not here.
             properties:
+              allowedPrincipals:
+                description: |-
+                  allowedPrincipals privately scopes this MCPTool to specific people, on
+                  top of allowedRoles (ADR 0060). Empty or unset means public: allowedRoles
+                  alone decides. Non-empty means a caller must ALSO be one of these
+                  principals, so it can only narrow what allowedRoles admits, never widen
+                  it. A principal is a caller subject as the orchestrator resolves it (for
+                  example "openwebui:<user-id>"); it matches a per-user caller's own
+                  subject, or the subject a verified webhook sender's account is linked
+                  under. Copied from the owning server's exposure entry,
+                  like allowedRoles.
+                items:
+                  type: string
+                type: array
               allowedRoles:
                 description: |-
                   allowedRoles gates RAG retrieval (RBAC filter, ADR 0004, fail-closed) —

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/aktisai/orchestrator/engines/temporal/internal/access"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/catalog"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/corpus"
 )
@@ -86,19 +87,23 @@ func (a *KnowledgeBaseActivities) ReadCorpus(
 		return ReadCorpusOutput{
 			Result: fmt.Sprintf(
 				"%q is not a readable reference. Use `<corpus>/<id>`, where <corpus> is one of: %s.",
-				in.SourceID, memberNames(exec.Members)),
+				in.SourceID, memberNames(in.Caller, exec.Members)),
 		}, nil
 	}
 
 	member, found := memberByID(exec.Members, corpusID)
-	if !found {
+	if !found || concealed(in.Caller, member) {
 		// Prose, not an error: the model named something outside this knowledge
 		// base, which it can correct. Saying what IS available turns a dead end
 		// into a usable next step.
+		//
+		// A private member the caller is not listed on gets the same answer as
+		// one that does not exist: refusing it by name would confirm that it is
+		// there and echo its label (ADR 0060).
 		return ReadCorpusOutput{
 			Result: fmt.Sprintf(
 				"%q is not part of %s. Readable here: %s.",
-				corpusID, exec.DisplayName, memberNames(exec.Members)),
+				corpusID, exec.DisplayName, memberNames(in.Caller, exec.Members)),
 		}, nil
 	}
 
@@ -110,7 +115,7 @@ func (a *KnowledgeBaseActivities) ReadCorpus(
 	// This is OUR policy layer and it is not the same question as the source's.
 	// A caller whose Atlassian account happens to see a page still may not reach
 	// it through a corpus the operator scoped to other roles.
-	if !holdsAnyRole(in.Caller.Roles, member.AllowedRoles) {
+	if !memberVisible(in.Caller, member) {
 		return ReadCorpusOutput{
 			Result: fmt.Sprintf("You do not have access to %s in this knowledge base.", member.Label),
 		}, nil
@@ -224,10 +229,27 @@ func memberByID(members []catalog.KnowledgeBaseExecMember, id string) (catalog.K
 
 // memberNames lists what the model may name, so a refusal is actionable rather
 // than a dead end.
-func memberNames(members []catalog.KnowledgeBaseExecMember) string {
+//
+// It names only what this caller may know exists: a private member they are
+// not listed on is counted, never named, the same way the shared skill and tool
+// text treat it (ADR 0060). A member hidden only by roles is still named, as it
+// is in that shared text.
+func memberNames(caller Caller, members []catalog.KnowledgeBaseExecMember) string {
 	names := make([]string, 0, len(members))
+	hidden := 0
 	for _, member := range members {
+		if concealed(caller, member) {
+			hidden++
+			continue
+		}
 		names = append(names, fmt.Sprintf("%s (%s)", member.ID, member.Label))
+	}
+	if hidden > 0 {
+		plural := "s"
+		if hidden == 1 {
+			plural = ""
+		}
+		names = append(names, fmt.Sprintf("plus %d private source%s", hidden, plural))
 	}
 	if len(names) == 0 {
 		return "nothing — this knowledge base has no readable members"
@@ -235,22 +257,19 @@ func memberNames(members []catalog.KnowledgeBaseExecMember) string {
 	return strings.Join(names, ", ")
 }
 
-// holdsAnyRole is the match-any rule the vector store applies to a point.
+// concealed is whether a member is private (ADR 0060) and this caller may not
+// see it, so nothing the caller is told should name it or confirm it exists.
+func concealed(caller Caller, member catalog.KnowledgeBaseExecMember) bool {
+	return len(member.AllowedPrincipals) > 0 && !memberVisible(caller, member)
+}
+
+// memberVisible is whether this caller may consult one knowledge-base member
+// at all: its Corpus's allowedRoles AND, when it is private, its
+// allowedPrincipals (ADR 0060) — the same rule the vector store applies to a
+// catalog record.
 //
 // Empty caller roles match NOTHING, which is the fail-closed default: an
 // unresolved identity is not a permissive one.
-func holdsAnyRole(caller, required []string) bool {
-	if len(caller) == 0 || len(required) == 0 {
-		return false
-	}
-	held := make(map[string]struct{}, len(caller))
-	for _, role := range caller {
-		held[role] = struct{}{}
-	}
-	for _, role := range required {
-		if _, ok := held[role]; ok {
-			return true
-		}
-	}
-	return false
+func memberVisible(caller Caller, member catalog.KnowledgeBaseExecMember) bool {
+	return caller.Viewer().Admits(access.Of(member.AllowedRoles, member.AllowedPrincipals))
 }

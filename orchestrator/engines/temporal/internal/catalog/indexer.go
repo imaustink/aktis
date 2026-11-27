@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aktisai/orchestrator/engines/temporal/internal/access"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/vectorstore"
 )
 
@@ -56,7 +57,7 @@ func (ix *Indexer) UpsertTool(ctx context.Context, tool ToolDescriptor) error {
 	// A hidden tool (a hidden MCPTool exposure, ADR 0045 §4) stays referenceable
 	// by id but out of retrieval, the same Record.Hidden a knowledge base's
 	// scoped tools get via upsertHidden.
-	rec, err := record(tool.ID, tool.EmbeddingText(), tool.AllowedRoles, false, tool)
+	rec, err := record(tool.ID, tool.EmbeddingText(), tool.Audience(), tool)
 	if err != nil {
 		return err
 	}
@@ -85,7 +86,7 @@ func (ix *Indexer) UpsertAgent(ctx context.Context, agent AgentDescriptor) error
 	ix.agents[agent.ID] = agent
 	ix.mu.Unlock()
 
-	if err := upsertOne(ctx, ix.stores.Agents, agent.ID, agent.EmbeddingText(), agent.AllowedRoles, false, agent); err != nil {
+	if err := upsertOne(ctx, ix.stores.Agents, agent.ID, agent.EmbeddingText(), agent.Audience(), agent); err != nil {
 		return err
 	}
 	ix.scheduleSkillReindex()
@@ -110,7 +111,7 @@ func (ix *Indexer) UpsertSkill(ctx context.Context, skill SkillDescriptor) error
 	derived := DeriveSkillAccess(skill, ix.tools, ix.agents)
 	ix.mu.Unlock()
 
-	return upsertOne(ctx, ix.stores.Skills, derived.ID, derived.EmbeddingText(), derived.EffectiveRoles, derived.Unrestricted, derived)
+	return upsertOne(ctx, ix.stores.Skills, derived.ID, derived.EmbeddingText(), derived.Audience(), derived)
 }
 
 func (ix *Indexer) DeleteSkill(ctx context.Context, id string) error {
@@ -144,7 +145,7 @@ func (ix *Indexer) ReindexSkills(ctx context.Context) error {
 	records := make([]vectorstore.Record, 0, len(ix.skills))
 	for _, skill := range ix.skills {
 		derived := DeriveSkillAccess(skill, ix.tools, ix.agents)
-		rec, err := record(derived.ID, derived.EmbeddingText(), derived.EffectiveRoles, derived.Unrestricted, derived)
+		rec, err := record(derived.ID, derived.EmbeddingText(), derived.Audience(), derived)
 		if err != nil {
 			ix.mu.Unlock()
 			return err
@@ -166,7 +167,10 @@ func (ix *Indexer) ReindexSkills(ctx context.Context) error {
 	return ix.reindexKnowledgeBases(ctx)
 }
 
-func record(id, text string, roles []string, unrestricted bool, descriptor any) (vectorstore.Record, error) {
+// record is one store record for a descriptor. Roles and principals arrive
+// together as one access.Audience so no call site can index a resource's
+// roles and forget its private scope (ADR 0060).
+func record(id, text string, aud access.Audience, descriptor any) (vectorstore.Record, error) {
 	raw, err := json.Marshal(descriptor)
 	if err != nil {
 		return vectorstore.Record{}, fmt.Errorf("marshal descriptor %s: %w", id, err)
@@ -174,14 +178,16 @@ func record(id, text string, roles []string, unrestricted bool, descriptor any) 
 	return vectorstore.Record{
 		ID:           id,
 		Text:         text,
-		Roles:        roles,
-		Unrestricted: unrestricted,
+		Roles:        aud.Roles,
+		Unrestricted: aud.Unrestricted,
+		Private:      aud.Private,
+		Principals:   aud.Principals,
 		Descriptor:   raw,
 	}, nil
 }
 
-func upsertOne(ctx context.Context, store vectorstore.Store, id, text string, roles []string, unrestricted bool, descriptor any) error {
-	rec, err := record(id, text, roles, unrestricted, descriptor)
+func upsertOne(ctx context.Context, store vectorstore.Store, id, text string, aud access.Audience, descriptor any) error {
+	rec, err := record(id, text, aud, descriptor)
 	if err != nil {
 		return err
 	}

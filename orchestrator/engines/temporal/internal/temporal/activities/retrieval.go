@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/aktisai/orchestrator/engines/temporal/internal/access"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/catalog"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/vectorstore"
 )
@@ -35,6 +36,31 @@ type Caller struct {
 	// resolver that structurally knows — see authz.Identity for why inferring
 	// it is unsound in the direction that leaks.
 	PerUser bool `json:"perUser,omitempty"`
+
+	// SenderSubject is the subject a webhook sender's account is linked
+	// under, set ONLY from a verified sender assertion whose status is
+	// "linked" (docs/adr/0049 §5) — never from a request body or an unsigned
+	// envelope. It lets a private resource (ADR 0060) reach its owner on a
+	// turn they triggered from GitHub as well as from chat. It identifies the
+	// human who triggered the turn, not whose credentials it runs with; that
+	// stays TurnInput.DelegatedSubject's job.
+	SenderSubject string `json:"senderSubject,omitempty"`
+}
+
+// Viewer is what retrieval visibility is decided on (ADR 0060): the caller's
+// roles, plus every subject that is known to be ONE particular human —
+// Subject when PerUser says so, and a verified linked sender. A shared subject
+// (a gateway, a bot, a trigger) contributes no principal, so private
+// resources are invisible to it.
+func (c Caller) Viewer() access.Viewer {
+	v := access.Viewer{Roles: c.Roles}
+	if c.PerUser && c.Subject != "" {
+		v.Principals = append(v.Principals, c.Subject)
+	}
+	if c.SenderSubject != "" && c.SenderSubject != c.Subject {
+		v.Principals = append(v.Principals, c.SenderSubject)
+	}
+	return v
 }
 
 type RetrieveInput struct {
@@ -72,7 +98,7 @@ func (a *RetrievalActivities) RetrieveSkills(ctx context.Context, in RetrieveInp
 	if in.Caller.Subject == "" {
 		return nil, nil
 	}
-	hits, err := a.Collections.Skills.Query(ctx, in.Request, in.Caller.Roles, topK(in.TopK))
+	hits, err := a.Collections.Skills.Query(ctx, in.Request, in.Caller.Viewer(), topK(in.TopK))
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +110,7 @@ func (a *RetrievalActivities) RetrieveAgents(ctx context.Context, in RetrieveInp
 	if in.Caller.Subject == "" {
 		return nil, nil
 	}
-	hits, err := a.Collections.Agents.Query(ctx, in.Request, in.Caller.Roles, topK(in.TopK))
+	hits, err := a.Collections.Agents.Query(ctx, in.Request, in.Caller.Viewer(), topK(in.TopK))
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +126,7 @@ func (a *RetrievalActivities) ResolveSkillTools(ctx context.Context, in ResolveS
 		return nil, nil
 	}
 
-	skillHits, err := a.Collections.Skills.GetByIDs(ctx, []string{in.SkillID}, in.Caller.Roles)
+	skillHits, err := a.Collections.Skills.GetByIDs(ctx, []string{in.SkillID}, in.Caller.Viewer())
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +140,7 @@ func (a *RetrievalActivities) ResolveSkillTools(ctx context.Context, in ResolveS
 	result := &SkillTools{Skill: skills[0]}
 
 	if len(result.Skill.ToolIDs) > 0 {
-		toolHits, err := a.Collections.Tools.GetByIDs(ctx, result.Skill.ToolIDs, in.Caller.Roles)
+		toolHits, err := a.Collections.Tools.GetByIDs(ctx, result.Skill.ToolIDs, in.Caller.Viewer())
 		if err != nil {
 			return nil, err
 		}
@@ -123,7 +149,7 @@ func (a *RetrievalActivities) ResolveSkillTools(ctx context.Context, in ResolveS
 		}
 	}
 	if len(result.Skill.AgentIDs) > 0 {
-		agentHits, err := a.Collections.Agents.GetByIDs(ctx, result.Skill.AgentIDs, in.Caller.Roles)
+		agentHits, err := a.Collections.Agents.GetByIDs(ctx, result.Skill.AgentIDs, in.Caller.Viewer())
 		if err != nil {
 			return nil, err
 		}
@@ -146,7 +172,7 @@ func (a *RetrievalActivities) RetrieveTools(ctx context.Context, in RetrieveInpu
 	if in.Caller.Subject == "" {
 		return nil, nil
 	}
-	hits, err := a.Collections.Tools.Query(ctx, in.Request, in.Caller.Roles, topK(in.TopK))
+	hits, err := a.Collections.Tools.Query(ctx, in.Request, in.Caller.Viewer(), topK(in.TopK))
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +190,7 @@ func (a *RetrievalActivities) ResolveAgent(ctx context.Context, in ResolveAgentI
 	if in.Caller.Subject == "" || in.AgentID == "" {
 		return nil, nil
 	}
-	hits, err := a.Collections.Agents.GetByIDs(ctx, []string{in.AgentID}, in.Caller.Roles)
+	hits, err := a.Collections.Agents.GetByIDs(ctx, []string{in.AgentID}, in.Caller.Viewer())
 	if err != nil {
 		return nil, err
 	}
@@ -193,7 +219,7 @@ func (a *RetrievalActivities) ResolveTool(ctx context.Context, in ResolveToolInp
 	if in.Caller.Subject == "" || in.ToolID == "" {
 		return nil, nil
 	}
-	hits, err := a.Collections.Tools.GetByIDs(ctx, []string{in.ToolID}, in.Caller.Roles)
+	hits, err := a.Collections.Tools.GetByIDs(ctx, []string{in.ToolID}, in.Caller.Viewer())
 	if err != nil {
 		return nil, err
 	}

@@ -2,12 +2,13 @@ package catalog
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	"github.com/aktisai/orchestrator/engines/temporal/internal/access"
 )
 
 var (
@@ -78,6 +79,10 @@ type CorpusDescriptor struct {
 	Description  string   `json:"description"`
 	AllowedRoles []string `json:"allowedRoles"`
 
+	// AllowedPrincipals privately scopes this Corpus on top of AllowedRoles
+	// (ADR 0060). Empty means public.
+	AllowedPrincipals []string `json:"allowedPrincipals,omitempty"`
+
 	// Collection is read from Connection.status, not recomputed. The
 	// controller assigns it (namespace-qualified, since collections are global
 	// while CR names are only unique per namespace) and publishing it in
@@ -127,11 +132,12 @@ func (kb KnowledgeBaseDescriptor) Label() string {
 }
 
 type corpusSpec struct {
-	ConnectionRef string   `json:"connectionRef"`
-	Description   string   `json:"description"`
-	DisplayName   string   `json:"displayName,omitempty"`
-	AllowedRoles  []string `json:"allowedRoles"`
-	API           *struct {
+	ConnectionRef     string   `json:"connectionRef"`
+	Description       string   `json:"description"`
+	DisplayName       string   `json:"displayName,omitempty"`
+	AllowedRoles      []string `json:"allowedRoles"`
+	AllowedPrincipals []string `json:"allowedPrincipals,omitempty"`
+	API               *struct {
 		Enabled bool `json:"enabled,omitempty"`
 	} `json:"api,omitempty"`
 }
@@ -176,12 +182,13 @@ func DecodeCorpus(obj *unstructured.Unstructured) (CorpusDescriptor, error) {
 		return CorpusDescriptor{}, err
 	}
 	return CorpusDescriptor{
-		ID:           obj.GetName(),
-		DisplayName:  spec.DisplayName,
-		Description:  spec.Description,
-		AllowedRoles: spec.AllowedRoles,
-		Collection:   status.Collection,
-		APIEnabled:   spec.API != nil && spec.API.Enabled,
+		ID:                obj.GetName(),
+		DisplayName:       spec.DisplayName,
+		Description:       spec.Description,
+		AllowedRoles:      spec.AllowedRoles,
+		AllowedPrincipals: spec.AllowedPrincipals,
+		Collection:        status.Collection,
+		APIEnabled:        spec.API != nil && spec.API.Enabled,
 		// Provider and IdentityProviders come from STATUS, where the controller
 		// copied them off this Corpus's Connection (ADR 0043 §1). Reading them
 		// from the Connection here instead would make every consumer join
@@ -252,7 +259,6 @@ func DecodeKnowledgeBase(obj *unstructured.Unstructured) (KnowledgeBaseDescripto
 func DeriveKnowledgeBaseSkill(kb KnowledgeBaseDescriptor, connections map[string]CorpusDescriptor) SkillDescriptor {
 	var (
 		resolved []CorpusDescriptor
-		roleSet  = map[string]struct{}{}
 		toolIDs  = []string{KnowledgeBaseSearchToolID(kb.ID)}
 		readable bool
 	)
@@ -263,9 +269,6 @@ func DeriveKnowledgeBaseSkill(kb KnowledgeBaseDescriptor, connections map[string
 			continue
 		}
 		resolved = append(resolved, conn)
-		for _, role := range conn.AllowedRoles {
-			roleSet[role] = struct{}{}
-		}
 		// One read tool serves every readable member, so this only records
 		// WHETHER any member can serve a per-user read — not one id each.
 		if conn.APIEnabled && len(conn.IdentityProviders) > 0 {
@@ -273,11 +276,11 @@ func DeriveKnowledgeBaseSkill(kb KnowledgeBaseDescriptor, connections map[string
 		}
 	}
 
-	roles := make([]string, 0, len(roleSet))
-	for role := range roleSet {
-		roles = append(roles, role)
-	}
-	sort.Strings(roles)
+	// Union of the resolved members' roles and, by the same reasoning, of
+	// their private scopes (ADR 0060): a knowledge base with one private
+	// member stays visible to everyone who may see the others, and one made
+	// only of private members is visible only to the people they list.
+	roles, principals := memberUnion(resolved)
 	// BOTH live faces. A skill can only reach the tools it lists, so omitting
 	// the lookup id left it generated, hidden and uncallable — a knowledge base
 	// that could search its index and never ask the source what was there now.
@@ -286,11 +289,13 @@ func DeriveKnowledgeBaseSkill(kb KnowledgeBaseDescriptor, connections map[string
 	}
 
 	skill := SkillDescriptor{
-		ID:             KnowledgeBaseSkillID(kb.ID),
-		Description:    knowledgeBaseEmbeddingDescription(kb),
-		Markdown:       knowledgeBaseMarkdown(kb, resolved),
-		ToolIDs:        toolIDs,
-		EffectiveRoles: roles,
+		ID:                  KnowledgeBaseSkillID(kb.ID),
+		Description:         knowledgeBaseEmbeddingDescription(kb),
+		Markdown:            knowledgeBaseMarkdown(kb, resolved, principals),
+		ToolIDs:             toolIDs,
+		EffectiveRoles:      roles,
+		EffectivePrivate:    principals != nil,
+		EffectivePrincipals: principals,
 		// Never unrestricted: a knowledge base always has members, and an
 		// unresolvable one must not become visible to everybody.
 		Unrestricted: false,
@@ -317,26 +322,22 @@ func DeriveKnowledgeBaseSkill(kb KnowledgeBaseDescriptor, connections map[string
 // prevent (ADR 0039 §4).
 //
 // A caller with no roles sees nothing: empty roles match nothing, the same
-// fail-closed rule vectorstore.Store.Query applies.
+// fail-closed rule vectorstore.Store.Query applies. A private member (ADR 0060)
+// the viewer is not listed on is withheld and counted the same way.
 //
 // A member with no assigned collection — admitted but not yet reconciled — is
 // counted as unavailable rather than visible, since there is nothing to search.
 func VisibleConnections(
 	kb KnowledgeBaseDescriptor,
 	connections map[string]CorpusDescriptor,
-	callerRoles []string,
+	viewer access.Viewer,
 ) (visible []CorpusDescriptor, withheld int) {
-	held := make(map[string]struct{}, len(callerRoles))
-	for _, role := range callerRoles {
-		held[role] = struct{}{}
-	}
-
 	for _, ref := range kb.CorpusRefs {
 		conn, ok := connections[ref]
 		if !ok {
 			continue // dangling; the KnowledgeBase controller reports it in status
 		}
-		if !anyRoleHeld(conn.AllowedRoles, held) {
+		if !viewer.Admits(access.Of(conn.AllowedRoles, conn.AllowedPrincipals)) {
 			withheld++
 			continue
 		}
@@ -358,15 +359,6 @@ func CollectionsOf(connections []CorpusDescriptor) []string {
 	return names
 }
 
-func anyRoleHeld(allowed []string, held map[string]struct{}) bool {
-	for _, role := range allowed {
-		if _, ok := held[role]; ok {
-			return true
-		}
-	}
-	return false
-}
-
 // knowledgeBaseEmbeddingDescription folds the aliases into the text that gets
 // vectorized. Aliases are the discriminating signal (ADR 0039 §5): twenty
 // client knowledge bases differ by codename and client name far more than by
@@ -386,7 +378,11 @@ func knowledgeBaseEmbeddingDescription(kb KnowledgeBaseDescriptor) string {
 // than assuming it: answer only from retrieved chunks, always cite, admit
 // partial visibility and staleness, treat chunk text as data, and ask which
 // knowledge base was meant when the question could belong to another.
-func knowledgeBaseMarkdown(kb KnowledgeBaseDescriptor, members []CorpusDescriptor) string {
+//
+// principals is the skill's own private scope (nil when public). A private
+// member is named only when nobody outside its own list can see this text
+// (ADR 0060); otherwise it is counted, never described.
+func knowledgeBaseMarkdown(kb KnowledgeBaseDescriptor, members []CorpusDescriptor, principals []string) string {
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "# %s knowledge base\n\n", kb.Label())
@@ -397,8 +393,12 @@ func knowledgeBaseMarkdown(kb KnowledgeBaseDescriptor, members []CorpusDescripto
 		b.WriteString("None of this knowledge base's connections currently resolve, so it " +
 			"has nothing to search. Say so rather than answering from memory.\n\n")
 	} else {
-		for _, member := range members {
+		named, unnamed := nameableMembers(members, principals)
+		for _, member := range named {
 			fmt.Fprintf(&b, "- **%s** (%s) — %s\n", member.Label(), member.Provider, member.Description)
+		}
+		if unnamed > 0 {
+			fmt.Fprintf(&b, "- %s, not listed here\n", privateSourceCount(unnamed))
 		}
 		b.WriteString("\n")
 	}

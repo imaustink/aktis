@@ -111,6 +111,17 @@ type AgentSpec struct {
 	// +kubebuilder:validation:MinItems=1
 	AllowedRoles []string `json:"allowedRoles"`
 
+	// allowedPrincipals privately scopes this Agent to specific people, on
+	// top of allowedRoles (ADR 0060). Empty or unset means public: allowedRoles
+	// alone decides. Non-empty means a caller must ALSO be one of these
+	// principals, so it can only narrow what allowedRoles admits, never widen
+	// it. A principal is a caller subject as the orchestrator resolves it (for
+	// example "openwebui:<user-id>"); it matches a per-user caller's own
+	// subject, or the subject a verified webhook sender's account is linked
+	// under.
+	// +optional
+	AllowedPrincipals []string `json:"allowedPrincipals,omitempty"`
+
 	// tier is an operator-defined cost/trust classification.
 	// +optional
 	Tier string `json:"tier,omitempty"`

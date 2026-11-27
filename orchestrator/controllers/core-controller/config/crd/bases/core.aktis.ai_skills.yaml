@@ -69,6 +69,24 @@ spec:
                   carry no RBAC because the caller both supplies and executes them (the
                   orchestrator never gains a capability from one).
                 type: boolean
+              allowedPrincipals:
+                description: |-
+                  allowedPrincipals privately scopes this Skill to specific people, on
+                  top of allowedRoles (ADR 0060). Empty or unset means public: allowedRoles
+                  alone decides. Non-empty means a caller must ALSO be one of these
+                  principals, so it can only narrow what allowedRoles admits, never widen
+                  it. A principal is a caller subject as the orchestrator resolves it (for
+                  example "openwebui:<user-id>"); it matches a per-user caller's own
+                  subject, or the subject a verified webhook sender's account is linked
+                  under.
+
+                  Skills carry no roles of their own (ADR 0011), and the same derivation
+                  applies here: a skill's effective audience is this list intersected
+                  with the allowedPrincipals of every referenced Tool/Agent that is itself
+                  private, so a skill can never widen a private tool's audience.
+                items:
+                  type: string
+                type: array
               description:
                 description: description is fed to the orchestrator's embedder for
                   RAG skill retrieval.

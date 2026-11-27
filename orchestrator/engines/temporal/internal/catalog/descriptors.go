@@ -5,7 +5,11 @@
 // descriptors carry catalog metadata only.
 package catalog
 
-import "k8s.io/apimachinery/pkg/runtime/schema"
+import (
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	"github.com/aktisai/orchestrator/engines/temporal/internal/access"
+)
 
 const (
 	Group   = "core.aktis.ai"
@@ -27,6 +31,10 @@ type ToolDescriptor struct {
 	Output       string   `json:"output,omitempty"`
 	AllowedRoles []string `json:"allowedRoles"`
 	Tier         string   `json:"tier,omitempty"`
+
+	// AllowedPrincipals privately scopes this resource to specific callers
+	// on top of AllowedRoles (ADR 0060). Empty means public.
+	AllowedPrincipals []string `json:"allowedPrincipals,omitempty"`
 
 	// Approval is the tool-approval policy (ADR 0003): "never" (or empty) runs
 	// silently, "always" pauses the turn for human approval, "auto" consults an
@@ -99,6 +107,9 @@ type KnowledgeBaseExecMember struct {
 	// the source-level filter that runs before any query and produces the
 	// withheld count (ADR 0039 §4).
 	AllowedRoles []string `json:"allowedRoles"`
+	// AllowedPrincipals is the member Corpus's private scope (ADR 0060),
+	// checked alongside AllowedRoles. Empty means public.
+	AllowedPrincipals []string `json:"allowedPrincipals,omitempty"`
 	// Granularity is the unit this member's provider authorizes at, so probes
 	// can be deduplicated per connection where that is the real access unit
 	// (ADR 0040).
@@ -177,6 +188,10 @@ type AgentDescriptor struct {
 	AllowedRoles []string `json:"allowedRoles"`
 	Tier         string   `json:"tier,omitempty"`
 
+	// AllowedPrincipals privately scopes this resource to specific callers
+	// on top of AllowedRoles (ADR 0060). Empty means public.
+	AllowedPrincipals []string `json:"allowedPrincipals,omitempty"`
+
 	// ApprovalDefault is the fallback tool-approval policy (ADR 0003) for tools
 	// this agent calls that do not set their own Approval. A tool's own Approval
 	// wins over this default (most-specific-wins; see workflows.resolveApproval).
@@ -237,6 +252,11 @@ type SkillDescriptor struct {
 	ToolIDs     []string `json:"toolIds,omitempty"`
 	AgentIDs    []string `json:"agentIds,omitempty"`
 
+	// AllowedPrincipals is the skill's OWN private scope as authored
+	// (ADR 0060). Not used for visibility directly: DeriveSkillAccess folds
+	// it into EffectivePrivate/EffectivePrincipals with its refs' scopes.
+	AllowedPrincipals []string `json:"allowedPrincipals,omitempty"`
+
 	// AllowCallerTools controls whether tools the CONSUMER supplied in the
 	// request body (upstream ADR 0035) may be offered to the planner
 	// alongside this skill's own tools. A pointer because **nil means
@@ -253,6 +273,34 @@ type SkillDescriptor struct {
 	// to no one (dangling ref or disjoint roles — fail closed).
 	EffectiveRoles []string `json:"effectiveRoles,omitempty"`
 	Unrestricted   bool     `json:"unrestricted,omitempty"`
+
+	// Derived at index time (ADR 0060): the skill's own AllowedPrincipals
+	// intersected with those of every referenced tool/agent that is itself
+	// private. EffectivePrivate with empty EffectivePrincipals means visible
+	// to no one; !EffectivePrivate means public on this axis.
+	EffectivePrivate    bool     `json:"effectivePrivate,omitempty"`
+	EffectivePrincipals []string `json:"effectivePrincipals,omitempty"`
+}
+
+// Audience is who may retrieve this tool.
+func (t ToolDescriptor) Audience() access.Audience {
+	return access.Of(t.AllowedRoles, t.AllowedPrincipals)
+}
+
+// Audience is who may retrieve this agent.
+func (a AgentDescriptor) Audience() access.Audience {
+	return access.Of(a.AllowedRoles, a.AllowedPrincipals)
+}
+
+// Audience is who may retrieve this skill, from its DERIVED access fields.
+// Only meaningful after DeriveSkillAccess / DeriveKnowledgeBaseSkill.
+func (s SkillDescriptor) Audience() access.Audience {
+	return access.Audience{
+		Roles:        s.EffectiveRoles,
+		Unrestricted: s.Unrestricted,
+		Private:      s.EffectivePrivate,
+		Principals:   s.EffectivePrincipals,
+	}
 }
 
 // EmbeddingText is what gets vectorized for retrieval, mirroring

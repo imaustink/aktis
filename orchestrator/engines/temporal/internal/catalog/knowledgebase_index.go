@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/aktisai/orchestrator/engines/temporal/internal/access"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/vectorstore"
 )
 
@@ -121,7 +122,7 @@ func (ix *Indexer) UpsertKnowledgeBase(ctx context.Context, kb KnowledgeBaseDesc
 
 	derived := DeriveKnowledgeBaseSkill(kb, connections)
 	return upsertOne(ctx, ix.stores.Skills, derived.ID, derived.EmbeddingText(),
-		derived.EffectiveRoles, derived.Unrestricted, derived)
+		derived.Audience(), derived)
 }
 
 // DeleteKnowledgeBase removes a knowledge base and everything derived from it.
@@ -169,7 +170,7 @@ func (ix *Indexer) reindexKnowledgeBases(ctx context.Context) error {
 		}
 		derived := DeriveKnowledgeBaseSkill(kb, connections)
 		rec, err := record(derived.ID, derived.EmbeddingText(),
-			derived.EffectiveRoles, derived.Unrestricted, derived)
+			derived.Audience(), derived)
 		if err != nil {
 			return err
 		}
@@ -205,6 +206,13 @@ func (ix *Indexer) corporaSnapshot() map[string]CorpusDescriptor {
 func knowledgeBaseTools(kb KnowledgeBaseDescriptor, connections map[string]CorpusDescriptor) []ToolDescriptor {
 	derived := DeriveKnowledgeBaseSkill(kb, connections)
 	roles := derived.EffectiveRoles
+	// Same union as the skill (ADR 0060). A ToolDescriptor has no separate
+	// private flag, and needs none: a union of private members is never
+	// empty, since a Corpus is private only by listing someone.
+	var principals []string
+	if derived.EffectivePrivate {
+		principals = derived.EffectivePrincipals
+	}
 	exec := knowledgeBaseExec(kb, connections)
 
 	tools := []ToolDescriptor{
@@ -218,6 +226,7 @@ func knowledgeBaseTools(kb KnowledgeBaseDescriptor, connections map[string]Corpu
 				"readable by the calling user, plus how many sources were withheld or " +
 				"could not be checked.",
 			AllowedRoles:      roles,
+			AllowedPrincipals: principals,
 			KnowledgeBaseExec: exec("search"),
 		},
 	}
@@ -260,23 +269,12 @@ func knowledgeBaseReadTool(
 	readable []CorpusDescriptor,
 	exec *KnowledgeBaseExecSpec,
 ) ToolDescriptor {
-	names := make([]string, 0, len(readable))
-	roles := map[string]bool{}
-	for _, conn := range readable {
-		names = append(names, fmt.Sprintf("%s (%s)", conn.ID, conn.Label()))
-		for _, role := range conn.AllowedRoles {
-			roles[role] = true
-		}
-	}
 
 	// Union to invoke, as the search tool does (ADR 0039 §4): a caller who may
 	// reach ANY member may call it, and which documents they can actually read
 	// is settled per read by the source itself.
-	allowed := make([]string, 0, len(roles))
-	for role := range roles {
-		allowed = append(allowed, role)
-	}
-	sort.Strings(allowed)
+	allowed, principals := memberUnion(readable)
+	names := memberNames(readable, principals)
 
 	return ToolDescriptor{
 		ID: KnowledgeBaseReadToolID(kb.ID),
@@ -291,6 +289,7 @@ func knowledgeBaseReadTool(
 			strings.Join(names, ", ")),
 		Output:            "The document as the source returns it now, with a citation.",
 		AllowedRoles:      allowed,
+		AllowedPrincipals: principals,
 		KnowledgeBaseExec: exec,
 	}
 }
@@ -313,19 +312,8 @@ func knowledgeBaseQueryTool(
 	readable []CorpusDescriptor,
 	exec *KnowledgeBaseExecSpec,
 ) ToolDescriptor {
-	names := make([]string, 0, len(readable))
-	roles := map[string]bool{}
-	for _, conn := range readable {
-		names = append(names, fmt.Sprintf("%s (%s)", conn.ID, conn.Label()))
-		for _, role := range conn.AllowedRoles {
-			roles[role] = true
-		}
-	}
-	allowed := make([]string, 0, len(roles))
-	for role := range roles {
-		allowed = append(allowed, role)
-	}
-	sort.Strings(allowed)
+	allowed, principals := memberUnion(readable)
+	names := memberNames(readable, principals)
 
 	return ToolDescriptor{
 		ID: KnowledgeBaseQueryToolID(kb.ID),
@@ -350,13 +338,104 @@ func knowledgeBaseQueryTool(
 			"`<corpus>/<id>` reference that can be read in full. Only what the asking user may " +
 			"see, and only from inside this knowledge base.",
 		AllowedRoles:      allowed,
+		AllowedPrincipals: principals,
 		KnowledgeBaseExec: exec,
 	}
 }
 
+// nameableMembers splits a face's members into the ones its shared text may
+// name and a count of the ones it may not (ADR 0060).
+//
+// Generated skill markdown and tool descriptions are one text for everyone the
+// face admits, so withholding a private member's CONTENT is not enough: naming
+// it — label, provider, description — discloses that it exists to people it was
+// scoped away from. A public member is always named. A private member is named
+// only when the face itself is private and every principal it admits is on that
+// member's own list, so the text can reach no one the member excludes.
+func nameableMembers(members []CorpusDescriptor, facePrincipals []string) (named []CorpusDescriptor, unnamed int) {
+	for _, conn := range members {
+		if len(conn.AllowedPrincipals) == 0 || withinScope(facePrincipals, conn.AllowedPrincipals) {
+			named = append(named, conn)
+			continue
+		}
+		unnamed++
+	}
+	return named, unnamed
+}
+
+// withinScope reports whether a private face's principals are all on list. A
+// nil face is public, which no private list contains.
+func withinScope(facePrincipals, list []string) bool {
+	if facePrincipals == nil {
+		return false
+	}
+	set := make(map[string]bool, len(list))
+	for _, p := range list {
+		set[p] = true
+	}
+	for _, p := range facePrincipals {
+		if !set[p] {
+			return false
+		}
+	}
+	return true
+}
+
+// memberNames is the "<id> (<label>)" list a read or query tool offers, with
+// private members this face may not name replaced by a count. Such a member
+// stays reachable: a caller it admits gets its `<corpus>` from a search
+// result, and execution gates every member per caller.
+func memberNames(members []CorpusDescriptor, facePrincipals []string) []string {
+	named, unnamed := nameableMembers(members, facePrincipals)
+	names := make([]string, 0, len(named)+1)
+	for _, conn := range named {
+		names = append(names, fmt.Sprintf("%s (%s)", conn.ID, conn.Label()))
+	}
+	if unnamed > 0 {
+		names = append(names, fmt.Sprintf("%s (use the `<corpus>` a search result cites)",
+			privateSourceCount(unnamed)))
+	}
+	return names
+}
+
+func privateSourceCount(n int) string {
+	if n == 1 {
+		return "plus 1 private source"
+	}
+	return fmt.Sprintf("plus %d private sources", n)
+}
+
+// memberUnion is the audience of a face usable by anyone who may reach ANY of
+// these members (ADR 0039 §4): the sorted union of their roles, and the union
+// of their principal scopes — nil (public) as soon as one member is public
+// (ADR 0060). Per-member gating at execution still decides what a caller
+// actually reaches.
+func memberUnion(members []CorpusDescriptor) (roles, principals []string) {
+	roleSet := map[string]bool{}
+	scopes := make([][]string, 0, len(members))
+	private := make([]bool, 0, len(members))
+	for _, conn := range members {
+		for _, role := range conn.AllowedRoles {
+			roleSet[role] = true
+		}
+		scopes = append(scopes, conn.AllowedPrincipals)
+		private = append(private, len(conn.AllowedPrincipals) > 0)
+	}
+	roles = make([]string, 0, len(roleSet))
+	for role := range roleSet {
+		roles = append(roles, role)
+	}
+	sort.Strings(roles)
+	if isPrivate, union := access.Widen(scopes, private); isPrivate {
+		sort.Strings(union)
+		principals = union
+	}
+	return roles, principals
+}
+
 // upsertHidden writes a tool that may be referenced but never retrieved.
 func upsertHidden(ctx context.Context, store vectorstore.Store, tool ToolDescriptor) error {
-	rec, err := record(tool.ID, tool.EmbeddingText(), tool.AllowedRoles, false, tool)
+	rec, err := record(tool.ID, tool.EmbeddingText(), tool.Audience(), tool)
 	if err != nil {
 		return err
 	}
@@ -385,6 +464,7 @@ func knowledgeBaseExec(
 			Label:             conn.Label(),
 			Collection:        conn.Collection,
 			AllowedRoles:      conn.AllowedRoles,
+			AllowedPrincipals: conn.AllowedPrincipals,
 			Granularity:       providerGranularity(conn.Provider),
 			IdentityProviders: conn.IdentityProviders,
 		})

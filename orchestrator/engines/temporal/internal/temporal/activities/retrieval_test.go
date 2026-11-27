@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/aktisai/orchestrator/engines/temporal/internal/access"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/catalog"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/temporal/activities"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/vectorstore"
@@ -21,21 +22,15 @@ type fakeStore struct {
 func (f *fakeStore) Upsert(context.Context, []vectorstore.Record) error { return nil }
 func (f *fakeStore) Delete(context.Context, []string) error             { return nil }
 
-func (f *fakeStore) visible(r vectorstore.Record, roles []string) bool {
-	if r.Unrestricted {
-		return true
-	}
-	for _, want := range roles {
-		for _, have := range r.Roles {
-			if want == have {
-				return true
-			}
-		}
-	}
-	return false
+// visible applies the real store's rule, so these tests exercise private
+// scoping (ADR 0060) as well as roles.
+func (f *fakeStore) visible(r vectorstore.Record, viewer access.Viewer) bool {
+	return viewer.Admits(access.Audience{
+		Roles: r.Roles, Unrestricted: r.Unrestricted, Private: r.Private, Principals: r.Principals,
+	})
 }
 
-func (f *fakeStore) Query(_ context.Context, _ string, roles []string, limit int) ([]vectorstore.Hit, error) {
+func (f *fakeStore) Query(_ context.Context, _ string, roles access.Viewer, limit int) ([]vectorstore.Hit, error) {
 	var hits []vectorstore.Hit
 	for _, r := range f.records {
 		if f.visible(r, roles) && len(hits) < limit {
@@ -45,7 +40,7 @@ func (f *fakeStore) Query(_ context.Context, _ string, roles []string, limit int
 	return hits, nil
 }
 
-func (f *fakeStore) GetByIDs(_ context.Context, ids []string, roles []string) ([]vectorstore.Hit, error) {
+func (f *fakeStore) GetByIDs(_ context.Context, ids []string, roles access.Viewer) ([]vectorstore.Hit, error) {
 	var hits []vectorstore.Hit
 	for _, id := range ids {
 		if r, ok := f.records[id]; ok && f.visible(r, roles) {

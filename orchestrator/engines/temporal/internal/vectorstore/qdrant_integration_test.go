@@ -12,6 +12,7 @@ import (
 	"github.com/qdrant/go-client/qdrant"
 	"github.com/stretchr/testify/require"
 
+	"github.com/aktisai/orchestrator/engines/temporal/internal/access"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/vectorstore"
 )
 
@@ -65,10 +66,46 @@ func TestQdrantStoreIntegration(t *testing.T) {
 		{ID: "scraper", Text: "scrape recipes from urls", Roles: []string{"cook", "admin"}, Descriptor: descriptor("scraper")},
 		{ID: "deployer", Text: "deploy services to kubernetes", Roles: []string{"admin"}, Descriptor: descriptor("deployer")},
 		{ID: "chitchat", Text: "general conversation", Unrestricted: true, Descriptor: descriptor("chitchat")},
+		{ID: "alice-notes", Text: "scrape recipes into my notes", Roles: []string{"cook"},
+			Private: true, Principals: []string{"openwebui:alice"}, Descriptor: descriptor("alice-notes")},
+		{ID: "nobody", Text: "scrape recipes for nobody", Roles: []string{"cook"},
+			Private: true, Descriptor: descriptor("nobody")},
 	}))
 
+	alice := access.Viewer{Roles: []string{"cook"}, Principals: []string{"openwebui:alice"}}
+	bob := access.Viewer{Roles: []string{"cook"}, Principals: []string{"openwebui:bob"}}
+
+	t.Run("private records are visible only to a listed principal (ADR 0060)", func(t *testing.T) {
+		hits, err := store.Query(ctx, "scrape recipes", alice, 10)
+		require.NoError(t, err)
+		require.Contains(t, hitIDs(hits), "alice-notes")
+		require.NotContains(t, hitIDs(hits), "nobody")
+
+		for _, viewer := range []access.Viewer{bob, roles("cook")} {
+			hits, err = store.Query(ctx, "scrape recipes", viewer, 10)
+			require.NoError(t, err)
+			require.NotContains(t, hitIDs(hits), "alice-notes")
+			require.Contains(t, hitIDs(hits), "scraper", "public records stay visible")
+		}
+	})
+
+	t.Run("a listed principal without the role still sees nothing private", func(t *testing.T) {
+		hits, err := store.Query(ctx, "scrape recipes", access.Viewer{Roles: []string{"admin"}, Principals: alice.Principals}, 10)
+		require.NoError(t, err)
+		require.NotContains(t, hitIDs(hits), "alice-notes")
+	})
+
+	t.Run("get by ids re-checks principals", func(t *testing.T) {
+		hits, err := store.GetByIDs(ctx, []string{"alice-notes", "nobody"}, bob)
+		require.NoError(t, err)
+		require.Empty(t, hits)
+		hits, err = store.GetByIDs(ctx, []string{"alice-notes", "nobody"}, alice)
+		require.NoError(t, err)
+		require.Equal(t, []string{"alice-notes"}, hitIDs(hits))
+	})
+
 	t.Run("query filters by role", func(t *testing.T) {
-		hits, err := store.Query(ctx, "scrape a recipe", []string{"cook"}, 10)
+		hits, err := store.Query(ctx, "scrape a recipe", roles("cook"), 10)
 		require.NoError(t, err)
 		ids := hitIDs(hits)
 		require.Contains(t, ids, "scraper")
@@ -77,20 +114,20 @@ func TestQdrantStoreIntegration(t *testing.T) {
 	})
 
 	t.Run("no roles fails closed to unrestricted only", func(t *testing.T) {
-		hits, err := store.Query(ctx, "deploy something", nil, 10)
+		hits, err := store.Query(ctx, "deploy something", access.Viewer{}, 10)
 		require.NoError(t, err)
 		require.Equal(t, []string{"chitchat"}, hitIDs(hits))
 	})
 
 	t.Run("get by ids re-checks roles", func(t *testing.T) {
-		hits, err := store.GetByIDs(ctx, []string{"scraper", "deployer", "chitchat", "missing"}, []string{"cook"})
+		hits, err := store.GetByIDs(ctx, []string{"scraper", "deployer", "chitchat", "missing"}, roles("cook"))
 		require.NoError(t, err)
 		ids := hitIDs(hits)
 		require.ElementsMatch(t, []string{"scraper", "chitchat"}, ids)
 	})
 
 	t.Run("descriptor round-trips", func(t *testing.T) {
-		hits, err := store.GetByIDs(ctx, []string{"scraper"}, []string{"cook"})
+		hits, err := store.GetByIDs(ctx, []string{"scraper"}, roles("cook"))
 		require.NoError(t, err)
 		require.Len(t, hits, 1)
 		require.JSONEq(t, `{"id":"scraper"}`, string(hits[0].Descriptor))
@@ -98,11 +135,13 @@ func TestQdrantStoreIntegration(t *testing.T) {
 
 	t.Run("delete removes the record", func(t *testing.T) {
 		require.NoError(t, store.Delete(ctx, []string{"scraper"}))
-		hits, err := store.GetByIDs(ctx, []string{"scraper"}, []string{"cook", "admin"})
+		hits, err := store.GetByIDs(ctx, []string{"scraper"}, roles("cook", "admin"))
 		require.NoError(t, err)
 		require.Empty(t, hits)
 	})
 }
+
+func roles(r ...string) access.Viewer { return access.Viewer{Roles: r} }
 
 func hitIDs(hits []vectorstore.Hit) []string {
 	ids := make([]string, len(hits))

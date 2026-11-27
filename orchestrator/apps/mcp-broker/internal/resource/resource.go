@@ -71,6 +71,9 @@ type MCPToolExposure struct {
 	// Expose defaults to true (matches the CRD's +kubebuilder:default=true).
 	Expose       *bool    `json:"expose,omitempty"`
 	AllowedRoles []string `json:"allowedRoles"`
+	// AllowedPrincipals privately scopes the materialized tool to specific
+	// callers on top of AllowedRoles (ADR 0060). Empty means public.
+	AllowedPrincipals []string `json:"allowedPrincipals,omitempty"`
 	// ToolID overrides the materialized MCPTool's metadata.name. Used VERBATIM
 	// (see CatalogIDFor) — the broker never sanitizes it, because a silent
 	// rename would break the id a Skill references in toolRefs. The CRD
@@ -141,6 +144,7 @@ type MCPToolSpec struct {
 	Description       string   `json:"description"`
 	InputSchema       *string  `json:"inputSchema,omitempty"`
 	AllowedRoles      []string `json:"allowedRoles"`
+	AllowedPrincipals []string `json:"allowedPrincipals,omitempty"`
 	Hidden            *bool    `json:"hidden,omitempty"`
 	Tier              *string  `json:"tier,omitempty"`
 	Approval          *string  `json:"approval,omitempty"`

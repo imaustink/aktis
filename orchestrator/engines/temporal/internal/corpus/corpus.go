@@ -15,6 +15,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/aktisai/orchestrator/engines/temporal/internal/access"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/vectorstore"
 )
 
@@ -122,7 +123,11 @@ func Search(
 			// Each member is asked for `limit` on the assumption that one of
 			// them could supply the whole answer; the merge below prunes back
 			// to `limit` overall.
-			found, queryErr := store.Query(ctx, query, callerRoles, limit)
+			//
+			// Roles only: chunks carry their Corpus's allowedRoles but never a
+			// principal scope. Private Corpora (ADR 0060) are gated per member
+			// before a search reaches here, so a chunk is never `private`.
+			found, queryErr := store.Query(ctx, query, access.Viewer{Roles: callerRoles}, limit)
 
 			mu.Lock()
 			defer mu.Unlock()

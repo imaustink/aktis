@@ -251,6 +251,36 @@ func TestDiscoveryMaterializes(t *testing.T) {
 		}
 	})
 
+	t.Run("copies allowedPrincipals from the exposure entry onto the materialized MCPTool (ADR 0060)", func(t *testing.T) {
+		server := makeServer(nil, eng("search_issues", func(e *resource.MCPToolExposure) {
+			e.AllowedPrincipals = []string{"openwebui:alice"}
+		}))
+		k := newFakeK8s(t, server)
+		discoveryWith(k, listing(liveTools)).RunServer(ctx, bind(server))
+		if got := k.tool(searchIssuesID).Spec.AllowedPrincipals; !reflect.DeepEqual(got, []string{"openwebui:alice"}) {
+			t.Fatalf("allowedPrincipals = %v", got)
+		}
+	})
+
+	t.Run("clears allowedPrincipals on an existing MCPTool when the exposure goes back to public (ADR 0060)", func(t *testing.T) {
+		server := makeServer(nil, eng("search_issues", func(e *resource.MCPToolExposure) {
+			e.AllowedPrincipals = []string{"openwebui:alice"}
+		}))
+		k := newFakeK8s(t, server)
+		discoveryWith(k, listing(liveTools)).RunServer(ctx, bind(server))
+		if got := k.tool(searchIssuesID).Spec.AllowedPrincipals; !reflect.DeepEqual(got, []string{"openwebui:alice"}) {
+			t.Fatalf("allowedPrincipals after create = %v", got)
+		}
+
+		// The operator removes allowedPrincipals: the next pass patches the
+		// already-materialized tool and must drop the key, not keep it.
+		server.Spec.Exposure[0].AllowedPrincipals = nil
+		discoveryWith(k, listing(liveTools)).RunServer(ctx, bind(server))
+		if got, ok := k.rawSpec(searchIssuesID)["allowedPrincipals"]; ok {
+			t.Fatalf("allowedPrincipals after going public = %#v, want the key removed", got)
+		}
+	})
+
 	t.Run("omits every optional field the exposure entry and server leave unset", func(t *testing.T) {
 		// Existing servers are unaffected by fields they never set: the stored
 		// spec carries no approval/hidden/tier/identityProviders/defaultIdentity

@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
+	"github.com/aktisai/orchestrator/engines/temporal/internal/access"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/catalog"
 )
 
@@ -246,7 +247,7 @@ func TestVisibleConnections(t *testing.T) {
 	conns := globexConnections()
 
 	t.Run("withholds members the caller has no role for, and counts them", func(t *testing.T) {
-		visible, withheld := catalog.VisibleConnections(globexKB(), conns, []string{"reader"})
+		visible, withheld := catalog.VisibleConnections(globexKB(), conns, access.Viewer{Roles: []string{"reader"}})
 
 		ids := make([]string, 0, len(visible))
 		for _, conn := range visible {
@@ -258,13 +259,13 @@ func TestVisibleConnections(t *testing.T) {
 	})
 
 	t.Run("a lead sees the restricted channel too", func(t *testing.T) {
-		visible, withheld := catalog.VisibleConnections(globexKB(), conns, []string{"reader", "lead"})
+		visible, withheld := catalog.VisibleConnections(globexKB(), conns, access.Viewer{Roles: []string{"reader", "lead"}})
 		require.Len(t, visible, 3)
 		require.Zero(t, withheld)
 	})
 
 	t.Run("no roles sees nothing", func(t *testing.T) {
-		visible, withheld := catalog.VisibleConnections(globexKB(), conns, nil)
+		visible, withheld := catalog.VisibleConnections(globexKB(), conns, access.Viewer{})
 		require.Empty(t, visible, "empty roles match nothing, as the store does")
 		require.Equal(t, 3, withheld)
 	})
@@ -275,7 +276,7 @@ func TestVisibleConnections(t *testing.T) {
 		conn.Collection = ""
 		unreconciled["globex-slack-eng"] = conn
 
-		visible, withheld := catalog.VisibleConnections(globexKB(), unreconciled, []string{"reader", "lead"})
+		visible, withheld := catalog.VisibleConnections(globexKB(), unreconciled, access.Viewer{Roles: []string{"reader", "lead"}})
 		require.Len(t, visible, 2)
 		require.Equal(t, 1, withheld, "nothing indexed yet is still something the answer is missing")
 	})
@@ -284,13 +285,13 @@ func TestVisibleConnections(t *testing.T) {
 		kb := globexKB()
 		kb.CorpusRefs = append(kb.CorpusRefs, "never-created")
 
-		_, withheld := catalog.VisibleConnections(kb, conns, []string{"reader", "lead"})
+		_, withheld := catalog.VisibleConnections(kb, conns, access.Viewer{Roles: []string{"reader", "lead"}})
 		require.Zero(t, withheld,
 			"a misconfiguration is the controller's to report, not an access disclosure")
 	})
 
 	t.Run("collections come back in member order", func(t *testing.T) {
-		visible, _ := catalog.VisibleConnections(globexKB(), conns, []string{"reader"})
+		visible, _ := catalog.VisibleConnections(globexKB(), conns, access.Viewer{Roles: []string{"reader"}})
 		require.Equal(t, []string{
 			"conn_default_globex-confluence",
 			"conn_default_globex-slack-eng",

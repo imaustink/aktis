@@ -367,6 +367,13 @@ func shapeInvokeTurn(
 		turn.SenderAccountID = sender.AccountID
 		turn.SenderSubjectStatus = sender.SubjectStatus
 		turn.DelegatedSubject = sender.Subject
+		// The same verified subject is who the turn's private resources
+		// (ADR 0060) may be matched against. Status is re-checked rather
+		// than trusting the claim's own "set only when linked" convention:
+		// an ambiguous or unlinked sender must never match anyone.
+		if sender.SubjectStatus == rbac.SenderSubjectLinked && sender.Subject != "" {
+			turn.Caller.SenderSubject = sender.Subject
+		}
 	}
 
 	// A resolved trigger turn from agent-orchestrator, or a plain turn. The

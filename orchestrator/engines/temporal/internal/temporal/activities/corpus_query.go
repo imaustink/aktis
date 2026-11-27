@@ -101,10 +101,15 @@ func (a *KnowledgeBaseActivities) QueryCorpus(
 	}
 
 	members, matched := membersNamed(exec.Members, q.Source)
+	// Naming a private member the caller is not listed on gets the same answer
+	// as naming nothing: anything else confirms it exists (ADR 0060).
+	if matched && q.Source != "" && len(members) == 1 && concealed(in.Caller, members[0]) {
+		matched = false
+	}
 	if !matched {
 		return QueryCorpusOutput{Result: fmt.Sprintf(
 			"%q is not a source in %s. Sources here: %s.",
-			q.Source, exec.DisplayName, memberNames(exec.Members))}, nil
+			q.Source, exec.DisplayName, memberNames(in.Caller, exec.Members))}, nil
 	}
 
 	var (
@@ -116,7 +121,7 @@ func (a *KnowledgeBaseActivities) QueryCorpus(
 		anyMember     bool
 	)
 	for _, member := range members {
-		if !holdsAnyRole(in.Caller.Roles, member.AllowedRoles) {
+		if !memberVisible(in.Caller, member) {
 			continue
 		}
 		anyMember = true

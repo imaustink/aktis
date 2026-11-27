@@ -11,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/aktisai/orchestrator/engines/temporal/internal/access"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/corpus"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/vectorstore"
 )
@@ -26,9 +27,9 @@ type fakeStore struct {
 	queriedFor [][]string
 }
 
-func (f *fakeStore) Query(_ context.Context, _ string, callerRoles []string, limit int) ([]vectorstore.Hit, error) {
+func (f *fakeStore) Query(_ context.Context, _ string, viewer access.Viewer, limit int) ([]vectorstore.Hit, error) {
 	f.mu.Lock()
-	f.queriedFor = append(f.queriedFor, callerRoles)
+	f.queriedFor = append(f.queriedFor, viewer.Roles)
 	f.mu.Unlock()
 
 	if f.err != nil {
@@ -46,7 +47,7 @@ func (f *fakeStore) Query(_ context.Context, _ string, callerRoles []string, lim
 
 func (f *fakeStore) Upsert(context.Context, []vectorstore.Record) error { return nil }
 func (f *fakeStore) Delete(context.Context, []string) error             { return nil }
-func (f *fakeStore) GetByIDs(context.Context, []string, []string) ([]vectorstore.Hit, error) {
+func (f *fakeStore) GetByIDs(context.Context, []string, access.Viewer) ([]vectorstore.Hit, error) {
 	return nil, nil
 }
 func (f *fakeStore) GetByIDsUnfiltered(context.Context, []string) ([]vectorstore.Hit, error) {

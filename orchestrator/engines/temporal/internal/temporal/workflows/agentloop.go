@@ -1202,6 +1202,7 @@ func adaptAgentAsTool(agent catalog.AgentDescriptor) catalog.ToolDescriptor {
 		Input:             agent.Input,
 		Output:            agent.Output,
 		AllowedRoles:      agent.AllowedRoles,
+		AllowedPrincipals: agent.AllowedPrincipals,
 		Tier:              agent.Tier,
 		AgentRef:          agent.ID,
 		IdentityProviders: agent.IdentityProviders,

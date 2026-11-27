@@ -108,6 +108,7 @@ former JS `manifest.json` ([ADR 0009](adr/0009-static-build-time-tool-manifests.
   - `description` (string, **required**) — embedded for RAG tool retrieval.
   - `input` / `output` (string, required) — the argv/stdin contract and result shape.
   - `allowedRoles` ([]string, **required**, ≥1) — RBAC retrieval filter; the caller needs at least one.
+  - `allowedPrincipals` ([]string, optional) — privately scopes it to named callers on top of `allowedRoles` ([ADR 0060](adr/0060-user-scoped-private-resources.md)); unset means public.
   - `tier` (string) — cost/trust class.
   - `agentRef` (string) — names an `Agent` this tool wraps.
   - `image` + `serviceAccountName` (string) — container launch target (the SA must pre-exist).
@@ -129,7 +130,7 @@ is **privileged** (it fetches and runs third-party code): gate it with k8s RBAC.
 
 - **Authored by:** operator (privileged).
 - **Key spec fields:**
-  - `description` / `input` / `output` / `allowedRoles` (≥1) / `tier` — same catalog semantics as `Tool`.
+  - `description` / `input` / `output` / `allowedRoles` (≥1) / `allowedPrincipals` / `tier` — same catalog semantics as `Tool`.
   - `runtime` (string, **required**, enum `node;python;go;shell`) — selects the executor sidecar.
   - `package` + `version` — registry coordinate and **exact** pinned version (ranges/tags are rejected fail-closed); required for node/python/go.
   - `entry` — module/console-script/binary when it differs from the package default.
@@ -171,7 +172,7 @@ mirrors `Tool` so agents join the same RBAC-scoped retrieval
 
 - **Authored by:** operator.
 - **Key spec fields:**
-  - `description` / `input` / `output` / `allowedRoles` (≥1) / `tier` — catalog fields.
+  - `description` / `input` / `output` / `allowedRoles` (≥1) / `allowedPrincipals` / `tier` — catalog fields.
   - `image` + `serviceAccountName` (**required**; SA must pre-exist).
   - `orchestratorPrompt` — guidance for the **parent** planner about when to delegate here.
   - `agentPrompt` — the system prompt the **sub-agent's** own loop runs with.
@@ -209,12 +210,16 @@ Hand-authored, **trusted** markdown plus an allowed tool/agent set
 pod; its markdown is injected as system-prompt context. It deliberately has **no
 `allowedRoles`** — its audience is **derived** as the intersection of its
 referenced tools' and agents' roles ([ADR 0011](adr/0011-skill-access-derived-from-tools.md)).
+It may carry its own `allowedPrincipals`, which is intersected with those of
+every private tool/agent it references, so it can narrow but never widen a
+private tool's audience ([ADR 0060](adr/0060-user-scoped-private-resources.md)).
 
 - **Authored by:** operator — and also **derived** from each `KnowledgeBase` ([ADR 0039](adr/0039-knowledgebase-crd-composed-corpora.md) §2).
 - **Key spec fields:**
   - `description` (**required**) — RAG retrieval.
   - `markdown` (string, **required**) — trusted system-prompt content.
   - `toolRefs` / `agentRefs` ([]string) — the tools it may invoke and agents it may delegate to; the planner's choice is re-validated against these.
+  - `allowedPrincipals` ([]string, optional) — owner-intent private scope, intersected with private refs' ([ADR 0060](adr/0060-user-scoped-private-resources.md)).
   - `allowCallerTools` (*bool) — governs caller-supplied tools ([ADR 0035](adr/0035-caller-supplied-tools-via-openai-facade.md)); **unset means allowed** (the OpenAI wire-contract default).
 - **Status:** `Ready` condition.
 - **Referenced by:** `Agent.skillRefs`, `EventTrigger.target.skillRef`.
@@ -265,6 +270,7 @@ collection, stamped with the Corpus's roles at ingest.
   - `connectionRef` (string, **required**) — the Connection it draws from.
   - `description` (**required**); `displayName` (defaults to the name; distinct within a KB for citations).
   - `allowedRoles` ([]string, **required**, ≥1) — RBAC, stamped on every chunk.
+  - `allowedPrincipals` ([]string, optional) — privately scopes the Corpus to named callers; checked per member before any chunk is searched or read ([ADR 0060](adr/0060-user-scoped-private-resources.md)).
   - `scope` (**required**) — exactly one of `space` / `channel` / `folderID`; the security boundary.
   - `sync` — `mode` (enum `webhook;poll;none`), `reconcileInterval`, `backfill.since`.
   - `api` — the live GET face: `enabled` (default false), `methods` (enum `GET`).
@@ -281,6 +287,8 @@ engagement) — many-to-many. The indexer **derives a `Skill`** from it whose to
 are its search/fetch tools plus each member's GET face. Like `Skill` it has **no
 `allowedRoles`**: its audience is the **union** of its members, enforced by
 per-chunk role filtering at the vector store ([ADR 0039](adr/0039-knowledgebase-crd-composed-corpora.md) §4).
+The same union applies to members' `allowedPrincipals`, and every search or read
+re-checks each member ([ADR 0060](adr/0060-user-scoped-private-resources.md)).
 
 - **Authored by:** operator; status counts are controller-written.
 - **Key spec fields:**
@@ -316,7 +324,7 @@ it introduces an externally-controlled call path reachable by agents.
   - `secretEnv` — the shared-service **discovery** credential (for `tools/list`).
   - `identityProviders` ([]string) — the per-user **invocation** credential, presented on `tools/call`; fails **closed**, never falling back to the discovery credential.
   - `defaultIdentity` (enum `agent;delegated`) — `agent` presents the providers' `agentCredential` instead of the caller's link (ADR 0049 step 5); copied onto each `MCPTool`.
-  - `exposure` ([]MCPToolExposure, default-**deny**, keyed by `remoteToolName`) — each entry: `remoteToolName` (**required**), `expose` (*bool, default true), `allowedRoles` (**required**, ≥1), `toolID` (optional, must be a DNS-1123 name), `hidden`, `tier`.
+  - `exposure` ([]MCPToolExposure, default-**deny**, keyed by `remoteToolName`) — each entry: `remoteToolName` (**required**), `expose` (*bool, default true), `allowedRoles` (**required**, ≥1), `allowedPrincipals` (optional, ADR 0060), `toolID` (optional, must be a DNS-1123 name), `hidden`, `tier`.
 - **Status:** `discoveredTools` (the full advertised inventory, each marked `exposed`), `exposedTools` (count), `Ready`/Degraded conditions.
 - **Owns:** the derived `MCPTool` CRs (via `ownerReferences`, so deletion cascades).
 - **Acted on by:** the **`mcp-broker`** — there is no in-cluster controller.
@@ -330,7 +338,7 @@ kind is `mcpExec`, carrying what the broker needs to proxy one `tools/call`.
 `MCPServer`'s exposure map and reconciles any hand-edit back.
 
 - **Authored by:** system — the `mcp-broker` (owner-referenced to its `MCPServer`).
-- **Key spec fields:** `serverRef` (**required**), `remoteToolName` (**required**), `description` (**required**, RAG), `inputSchema` (the remote JSON Schema, verbatim), `allowedRoles` (**required**, ≥1, copied from the exposure entry), `hidden`, `tier`, `identityProviders` and `defaultIdentity` (copied from the server).
+- **Key spec fields:** `serverRef` (**required**), `remoteToolName` (**required**), `description` (**required**, RAG), `inputSchema` (the remote JSON Schema, verbatim), `allowedRoles` (**required**, ≥1, copied from the exposure entry), `allowedPrincipals` (copied likewise), `hidden`, `tier`, `identityProviders` and `defaultIdentity` (copied from the server).
 - **Status:** `Ready` condition (the owning server still advertises this remote tool; the broker deletes it otherwise — the §6 existence rule).
 - **Referenced by:** `Skill.toolRefs` / `Agent.toolRefs`, by its catalog id (like any tool).
 - **Acted on by:** the **`mcp-broker`** — no in-cluster controller.
