@@ -199,6 +199,39 @@ func TestLiveTheLegacyDrainTerminatesLoopsOnTheOldQueue(t *testing.T) {
 	ensurer.Tick(ctx)
 }
 
+// A release that overrode temporal.taskQueue ran its 0058 loops at the very
+// id the Go worker now uses, on the queue it polls.
+func TestLiveTheDrainReplacesATypeScriptLoopAtTheSameID(t *testing.T) {
+	c := devServerClient(t)
+	queue := uniqueQueue(t)
+	ctx := context.Background()
+	id := WorkflowID(queue, "x")
+	old, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: id, TaskQueue: queue}, "corpusSync", map[string]string{"corpus": "x"})
+	require.NoError(t, err)
+
+	l := &liveSync{interval: time.Hour}
+	l.synced.Store(true)
+	startLiveWorker(t, c, queue, l)
+	ensurer := &Ensurer{
+		Client: c, TaskQueue: queue, LegacyTaskQueue: queue,
+		Synced: func(context.Context) ([]string, error) { return []string{"x"}, nil },
+		All:    func(context.Context) ([]string, error) { return []string{"x"}, nil },
+		Logf:   t.Logf,
+	}
+	ensurer.Tick(ctx)
+	desc, err := c.DescribeWorkflowExecution(ctx, id, "")
+	require.NoError(t, err)
+	info := desc.WorkflowExecutionInfo
+	require.Equal(t, enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING, info.Status)
+	require.Equal(t, WorkflowName, info.Type.Name)
+	require.NotEqual(t, old.GetRunID(), info.Execution.RunId)
+	// The Go loop is left alone on the next tick.
+	ensurer.Tick(ctx)
+	desc, err = c.DescribeWorkflowExecution(ctx, id, "")
+	require.NoError(t, err)
+	require.Equal(t, info.Execution.RunId, desc.WorkflowExecutionInfo.Execution.RunId)
+}
+
 // TestLiveCaptureHistories records the histories replay_test.go replays.
 func TestLiveCaptureHistories(t *testing.T) {
 	if os.Getenv("CAPTURE_CORPUS_SYNC_HISTORIES") != "1" {

@@ -3,6 +3,7 @@ package corpussync
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"time"
 
@@ -78,10 +79,15 @@ func (e *Ensurer) Tick(ctx context.Context) {
 	}
 }
 
-// Start makes sure the Corpus's loop is running; one already running is left alone.
+// Start makes sure the Corpus's loop is running; one already running is left
+// alone, unless it is a docs/adr/0058 TypeScript loop at the same id.
 func (e *Ensurer) Start(ctx context.Context, corpus string) error {
+	id := WorkflowID(e.TaskQueue, corpus)
+	if err := e.terminateForeign(ctx, corpus, id); err != nil {
+		return err
+	}
 	_, err := e.Client.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
-		ID:                       WorkflowID(e.TaskQueue, corpus),
+		ID:                       id,
 		TaskQueue:                e.TaskQueue,
 		WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
 	}, WorkflowName, Input{Corpus: corpus})
@@ -99,5 +105,37 @@ func (e *Ensurer) terminateLegacy(ctx context.Context, corpus string) {
 		// Never existed, or already closed: nothing to drain.
 	default:
 		e.logf("sync %s: could not terminate legacy loop %s: %v", corpus, id, err)
+	}
+}
+
+// terminateForeign ends a running loop at id whose workflow type is not
+// WorkflowName. A release that overrode its task queue under docs/adr/0058
+// ran its TypeScript loops ("corpusSync") at the very id this worker now
+// uses, on the queue it now polls, so the LegacyTaskQueue drain cannot tell
+// them apart and USE_EXISTING would keep the old run, which no worker can
+// execute any more. Remove with LegacyTaskQueue.
+func (e *Ensurer) terminateForeign(ctx context.Context, corpus, id string) error {
+	desc, err := e.Client.DescribeWorkflowExecution(ctx, id, "")
+	var notFound *serviceerror.NotFound
+	switch {
+	case errors.As(err, &notFound):
+		return nil
+	case err != nil:
+		return fmt.Errorf("describe %s: %w", id, err)
+	}
+	info := desc.GetWorkflowExecutionInfo()
+	if info.GetStatus() != enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING || info.GetType().GetName() == WorkflowName {
+		return nil
+	}
+	runID := info.GetExecution().GetRunId()
+	err = e.Client.TerminateWorkflow(ctx, id, runID, "corpus sync moved to the corpus-sync worker (docs/adr/0059)")
+	switch {
+	case err == nil:
+		e.logf("sync %s: terminated its %s loop at %s", corpus, info.GetType().GetName(), id)
+		return nil
+	case errors.As(err, &notFound):
+		return nil // closed meanwhile
+	default:
+		return fmt.Errorf("terminate %s loop %s: %w", info.GetType().GetName(), id, err)
 	}
 }
