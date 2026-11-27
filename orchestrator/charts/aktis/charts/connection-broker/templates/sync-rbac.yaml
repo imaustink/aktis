@@ -1,0 +1,47 @@
+{{- if include "connection-broker.syncEnabled" . }}
+{{- if .Values.sync.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "connection-broker.syncServiceAccountName" . }}
+  labels: {{- include "connection-broker.syncLabels" . | nindent 4 }}
+  {{- with .Values.sync.serviceAccount.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+{{- end }}
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "connection-broker.syncFullname" . }}
+  namespace: {{ include "connection-broker.knowledgeBaseNamespace" . }}
+  labels: {{- include "connection-broker.syncLabels" . | nindent 4 }}
+rules:
+  # Which Corpora to index, read fresh on every pass (docs/adr/0059 §3).
+  - apiGroups: ["core.aktis.ai"]
+    resources: ["corpora"]
+    verbs: ["get", "list"]
+  # Each pass's outcome, which the KnowledgeBase controller measures
+  # staleness by. Deliberately no Connections and no Secrets: the
+  # third-party credentials stay with the broker.
+  - apiGroups: ["core.aktis.ai"]
+    resources: ["corpora/status"]
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "connection-broker.syncFullname" . }}
+  namespace: {{ include "connection-broker.knowledgeBaseNamespace" . }}
+  labels: {{- include "connection-broker.syncLabels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "connection-broker.syncFullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "connection-broker.syncServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}

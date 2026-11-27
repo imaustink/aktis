@@ -9,8 +9,9 @@
 # calls on their behalf; the orchestrator holds cluster RBAC. Keeping them in
 # one pod would mean a compromise of either reached both.
 #
-# Debian (bookworm), not Alpine: the Temporal worker that runs Corpus syncs
-# (docs/adr/0058) loads a native core prebuilt for glibc.
+# Indexing is not here: corpus-sync (orchestrator/engines/temporal,
+# docs/adr/0059) runs each Corpus's sync and reads through this API. The
+# broker only signals and updates those workflows, with the pure-JS client.
 
 ############################
 # Build stage
@@ -24,9 +25,6 @@ RUN npm ci --workspace=connection-broker --include-workspace-root
 
 COPY orchestrator/apps/connection-broker/tsconfig.json orchestrator/apps/connection-broker/tsconfig.json
 COPY orchestrator/apps/connection-broker/src orchestrator/apps/connection-broker/src
-# `npm run build` bundles the sync workflow (scripts/bundle-workflows.mjs), so
-# a pod never runs webpack (docs/adr/0058).
-COPY orchestrator/apps/connection-broker/scripts/bundle-workflows.mjs orchestrator/apps/connection-broker/scripts/bundle-workflows.mjs
 
 RUN npm run build --workspace=connection-broker && npm prune --omit=dev
 

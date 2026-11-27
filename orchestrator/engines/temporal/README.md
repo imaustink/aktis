@@ -19,6 +19,7 @@ design and milestone plan.
 | `cmd/gateway` | Stateless HTTP front door: OpenAI Chat Completions-compatible facade and the `/invoke` accept/poll pair, both → per-session conversation workflow via update-with-start. Also hosts the HMAC callback→signal bridge for tool Jobs, and watches `EventTrigger` CRs to match event envelopes posted by direct callers (ADR 0048). |
 | `cmd/worker` | Temporal worker hosting workflows and activities. |
 | `cmd/catalog-sync` | Watches Aktis's Tool/Skill/Agent CRs (dynamic informers) and mirrors them into Qdrant with derived skill access roles. |
+| `cmd/corpus-sync` | Indexes each Corpus from one long-lived `CorpusSync` workflow (`internal/corpussync`, docs/adr/0059): lists and fetches through connection-broker with the Corpus's sync token, chunks, embeds, reconciles against Qdrant and records the Corpus's status. Deployed by the connection-broker subchart. |
 | `internal/catalog` | CR decoding, skill-access derivation (ADR 0011 port), indexer. |
 | `internal/vectorstore` | Store port + Qdrant adapter; RBAC filters baked into every read. |
 | `internal/messaging` | The tool event stream, HMAC callback signing and turn lifecycle envelope. Validity is decided by the canonical wire contract (`framework/protocol`, ADR 0047) via `CheckContract`; the structs here carry messages that passed it. |

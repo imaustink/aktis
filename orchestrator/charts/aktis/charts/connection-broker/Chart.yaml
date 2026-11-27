@@ -5,6 +5,8 @@ description: >-
   credentials for the external systems a Connection CR names, runs the provider
   drivers, serves incremental listing and fetch to the sync worker, and answers
   per-user authorization probes for retrieval (docs/adr/0038, docs/adr/0040).
+  When indexing is configured it also deploys that sync worker, corpus-sync
+  (docs/adr/0059), with its own narrower ServiceAccount.
   Deliberately a separate Deployment from agent-orchestrator so third-party
   credentials and outbound egress stay out of the pod holding cluster RBAC.
 type: application

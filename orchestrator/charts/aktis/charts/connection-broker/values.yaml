@@ -61,29 +61,61 @@ orchestratorTokenSecret:
 syncTokenSecret:
   name: connection-broker-sync-tokens
 
-# Indexing. With either of these unset the broker serves the API only and does
-# not index — a real arrangement (another process may own ingestion), which is
-# why it starts rather than exits.
+# Indexing (docs/adr/0059). With qdrant.url, embeddings.apiKeySecret.name and
+# temporal.address all set, the `sync` Deployment below indexes every synced
+# Corpus; with any unset the broker serves the API only and nothing indexes —
+# a real arrangement (another process may own ingestion).
 qdrant:
+  # Qdrant's REST URL, as the broker always took it. corpus-sync speaks gRPC
+  # to the same host on grpcPort; an https:// URL means TLS.
   url: ""
+  grpcPort: 6334
   apiKeySecret:
     name: ""
     key: apiKey
 
-# docs/adr/0058: each Corpus's sync -- its interval, the passes webhooks ask
-# for, and POST /corpora/:name/sync -- is a Temporal workflow this broker's
-# own worker runs. Required whenever the broker indexes (qdrant.url and an
-# embeddings key set): it refuses to start without an address then. Same
-# Temporal cluster and namespace as temporal-engine's.
+# Each Corpus's sync -- its interval, the passes webhooks ask for, and
+# POST /corpora/:name/sync -- is a Temporal workflow corpus-sync runs
+# (docs/adr/0058 §2, docs/adr/0059). The broker only signals and updates
+# those workflows. Same Temporal cluster and namespace as temporal-engine's.
 temporal:
   # Matches the temporalio/temporal chart's frontend Service (and
   # temporal-engine.temporal.address).
   address: temporal-frontend.temporal.svc:7233
-  # Must already exist; the broker does not register namespaces.
   namespace: default
-  # Every replica polls this queue; workflow ids live under it, so two
-  # releases sharing a namespace must not share it.
-  taskQueue: connection-broker
+  # corpus-sync polls this queue and the broker sends to it; workflow ids live
+  # under it, so two releases sharing a namespace must not share it.
+  taskQueue: corpus-sync
+  # Where a docs/adr/0058 broker ran these loops. corpus-sync terminates any
+  # left there. "" turns the drain off; remove it one release after 0059.
+  # Only used with the default taskQueue: an overridden queue's 0058 loops sit
+  # at the new ids, and corpus-sync replaces those before starting its own.
+  legacyTaskQueue: connection-broker
+
+# The indexer: corpus-sync (orchestrator/engines/temporal/cmd/corpus-sync),
+# deployed whenever indexing is configured (see qdrant above). It reads
+# sources only through this broker's Service with each Corpus's sync token
+# (syncTokenSecret), so it holds no third-party credential, and its own
+# ServiceAccount reads Corpora and writes their status -- nothing else.
+sync:
+  replicaCount: 1
+  image:
+    repository: ghcr.io/imaustink/agent-controller/temporal-engine-corpus-sync
+    # Same as the broker's: CI publishes `:latest` and `:<sha>` only.
+    tag: "latest"
+    pullPolicy: Always
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+  # A pass holds its corpus's chunks in memory while it embeds them.
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      memory: 512Mi
+  podAnnotations: {}
 
 # Where each provider's API lives, when it is not the vendor's public cloud.
 #
@@ -107,7 +139,8 @@ apiOrigins:
 embeddings:
   # Must match whatever the engines embed with: a knowledge base merges scores
   # from several collections as if directly comparable, which holds only when
-  # every collection was built by the same model.
+  # every collection was built by the same model. Used by corpus-sync; the
+  # broker itself no longer embeds.
   model: text-embedding-3-small
   apiKeySecret:
     name: ""

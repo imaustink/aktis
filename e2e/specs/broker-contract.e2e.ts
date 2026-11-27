@@ -9,18 +9,18 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { createBrokerServer, DELEGATED_TOKEN_HEADER } from "../../orchestrator/apps/connection-broker/src/server.js";
 import { StaticCorpusRegistry } from "../../orchestrator/apps/connection-broker/src/registry.js";
 import { SlackDriver } from "../../orchestrator/apps/connection-broker/src/drivers/slack.js";
-import { HttpResourceSource } from "../../orchestrator/apps/connection-broker/src/sync/http-source.js";
+import { runGoTestsAsync } from "../support/go-test.js";
 
 /**
  * The connection-broker's routes, driven for real, against the clients that call them.
  *
- * The broker (TypeScript) and its clients — the sync worker's
- * `HttpResourceSource` and the Temporal engine's Go `internal/corpus` package,
+ * The broker (TypeScript) and its clients — the Go corpus-sync worker's
+ * `HTTPSource` (docs/adr/0059) and the Temporal engine's Go `internal/corpus` package,
  * the only retrieval client since docs/adr/0053 removed the in-process engine
  * — agree on nothing but a convention. That agreement has broken twice, both
  * times silently, both times in a release that looked complete:
  *
- *   - `HttpResourceSource` asked for `/connections/:name/resources` after
+ *   - The sync worker's client (then TypeScript) asked for `/connections/:name/resources` after
  *     ADR 0043 moved data to `/corpora/`. Every sync request 404'd, so the
  *     write path could not list or fetch anything at all.
  *   - The retrieval prober asked for `/connections/:name/probe` for the same
@@ -28,8 +28,8 @@ import { HttpResourceSource } from "../../orchestrator/apps/connection-broker/sr
  *     matched" — indistinguishable from an empty corpus.
  *
  * Both survived a full unit suite, because the unit tests asserted the URL each
- * client BUILT. So the TypeScript client is driven against the real server
- * here, the routes the Go client calls are exercised with plain requests
+ * client BUILT. So the sync worker's Go client is driven against the real
+ * server here (through `go test`), the routes the Go client calls are exercised with plain requests
  * shaped like its own, and the Go source is checked for the same paths.
  *
  * Like `rbac-parity`, this needs NO cluster and NO credentials — the drivers
@@ -108,23 +108,24 @@ afterAll(() => server?.close());
 const DELEGATED = "user-token";
 
 describe("the sync worker's client", () => {
-  it("lists through the route the broker serves", async () => {
-    const source = new HttpResourceSource({ baseUrl, token: SYNC_TOKEN });
+  // corpus-sync is Go (docs/adr/0059): its HTTPSource is driven against this
+  // server by a Go test, asynchronously so this process can answer it.
+  it("lists and fetches through the routes the broker serves", async () => {
+    await runGoTestsAsync({
+      module: "orchestrator/engines/temporal",
+      pkg: "./internal/corpussync",
+      pattern: "^TestE2EBrokerContract$",
+      mustPass: ["TestE2EBrokerContract"],
+      env: {
+        BROKER_CONTRACT_URL: baseUrl,
+        BROKER_CONTRACT_CORPUS: CORPUS,
+        BROKER_CONTRACT_SYNC_TOKEN: SYNC_TOKEN,
+      },
+    });
 
-    const page = await source.list(CORPUS, undefined);
-
-    expect(page.resources.map((r) => r.id)).toEqual(["1"]);
     expect(driver.list).toHaveBeenCalled();
-  });
-
-  it("fetches through the route the broker serves", async () => {
-    const source = new HttpResourceSource({ baseUrl, token: SYNC_TOKEN });
-
-    const doc = await source.fetch(CORPUS, "1");
-
-    expect(doc.markdown).toBe("body");
     expect(driver.fetch).toHaveBeenCalled();
-  });
+  }, 300_000);
 });
 
 /**

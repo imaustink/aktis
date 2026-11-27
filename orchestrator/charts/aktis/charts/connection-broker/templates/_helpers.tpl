@@ -42,3 +42,45 @@ is installed, without ever reading across namespaces.
 {{- $g := .Values.global | default dict -}}
 {{- .Values.knowledgeBaseNamespace | default $g.knowledgeBaseNamespace | default .Release.Namespace -}}
 {{- end -}}
+
+{{/*
+The indexer (docs/adr/0059): corpus-sync, a separate Deployment from the
+broker. Its selector labels differ from the broker's in `name`, so the
+broker's Service never routes to it.
+*/}}
+{{- define "connection-broker.syncFullname" -}}
+{{- printf "%s-sync" (include "connection-broker.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "connection-broker.syncServiceAccountName" -}}
+{{- if .Values.sync.serviceAccount.create -}}
+{{- default (include "connection-broker.syncFullname" .) .Values.sync.serviceAccount.name -}}
+{{- else -}}
+{{- default "default" .Values.sync.serviceAccount.name -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "connection-broker.syncSelectorLabels" -}}
+app.kubernetes.io/name: {{ printf "%s-sync" (include "connection-broker.name" .) }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+
+{{- define "connection-broker.syncLabels" -}}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+{{ include "connection-broker.syncSelectorLabels" . }}
+app.kubernetes.io/component: corpus-sync
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end -}}
+
+{{/*
+Whether this release indexes: Qdrant, an embeddings key and Temporal are all
+configured. Otherwise the broker serves its API only -- a real arrangement
+(another process may own ingestion) -- and no indexer is deployed. Renders
+"true" or nothing.
+*/}}
+{{- define "connection-broker.syncEnabled" -}}
+{{- if and .Values.qdrant.url .Values.embeddings.apiKeySecret.name .Values.temporal.address -}}
+true
+{{- end -}}
+{{- end -}}

@@ -19,6 +19,7 @@
   {"image": "temporal-engine-worker", "filter": "temporal-engine", "dockerfile": "orchestrator/engines/temporal/Dockerfile.worker", "context": "orchestrator/engines/temporal"},
   {"image": "temporal-engine-gateway", "filter": "temporal-engine", "dockerfile": "orchestrator/engines/temporal/Dockerfile.gateway", "context": "orchestrator/engines/temporal"},
   {"image": "temporal-engine-catalog-sync", "filter": "temporal-engine", "dockerfile": "orchestrator/engines/temporal/Dockerfile.catalog-sync", "context": "orchestrator/engines/temporal"},
+  {"image": "temporal-engine-corpus-sync", "filter": "temporal-engine", "dockerfile": "orchestrator/engines/temporal/Dockerfile.corpus-sync", "context": "orchestrator/engines/temporal"},
   {"image": "localtool-executor-node", "filter": "localtool-executor", "dockerfile": "orchestrator/sidecars/localtool-executor/Dockerfile", "context": "orchestrator/sidecars/localtool-executor", "build_args": "BASE_IMAGE=node:24-bookworm-slim\nRUNTIME=node"},
   {"image": "localtool-executor-python", "filter": "localtool-executor", "dockerfile": "orchestrator/sidecars/localtool-executor/Dockerfile", "context": "orchestrator/sidecars/localtool-executor", "build_args": "BASE_IMAGE=python:3.12-slim-bookworm\nRUNTIME=python"},
   {"image": "localtool-executor-go", "filter": "localtool-executor", "dockerfile": "orchestrator/sidecars/localtool-executor/Dockerfile", "context": "orchestrator/sidecars/localtool-executor", "build_args": "BASE_IMAGE=golang:1.24-bookworm\nRUNTIME=go"},

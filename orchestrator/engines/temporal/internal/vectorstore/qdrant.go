@@ -45,6 +45,59 @@ func (s *Qdrant) EnsureCollection(ctx context.Context) error {
 	return nil
 }
 
+// Exists reports whether the collection exists. A Corpus collection that does
+// not exist yet has nothing indexed, which is a true answer, not an error.
+func (s *Qdrant) Exists(ctx context.Context) (bool, error) {
+	exists, err := s.client.CollectionExists(ctx, s.collection)
+	if err != nil {
+		return false, fmt.Errorf("check collection %s: %w", s.collection, err)
+	}
+	return exists, nil
+}
+
+// PointRef is what a scroll reads back from one point: the record id and its
+// descriptor JSON, both from the payload. ID is empty when the payload has
+// none.
+type PointRef struct {
+	ID         string
+	Descriptor string
+}
+
+// Scroll walks every point in the collection, `pageSize` at a time, reading
+// only the `id` and `descriptor` payload fields (vectors are the bulk of a
+// point and are not wanted). `page` is called once per page read, including
+// an empty last one.
+func (s *Qdrant) Scroll(ctx context.Context, pageSize uint32, page func([]PointRef) error) error {
+	var offset *qdrant.PointId
+	for {
+		points, next, err := s.client.ScrollAndOffset(ctx, &qdrant.ScrollPoints{
+			CollectionName: s.collection,
+			Limit:          &pageSize,
+			Offset:         offset,
+			WithPayload:    qdrant.NewWithPayloadInclude("id", "descriptor"),
+			WithVectors:    qdrant.NewWithVectors(false),
+		})
+		if err != nil {
+			return fmt.Errorf("scroll %s: %w", s.collection, err)
+		}
+		refs := make([]PointRef, 0, len(points))
+		for _, p := range points {
+			payload := p.GetPayload()
+			refs = append(refs, PointRef{
+				ID:         payload["id"].GetStringValue(),
+				Descriptor: payload["descriptor"].GetStringValue(),
+			})
+		}
+		if err := page(refs); err != nil {
+			return err
+		}
+		if next == nil {
+			return nil
+		}
+		offset = next
+	}
+}
+
 // pointID derives a stable UUID for a record id (Qdrant point ids must be
 // UUIDs or integers; the real id lives in the payload). The seed is this
 // module's pre-aktis path and must never change: it is part of every point

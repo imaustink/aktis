@@ -20,3 +20,4 @@ docker:
 	docker build -f Dockerfile.worker -t temporal-engine-worker:latest .
 	docker build -f Dockerfile.gateway -t temporal-engine-gateway:latest .
 	docker build -f Dockerfile.catalog-sync -t temporal-engine-catalog-sync:latest .
+	docker build -f Dockerfile.corpus-sync -t temporal-engine-corpus-sync:latest .

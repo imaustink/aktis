@@ -391,8 +391,9 @@ connection-broker:
     pullPolicy: IfNotPresent
   qdrant:
     url: "http://agent-controller-qdrant:6333"
-  # Each Corpus's sync is a workflow on the broker's own worker
-  # (docs/adr/0058), on the same dev server as the engine's and the gateway's.
+  # Each Corpus's sync is a workflow corpus-sync runs (docs/adr/0059), on the
+  # same dev server as the engine's and the gateway's. qdrant.url, the
+  # embeddings key and this address together deploy it.
   temporal:
     address: temporal-dev-server.controller-agent.svc:7233
     namespace: default

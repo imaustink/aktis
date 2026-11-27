@@ -11,6 +11,9 @@ conventions throughout: workflow ids prefixed with the task queue (0057 §5),
 `patched()` for any change to a workflow's commands with replayed histories
 enforcing it (0057 §7), tests against a real Temporal dev server.
 
+§2's workflow moved out of connection-broker to the Go `corpus-sync` worker,
+with the same behavior, in [0059](0059-corpus-sync-in-go.md).
+
 ## Context
 
 After 0057, four components still did durable work in process memory,

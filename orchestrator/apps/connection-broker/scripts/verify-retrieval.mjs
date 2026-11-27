@@ -7,13 +7,11 @@
  * would retrieve is the thing it should have retrieved — a corpus can be
  * perfectly synced and useless, and it looks identical from the outside.
  *
- * This is the only check that needs real vectors, which is exactly why the
- * --local-embeddings mode refuses to imply it.
+ * This is the only check that needs real vectors.
  *
  *   node orchestrator/apps/connection-broker/scripts/verify-retrieval.mjs <collection> [question...]
  */
 import { findEnvFile, loadEnv } from "./lib/env.mjs";
-import { OpenAIEmbedder } from "../dist/embedder.js";
 
 const env = loadEnv(findEnvFile());
 const QDRANT = process.env.QDRANT_URL ?? "http://localhost:6333";
@@ -34,7 +32,20 @@ if (questions.length === 0) {
   );
 }
 
-const embedder = new OpenAIEmbedder({ apiKey: env.OPENAI_API_KEY });
+// The model corpus-sync indexes with (docs/adr/0059): a query embedded with
+// anything else scores against nothing meaningful.
+const embedder = {
+  async embed(texts) {
+    const res = await fetch("https://api.openai.com/v1/embeddings", {
+      method: "POST",
+      headers: { authorization: `Bearer ${env.OPENAI_API_KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: process.env.EMBEDDING_MODEL ?? "text-embedding-3-small", input: texts }),
+    });
+    if (!res.ok) throw new Error(`embeddings ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    const { data } = await res.json();
+    return [...data].sort((a, b) => a.index - b.index).map((d) => d.embedding);
+  },
+};
 
 const info = await (await fetch(`${QDRANT}/collections/${COLLECTION}`)).json();
 if (!info.result) {
