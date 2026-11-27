@@ -198,6 +198,15 @@ spec:
         name: {{ .Values.claudeCodeSweAgent.secretName }}
         key: {{ .Values.claudeCodeSweAgent.githubAppInstallationIdSecretKey }}
     {{- end }}
+    {{- range .Values.claudeCodeSweAgent.extraSecretEnv }}
+    {{- if not (and .name .secretName .key) }}
+    {{- fail (printf "claudeCodeSweAgent.extraSecretEnv: every entry needs name, secretName and key (got %v)" .) }}
+    {{- end }}
+    - name: {{ .name }}
+      secretRef:
+        name: {{ .secretName }}
+        key: {{ .key }}
+    {{- end }}
   {{- with .Values.claudeCodeSweAgent.aws }}
   {{- range .profiles }}
   {{- if not (regexMatch "^[A-Za-z0-9._-]+$" .) }}
