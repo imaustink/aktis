@@ -2,6 +2,7 @@ package activities_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -163,6 +164,84 @@ func TestReadCorpusRefusesAPrivateMemberToOthers(t *testing.T) {
 	})
 
 	require.NoError(t, err)
-	require.Contains(t, out.Result, "do not have access")
+	require.Contains(t, out.Result, "is not part of GLOBEX",
+		"a private member is refused as if it did not exist, so its existence is not confirmed")
+	require.NotContains(t, out.Result, "#alices")
 	require.Zero(t, resolver.callCount)
+}
+
+// The read and query refusals list what the caller may name. A private member
+// the caller is not listed on must not be among them, by id or by label: it is
+// counted instead (ADR 0060).
+func TestKnowledgeBaseRefusalsNeverNameAPrivateMemberToOutsiders(t *testing.T) {
+	members := []catalog.KnowledgeBaseExecMember{
+		member("team-wiki", []string{"reader"}, "coll-team-wiki"),
+		privateMember("alice-1on1", []string{"reader"}, []string{aliceSubject}),
+	}
+	members[1].Label = "Alice's 1:1 notes"
+	readTool := catalog.ToolDescriptor{
+		ID: "kb:globex/read",
+		KnowledgeBaseExec: &catalog.KnowledgeBaseExecSpec{
+			KnowledgeBaseID: "globex", DisplayName: "GLOBEX", Operation: "read", Members: members,
+		},
+	}
+	queryTool := catalog.ToolDescriptor{
+		ID: "kb:globex/query",
+		KnowledgeBaseExec: &catalog.KnowledgeBaseExecSpec{
+			KnowledgeBaseID: "globex", DisplayName: "GLOBEX", Operation: "query", Members: members,
+		},
+	}
+	alice := activities.Caller{Subject: aliceSubject, Roles: []string{"reader"}, PerUser: true}
+	bob := activities.Caller{Subject: bobSubject, Roles: []string{"reader"}, PerUser: true}
+
+	read := func(c activities.Caller, ref string) string {
+		out, err := activitiesWith(&fakeResolver{token: "t"}).ReadCorpus(context.Background(),
+			activities.ReadCorpusInput{Caller: c, Tool: readTool, SourceID: ref})
+		require.NoError(t, err)
+		return out.Result
+	}
+	query := func(c activities.Caller, q string) string {
+		out, err := activitiesWith(&fakeResolver{token: "t"}).QueryCorpus(context.Background(),
+			activities.QueryCorpusInput{Caller: c, Tool: queryTool, Query: q})
+		require.NoError(t, err)
+		return out.Result
+	}
+	requireHidden := func(t *testing.T, result string) {
+		t.Helper()
+		require.NotContains(t, result, "alice-1on1")
+		require.NotContains(t, result, "Alice's 1:1 notes")
+	}
+
+	cases := map[string]func(activities.Caller) string{
+		"malformed read reference":       func(c activities.Caller) string { return read(c, "not-a-ref") },
+		"read of an unknown corpus":      func(c activities.Caller) string { return read(c, "nope/1") },
+		"query naming an unknown source": func(c activities.Caller) string { return query(c, `{"source":"nope"}`) },
+	}
+	for name, run := range cases {
+		t.Run(name, func(t *testing.T) {
+			outsider := run(bob)
+			requireHidden(t, outsider)
+			require.Contains(t, outsider, "team-wiki", "public members are still listed")
+			require.Contains(t, outsider, "plus 1 private source")
+
+			listed := run(alice)
+			require.Contains(t, listed, "alice-1on1 (Alice's 1:1 notes)", "a listed caller still sees it")
+			require.NotContains(t, listed, "private source")
+		})
+	}
+
+	t.Run("direct read of the private member", func(t *testing.T) {
+		result := read(bob, "alice-1on1/123")
+		requireHidden(t, strings.ReplaceAll(result, `"alice-1on1"`, ""))
+		require.Contains(t, result, "is not part of GLOBEX")
+	})
+
+	t.Run("query naming the private member", func(t *testing.T) {
+		for _, name := range []string{"alice-1on1", "Alice's 1:1 notes"} {
+			result := query(bob, `{"source":"`+name+`"}`)
+			require.Contains(t, result, "is not a source in GLOBEX")
+			require.Contains(t, result, "plus 1 private source")
+			require.NotContains(t, result, "do not have access")
+		}
+	})
 }

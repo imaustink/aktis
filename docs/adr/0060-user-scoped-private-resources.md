@@ -124,6 +124,14 @@ never reveals that, say, "Alice's 1:1 notes" exists. A caller the member does
 admit still reaches it: search results cite its `<corpus>`, which the read and
 query tools accept, and execution gates every member per caller.
 
+The same rule covers what the read and query tools **say back**. Their
+refusals list the members the model may name, so a malformed reference or an
+unknown source is actionable; that list names a private member only to a
+caller it admits and otherwise counts it ("plus N private sources"). A read
+or query that names a private member the caller is not listed on gets the
+same answer as one naming a member that does not exist, rather than "you do
+not have access to <label>", which would confirm it exists.
+
 Chunks in a Corpus collection carry roles only. Private scoping is enforced
 at the member, before any chunk query, on every path that reaches a corpus.
 

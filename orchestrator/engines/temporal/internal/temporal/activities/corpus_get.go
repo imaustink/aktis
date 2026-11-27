@@ -87,19 +87,23 @@ func (a *KnowledgeBaseActivities) ReadCorpus(
 		return ReadCorpusOutput{
 			Result: fmt.Sprintf(
 				"%q is not a readable reference. Use `<corpus>/<id>`, where <corpus> is one of: %s.",
-				in.SourceID, memberNames(exec.Members)),
+				in.SourceID, memberNames(in.Caller, exec.Members)),
 		}, nil
 	}
 
 	member, found := memberByID(exec.Members, corpusID)
-	if !found {
+	if !found || concealed(in.Caller, member) {
 		// Prose, not an error: the model named something outside this knowledge
 		// base, which it can correct. Saying what IS available turns a dead end
 		// into a usable next step.
+		//
+		// A private member the caller is not listed on gets the same answer as
+		// one that does not exist: refusing it by name would confirm that it is
+		// there and echo its label (ADR 0060).
 		return ReadCorpusOutput{
 			Result: fmt.Sprintf(
 				"%q is not part of %s. Readable here: %s.",
-				corpusID, exec.DisplayName, memberNames(exec.Members)),
+				corpusID, exec.DisplayName, memberNames(in.Caller, exec.Members)),
 		}, nil
 	}
 
@@ -225,15 +229,38 @@ func memberByID(members []catalog.KnowledgeBaseExecMember, id string) (catalog.K
 
 // memberNames lists what the model may name, so a refusal is actionable rather
 // than a dead end.
-func memberNames(members []catalog.KnowledgeBaseExecMember) string {
+//
+// It names only what this caller may know exists: a private member they are
+// not listed on is counted, never named, the same way the shared skill and tool
+// text treat it (ADR 0060). A member hidden only by roles is still named, as it
+// is in that shared text.
+func memberNames(caller Caller, members []catalog.KnowledgeBaseExecMember) string {
 	names := make([]string, 0, len(members))
+	hidden := 0
 	for _, member := range members {
+		if concealed(caller, member) {
+			hidden++
+			continue
+		}
 		names = append(names, fmt.Sprintf("%s (%s)", member.ID, member.Label))
+	}
+	if hidden > 0 {
+		plural := "s"
+		if hidden == 1 {
+			plural = ""
+		}
+		names = append(names, fmt.Sprintf("plus %d private source%s", hidden, plural))
 	}
 	if len(names) == 0 {
 		return "nothing — this knowledge base has no readable members"
 	}
 	return strings.Join(names, ", ")
+}
+
+// concealed is whether a member is private (ADR 0060) and this caller may not
+// see it, so nothing the caller is told should name it or confirm it exists.
+func concealed(caller Caller, member catalog.KnowledgeBaseExecMember) bool {
+	return len(member.AllowedPrincipals) > 0 && !memberVisible(caller, member)
 }
 
 // memberVisible is whether this caller may consult one knowledge-base member
