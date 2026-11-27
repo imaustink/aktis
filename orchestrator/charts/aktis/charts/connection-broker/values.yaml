@@ -88,6 +88,8 @@ temporal:
   taskQueue: corpus-sync
   # Where a docs/adr/0058 broker ran these loops. corpus-sync terminates any
   # left there. "" turns the drain off; remove it one release after 0059.
+  # Only used with the default taskQueue: an overridden queue's 0058 loops sit
+  # at the new ids, and corpus-sync replaces those before starting its own.
   legacyTaskQueue: connection-broker
 
 # The indexer: corpus-sync (orchestrator/engines/temporal/cmd/corpus-sync),

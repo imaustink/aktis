@@ -63,8 +63,11 @@ spec:
               value: {{ .Values.temporal.namespace | quote }}
             - name: CORPUS_SYNC_TASK_QUEUE
               value: {{ .Values.temporal.taskQueue | quote }}
+            # An overridden taskQueue keeps its 0058 ids (the same-id drain
+            # replaces those); draining connection-broker/... from here would
+            # kill another release's live loops in a shared namespace.
             - name: LEGACY_TASK_QUEUE
-              value: {{ .Values.temporal.legacyTaskQueue | quote }}
+              value: {{ ternary .Values.temporal.legacyTaskQueue "" (eq .Values.temporal.taskQueue "corpus-sync") | quote }}
           {{- if .Values.syncTokenSecret.name }}
           # SYNC_TOKEN_<CORPUS>, the same Secret the broker authorizes them
           # against: each reads one Corpus's source.

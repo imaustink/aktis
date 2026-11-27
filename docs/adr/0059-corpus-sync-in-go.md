@@ -141,7 +141,12 @@ Qdrant is reached over gRPC, like the engine. The chart passes the host from
 Loops started by a 0058 broker run on the `connection-broker` task queue, and
 nothing polls that queue any more. At startup, `corpus-sync` terminates
 `<LEGACY_TASK_QUEUE>/corpus-sync:<corpus>` for every Corpus it syncs. The
-default is `connection-broker`, and an empty value turns this off. A missing
+default is `connection-broker`, and an empty value turns this off. The chart
+sets it only when `temporal.taskQueue` is the default: a release that overrode
+the queue (required when two releases share a namespace) has its 0058 loops at
+the new ids, and draining `connection-broker/...` would kill another release's
+live loops. Before starting a loop, `corpus-sync` also terminates any running
+execution at that id whose type isn't `CorpusSync`. A missing
 workflow is not an error. The new loops schedule from `lastReconcileTime`, so
 switching over doesn't set off a full pass for every Corpus. Remove the drain
 one release after this ships.
