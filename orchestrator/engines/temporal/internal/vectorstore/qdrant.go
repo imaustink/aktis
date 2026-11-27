@@ -7,6 +7,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/qdrant/go-client/qdrant"
+
+	"github.com/aktisai/orchestrator/engines/temporal/internal/access"
 )
 
 // Qdrant implements Store over one Qdrant collection. Nothing outside this
@@ -122,17 +124,15 @@ func (s *Qdrant) Upsert(ctx context.Context, records []Record) error {
 
 	points := make([]*qdrant.PointStruct, len(records))
 	for i, r := range records {
-		roles := make([]any, len(r.Roles))
-		for j, role := range r.Roles {
-			roles[j] = role
-		}
 		points[i] = &qdrant.PointStruct{
 			Id:      qdrant.NewIDUUID(s.pointID(r.ID)),
 			Vectors: qdrant.NewVectors(vectors[i]...),
 			Payload: qdrant.NewValueMap(map[string]any{
 				"id":           r.ID,
-				"roles":        roles,
+				"roles":        anyList(r.Roles),
 				"unrestricted": r.Unrestricted,
+				"private":      r.Private,
+				"principals":   anyList(r.Principals),
 				"hidden":       r.Hidden,
 				"descriptor":   string(r.Descriptor),
 			}),
@@ -171,15 +171,40 @@ func (s *Qdrant) Delete(ctx context.Context, ids []string) error {
 	return nil
 }
 
-// visibilityFilter admits records whose roles intersect the caller's, plus
-// unrestricted records. With no caller roles only unrestricted records
-// match — the fail-closed default.
-func visibilityFilter(callerRoles []string) *qdrant.Filter {
-	conditions := []*qdrant.Condition{qdrant.NewMatchBool("unrestricted", true)}
-	if len(callerRoles) > 0 {
-		conditions = append(conditions, qdrant.NewMatchKeywords("roles", callerRoles...))
+func anyList(xs []string) []any {
+	out := make([]any, len(xs))
+	for i, x := range xs {
+		out[i] = x
 	}
-	return &qdrant.Filter{Should: conditions}
+	return out
+}
+
+// visibilityFilter is access.Viewer.Admits as a Qdrant filter: the record's
+// roles intersect the viewer's (or it is unrestricted), AND it is either
+// public or names one of the viewer's principals (ADR 0060). With no viewer
+// roles only unrestricted records pass the first clause, and with no viewer
+// principals only public records pass the second — both fail closed.
+//
+// Records written before `private` existed carry no such field. A must-not
+// match against an absent field passes, so they read as public, which is what
+// they were: nothing could make a record private before this field.
+func visibilityFilter(viewer access.Viewer) *qdrant.Filter {
+	roles := []*qdrant.Condition{qdrant.NewMatchBool("unrestricted", true)}
+	if len(viewer.Roles) > 0 {
+		roles = append(roles, qdrant.NewMatchKeywords("roles", viewer.Roles...))
+	}
+	principals := []*qdrant.Condition{
+		qdrant.NewFilterAsCondition(&qdrant.Filter{
+			MustNot: []*qdrant.Condition{qdrant.NewMatchBool("private", true)},
+		}),
+	}
+	if len(viewer.Principals) > 0 {
+		principals = append(principals, qdrant.NewMatchKeywords("principals", viewer.Principals...))
+	}
+	return &qdrant.Filter{Must: []*qdrant.Condition{
+		qdrant.NewFilterAsCondition(&qdrant.Filter{Should: roles}),
+		qdrant.NewFilterAsCondition(&qdrant.Filter{Should: principals}),
+	}}
 }
 
 // queryFilter is visibilityFilter plus the hidden exclusion, applied to
@@ -189,13 +214,13 @@ func visibilityFilter(callerRoles []string) *qdrant.Filter {
 // Records written before `hidden` existed carry no such field, and a must-not
 // match against an absent field passes, so this is backward compatible with an
 // already-populated collection.
-func queryFilter(callerRoles []string) *qdrant.Filter {
-	filter := visibilityFilter(callerRoles)
+func queryFilter(viewer access.Viewer) *qdrant.Filter {
+	filter := visibilityFilter(viewer)
 	filter.MustNot = []*qdrant.Condition{qdrant.NewMatchBool("hidden", true)}
 	return filter
 }
 
-func (s *Qdrant) Query(ctx context.Context, text string, callerRoles []string, limit int) ([]Hit, error) {
+func (s *Qdrant) Query(ctx context.Context, text string, viewer access.Viewer, limit int) ([]Hit, error) {
 	vectors, err := s.embedder.Embed(ctx, []string{text})
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
@@ -205,7 +230,7 @@ func (s *Qdrant) Query(ctx context.Context, text string, callerRoles []string, l
 	points, err := s.client.Query(ctx, &qdrant.QueryPoints{
 		CollectionName: s.collection,
 		Query:          qdrant.NewQuery(vectors[0]...),
-		Filter:         queryFilter(callerRoles),
+		Filter:         queryFilter(viewer),
 		Limit:          &limit64,
 		WithPayload:    qdrant.NewWithPayload(true),
 	})
@@ -225,7 +250,7 @@ func (s *Qdrant) Query(ctx context.Context, text string, callerRoles []string, l
 	return hits, nil
 }
 
-func (s *Qdrant) GetByIDs(ctx context.Context, ids []string, callerRoles []string) ([]Hit, error) {
+func (s *Qdrant) GetByIDs(ctx context.Context, ids []string, viewer access.Viewer) ([]Hit, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -242,16 +267,12 @@ func (s *Qdrant) GetByIDs(ctx context.Context, ids []string, callerRoles []strin
 		return nil, fmt.Errorf("get %d points from %s: %w", len(ids), s.collection, err)
 	}
 
-	// Role re-check in code: direct lookups bypass the query filter, so this
-	// is the defense-in-depth backstop (ADR 0008).
-	callerSet := map[string]bool{}
-	for _, r := range callerRoles {
-		callerSet[r] = true
-	}
+	// Visibility re-check in code: direct lookups bypass the query filter, so
+	// this is the defense-in-depth backstop (ADR 0008).
 	hits := make([]Hit, 0, len(points))
 	for _, p := range points {
 		payload := p.GetPayload()
-		if !recordVisible(payload, callerSet) {
+		if !viewer.Admits(audienceOf(payload)) {
 			continue
 		}
 		hit, err := hitFromPayload(payload)
@@ -292,16 +313,24 @@ func (s *Qdrant) GetByIDsUnfiltered(ctx context.Context, ids []string) ([]Hit, e
 	return hits, nil
 }
 
-func recordVisible(payload map[string]*qdrant.Value, callerRoles map[string]bool) bool {
-	if payload["unrestricted"].GetBoolValue() {
-		return true
+// audienceOf reads a point's access fields back into an access.Audience, so
+// the by-id re-check is the very rule the query filter encodes.
+func audienceOf(payload map[string]*qdrant.Value) access.Audience {
+	return access.Audience{
+		Roles:        stringList(payload["roles"]),
+		Unrestricted: payload["unrestricted"].GetBoolValue(),
+		Private:      payload["private"].GetBoolValue(),
+		Principals:   stringList(payload["principals"]),
 	}
-	for _, v := range payload["roles"].GetListValue().GetValues() {
-		if callerRoles[v.GetStringValue()] {
-			return true
-		}
+}
+
+func stringList(v *qdrant.Value) []string {
+	values := v.GetListValue().GetValues()
+	out := make([]string, 0, len(values))
+	for _, item := range values {
+		out = append(out, item.GetStringValue())
 	}
-	return false
+	return out
 }
 
 func hitFromPayload(payload map[string]*qdrant.Value) (Hit, error) {

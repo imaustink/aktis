@@ -72,6 +72,22 @@ type SkillSpec struct {
 	// +optional
 	AgentRefs []string `json:"agentRefs,omitempty"`
 
+	// allowedPrincipals privately scopes this Skill to specific people, on
+	// top of allowedRoles (ADR 0060). Empty or unset means public: allowedRoles
+	// alone decides. Non-empty means a caller must ALSO be one of these
+	// principals, so it can only narrow what allowedRoles admits, never widen
+	// it. A principal is a caller subject as the orchestrator resolves it (for
+	// example "openwebui:<user-id>"); it matches a per-user caller's own
+	// subject, or the subject a verified webhook sender's account is linked
+	// under.
+	//
+	// Skills carry no roles of their own (ADR 0011), and the same derivation
+	// applies here: a skill's effective audience is this list intersected
+	// with the allowedPrincipals of every referenced Tool/Agent that is itself
+	// private, so a skill can never widen a private tool's audience.
+	// +optional
+	AllowedPrincipals []string `json:"allowedPrincipals,omitempty"`
+
 	// allowCallerTools controls whether tools supplied by the CONSUMER in the
 	// request body (docs/adr/0035 — `/v1/chat/completions`'s `tools` array,
 	// executed by the caller's own client rather than by this cluster) may be

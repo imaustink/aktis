@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/aktisai/orchestrator/engines/temporal/internal/access"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/catalog"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/vectorstore"
 )
@@ -43,10 +44,10 @@ func (s *recordingStore) Delete(_ context.Context, ids []string) error {
 	return nil
 }
 
-func (s *recordingStore) Query(context.Context, string, []string, int) ([]vectorstore.Hit, error) {
+func (s *recordingStore) Query(context.Context, string, access.Viewer, int) ([]vectorstore.Hit, error) {
 	return nil, nil
 }
-func (s *recordingStore) GetByIDs(context.Context, []string, []string) ([]vectorstore.Hit, error) {
+func (s *recordingStore) GetByIDs(context.Context, []string, access.Viewer) ([]vectorstore.Hit, error) {
 	return nil, nil
 }
 func (s *recordingStore) GetByIDsUnfiltered(context.Context, []string) ([]vectorstore.Hit, error) {

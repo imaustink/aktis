@@ -8,6 +8,8 @@ package vectorstore
 import (
 	"context"
 	"encoding/json"
+
+	"github.com/aktisai/orchestrator/engines/temporal/internal/access"
 )
 
 // Embedder is satisfied by *llm.Embedder.
@@ -25,6 +27,14 @@ type Record struct {
 	// tool-less skills); Roles is ignored when set.
 	Roles        []string
 	Unrestricted bool
+
+	// Private scopes the record to Principals on top of Roles (Aktis
+	// ADR 0060): a viewer must ALSO hold one of them. A separate flag because
+	// a private record with no principals left is a real state (a skill
+	// whose own list and a private tool's do not intersect) and must mean
+	// "no one", not "public".
+	Private    bool
+	Principals []string
 
 	// Hidden keeps a record REFERENCEABLE but not RETRIEVABLE: GetByIDs finds
 	// it, semantic Query never returns it.
@@ -51,13 +61,14 @@ type Store interface {
 	Upsert(ctx context.Context, records []Record) error
 	Delete(ctx context.Context, ids []string) error
 
-	// Query returns the top-k role-visible records for the request text.
-	// Empty callerRoles matches only Unrestricted records (fail closed).
-	Query(ctx context.Context, text string, callerRoles []string, limit int) ([]Hit, error)
+	// Query returns the top-k records visible to viewer for the request text.
+	// No viewer roles matches only Unrestricted records, and no viewer
+	// principals matches no Private record (both fail closed).
+	Query(ctx context.Context, text string, viewer access.Viewer, limit int) ([]Hit, error)
 
 	// GetByIDs resolves records directly (no ranking), re-applying the same
-	// role visibility check. Missing ids are silently absent from the result.
-	GetByIDs(ctx context.Context, ids []string, callerRoles []string) ([]Hit, error)
+	// visibility check. Missing ids are silently absent from the result.
+	GetByIDs(ctx context.Context, ids []string, viewer access.Viewer) ([]Hit, error)
 
 	// GetByIDsUnfiltered resolves records by id with NO role check.
 	//

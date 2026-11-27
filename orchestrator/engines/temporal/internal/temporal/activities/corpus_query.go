@@ -116,7 +116,7 @@ func (a *KnowledgeBaseActivities) QueryCorpus(
 		anyMember     bool
 	)
 	for _, member := range members {
-		if !holdsAnyRole(in.Caller.Roles, member.AllowedRoles) {
+		if !memberVisible(in.Caller, member) {
 			continue
 		}
 		anyMember = true

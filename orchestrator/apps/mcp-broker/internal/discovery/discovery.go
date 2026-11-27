@@ -168,6 +168,9 @@ func desiredSpec(server *resource.MCPServer, entry resource.MCPToolExposure, liv
 	if len(server.Spec.IdentityProviders) > 0 {
 		spec.IdentityProviders = server.Spec.IdentityProviders
 	}
+	if len(entry.AllowedPrincipals) > 0 {
+		spec.AllowedPrincipals = entry.AllowedPrincipals
+	}
 	return spec
 }
 

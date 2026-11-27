@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/aktisai/orchestrator/engines/temporal/internal/access"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/authz"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/catalog"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/corpus"
@@ -172,7 +173,7 @@ func (a *KnowledgeBaseActivities) SearchKnowledgeBase(
 		return SearchKnowledgeBaseOutput{Result: "I could not establish who is asking, so I cannot search this knowledge base."}, nil
 	}
 
-	visible, withheld := visibleMembers(exec.Members, in.Caller.Roles)
+	visible, withheld := visibleMembers(exec.Members, in.Caller.Viewer())
 	if len(visible) == 0 {
 		renderInput := corpus.RenderInput{
 			Withheld: withheld,
@@ -448,22 +449,14 @@ func firstLinked(providers []string, linked map[string]DelegatedCredential) stri
 // A member with no collection is counted as withheld rather than visible: there
 // is nothing indexed to search, and that is still something the answer is
 // missing.
-func visibleMembers(members []catalog.KnowledgeBaseExecMember, callerRoles []string) ([]catalog.KnowledgeBaseExecMember, int) {
-	held := make(map[string]struct{}, len(callerRoles))
-	for _, role := range callerRoles {
-		held[role] = struct{}{}
-	}
-
+//
+// A private member (ADR 0060) the viewer is not listed on is withheld and
+// counted exactly like one scoped to other roles.
+func visibleMembers(members []catalog.KnowledgeBaseExecMember, viewer access.Viewer) ([]catalog.KnowledgeBaseExecMember, int) {
 	visible := make([]catalog.KnowledgeBaseExecMember, 0, len(members))
 	withheld := 0
 	for _, member := range members {
-		allowed := false
-		for _, role := range member.AllowedRoles {
-			if _, ok := held[role]; ok {
-				allowed = true
-				break
-			}
-		}
+		allowed := viewer.Admits(access.Of(member.AllowedRoles, member.AllowedPrincipals))
 		if !allowed || member.Collection == "" {
 			withheld++
 			continue

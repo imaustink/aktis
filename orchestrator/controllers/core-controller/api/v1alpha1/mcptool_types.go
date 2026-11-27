@@ -65,6 +65,18 @@ type MCPToolSpec struct {
 	// +kubebuilder:validation:MinItems=1
 	AllowedRoles []string `json:"allowedRoles"`
 
+	// allowedPrincipals privately scopes this MCPTool to specific people, on
+	// top of allowedRoles (ADR 0060). Empty or unset means public: allowedRoles
+	// alone decides. Non-empty means a caller must ALSO be one of these
+	// principals, so it can only narrow what allowedRoles admits, never widen
+	// it. A principal is a caller subject as the orchestrator resolves it (for
+	// example "openwebui:<user-id>"); it matches a per-user caller's own
+	// subject, or the subject a verified webhook sender's account is linked
+	// under. Copied from the owning server's exposure entry,
+	// like allowedRoles.
+	// +optional
+	AllowedPrincipals []string `json:"allowedPrincipals,omitempty"`
+
 	// hidden makes the tool referenceable-by-id but never returned by semantic
 	// retrieval (ADR 0008). Copied from the exposure entry.
 	// +optional

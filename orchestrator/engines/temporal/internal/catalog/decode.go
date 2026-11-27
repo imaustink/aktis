@@ -15,6 +15,7 @@ type toolSpec struct {
 	Input             string   `json:"input"`
 	Output            string   `json:"output"`
 	AllowedRoles      []string `json:"allowedRoles"`
+	AllowedPrincipals []string `json:"allowedPrincipals,omitempty"`
 	Tier              string   `json:"tier,omitempty"`
 	Approval          string   `json:"approval,omitempty"`
 	AgentRef          string   `json:"agentRef,omitempty"`
@@ -27,6 +28,7 @@ type agentSpec struct {
 	Input                  string   `json:"input"`
 	Output                 string   `json:"output"`
 	AllowedRoles           []string `json:"allowedRoles"`
+	AllowedPrincipals      []string `json:"allowedPrincipals,omitempty"`
 	Tier                   string   `json:"tier,omitempty"`
 	ApprovalDefault        string   `json:"approvalDefault,omitempty"`
 	ApprovalTimeoutSeconds int32    `json:"approvalTimeoutSeconds,omitempty"`
@@ -61,22 +63,23 @@ type secretEnvVarSpec struct {
 // (ADR 0014) — catalog fields plus the packaging/execution fields the
 // engine forwards verbatim to the executor sidecar.
 type localToolSpec struct {
-	Description    string             `json:"description"`
-	Input          string             `json:"input"`
-	Output         string             `json:"output"`
-	AllowedRoles   []string           `json:"allowedRoles"`
-	Tier           string             `json:"tier,omitempty"`
-	Approval       string             `json:"approval,omitempty"`
-	Runtime        string             `json:"runtime"`
-	Package        string             `json:"package,omitempty"`
-	Version        string             `json:"version,omitempty"`
-	Entry          string             `json:"entry,omitempty"`
-	SourceURL      string             `json:"sourceURL,omitempty"`
-	Checksum       string             `json:"checksum,omitempty"`
-	Env            []envVarSpec       `json:"env,omitempty"`
-	SecretEnv      []secretEnvVarSpec `json:"secretEnv,omitempty"`
-	Network        bool               `json:"network,omitempty"`
-	TimeoutSeconds int32              `json:"timeoutSeconds,omitempty"`
+	Description       string             `json:"description"`
+	Input             string             `json:"input"`
+	Output            string             `json:"output"`
+	AllowedRoles      []string           `json:"allowedRoles"`
+	AllowedPrincipals []string           `json:"allowedPrincipals,omitempty"`
+	Tier              string             `json:"tier,omitempty"`
+	Approval          string             `json:"approval,omitempty"`
+	Runtime           string             `json:"runtime"`
+	Package           string             `json:"package,omitempty"`
+	Version           string             `json:"version,omitempty"`
+	Entry             string             `json:"entry,omitempty"`
+	SourceURL         string             `json:"sourceURL,omitempty"`
+	Checksum          string             `json:"checksum,omitempty"`
+	Env               []envVarSpec       `json:"env,omitempty"`
+	SecretEnv         []secretEnvVarSpec `json:"secretEnv,omitempty"`
+	Network           bool               `json:"network,omitempty"`
+	TimeoutSeconds    int32              `json:"timeoutSeconds,omitempty"`
 }
 
 // mcpToolSpec mirrors orchestrator/controllers/core-controller/api/v1alpha1.MCPToolSpec
@@ -88,6 +91,7 @@ type mcpToolSpec struct {
 	Description       string   `json:"description"`
 	InputSchema       string   `json:"inputSchema,omitempty"`
 	AllowedRoles      []string `json:"allowedRoles"`
+	AllowedPrincipals []string `json:"allowedPrincipals,omitempty"`
 	Hidden            bool     `json:"hidden,omitempty"`
 	Tier              string   `json:"tier,omitempty"`
 	Approval          string   `json:"approval,omitempty"`
@@ -96,13 +100,14 @@ type mcpToolSpec struct {
 }
 
 type skillSpec struct {
-	Description      string   `json:"description"`
-	Input            string   `json:"input,omitempty"`
-	Output           string   `json:"output,omitempty"`
-	Markdown         string   `json:"markdown"`
-	ToolRefs         []string `json:"toolRefs,omitempty"`
-	AgentRefs        []string `json:"agentRefs,omitempty"`
-	AllowCallerTools *bool    `json:"allowCallerTools,omitempty"`
+	Description       string   `json:"description"`
+	Input             string   `json:"input,omitempty"`
+	Output            string   `json:"output,omitempty"`
+	Markdown          string   `json:"markdown"`
+	ToolRefs          []string `json:"toolRefs,omitempty"`
+	AgentRefs         []string `json:"agentRefs,omitempty"`
+	AllowedPrincipals []string `json:"allowedPrincipals,omitempty"`
+	AllowCallerTools  *bool    `json:"allowCallerTools,omitempty"`
 }
 
 func decodeSpec(obj *unstructured.Unstructured, into any) error {
@@ -124,6 +129,7 @@ func DecodeTool(obj *unstructured.Unstructured) (ToolDescriptor, error) {
 		Input:             spec.Input,
 		Output:            spec.Output,
 		AllowedRoles:      spec.AllowedRoles,
+		AllowedPrincipals: spec.AllowedPrincipals,
 		Tier:              spec.Tier,
 		Approval:          spec.Approval,
 		AgentRef:          spec.AgentRef,
@@ -155,13 +161,14 @@ func DecodeLocalTool(obj *unstructured.Unstructured) (ToolDescriptor, error) {
 	}
 
 	return ToolDescriptor{
-		ID:           obj.GetName(),
-		Description:  spec.Description,
-		Input:        spec.Input,
-		Output:       spec.Output,
-		AllowedRoles: spec.AllowedRoles,
-		Tier:         spec.Tier,
-		Approval:     spec.Approval,
+		ID:                obj.GetName(),
+		Description:       spec.Description,
+		Input:             spec.Input,
+		Output:            spec.Output,
+		AllowedRoles:      spec.AllowedRoles,
+		AllowedPrincipals: spec.AllowedPrincipals,
+		Tier:              spec.Tier,
+		Approval:          spec.Approval,
 		LocalExec: &LocalExecSpec{
 			Runtime:        spec.Runtime,
 			Package:        spec.Package,
@@ -198,6 +205,7 @@ func DecodeMCPTool(obj *unstructured.Unstructured) (ToolDescriptor, error) {
 		// either engine (ADR 0045 §2).
 		Input:             spec.InputSchema,
 		AllowedRoles:      spec.AllowedRoles,
+		AllowedPrincipals: spec.AllowedPrincipals,
 		Tier:              spec.Tier,
 		Approval:          spec.Approval,
 		Hidden:            spec.Hidden,
@@ -224,6 +232,7 @@ func DecodeAgent(obj *unstructured.Unstructured) (AgentDescriptor, error) {
 		Input:                  spec.Input,
 		Output:                 spec.Output,
 		AllowedRoles:           spec.AllowedRoles,
+		AllowedPrincipals:      spec.AllowedPrincipals,
 		Tier:                   spec.Tier,
 		ApprovalDefault:        spec.ApprovalDefault,
 		ApprovalTimeoutSeconds: spec.ApprovalTimeoutSeconds,
@@ -261,5 +270,7 @@ func DecodeSkill(obj *unstructured.Unstructured) (SkillDescriptor, error) {
 		ToolIDs:          spec.ToolRefs,
 		AgentIDs:         spec.AgentRefs,
 		AllowCallerTools: spec.AllowCallerTools,
+		// Copied as authored; DeriveSkillAccess turns it into the effective scope.
+		AllowedPrincipals: spec.AllowedPrincipals,
 	}, nil
 }

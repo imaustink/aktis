@@ -92,7 +92,7 @@ func (a *KnowledgeBaseActivities) LookupCorpus(
 		anyMember     bool
 	)
 	for _, member := range exec.Members {
-		if !holdsAnyRole(in.Caller.Roles, member.AllowedRoles) {
+		if !memberVisible(in.Caller, member) {
 			continue
 		}
 		anyMember = true

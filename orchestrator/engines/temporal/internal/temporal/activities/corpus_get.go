@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/aktisai/orchestrator/engines/temporal/internal/access"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/catalog"
 	"github.com/aktisai/orchestrator/engines/temporal/internal/corpus"
 )
@@ -110,7 +111,7 @@ func (a *KnowledgeBaseActivities) ReadCorpus(
 	// This is OUR policy layer and it is not the same question as the source's.
 	// A caller whose Atlassian account happens to see a page still may not reach
 	// it through a corpus the operator scoped to other roles.
-	if !holdsAnyRole(in.Caller.Roles, member.AllowedRoles) {
+	if !memberVisible(in.Caller, member) {
 		return ReadCorpusOutput{
 			Result: fmt.Sprintf("You do not have access to %s in this knowledge base.", member.Label),
 		}, nil
@@ -235,22 +236,13 @@ func memberNames(members []catalog.KnowledgeBaseExecMember) string {
 	return strings.Join(names, ", ")
 }
 
-// holdsAnyRole is the match-any rule the vector store applies to a point.
+// memberVisible is whether this caller may consult one knowledge-base member
+// at all: its Corpus's allowedRoles AND, when it is private, its
+// allowedPrincipals (ADR 0060) — the same rule the vector store applies to a
+// catalog record.
 //
 // Empty caller roles match NOTHING, which is the fail-closed default: an
 // unresolved identity is not a permissive one.
-func holdsAnyRole(caller, required []string) bool {
-	if len(caller) == 0 || len(required) == 0 {
-		return false
-	}
-	held := make(map[string]struct{}, len(caller))
-	for _, role := range caller {
-		held[role] = struct{}{}
-	}
-	for _, role := range required {
-		if _, ok := held[role]; ok {
-			return true
-		}
-	}
-	return false
+func memberVisible(caller Caller, member catalog.KnowledgeBaseExecMember) bool {
+	return caller.Viewer().Admits(access.Of(member.AllowedRoles, member.AllowedPrincipals))
 }

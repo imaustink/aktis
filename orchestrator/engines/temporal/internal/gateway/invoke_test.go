@@ -404,6 +404,50 @@ func TestShapeInvokeTurnSenderLoginTrust(t *testing.T) {
 	})
 }
 
+// ADR 0060: a verified LINKED sender is a principal private resources may be
+// matched against; nothing else that names a sender is.
+func TestShapeInvokeTurnSenderSubjectForPrivateScoping(t *testing.T) {
+	now := time.UnixMilli(1754150400000)
+	mint := func(secret string, claims rbac.SenderClaims) string {
+		return rbac.MintSenderClaims(secret, claims, rbac.DefaultAssertionTTL, now)
+	}
+	shape := func(t *testing.T, event *catalog.Envelope, assertion, secret string) shapedInvoke {
+		t.Helper()
+		shaped, err := shapeInvokeTurn(invokeRequest{Event: event}, assertion, "", secret, reviewTriggers(t), testCaller, now)
+		require.NoError(t, err)
+		return shaped
+	}
+
+	t.Run("a linked sender's subject is carried on the caller", func(t *testing.T) {
+		shaped := shape(t, prEnvelope("ai-review"), mint(assertionSecret, rbac.SenderClaims{
+			Login: "imaustink", Subject: "openwebui:alice", SubjectStatus: rbac.SenderSubjectLinked,
+		}), assertionSecret)
+		require.Equal(t, "openwebui:alice", shaped.turn.Caller.SenderSubject)
+		require.Contains(t, shaped.turn.Caller.Viewer().Principals, "openwebui:alice")
+	})
+
+	t.Run("a subject claimed without linked status is ignored", func(t *testing.T) {
+		shaped := shape(t, prEnvelope("ai-review"), mint(assertionSecret, rbac.SenderClaims{
+			Login: "imaustink", Subject: "openwebui:alice", SubjectStatus: "ambiguous",
+		}), assertionSecret)
+		require.Empty(t, shaped.turn.Caller.SenderSubject)
+	})
+
+	t.Run("an assertion signed by someone else carries no subject", func(t *testing.T) {
+		shaped := shape(t, prEnvelope("ai-review"), mint("some-other-secret", rbac.SenderClaims{
+			Login: "imaustink", Subject: "openwebui:alice", SubjectStatus: rbac.SenderSubjectLinked,
+		}), assertionSecret)
+		require.Empty(t, shaped.turn.Caller.SenderSubject)
+	})
+
+	t.Run("without a secret the unsigned envelope sender never becomes a principal", func(t *testing.T) {
+		shaped := shape(t, prEnvelope("ai-review"), "", "")
+		require.Equal(t, "imaustink", shaped.turn.SenderLogin)
+		require.Empty(t, shaped.turn.Caller.SenderSubject)
+		require.Empty(t, shaped.turn.Caller.Viewer().Principals)
+	})
+}
+
 // §5's non-turn outcomes are answered before any workflow is touched: a nil
 // Temporal client is the assertion, since reaching update-with-start would
 // panic.

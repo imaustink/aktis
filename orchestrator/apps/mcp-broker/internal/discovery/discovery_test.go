@@ -251,6 +251,17 @@ func TestDiscoveryMaterializes(t *testing.T) {
 		}
 	})
 
+	t.Run("copies allowedPrincipals from the exposure entry onto the materialized MCPTool (ADR 0060)", func(t *testing.T) {
+		server := makeServer(nil, eng("search_issues", func(e *resource.MCPToolExposure) {
+			e.AllowedPrincipals = []string{"openwebui:alice"}
+		}))
+		k := newFakeK8s(t, server)
+		discoveryWith(k, listing(liveTools)).RunServer(ctx, bind(server))
+		if got := k.tool(searchIssuesID).Spec.AllowedPrincipals; !reflect.DeepEqual(got, []string{"openwebui:alice"}) {
+			t.Fatalf("allowedPrincipals = %v", got)
+		}
+	})
+
 	t.Run("omits every optional field the exposure entry and server leave unset", func(t *testing.T) {
 		// Existing servers are unaffected by fields they never set: the stored
 		// spec carries no approval/hidden/tier/identityProviders/defaultIdentity
