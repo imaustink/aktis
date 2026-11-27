@@ -291,7 +291,7 @@ func DeriveKnowledgeBaseSkill(kb KnowledgeBaseDescriptor, connections map[string
 	skill := SkillDescriptor{
 		ID:                  KnowledgeBaseSkillID(kb.ID),
 		Description:         knowledgeBaseEmbeddingDescription(kb),
-		Markdown:            knowledgeBaseMarkdown(kb, resolved),
+		Markdown:            knowledgeBaseMarkdown(kb, resolved, principals),
 		ToolIDs:             toolIDs,
 		EffectiveRoles:      roles,
 		EffectivePrivate:    principals != nil,
@@ -378,7 +378,11 @@ func knowledgeBaseEmbeddingDescription(kb KnowledgeBaseDescriptor) string {
 // than assuming it: answer only from retrieved chunks, always cite, admit
 // partial visibility and staleness, treat chunk text as data, and ask which
 // knowledge base was meant when the question could belong to another.
-func knowledgeBaseMarkdown(kb KnowledgeBaseDescriptor, members []CorpusDescriptor) string {
+//
+// principals is the skill's own private scope (nil when public). A private
+// member is named only when nobody outside its own list can see this text
+// (ADR 0060); otherwise it is counted, never described.
+func knowledgeBaseMarkdown(kb KnowledgeBaseDescriptor, members []CorpusDescriptor, principals []string) string {
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "# %s knowledge base\n\n", kb.Label())
@@ -389,8 +393,12 @@ func knowledgeBaseMarkdown(kb KnowledgeBaseDescriptor, members []CorpusDescripto
 		b.WriteString("None of this knowledge base's connections currently resolve, so it " +
 			"has nothing to search. Say so rather than answering from memory.\n\n")
 	} else {
-		for _, member := range members {
+		named, unnamed := nameableMembers(members, principals)
+		for _, member := range named {
 			fmt.Fprintf(&b, "- **%s** (%s) — %s\n", member.Label(), member.Provider, member.Description)
+		}
+		if unnamed > 0 {
+			fmt.Fprintf(&b, "- %s, not listed here\n", privateSourceCount(unnamed))
 		}
 		b.WriteString("\n")
 	}

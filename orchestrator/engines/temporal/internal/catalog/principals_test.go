@@ -227,3 +227,73 @@ func TestIndexerWritesPrincipalScopeToTheStore(t *testing.T) {
 	require.True(t, ok)
 	require.True(t, rec.Private)
 }
+
+func TestSharedKnowledgeBaseTextNeverNamesAPrivateMemberToOutsiders(t *testing.T) {
+	secret := privateCorpus("alice-notes", []string{"eng"}, []string{alice})
+	secret.DisplayName = "Alice's 1:1 notes"
+	secret.Description = "Alice's private one-on-one notes"
+	shared := privateCorpus("team-wiki", []string{"eng"}, nil)
+	shared.DisplayName = "Team wiki"
+	shared.Description = "The team's shared wiki"
+
+	leaked := func(t *testing.T, text string) {
+		t.Helper()
+		require.NotContains(t, text, "alice-notes")
+		require.NotContains(t, text, secret.DisplayName)
+		require.NotContains(t, text, secret.Description)
+	}
+
+	t.Run("a knowledge base with a public member counts the private one instead of naming it", func(t *testing.T) {
+		tools := newRecordingStore()
+		skills := newRecordingStore()
+		ix := catalog.NewIndexer(vectorstore.Collections{Tools: tools, Skills: skills, Agents: newRecordingStore()})
+		ctx := context.Background()
+		require.NoError(t, ix.UpsertCorpus(ctx, secret))
+		require.NoError(t, ix.UpsertCorpus(ctx, shared))
+		require.NoError(t, ix.UpsertKnowledgeBase(ctx, catalog.KnowledgeBaseDescriptor{
+			ID: "team", Description: "d", CorpusRefs: []string{"alice-notes", "team-wiki"},
+		}))
+
+		skill := catalog.DeriveKnowledgeBaseSkill(
+			catalog.KnowledgeBaseDescriptor{ID: "team", Description: "d", CorpusRefs: []string{"alice-notes", "team-wiki"}},
+			map[string]catalog.CorpusDescriptor{"alice-notes": secret, "team-wiki": shared},
+		)
+		require.False(t, skill.EffectivePrivate)
+		leaked(t, skill.Markdown)
+		require.Contains(t, skill.Markdown, shared.Description)
+		require.Contains(t, skill.Markdown, "plus 1 private source")
+
+		for _, id := range []string{catalog.KnowledgeBaseReadToolID("team"), catalog.KnowledgeBaseQueryToolID("team")} {
+			rec, ok := tools.get(id)
+			require.True(t, ok, id)
+			tool := decodeTool(t, rec)
+			leaked(t, tool.Description+tool.Input+tool.Output)
+			require.Contains(t, tool.Input, "team-wiki (Team wiki)", id)
+			require.Contains(t, tool.Input, "plus 1 private source", id)
+		}
+		rec, ok := skills.get(catalog.KnowledgeBaseSkillID("team"))
+		require.True(t, ok)
+		leaked(t, rec.Text)
+	})
+
+	t.Run("a private member is still named when everyone who can see the text is on its list", func(t *testing.T) {
+		skill := catalog.DeriveKnowledgeBaseSkill(
+			catalog.KnowledgeBaseDescriptor{ID: "mine", Description: "d", CorpusRefs: []string{"alice-notes"}},
+			map[string]catalog.CorpusDescriptor{"alice-notes": secret},
+		)
+		require.Contains(t, skill.Markdown, secret.Description)
+		require.NotContains(t, skill.Markdown, "private source")
+	})
+
+	t.Run("a private member is not named when the union also admits someone it excludes", func(t *testing.T) {
+		bobs := privateCorpus("bob-notes", []string{"eng"}, []string{bob})
+		skill := catalog.DeriveKnowledgeBaseSkill(
+			catalog.KnowledgeBaseDescriptor{ID: "pair", Description: "d", CorpusRefs: []string{"alice-notes", "bob-notes"}},
+			map[string]catalog.CorpusDescriptor{"alice-notes": secret, "bob-notes": bobs},
+		)
+		require.True(t, skill.EffectivePrivate)
+		leaked(t, skill.Markdown)
+		require.NotContains(t, skill.Markdown, "bob-notes")
+		require.Contains(t, skill.Markdown, "plus 2 private sources")
+	})
+}

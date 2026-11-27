@@ -114,6 +114,16 @@ the full rule, and a private member the caller is not listed on is withheld
 and counted in the partial-visibility disclosure exactly like a role-scoped
 one.
 
+Withholding a private member's content is not enough, because the derived
+skill's markdown and the read/query tools' descriptions are one shared text
+for everyone the face admits. A private member is therefore **named** there
+(id, label, provider, description) only when the face is itself private and
+every principal it admits is on that member's own list. Otherwise it is
+replaced by a count ("plus N private sources"), so a public knowledge base
+never reveals that, say, "Alice's 1:1 notes" exists. A caller the member does
+admit still reaches it: search results cite its `<corpus>`, which the read and
+query tools accept, and execution gates every member per caller.
+
 Chunks in a Corpus collection carry roles only. Private scoping is enforced
 at the member, before any chunk query, on every path that reaches a corpus.
 

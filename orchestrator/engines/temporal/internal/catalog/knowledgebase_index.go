@@ -269,15 +269,12 @@ func knowledgeBaseReadTool(
 	readable []CorpusDescriptor,
 	exec *KnowledgeBaseExecSpec,
 ) ToolDescriptor {
-	names := make([]string, 0, len(readable))
-	for _, conn := range readable {
-		names = append(names, fmt.Sprintf("%s (%s)", conn.ID, conn.Label()))
-	}
 
 	// Union to invoke, as the search tool does (ADR 0039 §4): a caller who may
 	// reach ANY member may call it, and which documents they can actually read
 	// is settled per read by the source itself.
 	allowed, principals := memberUnion(readable)
+	names := memberNames(readable, principals)
 
 	return ToolDescriptor{
 		ID: KnowledgeBaseReadToolID(kb.ID),
@@ -315,11 +312,8 @@ func knowledgeBaseQueryTool(
 	readable []CorpusDescriptor,
 	exec *KnowledgeBaseExecSpec,
 ) ToolDescriptor {
-	names := make([]string, 0, len(readable))
-	for _, conn := range readable {
-		names = append(names, fmt.Sprintf("%s (%s)", conn.ID, conn.Label()))
-	}
 	allowed, principals := memberUnion(readable)
+	names := memberNames(readable, principals)
 
 	return ToolDescriptor{
 		ID: KnowledgeBaseQueryToolID(kb.ID),
@@ -347,6 +341,68 @@ func knowledgeBaseQueryTool(
 		AllowedPrincipals: principals,
 		KnowledgeBaseExec: exec,
 	}
+}
+
+// nameableMembers splits a face's members into the ones its shared text may
+// name and a count of the ones it may not (ADR 0060).
+//
+// Generated skill markdown and tool descriptions are one text for everyone the
+// face admits, so withholding a private member's CONTENT is not enough: naming
+// it — label, provider, description — discloses that it exists to people it was
+// scoped away from. A public member is always named. A private member is named
+// only when the face itself is private and every principal it admits is on that
+// member's own list, so the text can reach no one the member excludes.
+func nameableMembers(members []CorpusDescriptor, facePrincipals []string) (named []CorpusDescriptor, unnamed int) {
+	for _, conn := range members {
+		if len(conn.AllowedPrincipals) == 0 || withinScope(facePrincipals, conn.AllowedPrincipals) {
+			named = append(named, conn)
+			continue
+		}
+		unnamed++
+	}
+	return named, unnamed
+}
+
+// withinScope reports whether a private face's principals are all on list. A
+// nil face is public, which no private list contains.
+func withinScope(facePrincipals, list []string) bool {
+	if facePrincipals == nil {
+		return false
+	}
+	set := make(map[string]bool, len(list))
+	for _, p := range list {
+		set[p] = true
+	}
+	for _, p := range facePrincipals {
+		if !set[p] {
+			return false
+		}
+	}
+	return true
+}
+
+// memberNames is the "<id> (<label>)" list a read or query tool offers, with
+// private members this face may not name replaced by a count. Such a member
+// stays reachable: a caller it admits gets its `<corpus>` from a search
+// result, and execution gates every member per caller.
+func memberNames(members []CorpusDescriptor, facePrincipals []string) []string {
+	named, unnamed := nameableMembers(members, facePrincipals)
+	names := make([]string, 0, len(named)+1)
+	for _, conn := range named {
+		names = append(names, fmt.Sprintf("%s (%s)", conn.ID, conn.Label()))
+	}
+	if unnamed > 0 {
+		names = append(names, fmt.Sprintf("%s (use the `<corpus>` a search result cites)",
+			privateSourceCount(unnamed)))
+	}
+	return names
+}
+
+func privateSourceCount(n int) string {
+	if n == 1 {
+		return "plus 1 private source"
+	}
+	return fmt.Sprintf("plus %d private sources", n)
 }
 
 // memberUnion is the audience of a face usable by anyone who may reach ANY of
