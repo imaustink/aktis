@@ -108,7 +108,10 @@ URL gets `202`, not `401` or `404`.
 - For auto-triage of new issues, edit `factory-intake`'s `match.cel` as shown
   in doc §4.8, with the human's repository list. That is the only CEL edit to
   make by hand. If you used `--no-coordination`, edit `github-issue-triage`
-  instead.
+  instead, and also change its `label: body.label.name` param to
+  `label: 'has(body.label) ? body.label.name : "ai-triage"'`: an `opened`
+  delivery has no `body.label`, so the param would fail (422) and no run
+  would start.
 - If existing triggers have the same names (`github-pr-triage`,
   `github-pr-review`, …), diff the live spec against the render
   (`kubectl get eventtrigger <n> -n <ns> -o yaml`). Tell the human what will

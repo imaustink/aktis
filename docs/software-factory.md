@@ -144,6 +144,9 @@ them.
   - Metadata: read
   - Checks and Actions: read (the fix prompts run `gh pr checks` and
     `gh run view --log-failed`)
+  - Workflows: read & write, if the repositories have `.github/workflows/`
+    (pushes that touch workflow files, including merge-base resyncs that pull
+    in workflow changes from the base branch, are rejected without it)
 - **Organization permissions:** Members: read, but only if you grant roles by
   team (`githubTeamRoles`).
 - **Subscribe to events:** Issues, Pull request.
@@ -300,6 +303,13 @@ The `!labels.exists(...)` clause matters. An issue opened *with* the label
 also gets a `labeled` delivery, and without the clause it would be queued
 twice. The `author_association` check keeps strangers on public repositories
 out.
+
+With `--no-coordination` there is no `factory-intake`; put this CEL on
+`github-issue-triage` instead, and change its `label: body.label.name` param
+to `label: 'has(body.label) ? body.label.name : "ai-triage"'`. An `opened`
+delivery has no `body.label`, so the original param fails to evaluate, the
+gateway answers 422, and no run starts. (`factory-intake`'s params never read
+`body.label`, so it doesn't need this.)
 
 ## 5. Trigger reference
 

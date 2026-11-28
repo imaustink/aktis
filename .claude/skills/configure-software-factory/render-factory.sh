@@ -62,10 +62,21 @@ files+=(eventtrigger-github-pr-triage.yaml eventtrigger-github-pr-review.yaml
 
 # One manifest: drop the comment header above apiVersion, substitute the agent
 # and the App's search author.
+# Fails loudly if an example has an agentRef/author the substitution missed
+# (e.g. the example's agent or quoting changed), rather than rendering the
+# wrong Agent or production's App author.
 body() {
-  awk 'f || /^apiVersion:/ { f = 1; print }' "$ex/$1" \
+  local out
+  out="$(awk 'f || /^apiVersion:/ { f = 1; print }' "$ex/$1" \
     | sed -e "s|agentRef: \"opencode-swe-agent\"|agentRef: \"$agent\"|" \
-          -e "s|author: \"app/k5s-bot\"|author: \"app/$slug\"|"
+          -e "s|author: \"app/k5s-bot\"|author: \"app/$slug\"|")"
+  if grep -E '^[[:space:]]*agentRef:' <<<"$out" | grep -vqF "agentRef: \"$agent\""; then
+    echo "render-factory: agentRef in $1 was not substituted (example changed?)" >&2; exit 1
+  fi
+  if grep -E '^[[:space:]]*author:' <<<"$out" | grep -vqF "author: \"app/$slug\""; then
+    echo "render-factory: conflicts.author in $1 was not substituted (example changed?)" >&2; exit 1
+  fi
+  printf '%s\n' "$out"
 }
 
 if [ "$format" = kubectl ]; then
