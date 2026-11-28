@@ -105,4 +105,9 @@ explicitly selected one with `AKTIS_CLUSTER`. See
 - k8s API access goes through `@kubernetes/client-node` in-process (object-param
   APIs, e.g. `api.createNamespacedJob({ namespace, body })`), never by
   shelling out to `kubectl`.
+- Setting up or changing the software factory (the `ai-triage`/`ai-review`
+  EventTriggers and `factory-*` chain) on a deployment: follow
+  [docs/software-factory.md](../docs/software-factory.md) and its skill
+  `.claude/skills/configure-software-factory/SKILL.md`. Render the triggers
+  with that skill's `render-factory.sh`; don't hand-write them.
 - New tool/app checklist lives in [README.md § Adding a new tool](../README.md#adding-a-new-tool).

@@ -311,6 +311,12 @@ Install the `aktis` chart first (it owns the CRDs), then
 prerequisites and values. Tools are never deployed as long-running pods — the
 controller launches them as one-shot Jobs via `ToolRun`/`AgentRun` CRs.
 
+> **Turning on the software factory** (label an issue `ai-triage`, get a
+> reviewed PR assigned back to you)? Follow
+> [docs/software-factory.md](docs/software-factory.md). Coding agents can use
+> the [`configure-software-factory`](.claude/skills/configure-software-factory/SKILL.md)
+> skill.
+
 > **Upgrading a cluster installed before the Aktis rename?** The CRD API
 > group moved from `core.controller-agent.dev` to `core.aktis.ai`. Follow
 > [docs/aktis-migration.md](docs/aktis-migration.md) **before** upgrading,

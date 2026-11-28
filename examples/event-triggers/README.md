@@ -57,6 +57,11 @@ source or target does not exist reports `Ready=False` (`SourceNotFound` /
 `onComplete.emitTo` that doesn't name a run source) and dispatches nothing --
 `kubectl get eventtriggers` shows it.
 
+**Deploying the software factory?** Follow
+[docs/software-factory.md](../../docs/software-factory.md). It renders the
+factory set from these files for your Agent and GitHub App with
+`.claude/skills/configure-software-factory/render-factory.sh`.
+
 The three `factory-*` triggers plus `eventsource-runs.yaml` and the
 `onComplete` on the issue-triage, PR-triage and PR-review triggers make up the label-driven software factory of
 [ADR 0052](../../docs/adr/0052-run-events-and-software-factory.md); see
